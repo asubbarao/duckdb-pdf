@@ -1,0 +1,68 @@
+# name: test/sql/read_pdf_ocr.test
+# description: OCR and scanned PDF tests for read_pdf
+# group: [sql]
+
+require pdf
+
+# OCR needs a Tesseract language model at runtime (located via TESSDATA_PREFIX).
+# Package managers do not ship one, so this whole suite is skipped unless the
+# environment provides a model directory. Run locally/CI with e.g.
+#   TESSDATA_PREFIX="$(brew --prefix tesseract)/share/tessdata" make test
+require-env TESSDATA_PREFIX
+
+statement ok
+PRAGMA enable_verification
+
+# ── scanned.pdf: image-only PDF, no text layer ────────────────────────────
+
+# With OCR disabled, text should be empty or near-empty
+# (image-only PDF has no embedded text; result may be empty string or whitespace).
+# auto_ocr defaults to true, so we must turn it off to observe the raw text layer.
+query I
+SELECT length(trim(text)) < 5
+FROM read_pdf('test/data/scanned.pdf', auto_ocr:=false);
+----
+true
+
+# ── scanned.pdf with ocr:=true ────────────────────────────────────────────
+
+# OCR should detect words from the rasterized table image (scanned.pdf is an
+# image-only render of a small Item/Qty/Price table). OCR output is not
+# byte-stable across tesseract versions, so assert on words the engine recovers
+# reliably and match case-insensitively.
+
+query I
+SELECT text ILIKE '%Apples%'
+FROM read_pdf('test/data/scanned.pdf', ocr:=true);
+----
+true
+
+query I
+SELECT text ILIKE '%Cherries%'
+FROM read_pdf('test/data/scanned.pdf', ocr:=true);
+----
+true
+
+# ── auto_ocr behaviour ────────────────────────────────────────────────────
+
+# auto_ocr:=true on scanned.pdf should also trigger OCR (no text layer detected)
+query I
+SELECT text ILIKE '%Apples%'
+FROM read_pdf('test/data/scanned.pdf', auto_ocr:=true);
+----
+true
+
+# ── text PDF: OCR forced on text PDF should still return text ─────────────
+
+# hello.pdf has a text layer; even with ocr:=true it should contain the text
+query I
+SELECT text ILIKE '%Hello DuckDB%'
+FROM read_pdf('test/data/hello.pdf', ocr:=true);
+----
+true
+
+# ── error: missing file with OCR flag ─────────────────────────────────────
+
+statement error
+SELECT * FROM read_pdf('test/data/does_not_exist.pdf', ocr:=true);
+----

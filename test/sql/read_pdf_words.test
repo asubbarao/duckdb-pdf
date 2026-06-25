@@ -1,0 +1,105 @@
+# name: test/sql/read_pdf_words.test
+# description: read_pdf_words function tests
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── hello.pdf word extraction ─────────────────────────────────────────────
+
+# At least 1 row returned
+query I
+SELECT COUNT(*) > 0 FROM read_pdf_words('test/data/hello.pdf');
+----
+true
+
+# "Hello" word present on page 1
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_words('test/data/hello.pdf')
+WHERE word ILIKE 'Hello' AND page = 1;
+----
+true
+
+# "DuckDB" word present on page 1
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_words('test/data/hello.pdf')
+WHERE word ILIKE 'DuckDB' AND page = 1;
+----
+true
+
+# All bounding boxes are well-formed: x1 > x0 and y1 > y0
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_words('test/data/hello.pdf')
+WHERE NOT (x1 > x0 AND y1 > y0);
+----
+true
+
+# Coordinates are non-negative
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_words('test/data/hello.pdf')
+WHERE x0 < 0 OR y0 < 0 OR x1 < 0 OR y1 < 0;
+----
+true
+
+# ── two_pages.pdf: words appear on correct pages ──────────────────────────
+
+# Words from page 1 only have page = 1
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_words('test/data/two_pages.pdf')
+WHERE page = 1;
+----
+true
+
+# Words from page 2 only have page = 2
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_words('test/data/two_pages.pdf')
+WHERE page = 2;
+----
+true
+
+# Bounding boxes are well-formed across both pages
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_words('test/data/two_pages.pdf')
+WHERE NOT (x1 > x0 AND y1 > y0);
+----
+true
+
+# ── table.pdf: expected words present ────────────────────────────────────
+
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_words('test/data/table.pdf')
+WHERE word ILIKE 'Apples';
+----
+true
+
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_words('test/data/table.pdf')
+WHERE word ILIKE 'Cherries';
+----
+true
+
+# ── font_name and font_size columns are non-null for text PDFs ────────────
+
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_words('test/data/hello.pdf')
+WHERE font_size IS NULL OR font_size <= 0;
+----
+true
+
+# ── error: missing file ───────────────────────────────────────────────────
+
+statement error
+SELECT * FROM read_pdf_words('test/data/does_not_exist.pdf');
+----

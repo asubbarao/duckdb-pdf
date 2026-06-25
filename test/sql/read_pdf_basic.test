@@ -1,0 +1,98 @@
+# name: test/sql/read_pdf_basic.test
+# description: Basic read_pdf function tests
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── hello.pdf: 1 page, text contains "Hello DuckDB" ───────────────────────
+
+# Row count equals page count (1 page → 1 row)
+query I
+SELECT COUNT(*) FROM read_pdf('test/data/hello.pdf');
+----
+1
+
+# page column is 1
+query I
+SELECT page FROM read_pdf('test/data/hello.pdf');
+----
+1
+
+# page_count column is 1
+query I
+SELECT page_count FROM read_pdf('test/data/hello.pdf');
+----
+1
+
+# filename column reflects the path
+query I
+SELECT filename ILIKE '%hello.pdf' FROM read_pdf('test/data/hello.pdf');
+----
+true
+
+# text column contains the expected content
+query I
+SELECT text ILIKE '%Hello DuckDB%' FROM read_pdf('test/data/hello.pdf');
+----
+true
+
+# width and height are populated (Letter page ~ 612 x 792 pt)
+query I
+SELECT width > 0 AND height > 0 FROM read_pdf('test/data/hello.pdf');
+----
+true
+
+# ── two_pages.pdf: 2 pages ────────────────────────────────────────────────
+
+# Two rows returned (one per page)
+query I
+SELECT COUNT(*) FROM read_pdf('test/data/two_pages.pdf');
+----
+2
+
+# page_count is 2 on every row
+query I
+SELECT COUNT(*) FROM read_pdf('test/data/two_pages.pdf') WHERE page_count = 2;
+----
+2
+
+# Page 1 text contains "Alpha"
+query I
+SELECT text ILIKE '%Alpha%' FROM read_pdf('test/data/two_pages.pdf') WHERE page = 1;
+----
+true
+
+# Page 2 text contains "Beta"
+query I
+SELECT text ILIKE '%Beta%' FROM read_pdf('test/data/two_pages.pdf') WHERE page = 2;
+----
+true
+
+# Pages are distinct (both pages present)
+query I
+SELECT COUNT(DISTINCT page) FROM read_pdf('test/data/two_pages.pdf');
+----
+2
+
+# ── first_page / last_page named params ───────────────────────────────────
+
+# first_page:=2 on a 2-page PDF yields 1 row
+query I
+SELECT COUNT(*) FROM read_pdf('test/data/two_pages.pdf', first_page:=2);
+----
+1
+
+# last_page:=1 on a 2-page PDF yields 1 row
+query I
+SELECT COUNT(*) FROM read_pdf('test/data/two_pages.pdf', last_page:=1);
+----
+1
+
+# ── error: missing file ───────────────────────────────────────────────────
+
+statement error
+SELECT * FROM read_pdf('test/data/does_not_exist.pdf');
+----

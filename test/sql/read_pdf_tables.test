@@ -1,0 +1,108 @@
+# name: test/sql/read_pdf_tables.test
+# description: read_pdf_tables function tests
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── table.pdf: basic table extraction ────────────────────────────────────
+
+# At least one table row returned
+query I
+SELECT COUNT(*) > 0 FROM read_pdf_tables('test/data/table.pdf');
+----
+true
+
+# At least one table detected (table_index >= 0)
+query I
+SELECT COUNT(DISTINCT table_index) > 0 FROM read_pdf_tables('test/data/table.pdf');
+----
+true
+
+# All rows come from page 1
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_tables('test/data/table.pdf')
+WHERE page != 1;
+----
+true
+
+# row_index increments from 0
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_tables('test/data/table.pdf')
+WHERE row_index = 0;
+----
+true
+
+# cells array is non-null and non-empty for all rows
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_tables('test/data/table.pdf')
+WHERE cells IS NULL OR len(cells) = 0;
+----
+true
+
+# Each row has exactly 3 cells (3-column table)
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_tables('test/data/table.pdf')
+WHERE len(cells) != 3;
+----
+true
+
+# Header row contains "Item" in the first cell
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_tables('test/data/table.pdf')
+WHERE cells[1] ILIKE 'Item';
+----
+true
+
+# "Apples" appears as a cell value somewhere
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_tables('test/data/table.pdf')
+WHERE list_contains(cells, 'Apples');
+----
+true
+
+# "Bananas" appears as a cell value somewhere
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_tables('test/data/table.pdf')
+WHERE list_contains(cells, 'Bananas');
+----
+true
+
+# "Cherries" appears as a cell value somewhere
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_tables('test/data/table.pdf')
+WHERE list_contains(cells, 'Cherries');
+----
+true
+
+# Known price cell "9.99" or "Cherries" row: Qty = "100"
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_tables('test/data/table.pdf')
+WHERE list_contains(cells, '100');
+----
+true
+
+# ── two_pages.pdf: no tables expected ────────────────────────────────────
+
+# Plain text-only PDF should return 0 rows (no tables detected)
+query I
+SELECT COUNT(*) = 0 FROM read_pdf_tables('test/data/two_pages.pdf');
+----
+true
+
+# ── error: missing file ───────────────────────────────────────────────────
+
+statement error
+SELECT * FROM read_pdf_tables('test/data/does_not_exist.pdf');
+----

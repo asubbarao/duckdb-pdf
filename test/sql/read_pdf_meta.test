@@ -1,0 +1,76 @@
+# name: test/sql/read_pdf_meta.test
+# description: read_pdf_meta function tests
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── hello.pdf metadata ────────────────────────────────────────────────────
+
+# Returns exactly 1 row for a 1-page file
+query I
+SELECT COUNT(*) FROM read_pdf_meta('test/data/hello.pdf');
+----
+1
+
+# pages column reports the true page count
+query I
+SELECT pages FROM read_pdf_meta('test/data/hello.pdf');
+----
+1
+
+# not encrypted
+query I
+SELECT encrypted FROM read_pdf_meta('test/data/hello.pdf');
+----
+false
+
+# filename column is populated
+query I
+SELECT filename ILIKE '%hello.pdf' FROM read_pdf_meta('test/data/hello.pdf');
+----
+true
+
+# ── two_pages.pdf: pages = 2 ──────────────────────────────────────────────
+
+query I
+SELECT pages FROM read_pdf_meta('test/data/two_pages.pdf');
+----
+2
+
+query I
+SELECT encrypted FROM read_pdf_meta('test/data/two_pages.pdf');
+----
+false
+
+# ── table.pdf: pages = 1, not encrypted ──────────────────────────────────
+
+query I
+SELECT pages FROM read_pdf_meta('test/data/table.pdf');
+----
+1
+
+query I
+SELECT encrypted FROM read_pdf_meta('test/data/table.pdf');
+----
+false
+
+# ── scanned.pdf: pages = 1, not encrypted ────────────────────────────────
+
+query I
+SELECT pages FROM read_pdf_meta('test/data/scanned.pdf');
+----
+1
+
+query I
+SELECT encrypted FROM read_pdf_meta('test/data/scanned.pdf');
+----
+false
+
+# ── error: missing file ───────────────────────────────────────────────────
+
+statement error
+SELECT * FROM read_pdf_meta('test/data/does_not_exist.pdf');
+----

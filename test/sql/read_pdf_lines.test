@@ -1,0 +1,86 @@
+# name: test/sql/read_pdf_lines.test
+# description: read_pdf_lines function tests (layout-preserving line extraction)
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── hello.pdf: one page of text ───────────────────────────────────────────
+
+# At least one line returned
+query I
+SELECT COUNT(*) > 0 FROM read_pdf_lines('test/data/hello.pdf');
+----
+true
+
+# Some line carries the expected content
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_lines('test/data/hello.pdf')
+WHERE text ILIKE '%Hello DuckDB%';
+----
+true
+
+# filename column reflects the path
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_lines('test/data/hello.pdf')
+WHERE filename NOT ILIKE '%hello.pdf';
+----
+true
+
+# all lines on hello.pdf are page 1, and line numbers start at 1
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_lines('test/data/hello.pdf')
+WHERE page != 1;
+----
+true
+
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_lines('test/data/hello.pdf')
+WHERE line = 1;
+----
+true
+
+# ── two_pages.pdf: lines land on the correct pages ────────────────────────
+
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_lines('test/data/two_pages.pdf')
+WHERE page = 1 AND text ILIKE '%Alpha%';
+----
+true
+
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_lines('test/data/two_pages.pdf')
+WHERE page = 2 AND text ILIKE '%Beta%';
+----
+true
+
+# line numbering resets per page (line 1 exists on both pages)
+query I
+SELECT COUNT(DISTINCT page) = 2
+FROM read_pdf_lines('test/data/two_pages.pdf')
+WHERE line = 1;
+----
+true
+
+# ── first_page / last_page named params ───────────────────────────────────
+
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_lines('test/data/two_pages.pdf', first_page:=2)
+WHERE page = 1;
+----
+true
+
+# ── error: missing file ───────────────────────────────────────────────────
+
+statement error
+SELECT * FROM read_pdf_lines('test/data/does_not_exist.pdf');
+----

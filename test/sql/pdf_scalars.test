@@ -1,0 +1,133 @@
+# name: test/sql/pdf_scalars.test
+# description: Scalar function tests: pdf_to_text, pdf_to_html, pdf_to_xml, pdf_to_svg
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── pdf_to_text ───────────────────────────────────────────────────────────
+
+# Returns non-empty text for hello.pdf
+query I
+SELECT length(pdf_to_text('test/data/hello.pdf')) > 0;
+----
+true
+
+# Contains "Hello DuckDB" text
+query I
+SELECT pdf_to_text('test/data/hello.pdf') ILIKE '%Hello DuckDB%';
+----
+true
+
+# table.pdf: physical layout should include column header words
+query I
+SELECT pdf_to_text('test/data/table.pdf', 'physical') ILIKE '%Item%';
+----
+true
+
+query I
+SELECT pdf_to_text('test/data/table.pdf', 'physical') ILIKE '%Apples%';
+----
+true
+
+query I
+SELECT pdf_to_text('test/data/table.pdf', 'physical') ILIKE '%Cherries%';
+----
+true
+
+# reading layout also returns content
+query I
+SELECT pdf_to_text('test/data/hello.pdf', 'reading') ILIKE '%Hello DuckDB%';
+----
+true
+
+# raw layout also returns content
+query I
+SELECT pdf_to_text('test/data/hello.pdf', 'raw') ILIKE '%Hello DuckDB%';
+----
+true
+
+# two_pages.pdf: text contains content from both pages
+query I
+SELECT pdf_to_text('test/data/two_pages.pdf') ILIKE '%Alpha%';
+----
+true
+
+query I
+SELECT pdf_to_text('test/data/two_pages.pdf') ILIKE '%Beta%';
+----
+true
+
+# ── pdf_to_html ───────────────────────────────────────────────────────────
+
+# Returns non-empty HTML string
+query I
+SELECT length(pdf_to_html('test/data/hello.pdf')) > 0;
+----
+true
+
+# Should contain some HTML markup
+query I
+SELECT pdf_to_html('test/data/hello.pdf') ILIKE '%<%';
+----
+true
+
+# ── pdf_to_xml ────────────────────────────────────────────────────────────
+
+# Returns non-empty XML string
+query I
+SELECT length(pdf_to_xml('test/data/hello.pdf')) > 0;
+----
+true
+
+# Should contain XML markup
+query I
+SELECT pdf_to_xml('test/data/hello.pdf') ILIKE '%<%';
+----
+true
+
+# ── pdf_to_svg ────────────────────────────────────────────────────────────
+
+# Returns non-empty SVG for page 1 of hello.pdf
+query I
+SELECT length(pdf_to_svg('test/data/hello.pdf', 1)) > 0;
+----
+true
+
+# SVG output starts with SVG markup
+query I
+SELECT pdf_to_svg('test/data/hello.pdf', 1) ILIKE '%svg%';
+----
+true
+
+# page 1 of two_pages.pdf
+query I
+SELECT length(pdf_to_svg('test/data/two_pages.pdf', 1)) > 0;
+----
+true
+
+# page 2 of two_pages.pdf
+query I
+SELECT length(pdf_to_svg('test/data/two_pages.pdf', 2)) > 0;
+----
+true
+
+# ── error: missing file ───────────────────────────────────────────────────
+
+statement error
+SELECT pdf_to_text('test/data/does_not_exist.pdf');
+----
+
+statement error
+SELECT pdf_to_html('test/data/does_not_exist.pdf');
+----
+
+statement error
+SELECT pdf_to_xml('test/data/does_not_exist.pdf');
+----
+
+statement error
+SELECT pdf_to_svg('test/data/does_not_exist.pdf', 1);
+----
