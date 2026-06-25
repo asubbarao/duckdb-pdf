@@ -26,17 +26,55 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 if(NOT WIN32)
   # ---- POSIX path: pkg-config ----
   find_package(PkgConfig REQUIRED)
-  pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
-  pkg_check_modules(TESSERACT   REQUIRED IMPORTED_TARGET tesseract)
-  pkg_check_modules(LEPTONICA   REQUIRED IMPORTED_TARGET lept)
 
-  include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS})
+  if(VCPKG_TOOLCHAIN)
+    # ---- vcpkg (static) path: the community-extensions CI ----
+    # vcpkg ships poppler/tesseract/leptonica as STATIC archives. The default
+    # (shared) pkg-config link line omits each archive's *private* transitive
+    # dependencies, which then fail at the final link: tesseract.a references
+    # libcurl + libarchive (traineddata download / archive reading) and
+    # poppler-cpp.a references freetype/jpeg/png/openjpeg/zlib. Use pkg-config's
+    # STATIC closure so the full transitive set is linked. The _STATIC_LDFLAGS
+    # form carries the -L search paths inline (a later link_directories() would
+    # not apply to the extension targets, which were already created above).
+    pkg_check_modules(POPPLER_CPP REQUIRED poppler-cpp)
+    pkg_check_modules(TESSERACT   REQUIRED tesseract)
+    pkg_check_modules(LEPTONICA   REQUIRED lept)
+    include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS})
 
-  # Link poppler-cpp + tesseract + leptonica into both the static lib and the loadable extension
-  target_link_libraries(${EXTENSION_NAME}
-    PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA)
-  target_link_libraries(${LOADABLE_EXTENSION_NAME}
-    PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA)
+    set(PDF_POSIX_LIBS
+      ${POPPLER_CPP_STATIC_LDFLAGS}
+      ${TESSERACT_STATIC_LDFLAGS}
+      ${LEPTONICA_STATIC_LDFLAGS})
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      # GNU ld resolves static archives in command-line order; wrap the closure
+      # in a group so the cyclic deps between poppler/tesseract/leptonica/curl/
+      # archive resolve regardless of order. (mach-o ld neither needs nor
+      # supports this, so it is Linux-only.)
+      set(PDF_POSIX_LINK -Wl,--start-group ${PDF_POSIX_LIBS} -Wl,--end-group)
+    else()
+      set(PDF_POSIX_LINK ${PDF_POSIX_LIBS})
+    endif()
+
+    target_link_libraries(${EXTENSION_NAME} ${PDF_POSIX_LINK})
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} ${PDF_POSIX_LINK})
+  else()
+    # ---- system (shared) path: local dev via Homebrew / apt ----
+    # System installs are dynamic (.dylib/.so), so the IMPORTED_TARGET shared
+    # link line resolves the full dependency closure at load time. (The static
+    # closure is avoided here because keg-only system libs such as gettext's
+    # -lintl are not on the default linker search path.)
+    pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
+    pkg_check_modules(TESSERACT   REQUIRED IMPORTED_TARGET tesseract)
+    pkg_check_modules(LEPTONICA   REQUIRED IMPORTED_TARGET lept)
+    include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS})
+
+    target_link_libraries(${EXTENSION_NAME}
+      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME}
+      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA)
+  endif()
 else()
   # ---- Windows path: vcpkg CONFIG packages + find_path/find_library ----
   find_package(Tesseract CONFIG REQUIRED)
