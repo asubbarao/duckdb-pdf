@@ -18,7 +18,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # is unreliable there.
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/pdf_extension.cpp src/pdf_cli.cpp)
+set(EXTENSION_SOURCES src/pdf_extension.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

@@ -79,9 +79,7 @@ docs:
     **Scalar functions**
 
     - `pdf_to_text(path[, layout])` — entire document as a plain-text VARCHAR.
-    - `pdf_to_html(path)` — document rendered to HTML.
-    - `pdf_to_xml(path)` — document rendered to XML (Poppler pdftoxml format).
-    - `pdf_to_svg(path, page)` — a single page rendered to SVG.
+      `layout` is one of `reading` (default), `physical`, or `raw`.
 
     **OCR (scanned / image-only PDFs)**
 

@@ -10,9 +10,6 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
-// CLI/conversion engine (posix_spawn over pdftotext/pdftohtml/pdftocairo) — pure std C++
-#include "pdf_cli.hpp"
-
 // poppler-cpp — text extraction + page rendering + metadata
 #include <poppler-document.h>
 #include <poppler-page.h>
@@ -22,6 +19,8 @@
 // tesseract — OCR for scanned / image-only PDFs
 #include <tesseract/baseapi.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <memory>
@@ -52,6 +51,184 @@ static poppler::page::text_layout_enum LayoutFromString(const string &s, bool pa
 static string UStringToUtf8(const poppler::ustring &u) {
 	poppler::byte_array b = u.to_utf8();
 	return string(b.begin(), b.end());
+}
+
+//===--------------------------------------------------------------------===//
+// Table reconstruction (pure geometry over positioned words)
+//
+// Words come straight from poppler-cpp's page::text_list() — no external
+// `pdftotext` process. The clustering below is coordinate-system agnostic: it
+// only uses relative positions, so poppler's page coordinates work unchanged.
+//===--------------------------------------------------------------------===//
+struct PdfWord {
+	double xMin = 0.0;
+	double yMin = 0.0;
+	double xMax = 0.0;
+	double yMax = 0.0;
+	string text;
+};
+
+static double Median(std::vector<double> v) {
+	if (v.empty()) {
+		return 0.0;
+	}
+	std::sort(v.begin(), v.end());
+	size_t m = v.size() / 2;
+	if (v.size() % 2 == 1) {
+		return v[m];
+	}
+	return 0.5 * (v[m - 1] + v[m]);
+}
+
+// Reconstruct one page's words into a grid of text cells. Returns an empty grid
+// for non-tabular pages (prose, single column/row, irregular cell counts).
+//
+// HEURISTICS:
+//  1. ROW CLUSTERING: sort by yMin; two words share a row if their yMin differs
+//     by less than half the median line height.
+//  2. COLUMN DETECTION: cluster all xMins within ~1.5 median char-widths into
+//     column left-edges.
+//  3. CELL ASSIGNMENT: each word joins the column whose left edge is the
+//     greatest edge <= its xMin; same-cell words join with a space.
+//  4. TABULAR GATE (precision over recall): require >=3 rows and a strong
+//     majority of rows sharing the same non-empty cell count (modal count >= 2).
+static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord> page_words) {
+	std::vector<std::vector<string>> grid;
+	if (page_words.size() < 2) {
+		return grid;
+	}
+
+	// --- median line height ---
+	std::vector<double> heights;
+	heights.reserve(page_words.size());
+	for (const auto &w : page_words) {
+		double h = w.yMax - w.yMin;
+		if (h > 0) {
+			heights.push_back(h);
+		}
+	}
+	double med_h = Median(heights);
+	if (med_h <= 0) {
+		med_h = 10.0;
+	}
+	double row_tol = med_h * 0.5;
+
+	// --- cluster into rows by yMin ---
+	std::sort(page_words.begin(), page_words.end(), [](const PdfWord &a, const PdfWord &b) { return a.yMin < b.yMin; });
+
+	std::vector<std::vector<PdfWord>> rows;
+	{
+		std::vector<PdfWord> cur;
+		double row_anchor = page_words.front().yMin;
+		for (auto &w : page_words) {
+			if (cur.empty()) {
+				cur.push_back(w);
+				row_anchor = w.yMin;
+			} else if (std::fabs(w.yMin - row_anchor) <= row_tol) {
+				cur.push_back(w);
+			} else {
+				rows.push_back(cur);
+				cur.clear();
+				cur.push_back(w);
+				row_anchor = w.yMin;
+			}
+		}
+		if (!cur.empty()) {
+			rows.push_back(cur);
+		}
+	}
+
+	// --- detect column left-edges from all xMins ---
+	std::vector<double> xs;
+	std::vector<double> widths;
+	for (const auto &w : page_words) {
+		xs.push_back(w.xMin);
+		double ww = w.xMax - w.xMin;
+		size_t len = w.text.size();
+		if (ww > 0 && len > 0) {
+			widths.push_back(ww / static_cast<double>(len));
+		}
+	}
+	double char_w = Median(widths);
+	if (char_w <= 0) {
+		char_w = med_h * 0.5;
+	}
+	double col_tol = char_w * 1.5;
+
+	std::sort(xs.begin(), xs.end());
+	std::vector<double> col_edges;
+	for (double x : xs) {
+		if (col_edges.empty() || (x - col_edges.back()) > col_tol) {
+			col_edges.push_back(x);
+		}
+	}
+
+	if (col_edges.size() < 2 || rows.size() < 2) {
+		return grid;
+	}
+
+	auto col_for = [&](double xMin) -> size_t {
+		size_t chosen = 0;
+		for (size_t c = 0; c < col_edges.size(); ++c) {
+			if (xMin + col_tol * 0.5 >= col_edges[c]) {
+				chosen = c;
+			} else {
+				break;
+			}
+		}
+		return chosen;
+	};
+
+	const size_t ncols = col_edges.size();
+	for (auto &row : rows) {
+		std::sort(row.begin(), row.end(), [](const PdfWord &a, const PdfWord &b) { return a.xMin < b.xMin; });
+		std::vector<string> cells(ncols);
+		for (auto &w : row) {
+			size_t c = col_for(w.xMin);
+			if (!cells[c].empty()) {
+				cells[c].push_back(' ');
+			}
+			cells[c] += w.text;
+		}
+		grid.push_back(std::move(cells));
+	}
+
+	// --- tabular regularity gate ---
+	if (grid.size() < 3) {
+		grid.clear();
+		return grid;
+	}
+	std::vector<int> filled_per_row;
+	filled_per_row.reserve(grid.size());
+	for (const auto &row : grid) {
+		int filled = 0;
+		for (const auto &cell : row) {
+			if (!cell.empty()) {
+				filled++;
+			}
+		}
+		filled_per_row.push_back(filled);
+	}
+	int modal_filled = 0;
+	int modal_count = 0;
+	for (size_t i = 0; i < filled_per_row.size(); ++i) {
+		int c = 0;
+		for (size_t j = 0; j < filled_per_row.size(); ++j) {
+			if (filled_per_row[j] == filled_per_row[i]) {
+				c++;
+			}
+		}
+		if (c > modal_count) {
+			modal_count = c;
+			modal_filled = filled_per_row[i];
+		}
+	}
+	double modal_fraction = static_cast<double>(modal_count) / static_cast<double>(grid.size());
+	if (modal_filled < 2 || modal_fraction < 0.6) {
+		grid.clear();
+	}
+
+	return grid;
 }
 
 // A <lang>.traineddata model lives in some directory. Return that directory if
@@ -684,7 +861,7 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 
 //===--------------------------------------------------------------------===//
 // read_pdf_tables  -> one row per table row, cells as VARCHAR[]
-// Backed by pdf_cli::ReconstructTables (pdftotext -bbox-layout reconstruction).
+// Backed by ReconstructPageGrid over poppler-cpp page::text_list() positions.
 //===--------------------------------------------------------------------===//
 struct ReadPdfTablesBindData : public TableFunctionData {
 	vector<string> files;
@@ -695,7 +872,7 @@ struct TableRowOut {
 	int page;
 	int table_index;
 	int row_index;
-	std::vector<std::string> cells; // matches pdfcli::Table (pure std types)
+	std::vector<std::string> cells;
 };
 struct ReadPdfTablesState : public GlobalTableFunctionState {
 	vector<TableRowOut> rows;
@@ -720,17 +897,44 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 	auto &bind = input.bind_data->Cast<ReadPdfTablesBindData>();
 	auto st = make_uniq<ReadPdfTablesState>();
 	for (auto &f : bind.files) {
-		std::vector<pdfcli::Table> tables;
+		string bytes;
+		unique_ptr<poppler::document> doc;
 		try {
-			tables = pdfcli::ReconstructTables(f, bind.opt.first_page, bind.opt.last_page, "");
+			ReadAllBytes(context, f, bytes);
+			doc = LoadDoc(bytes, bind.opt.password, f);
 		} catch (std::exception &e) {
 			throw InvalidInputException("read_pdf_tables: %s", e.what());
 		}
-		for (idx_t ti = 0; ti < tables.size(); ti++) {
-			auto &t = tables[ti];
-			for (idx_t r = 0; r < t.rows.size(); r++) {
-				st->rows.push_back(TableRowOut {f, t.page, (int)ti, (int)r, t.rows[r]});
+		int page_count = doc->pages();
+		int first0 = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
+		int last0 = bind.opt.last_page < 0 ? page_count : MinValue<int>(bind.opt.last_page, page_count);
+		// table_index is a running counter over the tabular pages of this document
+		// (each tabular page yields one reconstructed grid).
+		int table_index = 0;
+		for (int p = first0; p < last0; p++) {
+			unique_ptr<poppler::page> page(doc->create_page(p));
+			if (!page) {
+				continue;
 			}
+			std::vector<PdfWord> words;
+			for (auto &b : page->text_list()) {
+				auto r = b.bbox();
+				PdfWord w;
+				w.xMin = r.x();
+				w.yMin = r.y();
+				w.xMax = r.x() + r.width();
+				w.yMax = r.y() + r.height();
+				w.text = UStringToUtf8(b.text());
+				words.push_back(std::move(w));
+			}
+			auto grid = ReconstructPageGrid(std::move(words));
+			if (grid.size() < 2 || grid.front().size() < 2) {
+				continue;
+			}
+			for (idx_t r = 0; r < grid.size(); r++) {
+				st->rows.push_back(TableRowOut {f, p + 1, table_index, (int)r, grid[r]});
+			}
+			table_index++;
 		}
 	}
 	return std::move(st);
@@ -757,55 +961,43 @@ static void ReadPdfTablesScan(ClientContext &context, TableFunctionInput &data_p
 }
 
 //===--------------------------------------------------------------------===//
-// Scalar conversion utilities — whole-document transforms via the CLI engine
+// pdf_to_text(path[, layout]) — whole-document text as a single VARCHAR.
+// Library-backed (poppler-cpp); no external process. layout is one of
+// 'reading' (default) | 'physical' | 'raw'.
 //===--------------------------------------------------------------------===//
+static string DocToText(const string &path, const string &layout_str) {
+	unique_ptr<poppler::document> doc(poppler::document::load_from_file(path));
+	if (!doc) {
+		throw InvalidInputException("pdf_to_text: could not open '%s' (missing, corrupt, or not a PDF)", path);
+	}
+	if (doc->is_locked() || doc->is_encrypted()) {
+		throw InvalidInputException("pdf_to_text: '%s' is encrypted (use read_pdf with password := '...')", path);
+	}
+	auto layout = LayoutFromString(layout_str, false);
+	string out;
+	int n = doc->pages();
+	for (int p = 0; p < n; p++) {
+		unique_ptr<poppler::page> page(doc->create_page(p));
+		if (!page) {
+			continue;
+		}
+		if (!out.empty()) {
+			out.push_back('\n');
+		}
+		out += UStringToUtf8(page->text(poppler::rectf(), layout));
+	}
+	return out;
+}
+
 static void PdfToTextFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
-		try {
-			return StringVector::AddString(result, pdfcli::PdfToText(path.GetString(), "reading", 1, -1, ""));
-		} catch (std::exception &e) {
-			throw InvalidInputException("pdf_to_text: %s", e.what());
-		}
+		return StringVector::AddString(result, DocToText(path.GetString(), "reading"));
 	});
 }
-// pdf_to_text(path, layout) — layout is one of 'reading' | 'physical' | 'raw'
 static void PdfToTextLayoutFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
 	    args.data[0], args.data[1], result, args.size(), [&](string_t path, string_t layout) {
-		    try {
-			    return StringVector::AddString(result,
-			                                   pdfcli::PdfToText(path.GetString(), layout.GetString(), 1, -1, ""));
-		    } catch (std::exception &e) {
-			    throw InvalidInputException("pdf_to_text: %s", e.what());
-		    }
-	    });
-}
-static void PdfToHtmlFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
-		try {
-			return StringVector::AddString(result, pdfcli::PdfToHtml(path.GetString(), false, false, ""));
-		} catch (std::exception &e) {
-			throw InvalidInputException("pdf_to_html: %s", e.what());
-		}
-	});
-}
-static void PdfToXmlFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
-		try {
-			return StringVector::AddString(result, pdfcli::PdfToXml(path.GetString(), 0, 0, ""));
-		} catch (std::exception &e) {
-			throw InvalidInputException("pdf_to_xml: %s", e.what());
-		}
-	});
-}
-static void PdfToSvgFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	BinaryExecutor::Execute<string_t, int32_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t path, int32_t page) {
-		    try {
-			    return StringVector::AddString(result, pdfcli::PdfToSvg(path.GetString(), page, ""));
-		    } catch (std::exception &e) {
-			    throw InvalidInputException("pdf_to_svg: %s", e.what());
-		    }
+		    return StringVector::AddString(result, DocToText(path.GetString(), layout.GetString()));
 	    });
 }
 
@@ -842,10 +1034,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_to_text_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToTextLayoutFun));
 	loader.RegisterFunction(pdf_to_text_set);
-	loader.RegisterFunction(ScalarFunction("pdf_to_html", {LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToHtmlFun));
-	loader.RegisterFunction(ScalarFunction("pdf_to_xml", {LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToXmlFun));
-	loader.RegisterFunction(
-	    ScalarFunction("pdf_to_svg", {LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::VARCHAR, PdfToSvgFun));
 }
 
 void PdfExtension::Load(ExtensionLoader &loader) {

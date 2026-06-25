@@ -13,10 +13,7 @@ The `pdf` extension exposes eight functions covering the full range of PDF extra
 | `read_pdf_meta` | Table | Document metadata: title, author, subject, keywords, creator, producer, pages, pdf_version, encrypted |
 | `read_pdf_words` | Table | One row per word with bounding box + font: `x0,y0,x1,y1`, `font_name`, `font_size` |
 | `read_pdf_tables` | Table | Tabular regions from digital PDFs: `page`, `table_index`, `row_index`, `cells VARCHAR[]` |
-| `pdf_to_text` | Scalar | Convert a PDF to plain text (optionally with a `layout` argument) |
-| `pdf_to_html` | Scalar | Convert a PDF to HTML |
-| `pdf_to_xml` | Scalar | Convert a PDF to XML |
-| `pdf_to_svg` | Scalar | Convert a PDF page to SVG |
+| `pdf_to_text` | Scalar | Convert a whole PDF to plain text (optionally with a `layout` argument: `reading`, `physical`, or `raw`) |
 
 ## Installation
 
@@ -156,37 +153,6 @@ FROM glob('docs/*.pdf');
 SELECT f.filename, length(pdf_to_text(f.filename)) AS char_count
 FROM glob('archive/*.pdf') AS f(filename)
 WHERE pdf_to_text(f.filename) ILIKE '%quarterly earnings%';
-```
-
-### `pdf_to_html` — HTML conversion
-
-Returns the document as an HTML string with layout approximation.
-
-```sql
-SELECT pdf_to_html('report.pdf') AS html;
-```
-
-### `pdf_to_xml` — XML conversion
-
-Returns the document as an XML string (Poppler's pdftoxml format).
-
-```sql
-SELECT pdf_to_xml('report.pdf') AS xml_content;
-
--- Parse with DuckDB's xml functions if available
-SELECT pdf_to_xml('invoice.pdf') AS raw_xml;
-```
-
-### `pdf_to_svg` — SVG page rendering
-
-Returns a single PDF page as an SVG string. Defaults to page 1.
-
-```sql
--- Render page 1 as SVG
-SELECT pdf_to_svg('diagram.pdf') AS svg;
-
--- Render a specific page (second argument is 1-based page number)
-SELECT pdf_to_svg('diagram.pdf', 3) AS svg;
 ```
 
 ## Building from source
