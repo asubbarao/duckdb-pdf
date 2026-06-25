@@ -1,0 +1,67 @@
+# name: test/sql/read_pdf_validation.test
+# description: Parameter validation and bad-input handling for read_pdf
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── OCR engine knobs are range-checked (out-of-range would be UB or OOM) ──
+
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', ocr_dpi := -5);
+----
+ocr_dpi must be between 1 and 2400
+
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', ocr_dpi := 100000);
+----
+ocr_dpi must be between 1 and 2400
+
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', ocr_psm := 99);
+----
+ocr_psm must be between 0 and 13
+
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', ocr_oem := 7);
+----
+ocr_oem must be between 0 and 3
+
+# ── page ranges are validated (no silent empty results) ──
+
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', first_page := 0);
+----
+first_page must be >= 1
+
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', last_page := 0);
+----
+last_page must be >= 1
+
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', first_page := 5, last_page := 2);
+----
+last_page (2) must be >= first_page (5)
+
+# ── a non-PDF / corrupt file errors clearly, never returns zero rows silently ──
+
+statement error
+SELECT * FROM read_pdf('test/sql/read_pdf_validation.test');
+----
+could not open
+
+# ── missing file errors ──
+
+statement error
+SELECT * FROM read_pdf('test/data/does_not_exist.pdf');
+----
+
+# ── valid bounds still work ──
+
+query I
+SELECT count(*) >= 1 FROM read_pdf('test/data/hello.pdf', first_page := 1, last_page := 1);
+----
+true

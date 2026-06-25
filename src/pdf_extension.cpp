@@ -201,6 +201,29 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 			o.last_page = IntegerValue::Get(kv.second);
 		}
 	}
+
+	// Validate up front so bad input fails with a clear message instead of
+	// silently returning zero rows or feeding out-of-range values to the
+	// rendering / OCR engines (a huge dpi can OOM; an out-of-range psm/oem is
+	// cast into an undefined enum).
+	if (o.ocr_dpi < 1 || o.ocr_dpi > 2400) {
+		throw InvalidInputException("read_pdf: ocr_dpi must be between 1 and 2400 (got %d)", o.ocr_dpi);
+	}
+	if (o.ocr_psm < 0 || o.ocr_psm > 13) {
+		throw InvalidInputException("read_pdf: ocr_psm must be between 0 and 13 (got %d)", o.ocr_psm);
+	}
+	if (o.ocr_oem < 0 || o.ocr_oem > 3) {
+		throw InvalidInputException("read_pdf: ocr_oem must be between 0 and 3 (got %d)", o.ocr_oem);
+	}
+	if (o.first_page < 1) {
+		throw InvalidInputException("read_pdf: first_page must be >= 1 (got %d)", o.first_page);
+	}
+	if (o.last_page == 0 || o.last_page < -1) {
+		throw InvalidInputException("read_pdf: last_page must be >= 1 (got %d)", o.last_page);
+	}
+	if (o.last_page > 0 && o.last_page < o.first_page) {
+		throw InvalidInputException("read_pdf: last_page (%d) must be >= first_page (%d)", o.last_page, o.first_page);
+	}
 }
 
 static void AddCommonNamedParams(TableFunction &fn) {
@@ -253,10 +276,21 @@ static void ReadAllBytes(ClientContext &context, const string &path, string &out
 }
 
 static unique_ptr<poppler::document> LoadDoc(const string &bytes, const string &password, const string &path) {
+	// poppler's load_from_raw_data takes an int length; guard against silent
+	// truncation (and the corresponding garbage read) for >2 GiB inputs.
+	if (bytes.size() > (size_t)NumericLimits<int>::Maximum()) {
+		throw IOException("read_pdf: '%s' is too large (%lld bytes; max ~2 GiB)", path, (long long)bytes.size());
+	}
 	auto doc = unique_ptr<poppler::document>(
 	    poppler::document::load_from_raw_data(bytes.data(), (int)bytes.size(), password, password));
-	if (!doc || doc->is_locked()) {
-		throw IOException("read_pdf: could not open '%s' (corrupt, empty, or wrong password)", path);
+	if (!doc) {
+		throw IOException("read_pdf: could not open '%s' (corrupt or not a PDF)", path);
+	}
+	if (doc->is_locked()) {
+		throw IOException("read_pdf: '%s' is encrypted; supply the correct password via password := '...'", path);
+	}
+	if (doc->pages() <= 0) {
+		throw IOException("read_pdf: '%s' has no readable pages (empty or unreadable document)", path);
 	}
 	return doc;
 }
@@ -758,7 +792,7 @@ static void PdfToHtmlFun(DataChunk &args, ExpressionState &state, Vector &result
 static void PdfToXmlFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
 		try {
-			return StringVector::AddString(result, pdfcli::PdfToXml(path.GetString(), ""));
+			return StringVector::AddString(result, pdfcli::PdfToXml(path.GetString(), 0, 0, ""));
 		} catch (std::exception &e) {
 			throw InvalidInputException("pdf_to_xml: %s", e.what());
 		}

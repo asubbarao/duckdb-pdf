@@ -682,6 +682,17 @@ std::string RunConverterOrThrow(const std::vector<std::string> &argv) {
 
 } // namespace
 
+// Poppler CLI tools treat any argument starting with '-' as a flag. A PDF path
+// like "-foo.pdf" would be misparsed as an option (argument injection). Prefix
+// such relative paths with "./" so they are always seen as filenames; absolute
+// paths (and anything not starting with '-') are returned unchanged.
+static std::string SafeInputPath(const std::string &path) {
+	if (!path.empty() && path[0] == '-') {
+		return "./" + path;
+	}
+	return path;
+}
+
 std::string PdfToText(const std::string &path, const std::string &layout, int first_page, int last_page,
                       const std::string &raw_args) {
 	std::vector<std::string> argv = {"pdftotext", "-enc", "UTF-8"};
@@ -704,8 +715,8 @@ std::string PdfToText(const std::string &path, const std::string &layout, int fi
 
 	AppendRawArgs(argv, raw_args);
 
-	argv.push_back(path); // input
-	argv.push_back("-");  // output to stdout
+	argv.push_back(SafeInputPath(path)); // input
+	argv.push_back("-");                 // output to stdout
 
 	return RunConverterOrThrow(argv);
 }
@@ -721,20 +732,30 @@ std::string PdfToHtml(const std::string &path, bool single_doc, bool ignore_imag
 
 	AppendRawArgs(argv, raw_args);
 
-	argv.push_back(path);
+	argv.push_back(SafeInputPath(path));
 	// pdftohtml emits to stdout because of -stdout.
 	return RunConverterOrThrow(argv);
 }
 
-std::string PdfToXml(const std::string &path, const std::string &raw_args) {
+std::string PdfToXml(const std::string &path, int first_page, int last_page, const std::string &raw_args) {
 	// -bbox-layout yields XML with <page>/<flow>/<block>/<line>/<word> nodes,
 	// each <word> carrying xMin/yMin/xMax/yMax attributes -- exactly what the
 	// table reconstructor needs.
 	std::vector<std::string> argv = {"pdftotext", "-enc", "UTF-8", "-bbox-layout"};
 
+	// Page range as explicit argv elements (never string-concatenated/re-tokenized).
+	if (first_page > 0) {
+		argv.push_back("-f");
+		argv.push_back(std::to_string(first_page));
+	}
+	if (last_page > 0) {
+		argv.push_back("-l");
+		argv.push_back(std::to_string(last_page));
+	}
+
 	AppendRawArgs(argv, raw_args);
 
-	argv.push_back(path);
+	argv.push_back(SafeInputPath(path));
 	argv.push_back("-");
 	return RunConverterOrThrow(argv);
 }
@@ -747,7 +768,7 @@ std::string PdfToSvg(const std::string &path, int page, const std::string &raw_a
 
 	AppendRawArgs(argv, raw_args);
 
-	argv.push_back(path);
+	argv.push_back(SafeInputPath(path));
 	argv.push_back("-");
 	return RunConverterOrThrow(argv);
 }
@@ -806,12 +827,28 @@ std::string DecodeEntities(const std::string &s) {
 					} catch (...) {
 						code = 0;
 					}
-					if (code > 0 && code < 128) {
-						out.push_back(static_cast<char>(code));
+					if (code > 0 && code <= 0x10FFFF) {
+						// UTF-8 encode the codepoint so accented / non-Latin
+						// table text survives instead of being dropped.
+						if (code < 0x80) {
+							out.push_back(static_cast<char>(code));
+						} else if (code < 0x800) {
+							out.push_back(static_cast<char>(0xC0 | (code >> 6)));
+							out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+						} else if (code < 0x10000) {
+							out.push_back(static_cast<char>(0xE0 | (code >> 12)));
+							out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+							out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+						} else {
+							out.push_back(static_cast<char>(0xF0 | (code >> 18)));
+							out.push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
+							out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+							out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+						}
 						i = semi + 1;
 						continue;
 					}
-					// Non-ASCII: just drop the entity rather than emit garbage.
+					// code == 0 or out of range: drop the entity.
 					i = semi + 1;
 					continue;
 				}
@@ -1156,17 +1193,9 @@ std::vector<std::vector<std::string>> ReconstructPageGrid(std::vector<Word> page
 
 std::vector<Table> ReconstructTables(const std::string &path, int first_page, int last_page,
                                      const std::string &raw_args) {
-	// Build the page-range raw_args for pdftotext -bbox-layout. We inject -f/-l
-	// alongside any user raw_args so the XML only contains the requested pages.
-	std::string ranged = raw_args;
-	if (first_page > 0) {
-		ranged += " -f " + std::to_string(first_page);
-	}
-	if (last_page > 0) {
-		ranged += " -l " + std::to_string(last_page);
-	}
-
-	std::string xml = PdfToXml(path, ranged);
+	// Page range is passed as explicit argv (PdfToXml handles -f/-l), so the
+	// only thing in raw_args is whatever the caller already validated.
+	std::string xml = PdfToXml(path, first_page, last_page, raw_args);
 
 	int pages = 0;
 	std::vector<PagedWord> paged = ParseWordsWithPages(xml, pages);

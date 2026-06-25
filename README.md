@@ -84,12 +84,13 @@ SELECT filename, title, author
 FROM read_pdf_meta('archive/*.pdf')
 WHERE author IS NULL OR author = '';
 
--- Find PDFs created before 2020
-SELECT filename, creation_date
+-- Find the largest PDFs and which tool produced them
+SELECT filename, producer, pages
 FROM read_pdf_meta('docs/*.pdf')
-WHERE creation_date < DATE '2020-01-01'
-ORDER BY creation_date;
+ORDER BY pages DESC;
 ```
+
+Columns: `filename`, `title`, `author`, `subject`, `keywords`, `creator`, `producer`, `pages`, `pdf_version`, `encrypted`.
 
 ### `read_pdf_words` — word-level extraction with bounding boxes
 

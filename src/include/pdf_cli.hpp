@@ -72,8 +72,7 @@ struct Table {
 //   * The child's stdout is captured into `out`, stderr into `err`.
 // Returns the child's exit status (0..255), or -1 if the process could not be
 // spawned at all.
-int RunCapture(const std::vector<std::string> &argv, const std::string &stdin_data, std::string &out,
-               std::string &err);
+int RunCapture(const std::vector<std::string> &argv, const std::string &stdin_data, std::string &out, std::string &err);
 
 // Return true if `tool` can be found (either an absolute/relative path that
 // exists & is executable, or a bare name resolvable on $PATH).
@@ -106,7 +105,8 @@ std::string PdfToText(const std::string &path, const std::string &layout, int fi
 std::string PdfToHtml(const std::string &path, bool single_doc, bool ignore_images, const std::string &raw_args);
 
 // pdftotext -bbox-layout ... -   (XML with flow/block/line/word bboxes).
-std::string PdfToXml(const std::string &path, const std::string &raw_args);
+// first_page/last_page (1-based, <=0 means unbounded) are passed as explicit argv.
+std::string PdfToXml(const std::string &path, int first_page, int last_page, const std::string &raw_args);
 
 // pdftocairo -svg -f <page> -l <page> <path> -   (single-page SVG to stdout).
 std::string PdfToSvg(const std::string &path, int page, const std::string &raw_args);
