@@ -29,32 +29,46 @@ if(NOT WIN32)
 
   if(VCPKG_TOOLCHAIN)
     # ---- vcpkg (static) path: the community-extensions CI ----
-    # vcpkg ships poppler/tesseract/leptonica as STATIC archives. The default
-    # (shared) pkg-config link line omits each archive's *private* transitive
-    # dependencies, which then fail at the final link: tesseract.a references
-    # libcurl + libarchive (traineddata download / archive reading) and
-    # poppler-cpp.a references freetype/jpeg/png/openjpeg/zlib. Use pkg-config's
-    # STATIC closure so the full transitive set is linked. The _STATIC_LDFLAGS
-    # form carries the -L search paths inline (a later link_directories() would
-    # not apply to the extension targets, which were already created above).
+    # vcpkg ships poppler/tesseract/leptonica as STATIC archives. We use
+    # pkg-config only to locate headers + the install lib dir; we do NOT trust its
+    # link line. vcpkg builds tesseract with CMake, and the generated tesseract.pc
+    # does not declare the full transitive static closure: libtesseract.a
+    # references libcurl + libarchive (traineddata download / archive reading),
+    # which in turn pull in ssl/crypto/zstd/lzma/bz2/..., and libpoppler.a
+    # references freetype/harfbuzz/jpeg/png/openjpeg/zlib. `pkg-config --static`
+    # silently omits any of these not reachable via Requires.private, so the final
+    # link fails with undefined curl_easy_*/archive_* symbols.
+    #
+    # Rather than hand-maintain a fragile dependency list, link EVERY archive vcpkg
+    # installed: over-linking is harmless for a static link (the linker pulls in
+    # only objects that resolve a referenced symbol). This mirrors the Windows
+    # branch below. Crucially the archives are attached to the *static* extension
+    # target so the closure also propagates into DuckDB's own executables
+    # (duckdb / unittest / plan_serializer), which link the extension by target
+    # name and -- unlike a shared library -- do not tolerate unresolved symbols.
     pkg_check_modules(POPPLER_CPP REQUIRED poppler-cpp)
     pkg_check_modules(TESSERACT   REQUIRED tesseract)
     pkg_check_modules(LEPTONICA   REQUIRED lept)
     include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS})
 
-    set(PDF_POSIX_LIBS
-      ${POPPLER_CPP_STATIC_LDFLAGS}
-      ${TESSERACT_STATIC_LDFLAGS}
-      ${LEPTONICA_STATIC_LDFLAGS})
+    if(DEFINED TESSERACT_LIBDIR AND EXISTS "${TESSERACT_LIBDIR}")
+      set(VCPKG_STATIC_LIBDIR "${TESSERACT_LIBDIR}")
+    else()
+      list(GET TESSERACT_LIBRARY_DIRS 0 VCPKG_STATIC_LIBDIR)
+    endif()
+    file(GLOB VCPKG_STATIC_ARCHIVES "${VCPKG_STATIC_LIBDIR}/*.a")
+    if(NOT VCPKG_STATIC_ARCHIVES)
+      message(FATAL_ERROR "pdf: no static archives found under '${VCPKG_STATIC_LIBDIR}'")
+    endif()
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-      # GNU ld resolves static archives in command-line order; wrap the closure
-      # in a group so the cyclic deps between poppler/tesseract/leptonica/curl/
-      # archive resolve regardless of order. (mach-o ld neither needs nor
+      # GNU ld is single-pass; wrap the whole archive set in a group so the cyclic
+      # deps among poppler/tesseract/leptonica/curl/archive/crypto/freetype resolve
+      # regardless of order. (mach-o ld is multi-pass and neither needs nor
       # supports this, so it is Linux-only.)
-      set(PDF_POSIX_LINK -Wl,--start-group ${PDF_POSIX_LIBS} -Wl,--end-group)
+      set(PDF_POSIX_LINK -Wl,--start-group ${VCPKG_STATIC_ARCHIVES} -Wl,--end-group)
     else()
-      set(PDF_POSIX_LINK ${PDF_POSIX_LIBS})
+      set(PDF_POSIX_LINK ${VCPKG_STATIC_ARCHIVES})
     endif()
 
     target_link_libraries(${EXTENSION_NAME} ${PDF_POSIX_LINK})
