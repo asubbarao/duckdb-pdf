@@ -65,7 +65,8 @@ docs:
     All table functions accept a single path, a list of paths, or a glob
     (`'docs/*.pdf'`). Shared named parameters: `first_page`, `last_page`,
     `password`, `layout` ('reading' | 'physical' | 'raw'), and the OCR knobs
-    `ocr`, `auto_ocr`, `ocr_language`, `ocr_dpi`, `ocr_psm`, `ocr_oem`.
+    `ocr`, `auto_ocr`, `ocr_language`, `ocr_dpi`, `ocr_psm`, `ocr_oem`,
+    `tessdata_dir`.
 
     **Table functions**
 
@@ -92,13 +93,17 @@ docs:
 
     Pages with no extractable text layer are OCR'd automatically (`auto_ocr`,
     on by default); pass `ocr := true` to force OCR on every page. OCR requires a
-    Tesseract language model at runtime, located via the `TESSDATA_PREFIX`
-    environment variable — package managers do not ship one. Install a model
-    (`brew install tesseract-lang` on macOS; `apt-get install tesseract-ocr-eng`
-    on Debian/Ubuntu; or download `eng.traineddata` from the tessdata_fast repo)
-    and point `TESSDATA_PREFIX` at its directory. Select the language with
-    `ocr_language` (e.g. `ocr_language := 'deu'`). If no model is found, OCR
-    raises a clear error with these instructions rather than returning empty text.
+    Tesseract language model at runtime — package managers do not ship one — but
+    once you install one the usual way it works with **no configuration**: the
+    extension auto-detects the standard model directories used by Homebrew
+    (`brew install tesseract tesseract-lang`), apt
+    (`apt-get install tesseract-ocr tesseract-ocr-eng`), and the Windows
+    installer. To use a non-standard location, pass
+    `tessdata_dir := '/path/to/tessdata'` per query, or set the `TESSDATA_PREFIX`
+    environment variable (resolution order: `tessdata_dir` → `TESSDATA_PREFIX` →
+    auto-detected paths). Select the language with `ocr_language`
+    (e.g. `ocr_language := 'deu'`). If no model is found anywhere, OCR raises a
+    clear, actionable error rather than returning empty text.
 
     **Table extraction: scope**
 

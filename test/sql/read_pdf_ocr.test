@@ -61,6 +61,18 @@ FROM read_pdf('test/data/hello.pdf', ocr:=true);
 ----
 true
 
+# ── tessdata_dir: connect an existing Tesseract install explicitly ────────
+
+# The standard OCR path above already exercises auto-detection: this suite runs
+# with TESSDATA_PREFIX pointing at a real models dir, which ResolveTessdataDir
+# honours without any per-call config. Here we cover the explicit override: a
+# bogus tessdata_dir is trusted over auto-detection (explicit wins) and fails
+# loudly with the actionable install message rather than silently returning empty.
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr:=true, tessdata_dir:='/no/such/tessdata');
+----
+could not load the Tesseract model
+
 # ── error: missing file with OCR flag ─────────────────────────────────────
 
 statement error

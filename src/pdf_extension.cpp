@@ -22,6 +22,8 @@
 // tesseract — OCR for scanned / image-only PDFs
 #include <tesseract/baseapi.h>
 
+#include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -52,8 +54,66 @@ static string UStringToUtf8(const poppler::ustring &u) {
 	return string(b.begin(), b.end());
 }
 
+// A <lang>.traineddata model lives in some directory. Return that directory if
+// the file is there, else empty string.
+static bool ModelExistsIn(const string &dir, const string &language) {
+	if (dir.empty()) {
+		return false;
+	}
+	string path = dir;
+	char sep = path.back();
+	if (sep != '/' && sep != '\\') {
+		path += '/';
+	}
+	path += language + ".traineddata";
+	std::ifstream f(path.c_str());
+	return f.good();
+}
+
+// Resolve the tessdata directory that contains <language>.traineddata, so OCR
+// works out-of-the-box without the user setting TESSDATA_PREFIX. Resolution
+// order (first hit wins):
+//   1. explicit `tessdata_dir` named parameter (connect an existing install)
+//   2. TESSDATA_PREFIX env var (Tesseract's own native mechanism)
+//   3. probe the standard locations the OS package managers install models to
+// Returns empty string if nothing was found; the caller then errors loudly.
+static string ResolveTessdataDir(const string &language, const string &explicit_dir) {
+	// 1. Explicit param — trust it even if the file probe fails (the user may
+	//    have a non-standard naming or a model alias); only prefer it if present.
+	if (!explicit_dir.empty()) {
+		return explicit_dir;
+	}
+	// 2. TESSDATA_PREFIX — return it so we pass it explicitly to Init().
+	const char *env = std::getenv("TESSDATA_PREFIX");
+	if (env && *env && ModelExistsIn(env, language)) {
+		return string(env);
+	}
+	// 3. Probe standard package-manager install locations.
+	static const char *kCandidates[] = {
+	    // macOS Homebrew (Apple Silicon / Intel)
+	    "/opt/homebrew/share/tessdata",
+	    "/usr/local/share/tessdata",
+	    // Debian/Ubuntu apt + generic Linux
+	    "/usr/share/tessdata",
+	    "/usr/share/tesseract-ocr/5/tessdata",
+	    "/usr/share/tesseract-ocr/4.00/tessdata",
+	    "/usr/share/tesseract-ocr/tessdata",
+	    "/usr/local/share/tesseract-ocr/tessdata",
+	    // Windows (UB Mannheim installer default)
+	    "C:\\Program Files\\Tesseract-OCR\\tessdata",
+	    "C:\\Program Files (x86)\\Tesseract-OCR\\tessdata",
+	};
+	for (auto candidate : kCandidates) {
+		if (ModelExistsIn(candidate, language)) {
+			return string(candidate);
+		}
+	}
+	return string();
+}
+
 // Render a poppler page and OCR it with tesseract, honoring engine knobs.
-static string OcrPage(poppler::page *page, const string &language, int dpi, int psm, int oem) {
+static string OcrPage(poppler::page *page, const string &language, int dpi, int psm, int oem,
+                      const string &tessdata_dir) {
 	poppler::page_renderer renderer;
 	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
@@ -64,17 +124,22 @@ static string OcrPage(poppler::page *page, const string &language, int dpi, int 
 	}
 
 	tesseract::TessBaseAPI api;
-	// Tesseract needs a <lang>.traineddata model at runtime, located via the
-	// TESSDATA_PREFIX env var (a `tessdata/` directory). vcpkg/most package
+	// Tesseract needs a <lang>.traineddata model at runtime. vcpkg/most package
 	// managers do NOT ship language models, so OCR requires the user to install
-	// one. Fail loudly with actionable instructions rather than returning empty.
-	if (api.Init(nullptr, language.c_str(), static_cast<tesseract::OcrEngineMode>(oem)) != 0) {
-		throw IOException("read_pdf OCR: could not load the Tesseract model for language '%s'. Install a "
-		                  "language model and point TESSDATA_PREFIX at its directory. macOS: `brew install "
-		                  "tesseract-lang`; Debian/Ubuntu: `apt-get install tesseract-ocr-%s`; or download "
-		                  "%s.traineddata from https://github.com/tesseract-ocr/tessdata_fast and set "
-		                  "TESSDATA_PREFIX to the folder that contains it.",
-		                  language, language, language);
+	// one. We auto-detect the standard install dirs (so a plain `brew install
+	// tesseract-lang` / `apt-get install tesseract-ocr-eng` Just Works with no
+	// env var), honor an explicit `tessdata_dir` parameter, and fall back to
+	// TESSDATA_PREFIX. If none has the model, fail loudly with instructions.
+	string datadir = ResolveTessdataDir(language, tessdata_dir);
+	const char *datapath = datadir.empty() ? nullptr : datadir.c_str();
+	if (api.Init(datapath, language.c_str(), static_cast<tesseract::OcrEngineMode>(oem)) != 0) {
+		throw IOException(
+		    "read_pdf OCR: could not load the Tesseract model for language '%s'. Install a language model — "
+		    "macOS: `brew install tesseract-lang`; Debian/Ubuntu: `apt-get install tesseract-ocr-%s`; Windows: "
+		    "the UB Mannheim installer; or download %s.traineddata from "
+		    "https://github.com/tesseract-ocr/tessdata_fast. Standard install locations are auto-detected; if "
+		    "yours is non-standard, pass `tessdata_dir := '/path/to/tessdata'` or set the TESSDATA_PREFIX env var.",
+		    language, language, language);
 	}
 	api.SetPageSegMode(static_cast<tesseract::PageSegMode>(psm));
 
@@ -99,6 +164,7 @@ struct PdfOptions {
 	int32_t ocr_dpi = 300;
 	int32_t ocr_psm = 3; // PSM_AUTO
 	int32_t ocr_oem = 3; // OEM_DEFAULT
+	string tessdata_dir; // optional: directory containing <lang>.traineddata
 	string layout = "reading";
 	bool parse_tables = false;
 	string password;
@@ -121,6 +187,8 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 			o.ocr_psm = IntegerValue::Get(kv.second);
 		} else if (key == "ocr_oem") {
 			o.ocr_oem = IntegerValue::Get(kv.second);
+		} else if (key == "tessdata_dir") {
+			o.tessdata_dir = StringValue::Get(kv.second);
 		} else if (key == "layout") {
 			o.layout = StringValue::Get(kv.second);
 		} else if (key == "parse_tables") {
@@ -142,6 +210,7 @@ static void AddCommonNamedParams(TableFunction &fn) {
 	fn.named_parameters["ocr_dpi"] = LogicalType::INTEGER;
 	fn.named_parameters["ocr_psm"] = LogicalType::INTEGER;
 	fn.named_parameters["ocr_oem"] = LogicalType::INTEGER;
+	fn.named_parameters["tessdata_dir"] = LogicalType::VARCHAR;
 	fn.named_parameters["layout"] = LogicalType::VARCHAR;
 	fn.named_parameters["parse_tables"] = LogicalType::BOOLEAN;
 	fn.named_parameters["password"] = LogicalType::VARCHAR;
@@ -275,8 +344,8 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 			}
 			bool blank = text.find_first_not_of(" \t\r\n\f\v") == string::npos;
 			if (bind.opt.force_ocr || (bind.opt.auto_ocr && blank)) {
-				string ocr =
-				    OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm, bind.opt.ocr_oem);
+				string ocr = OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
+				                     bind.opt.ocr_oem, bind.opt.tessdata_dir);
 				if (!ocr.empty()) {
 					text = ocr;
 				}
