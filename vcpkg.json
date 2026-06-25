@@ -1,6 +1,12 @@
 {
 	"dependencies": [
-		"poppler",
+		{
+			"name": "poppler",
+			"default-features": false,
+			"features": [
+				"zlib"
+			]
+		},
 		"tesseract",
 		"leptonica"
 	],
