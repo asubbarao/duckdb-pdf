@@ -68,7 +68,11 @@ if(NOT WIN32)
       # supports this, so it is Linux-only.)
       set(PDF_POSIX_LINK -Wl,--start-group ${VCPKG_STATIC_ARCHIVES} -Wl,--end-group)
     else()
-      set(PDF_POSIX_LINK ${VCPKG_STATIC_ARCHIVES})
+      # macOS: ld64 resolves archives order-independently, so no group is needed.
+      # But libiconv is a macOS *system* library (poppler-cpp's ustring::to_utf8 /
+      # from_utf8 call iconv) — it is not among the vcpkg archives, so link it
+      # explicitly. (On Linux iconv lives in glibc and needs no separate lib.)
+      set(PDF_POSIX_LINK ${VCPKG_STATIC_ARCHIVES} -liconv)
     endif()
 
     target_link_libraries(${EXTENSION_NAME} ${PDF_POSIX_LINK})
@@ -151,16 +155,24 @@ else()
     user32.lib
     gdi32.lib)
 
-  # CRITICAL: the vcpkg triplet is x64-windows-static-md => deps use the DYNAMIC
-  # CRT (/MD). DuckDB's extension build defaults extension objects to the STATIC
-  # CRT (/MT), which causes LNK2038 RuntimeLibrary mismatch (MD vs MT) and the
-  # cascade of unresolved __imp_* CRT symbols. Force our extension objects to /MD
-  # so they match the vcpkg libs. Requires policy CMP0091=NEW (abstraction via
-  # MSVC_RUNTIME_LIBRARY), which DuckDB's build already sets.
+  # CRITICAL: the extension objects' C runtime MUST match the vcpkg deps and
+  # duckdb_static, or the link fails — either LNK2038 (RuntimeLibrary MD vs MT
+  # mismatch) or LNK2005 duplicate-CRT-symbol errors (e.g. std::codecvt defined
+  # in both msvcprt.lib/MSVCP140.dll and the static libs). The CRT is determined
+  # by the vcpkg triplet:
+  #   x64-windows-static-release  -> static CRT (/MT)   [community-extensions CI]
+  #   x64-windows-static-md       -> dynamic CRT (/MD)
+  # Pick to match. Requires policy CMP0091=NEW (MSVC_RUNTIME_LIBRARY), which
+  # DuckDB's build already sets.
+  if(VCPKG_TARGET_TRIPLET MATCHES "-md")
+    set(PDF_MSVC_RUNTIME "MultiThreadedDLL")
+  else()
+    set(PDF_MSVC_RUNTIME "MultiThreaded")
+  endif()
   set_property(TARGET ${EXTENSION_NAME} PROPERTY
-    MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+    MSVC_RUNTIME_LIBRARY "${PDF_MSVC_RUNTIME}")
   set_property(TARGET ${LOADABLE_EXTENSION_NAME} PROPERTY
-    MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+    MSVC_RUNTIME_LIBRARY "${PDF_MSVC_RUNTIME}")
 
   target_link_libraries(${EXTENSION_NAME} ${WIN_PDF_LIBS})
   target_link_libraries(${LOADABLE_EXTENSION_NAME} ${WIN_PDF_LIBS})
