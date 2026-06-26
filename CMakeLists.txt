@@ -69,10 +69,17 @@ if(NOT WIN32)
       set(PDF_POSIX_LINK -Wl,--start-group ${VCPKG_STATIC_ARCHIVES} -Wl,--end-group)
     else()
       # macOS: ld64 resolves archives order-independently, so no group is needed.
-      # But libiconv is a macOS *system* library (poppler-cpp's ustring::to_utf8 /
-      # from_utf8 call iconv) — it is not among the vcpkg archives, so link it
-      # explicitly. (On Linux iconv lives in glibc and needs no separate lib.)
-      set(PDF_POSIX_LINK ${VCPKG_STATIC_ARCHIVES} -liconv)
+      # The static closure pulls in macOS *system* dependencies that are not vcpkg
+      # archives and must be linked explicitly:
+      #   * libiconv      — poppler-cpp's ustring::to_utf8 / from_utf8 call iconv.
+      #   * CoreFoundation + SystemConfiguration — libcurl (pulled in by tesseract)
+      #     references _CFRelease and _SCDynamicStoreCopyProxies to read the macOS
+      #     system proxy configuration.
+      # (On Linux iconv lives in glibc and curl needs no frameworks.)
+      find_library(PDF_COREFOUNDATION CoreFoundation REQUIRED)
+      find_library(PDF_SYSTEMCONFIGURATION SystemConfiguration REQUIRED)
+      set(PDF_POSIX_LINK ${VCPKG_STATIC_ARCHIVES} -liconv
+          ${PDF_COREFOUNDATION} ${PDF_SYSTEMCONFIGURATION})
     endif()
 
     target_link_libraries(${EXTENSION_NAME} ${PDF_POSIX_LINK})
