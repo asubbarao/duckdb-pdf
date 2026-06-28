@@ -6,6 +6,8 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/blob.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -21,6 +23,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <memory>
@@ -1129,40 +1132,123 @@ static void PdfToHtmlFun(DataChunk &args, ExpressionState &state, Vector &result
 }
 
 //===--------------------------------------------------------------------===//
-// pdf_to_svg(path, page) — text-layer SVG for ONE 1-based page. Each word is a
-// <text> element placed at its bbox. (Text-layer chosen over raster: poppler-cpp
-// image::save() only writes PNG to a file path — there is no in-memory PNG
-// encoder available, and a new dependency is disallowed; a temp-file round-trip
-// is undesirable, so we emit a self-contained vector text layer instead.)
+// pdf_to_svg(path, page[, dpi]) — REAL raster render of ONE 1-based page.
+//
+// The page is rasterized with poppler::page_renderer (the same render path the
+// OCR code uses) and saved to a unique temp file as PNG via image::save(...,
+// "png"). poppler's PNG writer uses libpng, which is ALREADY linked through
+// poppler — no external process, no new dependency. The PNG bytes are read back,
+// base64-encoded, and embedded as a <image href="data:image/png;base64,..."/>
+// inside an <svg> sized to the page's POINT dimensions, so the raster scales to
+// the page box. The temp file is always removed (RAII guard), even on error.
 //===--------------------------------------------------------------------===//
-static string DocToSvg(const string &path, int32_t page_no) {
+
+// Removes a path on scope exit (best-effort; never throws).
+struct TempFileGuard {
+	std::string path;
+	explicit TempFileGuard(std::string p) : path(std::move(p)) {
+	}
+	~TempFileGuard() {
+		if (!path.empty()) {
+			std::remove(path.c_str());
+		}
+	}
+	TempFileGuard(const TempFileGuard &) = delete;
+	TempFileGuard &operator=(const TempFileGuard &) = delete;
+};
+
+// Portable temp directory (avoids std::filesystem, which is unavailable on some
+// of the extension's build targets). Honors the standard env vars, falls back to
+// /tmp (POSIX) or the current dir (Windows, where TEMP/TMP are virtually always
+// set). Returns a directory path WITHOUT a trailing separator.
+static string TempDir() {
+	const char *candidates[] = {
+#ifdef _WIN32
+	    std::getenv("TEMP"), std::getenv("TMP"), "."
+#else
+	    std::getenv("TMPDIR"), std::getenv("TMP"), "/tmp"
+#endif
+	};
+	for (const char *c : candidates) {
+		if (c && *c) {
+			string dir(c);
+			while (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\')) {
+				dir.pop_back();
+			}
+			return dir;
+		}
+	}
+	return ".";
+}
+
+static string DocToSvg(const string &path, int32_t page_no, int32_t dpi) {
 	auto doc = LoadRenderDoc("pdf_to_svg", path);
 	int n = doc->pages();
 	if (page_no < 1 || page_no > n) {
 		throw IOException("pdf_to_svg: page %d is out of range for '%s' (document has %d page%s)", (int)page_no, path,
 		                  n, n == 1 ? "" : "s");
 	}
+	if (dpi <= 0) {
+		throw InvalidInputException("pdf_to_svg: dpi must be positive (got %d)", (int)dpi);
+	}
 	unique_ptr<poppler::page> page(doc->create_page(page_no - 1));
 	if (!page) {
 		throw IOException("pdf_to_svg: could not read page %d of '%s'", (int)page_no, path);
 	}
+
+	// Rasterize the page (same render hints as the OCR path).
+	poppler::page_renderer renderer;
+	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
+	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
+	poppler::image img = renderer.render_page(page.get(), dpi, dpi);
+	if (!img.is_valid()) {
+		throw IOException("pdf_to_svg: failed to render page %d of '%s'", (int)page_no, path);
+	}
+
+	// Write the raster to a unique temp file as PNG. image::save() needs a real
+	// on-disk path; we build one from a portable temp dir plus a random UUID for a
+	// thread-safe, cross-platform unique name, and always remove it on scope exit.
+#ifdef _WIN32
+	const char sep = '\\';
+#else
+	const char sep = '/';
+#endif
+	string unique = BaseUUID::ToString(UUID::GenerateRandomUUID());
+	string tmp_path = TempDir() + sep + "pdf_to_svg_" + unique + ".png";
+	TempFileGuard guard(tmp_path);
+
+	if (!img.save(tmp_path, "png", dpi)) {
+		// poppler returns false if it was built without a PNG writer, or on I/O
+		// failure. Fail loudly — never silently degrade.
+		throw IOException("pdf_to_svg: poppler could not write a PNG for page %d of '%s' (this poppler build may lack "
+		                  "the PNG image writer)",
+		                  (int)page_no, path);
+	}
+
+	// Read the PNG bytes back.
+	std::ifstream in(tmp_path, std::ios::binary);
+	if (!in) {
+		throw IOException("pdf_to_svg: could not reopen rendered PNG for page %d of '%s'", (int)page_no, path);
+	}
+	string png((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+	in.close();
+	if (png.size() < 8 || static_cast<unsigned char>(png[0]) != 0x89 || png[1] != 'P' || png[2] != 'N' ||
+	    png[3] != 'G') {
+		throw IOException("pdf_to_svg: rendered output for page %d of '%s' is not a valid PNG", (int)page_no, path);
+	}
+
+	// Base64-encode the PNG via DuckDB's blob helper.
+	string b64 = Blob::ToBase64(string_t(png.data(), static_cast<uint32_t>(png.size())));
+
+	// Emit an SVG sized to the page's POINT dimensions; the embedded raster scales
+	// to fill the page box via the viewBox.
 	auto rect = page->page_rect();
 	string w = FmtCoord(rect.width());
 	string h = FmtCoord(rect.height());
 	string out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
-	out += "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + w + "\" height=\"" + h + "\" viewBox=\"0 0 " + w +
-	       " " + h + "\">\n";
-	out += "<rect width=\"" + w + "\" height=\"" + h + "\" fill=\"white\"/>\n";
-	for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
-		auto r = b.bbox();
-		double fs = b.has_font_info() ? b.get_font_size() : (r.height() > 0 ? r.height() : 10.0);
-		// SVG text y is the baseline; bbox y is the top, so place the baseline at
-		// the bbox bottom (top + height).
-		out += "<text x=\"" + FmtCoord(r.x()) + "\" y=\"" + FmtCoord(r.y() + r.height()) + "\" font-size=\"" +
-		       FmtCoord(fs) + "\">";
-		AppendXmlEscaped(out, UStringToUtf8(b.text()));
-		out += "</text>\n";
-	}
+	out += "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"" + w +
+	       "\" height=\"" + h + "\" viewBox=\"0 0 " + w + " " + h + "\">\n";
+	out += "<image width=\"" + w + "\" height=\"" + h + "\" href=\"data:image/png;base64," + b64 + "\"/>\n";
 	out += "</svg>\n";
 	return out;
 }
@@ -1170,7 +1256,14 @@ static string DocToSvg(const string &path, int32_t page_no) {
 static void PdfToSvgFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	BinaryExecutor::Execute<string_t, int32_t, string_t>(
 	    args.data[0], args.data[1], result, args.size(), [&](string_t path, int32_t page_no) {
-		    return StringVector::AddString(result, DocToSvg(path.GetString(), page_no));
+		    return StringVector::AddString(result, DocToSvg(path.GetString(), page_no, 150));
+	    });
+}
+static void PdfToSvgDpiFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	TernaryExecutor::Execute<string_t, int32_t, int32_t, string_t>(
+	    args.data[0], args.data[1], args.data[2], result, args.size(),
+	    [&](string_t path, int32_t page_no, int32_t dpi) {
+		    return StringVector::AddString(result, DocToSvg(path.GetString(), page_no, dpi));
 	    });
 }
 
@@ -1210,8 +1303,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(ScalarFunction("pdf_to_html", {LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToHtmlFun));
 	loader.RegisterFunction(ScalarFunction("pdf_to_xml", {LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToXmlFun));
-	loader.RegisterFunction(
-	    ScalarFunction("pdf_to_svg", {LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::VARCHAR, PdfToSvgFun));
+
+	ScalarFunctionSet pdf_to_svg_set("pdf_to_svg");
+	pdf_to_svg_set.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::VARCHAR, PdfToSvgFun));
+	pdf_to_svg_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER},
+	                                          LogicalType::VARCHAR, PdfToSvgDpiFun));
+	loader.RegisterFunction(pdf_to_svg_set);
 }
 
 void PdfExtension::Load(ExtensionLoader &loader) {

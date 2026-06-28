@@ -94,17 +94,30 @@ SELECT contains(pdf_to_html('test/data/two_pages.pdf'), 'Alpha') AND contains(pd
 ----
 true
 
-# ── pdf_to_svg ────────────────────────────────────────────────────────────
+# ── pdf_to_svg (real raster render) ───────────────────────────────────────
 
 # A single page renders to an SVG document
 query I
-SELECT starts_with(trim(pdf_to_svg('test/data/two_pages.pdf', 1)), '<') AND contains(pdf_to_svg('test/data/two_pages.pdf', 1), 'svg');
+SELECT starts_with(trim(pdf_to_svg('test/data/two_pages.pdf', 1)), '<') AND contains(pdf_to_svg('test/data/two_pages.pdf', 1), '<svg');
 ----
 true
 
-# Page 1 carries Alpha-section text; page 2 carries Beta-section text
+# The page is embedded as a base64 PNG data URI (PNG magic bytes -> iVBORw0KGgo)
 query I
-SELECT contains(pdf_to_svg('test/data/two_pages.pdf', 1), 'Alpha') AND contains(pdf_to_svg('test/data/two_pages.pdf', 2), 'Beta');
+SELECT contains(pdf_to_svg('test/data/two_pages.pdf', 1), 'data:image/png;base64,iVBORw0KGgo');
+----
+true
+
+# Both pages render independently to valid PNG-embedded SVGs
+query I
+SELECT contains(pdf_to_svg('test/data/two_pages.pdf', 2), 'data:image/png;base64,iVBORw0KGgo');
+----
+true
+
+# Optional dpi overload renders too (lower dpi -> smaller raster -> shorter output)
+query I
+SELECT contains(pdf_to_svg('test/data/two_pages.pdf', 1, 72), 'data:image/png;base64,iVBORw0KGgo')
+  AND length(pdf_to_svg('test/data/two_pages.pdf', 1, 72)) < length(pdf_to_svg('test/data/two_pages.pdf', 1, 150));
 ----
 true
 
