@@ -60,6 +60,72 @@ SELECT pdf_to_text('test/data/two_pages.pdf') ILIKE '%Beta%';
 ----
 true
 
+# ── pdf_to_xml ────────────────────────────────────────────────────────────
+
+# pdftoxml-style document: per-page <page> elements wrapping <word> bboxes
+query I
+SELECT contains(pdf_to_xml('test/data/two_pages.pdf'), 'Alpha') AND contains(pdf_to_xml('test/data/two_pages.pdf'), '<page');
+----
+true
+
+# Beta content from the second page is present, and words carry bbox attrs
+query I
+SELECT contains(pdf_to_xml('test/data/two_pages.pdf'), 'Beta') AND contains(pdf_to_xml('test/data/two_pages.pdf'), 'xMin=');
+----
+true
+
+# Outer pdf2xml wrapper element is emitted
+query I
+SELECT contains(pdf_to_xml('test/data/two_pages.pdf'), '<pdf2xml>');
+----
+true
+
+# ── pdf_to_html ───────────────────────────────────────────────────────────
+
+# Valid HTML document containing page content
+query I
+SELECT contains(pdf_to_html('test/data/two_pages.pdf'), 'Beta') AND contains(lower(pdf_to_html('test/data/two_pages.pdf')), '<html');
+----
+true
+
+# First-page content is present and the body/page structure is emitted
+query I
+SELECT contains(pdf_to_html('test/data/two_pages.pdf'), 'Alpha') AND contains(pdf_to_html('test/data/two_pages.pdf'), 'class="page"');
+----
+true
+
+# ── pdf_to_svg ────────────────────────────────────────────────────────────
+
+# A single page renders to an SVG document
+query I
+SELECT starts_with(trim(pdf_to_svg('test/data/two_pages.pdf', 1)), '<') AND contains(pdf_to_svg('test/data/two_pages.pdf', 1), 'svg');
+----
+true
+
+# Page 1 carries Alpha-section text; page 2 carries Beta-section text
+query I
+SELECT contains(pdf_to_svg('test/data/two_pages.pdf', 1), 'Alpha') AND contains(pdf_to_svg('test/data/two_pages.pdf', 2), 'Beta');
+----
+true
+
+# ── errors: missing file / out-of-range page ──────────────────────────────
+
+statement error
+SELECT pdf_to_xml('test/data/does_not_exist.pdf');
+----
+
+statement error
+SELECT pdf_to_html('test/data/does_not_exist.pdf');
+----
+
+statement error
+SELECT pdf_to_svg('test/data/two_pages.pdf', 99);
+----
+
+statement error
+SELECT pdf_to_svg('test/data/two_pages.pdf', 0);
+----
+
 # ── error: missing file ───────────────────────────────────────────────────
 
 statement error

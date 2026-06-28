@@ -1002,6 +1002,179 @@ static void PdfToTextLayoutFun(DataChunk &args, ExpressionState &state, Vector &
 }
 
 //===--------------------------------------------------------------------===//
+// pdf_to_html / pdf_to_xml / pdf_to_svg
+//
+// All three are library-backed (poppler-cpp); NO external process is spawned.
+// Geometry comes from page::text_list() / page::page_rect(), reusing exactly the
+// word/bbox handling that backs read_pdf_words (top-left origin, PDF points).
+//===--------------------------------------------------------------------===//
+
+// Open a document for a scalar render function, matching pdf_to_text's error
+// style (InvalidInputException for missing/corrupt, encrypted-without-password).
+static unique_ptr<poppler::document> LoadRenderDoc(const string &fn, const string &path) {
+	unique_ptr<poppler::document> doc(poppler::document::load_from_file(path));
+	if (!doc) {
+		throw InvalidInputException("%s: could not open '%s' (missing, corrupt, or not a PDF)", fn, path);
+	}
+	if (doc->is_locked() || doc->is_encrypted()) {
+		throw InvalidInputException("%s: '%s' is encrypted (use read_pdf with password := '...')", fn, path);
+	}
+	return doc;
+}
+
+// Escape the five predefined XML entities. Also used for HTML (a strict superset
+// for text/attribute contexts of the characters we emit).
+static void AppendXmlEscaped(string &out, const string &s) {
+	for (char c : s) {
+		switch (c) {
+		case '&':
+			out += "&amp;";
+			break;
+		case '<':
+			out += "&lt;";
+			break;
+		case '>':
+			out += "&gt;";
+			break;
+		case '"':
+			out += "&quot;";
+			break;
+		case '\'':
+			out += "&apos;";
+			break;
+		default:
+			out.push_back(c);
+			break;
+		}
+	}
+}
+
+// Format a coordinate compactly (avoids locale issues / trailing noise).
+static string FmtCoord(double v) {
+	char buf[32];
+	snprintf(buf, sizeof(buf), "%.2f", v);
+	return string(buf);
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_to_xml(path) — pdftoxml-style: <pdf2xml><page ..><word ..>..</word>..
+//===--------------------------------------------------------------------===//
+static string DocToXml(const string &path) {
+	auto doc = LoadRenderDoc("pdf_to_xml", path);
+	string out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<pdf2xml>\n";
+	int n = doc->pages();
+	for (int p = 0; p < n; p++) {
+		unique_ptr<poppler::page> page(doc->create_page(p));
+		if (!page) {
+			continue;
+		}
+		auto rect = page->page_rect();
+		out += "  <page number=\"" + std::to_string(p + 1) + "\" width=\"" + FmtCoord(rect.width()) + "\" height=\"" +
+		       FmtCoord(rect.height()) + "\">\n";
+		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
+			auto r = b.bbox();
+			out += "    <word xMin=\"" + FmtCoord(r.x()) + "\" yMin=\"" + FmtCoord(r.y()) + "\" xMax=\"" +
+			       FmtCoord(r.x() + r.width()) + "\" yMax=\"" + FmtCoord(r.y() + r.height()) + "\">";
+			AppendXmlEscaped(out, UStringToUtf8(b.text()));
+			out += "</word>\n";
+		}
+		out += "  </page>\n";
+	}
+	out += "</pdf2xml>\n";
+	return out;
+}
+
+static void PdfToXmlFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
+		return StringVector::AddString(result, DocToXml(path.GetString()));
+	});
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_to_html(path) — one absolutely-positioned <div class="page"> per page,
+// each word an absolutely-positioned <span> at its bbox (PDF points -> px).
+//===--------------------------------------------------------------------===//
+static string DocToHtml(const string &path) {
+	auto doc = LoadRenderDoc("pdf_to_html", path);
+	string out = "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\"/>\n"
+	             "<style>.page{position:relative;border:1px solid #ccc;margin:8px auto;}"
+	             ".page span{position:absolute;white-space:pre;}</style>\n</head>\n<body>\n";
+	int n = doc->pages();
+	for (int p = 0; p < n; p++) {
+		unique_ptr<poppler::page> page(doc->create_page(p));
+		if (!page) {
+			continue;
+		}
+		auto rect = page->page_rect();
+		out += "<div class=\"page\" id=\"page" + std::to_string(p + 1) + "\" style=\"width:" + FmtCoord(rect.width()) +
+		       "px;height:" + FmtCoord(rect.height()) + "px;\">\n";
+		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
+			auto r = b.bbox();
+			double fs = b.has_font_info() ? b.get_font_size() : (r.height() > 0 ? r.height() : 10.0);
+			out += "<span style=\"left:" + FmtCoord(r.x()) + "px;top:" + FmtCoord(r.y()) +
+			       "px;font-size:" + FmtCoord(fs) + "px;\">";
+			AppendXmlEscaped(out, UStringToUtf8(b.text()));
+			out += "</span>\n";
+		}
+		out += "</div>\n";
+	}
+	out += "</body>\n</html>\n";
+	return out;
+}
+
+static void PdfToHtmlFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
+		return StringVector::AddString(result, DocToHtml(path.GetString()));
+	});
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_to_svg(path, page) — text-layer SVG for ONE 1-based page. Each word is a
+// <text> element placed at its bbox. (Text-layer chosen over raster: poppler-cpp
+// image::save() only writes PNG to a file path — there is no in-memory PNG
+// encoder available, and a new dependency is disallowed; a temp-file round-trip
+// is undesirable, so we emit a self-contained vector text layer instead.)
+//===--------------------------------------------------------------------===//
+static string DocToSvg(const string &path, int32_t page_no) {
+	auto doc = LoadRenderDoc("pdf_to_svg", path);
+	int n = doc->pages();
+	if (page_no < 1 || page_no > n) {
+		throw IOException("pdf_to_svg: page %d is out of range for '%s' (document has %d page%s)", (int)page_no, path,
+		                  n, n == 1 ? "" : "s");
+	}
+	unique_ptr<poppler::page> page(doc->create_page(page_no - 1));
+	if (!page) {
+		throw IOException("pdf_to_svg: could not read page %d of '%s'", (int)page_no, path);
+	}
+	auto rect = page->page_rect();
+	string w = FmtCoord(rect.width());
+	string h = FmtCoord(rect.height());
+	string out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+	out += "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + w + "\" height=\"" + h + "\" viewBox=\"0 0 " + w +
+	       " " + h + "\">\n";
+	out += "<rect width=\"" + w + "\" height=\"" + h + "\" fill=\"white\"/>\n";
+	for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
+		auto r = b.bbox();
+		double fs = b.has_font_info() ? b.get_font_size() : (r.height() > 0 ? r.height() : 10.0);
+		// SVG text y is the baseline; bbox y is the top, so place the baseline at
+		// the bbox bottom (top + height).
+		out += "<text x=\"" + FmtCoord(r.x()) + "\" y=\"" + FmtCoord(r.y() + r.height()) + "\" font-size=\"" +
+		       FmtCoord(fs) + "\">";
+		AppendXmlEscaped(out, UStringToUtf8(b.text()));
+		out += "</text>\n";
+	}
+	out += "</svg>\n";
+	return out;
+}
+
+static void PdfToSvgFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	BinaryExecutor::Execute<string_t, int32_t, string_t>(
+	    args.data[0], args.data[1], result, args.size(), [&](string_t path, int32_t page_no) {
+		    return StringVector::AddString(result, DocToSvg(path.GetString(), page_no));
+	    });
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 static void LoadInternal(ExtensionLoader &loader) {
@@ -1034,6 +1207,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_to_text_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToTextLayoutFun));
 	loader.RegisterFunction(pdf_to_text_set);
+
+	loader.RegisterFunction(ScalarFunction("pdf_to_html", {LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToHtmlFun));
+	loader.RegisterFunction(ScalarFunction("pdf_to_xml", {LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToXmlFun));
+	loader.RegisterFunction(
+	    ScalarFunction("pdf_to_svg", {LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::VARCHAR, PdfToSvgFun));
 }
 
 void PdfExtension::Load(ExtensionLoader &loader) {
