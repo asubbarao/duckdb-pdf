@@ -61,6 +61,28 @@ if(NOT WIN32)
       message(FATAL_ERROR "pdf: no static archives found under '${VCPKG_STATIC_LIBDIR}'")
     endif()
 
+    # DROP vcpkg's mbedTLS archives (libmbedcrypto/libmbedtls/libmbedx509) from the
+    # over-link set: DuckDB statically bundles its OWN mbedTLS inside
+    # libduckdb_static.a (third_party/mbedtls -> cipher_wrap.cpp.o etc.). curl —
+    # pulled in transitively by tesseract — references mbedTLS symbols, and the
+    # pdf_to_svg PNG-writer code path now reaches that closure, so ld would
+    # otherwise pull cipher_wrap.c.o from BOTH vcpkg's libmbedcrypto.a AND DuckDB's
+    # bundled copy, yielding `duplicate symbol _mbedtls_cipher_definitions /
+    # _mbedtls_cipher_base_lookup_table`. macOS ld64 errors hard on that (Linux's
+    # --start-group merely picks the first, which is why only MacOS failed). Letting
+    # DuckDB's bundled mbedTLS satisfy those references resolves the collision; the
+    # vcpkg curl/poppler objects link against the bundled symbols instead.
+    set(VCPKG_STATIC_ARCHIVES_FILTERED "")
+    foreach(_lib ${VCPKG_STATIC_ARCHIVES})
+      get_filename_component(_libname "${_lib}" NAME)
+      if(_libname MATCHES "^libmbed")
+        message(STATUS "pdf: excluding vcpkg mbedTLS archive from over-link (DuckDB bundles its own): ${_libname}")
+      else()
+        list(APPEND VCPKG_STATIC_ARCHIVES_FILTERED "${_lib}")
+      endif()
+    endforeach()
+    set(VCPKG_STATIC_ARCHIVES ${VCPKG_STATIC_ARCHIVES_FILTERED})
+
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       # GNU ld is single-pass; wrap the whole archive set in a group so the cyclic
       # deps among poppler/tesseract/leptonica/curl/archive/crypto/freetype resolve
