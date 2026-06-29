@@ -1,0 +1,66 @@
+# name: test/sql/pdf_to_pdf.test
+# description: to_pdf scalar — convert office/markup docs to PDF via LibreOffice
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── graceful-require (CI-safe, no converter installed) ────────────────────
+#
+# When no LibreOffice converter is available, to_pdf must fail loudly with an
+# actionable message naming LibreOffice — never silently. This is the default
+# CI path: CI runners have no soffice, so the error path is what gets exercised.
+# (The positive conversion path is gated behind LIBREOFFICE_PATH below, the same
+# way the OCR suite gates on TESSDATA_PREFIX.)
+
+statement error
+SELECT to_pdf('test/data/does_not_exist.docx');
+----
+LibreOffice
+
+statement error
+SELECT to_pdf('test/data/does_not_exist.docx', '/tmp/out.pdf');
+----
+LibreOffice
+
+# ── positive path (opt-in; only runs when LibreOffice is wired up) ─────────
+#
+# Set LIBREOFFICE_PATH to the soffice binary to exercise a real conversion, e.g.
+#   brew install --cask libreoffice
+#   LIBREOFFICE_PATH=/Applications/LibreOffice.app/Contents/MacOS/soffice make test
+# Everything below is skipped unless that env var is present, so the suite stays
+# green on machines (and CI) with no converter installed.
+require-env LIBREOFFICE_PATH
+
+# Generate a tiny HTML fixture at test time (LibreOffice converts html -> pdf),
+# so nothing binary is checked into the repo.
+statement ok
+COPY (SELECT '<html><body><h1>to_pdf hello</h1><p>DuckDB pdf extension</p></body></html>' AS html)
+TO '__TEST_DIR__/to_pdf_fixture.html' (FORMAT csv, HEADER false, QUOTE '', DELIMITER '');
+
+# Two-arg form: explicit output path. Result is the output path and ends in .pdf.
+query I
+SELECT ends_with(to_pdf('__TEST_DIR__/to_pdf_fixture.html', '__TEST_DIR__/to_pdf_explicit.pdf'), '.pdf');
+----
+true
+
+# The produced PDF is a real PDF that read_pdf can read back.
+query I
+SELECT length(trim(string_agg(text, ''))) > 0
+FROM read_pdf('__TEST_DIR__/to_pdf_explicit.pdf');
+----
+true
+
+# One-arg form: output is written next to the input with the ext swapped to .pdf.
+query I
+SELECT ends_with(to_pdf('__TEST_DIR__/to_pdf_fixture.html'), '.pdf');
+----
+true
+
+query I
+SELECT count(*) >= 1
+FROM read_pdf('__TEST_DIR__/to_pdf_fixture.pdf');
+----
+true

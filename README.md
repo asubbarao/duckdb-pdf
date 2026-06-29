@@ -14,6 +14,7 @@ The `pdf` extension exposes eight functions covering the full range of PDF extra
 | `read_pdf_words` | Table | One row per word with bounding box + font: `x0,y0,x1,y1`, `font_name`, `font_size` |
 | `read_pdf_tables` | Table | Tabular regions from digital PDFs: `page`, `table_index`, `row_index`, `cells VARCHAR[]` |
 | `pdf_to_text` | Scalar | Convert a whole PDF to plain text (optionally with a `layout` argument: `reading`, `physical`, or `raw`) |
+| `to_pdf` | Scalar | Convert an office/markup document (docx, odt, rtf, html, pptx, xlsx, ...) **to** a PDF via LibreOffice (runtime shell-out) |
 
 ## Installation
 
@@ -153,6 +154,68 @@ FROM glob('docs/*.pdf');
 SELECT f.filename, length(pdf_to_text(f.filename)) AS char_count
 FROM glob('archive/*.pdf') AS f(filename)
 WHERE pdf_to_text(f.filename) ILIKE '%quarterly earnings%';
+```
+
+## Saving / converting documents to PDF
+
+The reading functions above go *from* a PDF. To go the other way — turn a
+`docx`, `doc`, `odt`, `rtf`, `html`, `odp`, `pptx`, `xlsx`, ... into a PDF — there
+are two routes. Both rely on [LibreOffice](https://www.libreoffice.org/) for the
+actual conversion.
+
+### Route 1 — the native `to_pdf` function
+
+`to_pdf(input_path[, output_path])` is a scalar that converts a document to a PDF
+and returns the output path. Like OCR needs Tesseract, **`to_pdf` needs
+LibreOffice installed at runtime** — it shells out to the `soffice` binary. It is
+*not* a build/link dependency, so the extension installs and loads fine on
+machines without LibreOffice; the function only errors (with an actionable
+message) if you call it when no converter is present.
+
+```bash
+# Install LibreOffice once
+brew install --cask libreoffice                 # macOS
+sudo apt-get install libreoffice                # Debian / Ubuntu
+# Windows: https://www.libreoffice.org/download
+```
+
+```sql
+-- Convert next to the input (extension swapped to .pdf); returns the new path
+SELECT to_pdf('resume.docx');                   -- -> 'resume.pdf'
+
+-- Convert to an explicit output path; returns that path
+SELECT to_pdf('slides.pptx', '/tmp/slides.pdf');
+
+-- Convert a directory of docs, then read them straight back
+SELECT f.file, to_pdf(f.file) AS pdf_path
+FROM glob('docs/*.docx') AS f(file);
+
+-- One-shot: convert and immediately read the produced PDF
+SELECT page, text
+FROM read_pdf((SELECT to_pdf('report.odt')));
+```
+
+The `soffice`/`libreoffice` binary is auto-detected on `$PATH` (and the macOS app
+bundle at `/Applications/LibreOffice.app/Contents/MacOS/soffice`). Resolution
+order: **`LIBREOFFICE_PATH` env var → `soffice` on `$PATH` → `libreoffice` on
+`$PATH` → the macOS app bundle.** If yours is in a non-standard location, set
+`LIBREOFFICE_PATH` to the binary's absolute path. NULL input yields NULL output.
+
+### Route 2 — pure SQL via shellfs (no extension change)
+
+If you'd rather not depend on `to_pdf`, the same conversion composes from the
+community [`shellfs`](https://duckdb.org/community_extensions/extensions/shellfs)
+extension, which runs a shell command as a virtual file — no change to this
+extension needed:
+
+```sql
+LOAD shellfs;  -- run a shell command as a virtual file
+-- convert with LibreOffice, swallow stdout:
+SELECT * FROM read_text(
+  'soffice --headless --convert-to pdf --outdir /tmp "/path/resume.docx" && echo ok |'
+);
+-- then read the produced PDF straight back into DuckDB:
+SELECT * FROM read_pdf('/tmp/resume.pdf');
 ```
 
 ## Building from source

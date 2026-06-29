@@ -30,6 +30,17 @@
 #include <string>
 #include <vector>
 
+// Process spawn + PATH probing for the runtime LibreOffice shell-out (to_pdf).
+// These are the ONLY new system headers; no new library is linked.
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#define popen  _popen
+#define pclose _pclose
+#else
+#include <unistd.h>
+#endif
+
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
@@ -1268,6 +1279,249 @@ static void PdfToSvgDpiFun(DataChunk &args, ExpressionState &state, Vector &resu
 }
 
 //===--------------------------------------------------------------------===//
+// to_pdf(input_path[, output_path]) — convert an office/markup document
+// (docx, doc, odt, rtf, html, odp, pptx, xlsx, ...) to a PDF by shelling out AT
+// RUNTIME to LibreOffice's `soffice`.
+//
+// This is a RUNTIME process spawn (popen), NOT a build/link dependency: the
+// extension compiles and CI stays green on machines with no converter
+// installed. If LibreOffice is absent at call time, we throw a clear, actionable
+// IOException (mirroring the graceful-require pattern the OCR path uses).
+//===--------------------------------------------------------------------===//
+
+// Removes a directory tree on scope exit (best-effort; never throws). Used for
+// the per-call LibreOffice user-profile dir and the temp output dir.
+struct TempDirGuard {
+	std::string path;
+	explicit TempDirGuard(std::string p) : path(std::move(p)) {
+	}
+	~TempDirGuard() {
+		if (path.empty()) {
+			return;
+		}
+		// Recursive remove via the OS shell — portable and dependency-free. Quote
+		// the path; best-effort, so ignore the result.
+#ifdef _WIN32
+		string cmd = "rmdir /s /q \"" + path + "\" >nul 2>&1";
+#else
+		string cmd = "rm -rf \"" + path + "\" >/dev/null 2>&1";
+#endif
+		int rc = std::system(cmd.c_str());
+		(void)rc;
+	}
+	TempDirGuard(const TempDirGuard &) = delete;
+	TempDirGuard &operator=(const TempDirGuard &) = delete;
+};
+
+// True if `path` names an existing executable file.
+static bool IsExecutable(const string &path) {
+	if (path.empty()) {
+		return false;
+	}
+#ifdef _WIN32
+	return _access(path.c_str(), 0) == 0; // existence; Windows has no X bit
+#else
+	return access(path.c_str(), X_OK) == 0;
+#endif
+}
+
+// Resolve a bare command name (no separator) against the entries of $PATH,
+// returning the first executable match, or empty string if none.
+static string WhichOnPath(const string &name) {
+	const char *path_env = std::getenv("PATH");
+	if (!path_env || !*path_env) {
+		return string();
+	}
+#ifdef _WIN32
+	const char list_sep = ';';
+	const char dir_sep = '\\';
+#else
+	const char list_sep = ':';
+	const char dir_sep = '/';
+#endif
+	string paths(path_env);
+	size_t start = 0;
+	while (start <= paths.size()) {
+		size_t end = paths.find(list_sep, start);
+		string dir = (end == string::npos) ? paths.substr(start) : paths.substr(start, end - start);
+		if (!dir.empty()) {
+			string candidate = dir;
+			if (candidate.back() != dir_sep) {
+				candidate += dir_sep;
+			}
+			candidate += name;
+			if (IsExecutable(candidate)) {
+				return candidate;
+			}
+		}
+		if (end == string::npos) {
+			break;
+		}
+		start = end + 1;
+	}
+	return string();
+}
+
+// Locate the LibreOffice binary (graceful-require). Resolution order, first hit
+// wins:
+//   1. env LIBREOFFICE_PATH  (explicit absolute path to the binary)
+//   2. `soffice` on $PATH
+//   3. `libreoffice` on $PATH
+//   4. macOS app bundle: /Applications/LibreOffice.app/Contents/MacOS/soffice
+//   5. none -> throw a clear, actionable IOException naming LibreOffice + install.
+static string ResolveLibreOffice() {
+	const char *explicit_path = std::getenv("LIBREOFFICE_PATH");
+	if (explicit_path && *explicit_path && IsExecutable(explicit_path)) {
+		return string(explicit_path);
+	}
+	string soffice = WhichOnPath("soffice");
+	if (!soffice.empty()) {
+		return soffice;
+	}
+	string libreoffice = WhichOnPath("libreoffice");
+	if (!libreoffice.empty()) {
+		return libreoffice;
+	}
+	static const char *kBundle = "/Applications/LibreOffice.app/Contents/MacOS/soffice";
+	if (IsExecutable(kBundle)) {
+		return string(kBundle);
+	}
+	throw IOException(
+	    "to_pdf: could not find a LibreOffice converter. Install LibreOffice — macOS: `brew install --cask "
+	    "libreoffice`; Debian/Ubuntu: `apt-get install libreoffice`; Windows: https://www.libreoffice.org/download. "
+	    "The `soffice`/`libreoffice` binary is auto-detected on $PATH (and the macOS app bundle); if yours is in a "
+	    "non-standard location, set the LIBREOFFICE_PATH environment variable to the binary's absolute path.");
+}
+
+// Split a path into directory, basename-without-extension, and extension.
+// Coordinate-system-free string surgery (no std::filesystem, which does not
+// compile on this target). A path with no directory separator has empty `dir`.
+static void SplitPath(const string &path, string &dir, string &stem, string &ext) {
+	size_t slash = path.find_last_of("/\\");
+	string fname = (slash == string::npos) ? path : path.substr(slash + 1);
+	dir = (slash == string::npos) ? string() : path.substr(0, slash);
+	size_t dot = fname.find_last_of('.');
+	if (dot == string::npos || dot == 0) {
+		stem = fname;
+		ext = string();
+	} else {
+		stem = fname.substr(0, dot);
+		ext = fname.substr(dot); // includes the leading '.'
+	}
+}
+
+// Run a command line, capturing combined stdout+stderr, returning the child's
+// exit status. Uses popen/_popen — a runtime process spawn, not a linked lib.
+static int RunCapture(const string &cmd, string &output) {
+	output.clear();
+	FILE *pipe = popen(cmd.c_str(), "r");
+	if (!pipe) {
+		throw IOException("to_pdf: failed to spawn the LibreOffice converter process");
+	}
+	char buf[4096];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) {
+		output.append(buf, n);
+	}
+	return pclose(pipe);
+}
+
+// Convert `input_path` to a PDF written at `output_path`, returning output_path.
+// LibreOffice cannot name its output directly (it writes
+// <outdir>/<input-stem>.pdf), so we convert into a unique temp outdir and then
+// move the produced file to `output_path`. A unique per-call user-profile dir
+// avoids the "another LibreOffice instance is running" lock.
+static string ConvertToPdf(const string &input_path, const string &output_path) {
+	string soffice = ResolveLibreOffice();
+
+#ifdef _WIN32
+	const char sep = '\\';
+#else
+	const char sep = '/';
+#endif
+	string base = TempDir();
+	string unique = BaseUUID::ToString(UUID::GenerateRandomUUID());
+	string profile_dir = base + sep + "to_pdf_profile_" + unique;
+	string out_dir = base + sep + "to_pdf_out_" + unique;
+	TempDirGuard profile_guard(profile_dir);
+	TempDirGuard out_guard(out_dir);
+
+	// Build the command. UserInstallation must be a file:// URL. Quote all paths.
+	// Capture combined output (2>&1) so a failure surfaces soffice's diagnostics.
+	string cmd = "\"" + soffice + "\" --headless -env:UserInstallation=file://" + profile_dir +
+	             " --convert-to pdf --outdir \"" + out_dir + "\" \"" + input_path + "\" 2>&1";
+	string captured;
+	int rc = RunCapture(cmd, captured);
+
+	// LibreOffice names the output <out_dir>/<input-stem>.pdf.
+	string in_dir, in_stem, in_ext;
+	SplitPath(input_path, in_dir, in_stem, in_ext);
+	string produced = out_dir + sep + in_stem + ".pdf";
+
+	std::ifstream check(produced, std::ios::binary);
+	if (!check.good()) {
+		throw IOException("to_pdf: LibreOffice did not produce a PDF for '%s' (exit status %d). soffice output: %s",
+		                  input_path, rc, captured.empty() ? "(none)" : captured);
+	}
+
+	// Validate the produced file starts with the PDF magic bytes; fail loud
+	// otherwise (mirrors the PNG-magic check in pdf_to_svg).
+	char magic[5] = {0};
+	check.read(magic, 5);
+	check.close();
+	if (string(magic, 5) != "%PDF-") {
+		throw IOException("to_pdf: the file LibreOffice produced for '%s' is not a valid PDF (missing %%PDF- header)",
+		                  input_path);
+	}
+
+	// Move produced -> output_path. std::rename fails across filesystems, so fall
+	// back to a byte copy + remove of the source.
+	std::remove(output_path.c_str());
+	if (std::rename(produced.c_str(), output_path.c_str()) != 0) {
+		std::ifstream src(produced, std::ios::binary);
+		std::ofstream dst(output_path, std::ios::binary | std::ios::trunc);
+		if (!src || !dst) {
+			throw IOException("to_pdf: could not write the converted PDF to '%s'", output_path);
+		}
+		dst << src.rdbuf();
+		if (!dst.good()) {
+			throw IOException("to_pdf: failed while writing the converted PDF to '%s'", output_path);
+		}
+		src.close();
+		dst.close();
+		std::remove(produced.c_str());
+	}
+	return output_path;
+}
+
+// Default output path: the input path with its extension swapped to `.pdf`.
+static string DefaultPdfOutput(const string &input_path) {
+	string dir, stem, ext;
+	SplitPath(input_path, dir, stem, ext);
+#ifdef _WIN32
+	const char sep = '\\';
+#else
+	const char sep = '/';
+#endif
+	string out = dir.empty() ? stem : (dir + sep + stem);
+	out += ".pdf";
+	return out;
+}
+
+static void ToPdfFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t in) {
+		string input_path = in.GetString();
+		return StringVector::AddString(result, ConvertToPdf(input_path, DefaultPdfOutput(input_path)));
+	});
+}
+static void ToPdfOutFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	BinaryExecutor::Execute<string_t, string_t, string_t>(
+	    args.data[0], args.data[1], result, args.size(), [&](string_t in, string_t out) {
+		    return StringVector::AddString(result, ConvertToPdf(in.GetString(), out.GetString()));
+	    });
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 static void LoadInternal(ExtensionLoader &loader) {
@@ -1310,6 +1564,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_to_svg_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER},
 	                                          LogicalType::VARCHAR, PdfToSvgDpiFun));
 	loader.RegisterFunction(pdf_to_svg_set);
+
+	ScalarFunctionSet to_pdf_set("to_pdf");
+	to_pdf_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, ToPdfFun));
+	to_pdf_set.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, ToPdfOutFun));
+	loader.RegisterFunction(to_pdf_set);
 }
 
 void PdfExtension::Load(ExtensionLoader &loader) {
