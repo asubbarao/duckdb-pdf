@@ -2,6 +2,35 @@
 
 A DuckDB community extension (`pdf`) for reading and extracting content from PDF files. Built on [Poppler](https://poppler.freedesktop.org/) for PDF parsing and [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR for scanned documents.
 
+## Quick demo
+
+Query any PDF like it's a table — text, lines, words with coordinates, tables, and metadata — **entirely in SQL, in the DuckDB process, with no external tools:**
+
+```sql
+INSTALL pdf FROM community;
+LOAD pdf;
+
+-- grep a PDF the way you'd grep a text file, keeping page + line context
+SELECT page, line, text
+FROM read_pdf_lines('resume.pdf')
+WHERE text ILIKE '%duckdb%';
+```
+
+**Round-trip: read a PDF, edit it with SQL, write a fresh PDF** — the extraction and transformation never leave DuckDB. Use the new native `write_pdf` (libharu, in-process, no LibreOffice) for plain text→PDF; `to_pdf` (LibreOffice) remains only for rich office docs (see [Writing PDFs natively (no LibreOffice)](#writing-pdfs-natively-no-libreoffice) and [Saving / converting documents to PDF](#saving--converting-documents-to-pdf)).
+
+```sql
+-- 1. read the PDF, rewrite a job title in pure SQL, emit the edited doc as HTML
+COPY (
+  SELECT '<html><body style="font-family:Helvetica;white-space:pre-wrap">'
+      || replace(pdf_to_text('resume.pdf'), 'Senior Engineer', 'Staff Engineer')
+      || '</body></html>'
+) TO 'edited.html' (FORMAT csv, HEADER false, QUOTE '');
+
+-- 2. render the edited HTML to a new PDF, then read it back to prove the loop closed
+SELECT to_pdf('edited.html', 'resume_v2.pdf');          -- requires LibreOffice
+SELECT page, page_count, left(text, 60) AS head FROM read_pdf('resume_v2.pdf');
+```
+
 ## What it does
 
 The `pdf` extension exposes eight functions covering the full range of PDF extraction tasks:
@@ -14,7 +43,8 @@ The `pdf` extension exposes eight functions covering the full range of PDF extra
 | `read_pdf_words` | Table | One row per word with bounding box + font: `x0,y0,x1,y1`, `font_name`, `font_size` |
 | `read_pdf_tables` | Table | Tabular regions from digital PDFs: `page`, `table_index`, `row_index`, `cells VARCHAR[]` |
 | `pdf_to_text` | Scalar | Convert a whole PDF to plain text (optionally with a `layout` argument: `reading`, `physical`, or `raw`) |
-| `to_pdf` | Scalar | Convert an office/markup document (docx, odt, rtf, html, pptx, xlsx, ...) **to** a PDF via LibreOffice (runtime shell-out) |
+| `write_pdf` | Scalar | **Native** (no LibreOffice) write of VARCHAR content to a PDF file using libharu (Letter, Helvetica 10pt, word-wrap + paginate). Returns the output path. |
+| `to_pdf` | Scalar | Convert an office/markup document (docx, odt, rtf, html, pptx, xlsx, ...) **to** a PDF via LibreOffice (runtime shell-out). Only needed for rich document conversion. |
 
 ## Installation
 
@@ -156,12 +186,52 @@ FROM glob('archive/*.pdf') AS f(filename)
 WHERE pdf_to_text(f.filename) ILIKE '%quarterly earnings%';
 ```
 
+## Writing PDFs natively (no LibreOffice)
+
+`write_pdf` is a **purely native, in-process** scalar that authors a PDF from a
+VARCHAR (plain text or SQL-generated). It uses libharu directly — **no external
+tools, no LibreOffice, no shell-out**. It is always available once the extension
+is loaded.
+
+```sql
+LOAD pdf;
+
+-- 1-arg: writes to a temp file (platform TMPDIR/TMP/TEMP or /tmp + UUID); returns the path
+SELECT write_pdf('Line one.' || chr(10) || 'Line two with wrapping that will be handled.');
+
+-- 2-arg: explicit output path; returns that path
+SELECT write_pdf('Hello native PDF from DuckDB.', 'out.pdf');
+
+-- NULLs propagate
+SELECT write_pdf(NULL);                 -- NULL
+SELECT write_pdf('x', NULL);            -- NULL
+```
+
+**Behavior and limits:**
+- Letter page size, 0.75 in margins, Helvetica 10 pt.
+- Splits on `\n`, expands tabs, word-wraps each logical line, auto-paginates.
+- Empty content produces a single blank (but valid) page.
+- Only Base-14 Helvetica (WinAnsi/Latin-1 encoding): non-Latin scripts and many
+  UTF-8 glyphs will not render correctly (they are dropped or replaced). This is
+  acceptable for v1; use `to_pdf` + rich HTML for international text.
+- Output path must be writable; failures raise a clear `IOException`.
+
+**Self-contained roundtrip (read → edit in SQL → write → read, all in-process):**
+
+```sql
+LOAD pdf;
+-- read a PDF, edit its text in SQL, write a NEW pdf entirely in-process:
+SELECT write_pdf(replace(pdf_to_text('in.pdf'), 'old', 'new'), 'out.pdf');
+SELECT page, text FROM read_pdf('out.pdf');
+```
+
 ## Saving / converting documents to PDF
 
 The reading functions above go *from* a PDF. To go the other way — turn a
-`docx`, `doc`, `odt`, `rtf`, `html`, `odp`, `pptx`, `xlsx`, ... into a PDF — there
-are two routes. Both rely on [LibreOffice](https://www.libreoffice.org/) for the
-actual conversion.
+`docx`, `doc`, `odt`, `rtf`, `html`, `odp`, `pptx`, `xlsx`, ... into a PDF — use
+`write_pdf` (above) for plain-text content, or `to_pdf` when you need rich
+office-to-PDF conversion. `to_pdf` is the only route that shells out to
+LibreOffice at runtime.
 
 ### Route 1 — the native `to_pdf` function
 
@@ -226,10 +296,10 @@ Install native libraries before building:
 
 ```bash
 # macOS
-brew install poppler tesseract leptonica
+brew install poppler tesseract leptonica libharu
 
 # Ubuntu / Debian
-sudo apt-get install libpoppler-dev libtesseract-dev libleptonica-dev
+sudo apt-get install libpoppler-dev libtesseract-dev libleptonica-dev libhpdf-dev
 ```
 
 ### Build

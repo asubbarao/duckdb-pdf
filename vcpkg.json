@@ -8,7 +8,8 @@
 			]
 		},
 		"tesseract",
-		"leptonica"
+		"leptonica",
+		"libharu"
 	],
 	"vcpkg-configuration": {
 		"overlay-ports": [

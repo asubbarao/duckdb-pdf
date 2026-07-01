@@ -21,12 +21,16 @@
 // tesseract — OCR for scanned / image-only PDFs
 #include <tesseract/baseapi.h>
 
+// libharu — native PDF writer (C API) for write_pdf. No external processes.
+#include <hpdf.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1522,6 +1526,196 @@ static void ToPdfOutFun(DataChunk &args, ExpressionState &state, Vector &result)
 }
 
 //===--------------------------------------------------------------------===//
+// write_pdf(content [, output_path]) — NATIVE in-process PDF author using libharu.
+// Two overloads:
+//   write_pdf(content) -> writes to temp .pdf (TempDir + UUID), returns path
+//   write_pdf(content, output_path) -> writes to given path, returns it
+// NULL (content or output_path) propagates to NULL result (via executor).
+// Rendering: Letter (612x792), 0.75in=54pt margins, Helvetica 10pt, \n-split +
+// word-wrap + auto-paginate. Tabs expanded to 4 spaces. Empty content yields
+// one blank (valid) page. On any libharu or I/O failure: IOException (no silent
+// truncation).
+//===--------------------------------------------------------------------===//
+
+// libharu error context for the C callback.
+struct HpdfError {
+	HPDF_STATUS error_no = 0;
+	HPDF_STATUS detail_no = 0;
+};
+
+static void HpdfErrorHandler(HPDF_STATUS error_no, HPDF_STATUS detail_no, void *user_data) {
+	if (user_data) {
+		auto *e = static_cast<HpdfError *>(user_data);
+		e->error_no = error_no;
+		e->detail_no = detail_no;
+	}
+}
+
+// RAII: guarantee HPDF_Free even if we throw.
+struct HpdfDocGuard {
+	HPDF_Doc pdf = nullptr;
+	explicit HpdfDocGuard(HPDF_Doc p) : pdf(p) {}
+	~HpdfDocGuard() {
+		if (pdf) {
+			HPDF_Free(pdf);
+		}
+	}
+	HpdfDocGuard(const HpdfDocGuard &) = delete;
+	HpdfDocGuard &operator=(const HpdfDocGuard &) = delete;
+};
+
+static string ExpandTabs(const string &s) {
+	string r;
+	r.reserve(s.size() + (s.size() / 4));
+	for (char c : s) {
+		if (c == '\t') {
+			r += "    ";
+		} else {
+			r.push_back(c);
+		}
+	}
+	return r;
+}
+
+// Word-wrap a single logical line using the page's current font metrics.
+static std::vector<string> WrapLine(HPDF_Page page, const string &line, double max_width) {
+	std::vector<string> out;
+	string l = line;
+	// strip trailing CR from \r\n
+	if (!l.empty() && l.back() == '\r') {
+		l.pop_back();
+	}
+	if (l.empty()) {
+		out.emplace_back();
+		return out;
+	}
+	std::istringstream iss(l);
+	std::vector<string> words;
+	string w;
+	while (iss >> w) {
+		words.push_back(std::move(w));
+	}
+	if (words.empty()) {
+		out.emplace_back();
+		return out;
+	}
+	string cur;
+	for (const auto &word : words) {
+		string trial = cur.empty() ? word : (cur + " " + word);
+		double tw = HPDF_Page_TextWidth(page, trial.c_str());
+		if (tw > max_width && !cur.empty()) {
+			out.push_back(cur);
+			cur = word;
+		} else {
+			cur = std::move(trial);
+		}
+	}
+	if (!cur.empty()) {
+		out.push_back(cur);
+	}
+	return out;
+}
+
+static string WritePdfImpl(const string &content, const string &output_path) {
+	HpdfError err_ctx;
+	HPDF_Doc pdf = HPDF_New(HpdfErrorHandler, &err_ctx);
+	if (!pdf) {
+		throw IOException("write_pdf: HPDF_New failed to create document (libharu error %u:%u).",
+		                  err_ctx.error_no, err_ctx.detail_no);
+	}
+	HpdfDocGuard guard(pdf);
+
+	HPDF_Page page = HPDF_AddPage(pdf);
+	HPDF_STATUS st = HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_LETTER, HPDF_PAGE_PORTRAIT);
+	if (st != HPDF_OK) {
+		throw IOException("write_pdf: HPDF_Page_SetSize(LETTER) failed (status %u).", st);
+	}
+
+	const double MARGIN = 54.0; // 0.75 in
+	const double PAGE_W = 612.0;
+	const double PAGE_H = 792.0;
+	const double TEXT_W = PAGE_W - 2.0 * MARGIN;
+	const double TOP = PAGE_H - MARGIN;
+	const double BOTTOM = MARGIN;
+	const double LINE_H = 14.0; // 10pt + leading
+
+	HPDF_Font font = HPDF_GetFont(pdf, "Helvetica", NULL);
+	if (!font) {
+		throw IOException("write_pdf: HPDF_GetFont('Helvetica') failed.");
+	}
+	HPDF_Page_SetFontAndSize(page, font, 10.0);
+
+	double y = TOP;
+
+	string expanded = ExpandTabs(content);
+	std::istringstream lines(expanded);
+	string line;
+	bool emitted_any = false;
+
+	while (std::getline(lines, line)) {
+		auto wrapped = WrapLine(page, line, TEXT_W);
+		for (const auto &wline : wrapped) {
+			emitted_any = true;
+			if (y < BOTTOM + LINE_H * 0.5) {
+				page = HPDF_AddPage(pdf);
+				st = HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_LETTER, HPDF_PAGE_PORTRAIT);
+				if (st != HPDF_OK) {
+					throw IOException("write_pdf: HPDF_Page_SetSize on new page failed (status %u).", st);
+				}
+				HPDF_Page_SetFontAndSize(page, font, 10.0);
+				y = TOP;
+			}
+			st = HPDF_Page_BeginText(page);
+			if (st != HPDF_OK) {
+				throw IOException("write_pdf: HPDF_Page_BeginText failed (status %u).", st);
+			}
+			st = HPDF_Page_TextOut(page, MARGIN, y, wline.c_str());
+			if (st != HPDF_OK) {
+				throw IOException("write_pdf: HPDF_Page_TextOut failed (status %u).", st);
+			}
+			st = HPDF_Page_EndText(page);
+			if (st != HPDF_OK) {
+				throw IOException("write_pdf: HPDF_Page_EndText failed (status %u).", st);
+			}
+			y -= LINE_H;
+		}
+	}
+
+	if (!emitted_any) {
+		// empty content: one blank page is already present — valid PDF
+	}
+
+	st = HPDF_SaveToFile(pdf, output_path.c_str());
+	if (st != HPDF_OK) {
+		throw IOException("write_pdf: HPDF_SaveToFile('%s') failed (status %u) — check that the path is writable and the parent directory exists.",
+		                  output_path.c_str(), st);
+	}
+
+	// guard ~ calls HPDF_Free
+	return output_path;
+}
+
+static void WritePdfFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t content) {
+#ifdef _WIN32
+		const char sep = '\\';
+#else
+		const char sep = '/';
+#endif
+		string unique = BaseUUID::ToString(UUID::GenerateRandomUUID());
+		string tmp_path = TempDir() + sep + "write_pdf_" + unique + ".pdf";
+		return StringVector::AddString(result, WritePdfImpl(content.GetString(), tmp_path));
+	});
+}
+
+static void WritePdfOutFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	BinaryExecutor::Execute<string_t, string_t, string_t>(
+	    args.data[0], args.data[1], result, args.size(), [&](string_t content, string_t outpath) {
+		    return StringVector::AddString(result, WritePdfImpl(content.GetString(), outpath.GetString()));
+	    });
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 static void LoadInternal(ExtensionLoader &loader) {
@@ -1570,6 +1764,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	to_pdf_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, ToPdfOutFun));
 	loader.RegisterFunction(to_pdf_set);
+
+	ScalarFunctionSet write_pdf_set("write_pdf");
+	write_pdf_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, WritePdfFun));
+	write_pdf_set.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, WritePdfOutFun));
+	loader.RegisterFunction(write_pdf_set);
 }
 
 void PdfExtension::Load(ExtensionLoader &loader) {

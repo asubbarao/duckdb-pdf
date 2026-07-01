@@ -18,6 +18,35 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # is unreliable there.
 include_directories(src/include)
 
+# libharu (HPDF) for native in-process write_pdf (no LibreOffice).
+# Use find_path (NOT pkg_check_modules) — brew libharu ships no .pc file.
+# A single find_path(HPDF_INCLUDE_DIR hpdf.h) works for BOTH branches:
+#   * vcpkg/CI (static): vcpkg toolchain + include layout makes find_path locate it;
+#     also the GLOB *.a later will auto-include libhpdf.a (and its libpng.a etc).
+#   * local POSIX (brew): we seed common paths (homebrew on arm64/x86, macports, etc).
+# The include_directories below ensures headers are found for the compile of pdf_extension.cpp.
+find_path(HPDF_INCLUDE_DIR
+	NAMES hpdf.h
+	PATHS
+		${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include
+		/opt/homebrew/opt/libharu/include
+		/usr/local/opt/libharu/include
+		/opt/local/include
+		/usr/local/include
+		/usr/include
+	PATH_SUFFIXES include
+)
+if(HPDF_INCLUDE_DIR)
+	include_directories(${HPDF_INCLUDE_DIR})
+	message(STATUS "pdf: libharu headers at ${HPDF_INCLUDE_DIR}")
+else()
+	# last resort — compiler may still find it via defaults or prior -I
+	find_path(HPDF_INCLUDE_DIR NAMES hpdf.h)
+	if(HPDF_INCLUDE_DIR)
+		include_directories(${HPDF_INCLUDE_DIR})
+	endif()
+endif()
+
 set(EXTENSION_SOURCES src/pdf_extension.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -121,6 +150,23 @@ if(NOT WIN32)
       PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA)
     target_link_libraries(${LOADABLE_EXTENSION_NAME}
       PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA)
+
+    # libharu for write_pdf (local brew path). Dynamic dylib; find explicitly (no pkg-config).
+    # Transitive (libpng, zlib) are satisfied by the dylib itself at runtime.
+    find_library(HPDF_LIBRARY
+      NAMES hpdf libhpdf HPDF
+      PATHS
+        /opt/homebrew/opt/libharu/lib
+        /usr/local/opt/libharu/lib
+        /opt/local/lib
+        /usr/local/lib
+        /usr/lib
+    )
+    if(NOT HPDF_LIBRARY)
+      message(FATAL_ERROR "pdf: libharu (libhpdf.dylib) not found. Run: brew install libharu")
+    endif()
+    target_link_libraries(${EXTENSION_NAME} ${HPDF_LIBRARY})
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} ${HPDF_LIBRARY})
   endif()
 else()
   # ---- Windows path: vcpkg CONFIG packages + find_path/find_library ----

@@ -1,0 +1,109 @@
+# name: test/sql/write_pdf.test
+# description: write_pdf native libharu writer — in-process (no LibreOffice), roundtrips with pdf_to_text/read_pdf
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── NULL propagation (both overloads) ─────────────────────────────────────
+
+query I
+SELECT write_pdf(NULL) IS NULL;
+----
+true
+
+query I
+SELECT write_pdf('x', NULL) IS NULL;
+----
+true
+
+query I
+SELECT write_pdf(NULL, '__TEST_DIR__/nullpath.pdf') IS NULL;
+----
+true
+
+# ── simple write + roundtrip (2-arg form) via pdf_to_text and read_pdf ────
+
+query I
+SELECT ends_with(write_pdf('Hello from native libharu write_pdf.' || chr(10) || 'Second line here. This paragraph continues with enough text to exercise wrapping at 10pt Helvetica on Letter with 0.75 inch margins.', '__TEST_DIR__/wp_basic.pdf'), '.pdf');
+----
+true
+
+query I
+SELECT contains(pdf_to_text('__TEST_DIR__/wp_basic.pdf'), 'Hello from native libharu');
+----
+true
+
+query I
+SELECT contains(pdf_to_text('__TEST_DIR__/wp_basic.pdf'), 'Second line here');
+----
+true
+
+query I
+SELECT page_count >= 1 AND contains(text, 'libharu') FROM read_pdf('__TEST_DIR__/wp_basic.pdf');
+----
+true
+
+# ── multi-paragraph long content that forces >1 page + distinctive markers survive roundtrip ─
+
+statement ok
+SELECT write_pdf(
+  'Paragraph one. ' || repeat('The quick brown fox jumps over the lazy dog. ', 20) || chr(10) || chr(10) ||
+  'Paragraph two. ' || repeat('Lorem ipsum dolor sit amet, consectetur adipiscing elit. ', 20) || chr(10) || chr(10) ||
+  repeat('Filler line to force pagination and word-wrap across pages. ', 30) || chr(10) ||
+  'DistinctiveMarkerOne early. ' || chr(10) ||
+  repeat('More filler for pagination verification in the native writer. ', 25) || chr(10) ||
+  'DistinctiveMarkerTwo must survive. ' || chr(10) ||
+  repeat('Additional lines to cross page boundary reliably. ', 25)
+, '__TEST_DIR__/roundtrip.pdf');
+
+# substring contains (per task: no ILIKE)
+query I
+SELECT contains(pdf_to_text('__TEST_DIR__/roundtrip.pdf'), 'DistinctiveMarkerOne')
+   AND contains(pdf_to_text('__TEST_DIR__/roundtrip.pdf'), 'DistinctiveMarkerTwo');
+----
+true
+
+# page_count > 1 via read_pdf
+query I
+SELECT (SELECT max(page_count) FROM read_pdf('__TEST_DIR__/roundtrip.pdf')) > 1;
+----
+true
+
+# roundtrip via read_pdf aggregation also recovers markers (substring)
+query I
+SELECT contains(string_agg(text, chr(10)), 'DistinctiveMarkerOne')
+   AND contains(string_agg(text, chr(10)), 'DistinctiveMarkerTwo')
+FROM read_pdf('__TEST_DIR__/roundtrip.pdf');
+----
+true
+
+# valid multi-page PDF
+query I
+SELECT count(*) >= 2 FROM read_pdf('__TEST_DIR__/roundtrip.pdf');
+----
+true
+
+# ── 1-arg overload: writes to a unique temp path and returns it ───────────
+
+query I
+SELECT ends_with(write_pdf('One-arg temp path test. Line two.'), '.pdf');
+----
+true
+
+# the temp file can be read back immediately (path is returned and usable)
+query I
+SELECT contains(pdf_to_text((SELECT write_pdf('Temp one arg roundtrip marker.'))), 'Temp one arg roundtrip marker');
+----
+true
+
+# empty content still produces a valid 1-page PDF
+statement ok
+SELECT write_pdf('', '__TEST_DIR__/empty.pdf');
+
+query I
+SELECT page_count = 1 FROM read_pdf('__TEST_DIR__/empty.pdf');
+----
+true
