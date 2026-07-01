@@ -1,0 +1,35 @@
+# name: test/sql/copy_to_pdf.test
+# description: COPY ... TO (FORMAT pdf) using the native pdf CopyFunction (row text lines -> libharu PDF)
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# Basic single-column COPY with markers; roundtrip via pdf_to_text (contains, no ILIKE)
+statement ok
+COPY (SELECT 'alpha_marker' AS a UNION ALL SELECT 'beta_marker' UNION ALL SELECT 'gamma_marker') TO '__TEST_DIR__/copy_out.pdf' (FORMAT pdf);
+
+query I
+SELECT contains(pdf_to_text('__TEST_DIR__/copy_out.pdf'), 'alpha_marker')
+   AND contains(pdf_to_text('__TEST_DIR__/copy_out.pdf'), 'beta_marker')
+   AND contains(pdf_to_text('__TEST_DIR__/copy_out.pdf'), 'gamma_marker');
+----
+true
+
+# Multi-column, 49 rows; verify all rows written (late marker) + pagination (page_count >=1)
+statement ok
+COPY (SELECT i AS n, 'row'||i AS label FROM range(1,50) t(i)) TO '__TEST_DIR__/copy_multi.pdf' (FORMAT pdf);
+
+query I
+SELECT (SELECT max(page_count) FROM read_pdf('__TEST_DIR__/copy_multi.pdf')) >= 1
+   AND contains(pdf_to_text('__TEST_DIR__/copy_multi.pdf'), 'row49');
+----
+true
+
+# Also assert via read_pdf aggregate contains (proves content survived)
+query I
+SELECT contains(string_agg(text, chr(10)), 'row49') FROM read_pdf('__TEST_DIR__/copy_multi.pdf');
+----
+true

@@ -10,7 +10,9 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/common/mutex.hpp"
 
 // poppler-cpp — text extraction + page rendering + metadata
 #include <poppler-document.h>
@@ -1616,7 +1618,10 @@ static std::vector<string> WrapLine(HPDF_Page page, const string &line, double m
 	return out;
 }
 
-static string WritePdfImpl(const string &content, const string &output_path) {
+// Core text->PDF renderer using libharu (Letter, Helvetica 10pt, wrap/paginate).
+// Extracted so both write_pdf scalar AND the COPY (FORMAT pdf) CopyFunction
+// finalize can use exactly the same logic with no behavior divergence.
+static void RenderTextToPdf(const string &content, const string &output_path) {
 	HpdfError err_ctx;
 	HPDF_Doc pdf = HPDF_New(HpdfErrorHandler, &err_ctx);
 	if (!pdf) {
@@ -1692,6 +1697,10 @@ static string WritePdfImpl(const string &content, const string &output_path) {
 	}
 
 	// guard ~ calls HPDF_Free
+}
+
+static string WritePdfImpl(const string &content, const string &output_path) {
+	RenderTextToPdf(content, output_path);
 	return output_path;
 }
 
@@ -1713,6 +1722,100 @@ static void WritePdfOutFun(DataChunk &args, ExpressionState &state, Vector &resu
 	    args.data[0], args.data[1], result, args.size(), [&](string_t content, string_t outpath) {
 		    return StringVector::AddString(result, WritePdfImpl(content.GetString(), outpath.GetString()));
 	    });
+}
+
+//===--------------------------------------------------------------------===//
+// COPY ... TO 'file.pdf' (FORMAT pdf) — uses the same RenderTextToPdf core.
+// Produces one text line per input row (columns joined by single space; NULLs become empty).
+// Accumulates in global buffer (mutex-protected), writes via Render in finalize.
+// Only copy_to (write); row order preserved by forcing REGULAR (serial) execution.
+//===--------------------------------------------------------------------===//
+
+struct PdfCopyBindData : public TableFunctionData {
+	string file_path;
+	vector<string> column_names;
+	vector<LogicalType> column_types;
+};
+
+struct PdfCopyGlobalState : public GlobalFunctionData {
+	string buffer;
+	mutex lock;
+};
+
+struct PdfCopyLocalState : public LocalFunctionData {
+	string buffer;
+};
+
+static unique_ptr<FunctionData> PdfCopyBind(ClientContext &context, CopyFunctionBindInput &input,
+                                            const vector<string> &names, const vector<LogicalType> &sql_types) {
+	auto result = make_uniq<PdfCopyBindData>();
+	result->file_path = input.info.file_path;
+	result->column_names = names;
+	result->column_types = sql_types;
+	// No custom options supported yet (HEADER etc.); FORMAT pdf alone is sufficient.
+	// Unknown options are ignored for minimal impl (no over-engineering).
+	return std::move(result);
+}
+
+static unique_ptr<GlobalFunctionData> PdfCopyInitializeGlobal(ClientContext &context, FunctionData &bind_data,
+                                                              const string &file_path) {
+	auto result = make_uniq<PdfCopyGlobalState>();
+	return std::move(result);
+}
+
+static unique_ptr<LocalFunctionData> PdfCopyInitializeLocal(ExecutionContext &context, FunctionData &bind_data) {
+	return make_uniq<PdfCopyLocalState>();
+}
+
+static void PdfCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
+                        LocalFunctionData &lstate, DataChunk &input) {
+	auto &global = gstate.Cast<PdfCopyGlobalState>();
+	lock_guard<mutex> glock(global.lock);
+
+	idx_t ncols = input.ColumnCount();
+	for (idx_t r = 0; r < input.size(); r++) {
+		string line;
+		for (idx_t c = 0; c < ncols; c++) {
+			if (c > 0) {
+				line += " "; // columns space-separated (documented)
+			}
+			Value val = input.GetValue(c, r);
+			if (val.IsNull()) {
+				continue;
+			}
+			try {
+				Value str_val = val.DefaultCastAs(LogicalType::VARCHAR);
+				if (!str_val.IsNull()) {
+					line += StringValue::Get(str_val);
+				}
+			} catch (...) {
+				line += val.ToString();
+			}
+		}
+		line += "\n";
+		global.buffer += line;
+	}
+}
+
+static void PdfCopyCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
+                           LocalFunctionData &lstate) {
+	// No-op: we append directly under lock in sink for simplicity and order safety.
+	// (Per-local buffering + concat would also work; direct-to-global + lock is robust here.)
+}
+
+static CopyFunctionExecutionMode PdfCopyExecutionMode(bool preserve_insertion_order, bool supports_batch_index) {
+	// Force serial to guarantee row order in the emitted text lines.
+	return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
+}
+
+static void PdfCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+	auto &global = gstate.Cast<PdfCopyGlobalState>();
+	auto &bind = bind_data.Cast<PdfCopyBindData>();
+	string path = bind.file_path;
+	if (path.empty()) {
+		throw IOException("COPY ... TO (FORMAT pdf): output file path is empty");
+	}
+	RenderTextToPdf(global.buffer, path);
 }
 
 //===--------------------------------------------------------------------===//
@@ -1770,6 +1873,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	write_pdf_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, WritePdfOutFun));
 	loader.RegisterFunction(write_pdf_set);
+
+	// COPY TO pdf
+	CopyFunction pdf_copy("pdf");
+	pdf_copy.extension = "pdf";
+	pdf_copy.copy_to_bind = PdfCopyBind;
+	pdf_copy.copy_to_initialize_global = PdfCopyInitializeGlobal;
+	pdf_copy.copy_to_initialize_local = PdfCopyInitializeLocal;
+	pdf_copy.copy_to_sink = PdfCopySink;
+	pdf_copy.copy_to_combine = PdfCopyCombine;
+	pdf_copy.copy_to_finalize = PdfCopyFinalize;
+	pdf_copy.execution_mode = PdfCopyExecutionMode;
+	loader.RegisterFunction(pdf_copy);
 }
 
 void PdfExtension::Load(ExtensionLoader &loader) {

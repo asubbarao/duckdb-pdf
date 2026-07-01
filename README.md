@@ -225,6 +225,16 @@ SELECT write_pdf(replace(pdf_to_text('in.pdf'), 'old', 'new'), 'out.pdf');
 SELECT page, text FROM read_pdf('out.pdf');
 ```
 
+You can also use the `COPY` statement to write query results directly to a PDF:
+
+```sql
+LOAD pdf;
+COPY (SELECT page, text FROM read_pdf('in.pdf')) TO 'out.pdf' (FORMAT pdf);  -- native, no LibreOffice
+SELECT page, text FROM read_pdf('out.pdf');
+```
+
+(Note: each result row is emitted as one text line with columns space-separated; Helvetica 10pt, word-wrapped + paginated exactly as `write_pdf`.)
+
 ## Saving / converting documents to PDF
 
 The reading functions above go *from* a PDF. To go the other way — turn a
