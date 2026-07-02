@@ -37,11 +37,6 @@
 #include <string>
 #include <vector>
 
-// Keep-alive for BLOB-provided buffers passed to poppler load_from_raw_data (which does not copy).
-// Poppler keeps internal references to the provided data buffer for doc lifetime; we must keep it alive.
-thread_local std::vector<std::string> pdf_blob_keep_alive;
-thread_local std::vector<std::string> pdf_temp_pdf_keep;
-
 // Process spawn + PATH probing for the runtime LibreOffice shell-out (to_pdf).
 // These are the ONLY new system headers; no new library is linked.
 #ifdef _WIN32
@@ -1039,10 +1034,44 @@ static void PdfToTextLayoutFun(DataChunk &args, ExpressionState &state, Vector &
 // word/bbox handling that backs read_pdf_words (top-left origin, PDF points).
 //===--------------------------------------------------------------------===//
 
+// Removes a path on scope exit (best-effort; never throws).
+struct TempFileGuard {
+	std::string path;
+	explicit TempFileGuard(std::string p) : path(std::move(p)) {
+	}
+	~TempFileGuard() {
+		if (!path.empty()) {
+			std::remove(path.c_str());
+		}
+	}
+	TempFileGuard(const TempFileGuard &) = delete;
+	TempFileGuard &operator=(const TempFileGuard &) = delete;
+	TempFileGuard(TempFileGuard &&other) noexcept : path(std::move(other.path)) {
+		other.path.clear();
+	}
+	TempFileGuard &operator=(TempFileGuard &&other) noexcept {
+		if (this != &other) {
+			if (!path.empty()) {
+				std::remove(path.c_str());
+			}
+			path = std::move(other.path);
+			other.path.clear();
+		}
+		return *this;
+	}
+};
+
+// Holds a poppler document and its backing temp file. Destruction order (doc first, then guard)
+// ensures poppler releases any file handles before std::remove.
+struct PdfDocHandle {
+	unique_ptr<poppler::document> doc; // declared first → destroyed first
+	TempFileGuard guard;               // destroyed second → file removed after doc is gone
+};
+
 // Open a document for a scalar render function, matching pdf_to_text's error
 // style (InvalidInputException for missing/corrupt, encrypted-without-password).
 // Now routes through DuckDB VFS via ReadAllBytes + LoadDoc (bytes) for s3:// etc.
-static unique_ptr<poppler::document> LoadRenderDoc(const string &fn, const string &path, ClientContext &ctx) {
+static PdfDocHandle LoadRenderDoc(const string &fn, const string &path, ClientContext &ctx) {
 	string bytes;
 	try {
 		ReadAllBytes(ctx, path, bytes);
@@ -1061,7 +1090,7 @@ static unique_ptr<poppler::document> LoadRenderDoc(const string &fn, const strin
 			std::ofstream of(tmp_path, std::ios::binary);
 			of.write(bytes.data(), bytes.size());
 		}
-		pdf_temp_pdf_keep.push_back(tmp_path);
+		TempFileGuard guard(tmp_path);
 		unique_ptr<poppler::document> doc(poppler::document::load_from_file(tmp_path));
 		if (!doc) {
 			throw InvalidInputException("%s: could not open '%s' (missing, corrupt, or not a PDF)", fn, path);
@@ -1069,10 +1098,7 @@ static unique_ptr<poppler::document> LoadRenderDoc(const string &fn, const strin
 		if (doc->is_locked() || doc->is_encrypted()) {
 			throw InvalidInputException("%s: '%s' is encrypted (use read_pdf with password := '...')", fn, path);
 		}
-		for (int i = 0; i < doc->pages(); i++) {
-			(void)doc->create_page(i);
-		}
-		return std::move(doc);
+		return PdfDocHandle {std::move(doc), std::move(guard)};
 	} catch (const InvalidInputException &) {
 		throw;
 	} catch (...) {
@@ -1083,7 +1109,7 @@ static unique_ptr<poppler::document> LoadRenderDoc(const string &fn, const strin
 // New BLOB loader for the BLOB overloads of the scalar PDF functions. Accepts raw PDF bytes
 // (BLOBs arrive as string_t in executors). Mirrors LoadDoc validation but with BLOB-specific
 // InvalidInputException messages (no password support for BLOBs).
-static unique_ptr<poppler::document> LoadBlobDoc(const string &fn, const char *data, idx_t size) {
+static PdfDocHandle LoadBlobDoc(const string &fn, const char *data, idx_t size) {
 	if (size > (idx_t)NumericLimits<int>::Maximum()) {
 		throw InvalidInputException("%s: BLOB input is too large (%llu bytes; max ~2 GiB)", fn,
 		                            (unsigned long long)size);
@@ -1102,7 +1128,7 @@ static unique_ptr<poppler::document> LoadBlobDoc(const string &fn, const char *d
 		std::ofstream of(tmp_path, std::ios::binary);
 		of.write(bytes.data(), bytes.size());
 	}
-	pdf_temp_pdf_keep.push_back(tmp_path);
+	TempFileGuard guard(tmp_path);
 	auto doc = unique_ptr<poppler::document>(poppler::document::load_from_file(tmp_path));
 	if (!doc) {
 		throw InvalidInputException("%s: input BLOB is not a valid PDF (%llu bytes)", fn, (unsigned long long)size);
@@ -1113,12 +1139,7 @@ static unique_ptr<poppler::document> LoadBlobDoc(const string &fn, const char *d
 	if (doc->pages() <= 0) {
 		throw InvalidInputException("%s: BLOB input has no readable pages", fn);
 	}
-	for (int i = 0; i < doc->pages(); i++) {
-		(void)doc->create_page(i);
-	}
-	// also keep the bytes copy per original helper body
-	pdf_blob_keep_alive.push_back(std::move(bytes));
-	return doc;
+	return PdfDocHandle {std::move(doc), std::move(guard)};
 }
 
 // Escape the five predefined XML entities. Also used for HTML (a strict superset
@@ -1183,8 +1204,8 @@ static string DocToXml(poppler::document &doc) {
 }
 
 static string DocToXml(ClientContext &ctx, const string &path) {
-	auto doc = LoadRenderDoc("pdf_to_xml", path, ctx);
-	return DocToXml(*doc);
+	auto handle = LoadRenderDoc("pdf_to_xml", path, ctx);
+	return DocToXml(*handle.doc);
 }
 
 static void PdfToXmlFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -1226,8 +1247,8 @@ static string DocToHtml(poppler::document &doc) {
 }
 
 static string DocToHtml(ClientContext &ctx, const string &path) {
-	auto doc = LoadRenderDoc("pdf_to_html", path, ctx);
-	return DocToHtml(*doc);
+	auto handle = LoadRenderDoc("pdf_to_html", path, ctx);
+	return DocToHtml(*handle.doc);
 }
 
 static void PdfToHtmlFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -1248,20 +1269,6 @@ static void PdfToHtmlFun(DataChunk &args, ExpressionState &state, Vector &result
 // inside an <svg> sized to the page's POINT dimensions, so the raster scales to
 // the page box. The temp file is always removed (RAII guard), even on error.
 //===--------------------------------------------------------------------===//
-
-// Removes a path on scope exit (best-effort; never throws).
-struct TempFileGuard {
-	std::string path;
-	explicit TempFileGuard(std::string p) : path(std::move(p)) {
-	}
-	~TempFileGuard() {
-		if (!path.empty()) {
-			std::remove(path.c_str());
-		}
-	}
-	TempFileGuard(const TempFileGuard &) = delete;
-	TempFileGuard &operator=(const TempFileGuard &) = delete;
-};
 
 // Portable temp directory (avoids std::filesystem, which is unavailable on some
 // of the extension's build targets). Honors the standard env vars, falls back to
@@ -1359,8 +1366,8 @@ static string DocToSvg(poppler::document &doc, int32_t page_no, int32_t dpi) {
 }
 
 static string DocToSvg(ClientContext &ctx, const string &path, int32_t page_no, int32_t dpi) {
-	auto doc = LoadRenderDoc("pdf_to_svg", path, ctx);
-	int n = doc->pages();
+	auto handle = LoadRenderDoc("pdf_to_svg", path, ctx);
+	int n = handle.doc->pages();
 	if (page_no < 1 || page_no > n) {
 		throw IOException("pdf_to_svg: page %d is out of range for '%s' (document has %d page%s)", (int)page_no, path,
 		                  n, n == 1 ? "" : "s");
@@ -1368,7 +1375,7 @@ static string DocToSvg(ClientContext &ctx, const string &path, int32_t page_no, 
 	if (dpi <= 0) {
 		throw InvalidInputException("pdf_to_svg: dpi must be positive (got %d)", (int)dpi);
 	}
-	return DocToSvg(*doc, page_no, dpi);
+	return DocToSvg(*handle.doc, page_no, dpi);
 }
 
 static void PdfToSvgFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -1395,45 +1402,45 @@ static void PdfToSvgDpiFun(DataChunk &args, ExpressionState &state, Vector &resu
 
 static void PdfToTextBlobFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t blob) {
-		auto doc = LoadBlobDoc("pdf_to_text", blob.GetDataUnsafe(), blob.GetSize());
-		return StringVector::AddString(result, DocToText(*doc, "reading"));
+		auto handle = LoadBlobDoc("pdf_to_text", blob.GetDataUnsafe(), blob.GetSize());
+		return StringVector::AddString(result, DocToText(*handle.doc, "reading"));
 	});
 }
 static void PdfToTextBlobLayoutFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
 	    args.data[0], args.data[1], result, args.size(), [&](string_t blob, string_t layout) {
-		    auto doc = LoadBlobDoc("pdf_to_text", blob.GetDataUnsafe(), blob.GetSize());
-		    return StringVector::AddString(result, DocToText(*doc, layout.GetString()));
+		    auto handle = LoadBlobDoc("pdf_to_text", blob.GetDataUnsafe(), blob.GetSize());
+		    return StringVector::AddString(result, DocToText(*handle.doc, layout.GetString()));
 	    });
 }
 
 static void PdfToXmlBlobFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t blob) {
-		auto doc = LoadBlobDoc("pdf_to_xml", blob.GetDataUnsafe(), blob.GetSize());
-		return StringVector::AddString(result, DocToXml(*doc));
+		auto handle = LoadBlobDoc("pdf_to_xml", blob.GetDataUnsafe(), blob.GetSize());
+		return StringVector::AddString(result, DocToXml(*handle.doc));
 	});
 }
 
 static void PdfToHtmlBlobFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t blob) {
-		auto doc = LoadBlobDoc("pdf_to_html", blob.GetDataUnsafe(), blob.GetSize());
-		return StringVector::AddString(result, DocToHtml(*doc));
+		auto handle = LoadBlobDoc("pdf_to_html", blob.GetDataUnsafe(), blob.GetSize());
+		return StringVector::AddString(result, DocToHtml(*handle.doc));
 	});
 }
 
 static void PdfToSvgBlobFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	BinaryExecutor::Execute<string_t, int32_t, string_t>(
 	    args.data[0], args.data[1], result, args.size(), [&](string_t blob, int32_t page_no) {
-		    auto doc = LoadBlobDoc("pdf_to_svg", blob.GetDataUnsafe(), blob.GetSize());
-		    return StringVector::AddString(result, DocToSvg(*doc, page_no, 150));
+		    auto handle = LoadBlobDoc("pdf_to_svg", blob.GetDataUnsafe(), blob.GetSize());
+		    return StringVector::AddString(result, DocToSvg(*handle.doc, page_no, 150));
 	    });
 }
 static void PdfToSvgBlobDpiFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	TernaryExecutor::Execute<string_t, int32_t, int32_t, string_t>(
 	    args.data[0], args.data[1], args.data[2], result, args.size(),
 	    [&](string_t blob, int32_t page_no, int32_t dpi) {
-		    auto doc = LoadBlobDoc("pdf_to_svg", blob.GetDataUnsafe(), blob.GetSize());
-		    return StringVector::AddString(result, DocToSvg(*doc, page_no, dpi));
+		    auto handle = LoadBlobDoc("pdf_to_svg", blob.GetDataUnsafe(), blob.GetSize());
+		    return StringVector::AddString(result, DocToSvg(*handle.doc, page_no, dpi));
 	    });
 }
 

@@ -68,3 +68,63 @@ SELECT contains(pdf_to_text(content, 'physical'), 'blob roundtrip marker')
 FROM read_blob('__TEST_DIR__/blob_src.pdf');
 ----
 true
+
+# (h) Temp-file leak regression: N distinct PDFs, results must all be valid
+# Write 5 distinct PDFs via a VALUES table (distinct marker text per row)
+statement ok
+CREATE TABLE leak_test_pdfs AS
+SELECT
+    '__TEST_DIR__/leak_' || i::VARCHAR || '.pdf' AS path,
+    'leak test marker ' || i::VARCHAR AS marker
+FROM (VALUES (1),(2),(3),(4),(5)) t(i);
+
+statement ok
+SELECT write_pdf(marker, path) FROM leak_test_pdfs;
+
+# Call pdf_to_html on each distinct path and verify all outputs are valid HTML
+query I
+SELECT bool_and(starts_with(pdf_to_html(path), '<!DOCTYPE html'))
+FROM leak_test_pdfs;
+----
+true
+
+# Call pdf_to_xml on each distinct path and verify all outputs are valid XML
+query I
+SELECT bool_and(starts_with(pdf_to_xml(path), '<?xml'))
+FROM leak_test_pdfs;
+----
+true
+
+# BLOB overloads: read each distinct PDF as blob, verify pdf_to_html works
+# Use separate queries per file (one BLOB input per row) to ensure distinct invocation
+query I
+SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_1.pdf'))), '<!DOCTYPE html');
+----
+true
+
+query I
+SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_2.pdf'))), '<!DOCTYPE html');
+----
+true
+
+query I
+SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_3.pdf'))), '<!DOCTYPE html');
+----
+true
+
+query I
+SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_4.pdf'))), '<!DOCTYPE html');
+----
+true
+
+query I
+SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_5.pdf'))), '<!DOCTYPE html');
+----
+true
+
+# pdf_to_svg on distinct paths (requires page arg)
+query I
+SELECT bool_and(starts_with(pdf_to_svg(path, 1), '<?xml'))
+FROM leak_test_pdfs;
+----
+true
