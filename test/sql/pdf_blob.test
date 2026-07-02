@@ -1,0 +1,130 @@
+# pdf_blob.test — BLOB overloads + VFS refactor regression
+# Verifies: BLOB input to pdf_to_text/html/xml/svg, roundtrip via read_blob,
+#            and that path-based scalars still work (VFS refactor regression).
+
+require pdf
+
+# (a) Write a known PDF from text for roundtrip testing
+statement ok
+SELECT write_pdf('blob roundtrip marker text', '__TEST_DIR__/blob_src.pdf');
+
+# (b) BLOB roundtrip: read_blob -> pdf_to_text(BLOB) — proves BLOB overload + roundtrip
+query I
+SELECT contains(pdf_to_text(content), 'blob roundtrip marker')
+FROM read_blob('__TEST_DIR__/blob_src.pdf');
+----
+true
+
+# (c) BLOB overload: pdf_to_xml — prefix check
+query I
+SELECT starts_with(pdf_to_xml(content), '<?xml')
+FROM read_blob('__TEST_DIR__/blob_src.pdf');
+----
+true
+
+# (c) BLOB overload: pdf_to_html — DOCTYPE prefix check
+query I
+SELECT starts_with(pdf_to_html(content), '<!DOCTYPE html')
+FROM read_blob('__TEST_DIR__/blob_src.pdf');
+----
+true
+
+# (d) BLOB overload: pdf_to_svg — SVG XML prefix check
+query I
+SELECT starts_with(pdf_to_svg(content, 1), '<?xml')
+FROM read_blob('__TEST_DIR__/blob_src.pdf');
+----
+true
+
+# (e) Invalid BLOB must error
+statement error
+SELECT pdf_to_text('notapdf'::BLOB);
+----
+
+# (f) Regression: path-based scalars still work after VFS refactor
+query I
+SELECT contains(pdf_to_text('__TEST_DIR__/blob_src.pdf'), 'blob roundtrip marker');
+----
+true
+
+query I
+SELECT starts_with(pdf_to_xml('__TEST_DIR__/blob_src.pdf'), '<?xml');
+----
+true
+
+query I
+SELECT starts_with(pdf_to_html('__TEST_DIR__/blob_src.pdf'), '<!DOCTYPE html');
+----
+true
+
+query I
+SELECT starts_with(pdf_to_svg('__TEST_DIR__/blob_src.pdf', 1), '<?xml');
+----
+true
+
+# (g) BLOB overload: pdf_to_text with layout parameter
+query I
+SELECT contains(pdf_to_text(content, 'physical'), 'blob roundtrip marker')
+FROM read_blob('__TEST_DIR__/blob_src.pdf');
+----
+true
+
+# (h) Temp-file leak regression: N distinct PDFs, results must all be valid
+# Write 5 distinct PDFs via a VALUES table (distinct marker text per row)
+statement ok
+CREATE TABLE leak_test_pdfs AS
+SELECT
+    '__TEST_DIR__/leak_' || i::VARCHAR || '.pdf' AS path,
+    'leak test marker ' || i::VARCHAR AS marker
+FROM (VALUES (1),(2),(3),(4),(5)) t(i);
+
+statement ok
+SELECT write_pdf(marker, path) FROM leak_test_pdfs;
+
+# Call pdf_to_html on each distinct path and verify all outputs are valid HTML
+query I
+SELECT bool_and(starts_with(pdf_to_html(path), '<!DOCTYPE html'))
+FROM leak_test_pdfs;
+----
+true
+
+# Call pdf_to_xml on each distinct path and verify all outputs are valid XML
+query I
+SELECT bool_and(starts_with(pdf_to_xml(path), '<?xml'))
+FROM leak_test_pdfs;
+----
+true
+
+# BLOB overloads: read each distinct PDF as blob, verify pdf_to_html works
+# Use separate queries per file (one BLOB input per row) to ensure distinct invocation
+query I
+SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_1.pdf'))), '<!DOCTYPE html');
+----
+true
+
+query I
+SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_2.pdf'))), '<!DOCTYPE html');
+----
+true
+
+query I
+SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_3.pdf'))), '<!DOCTYPE html');
+----
+true
+
+query I
+SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_4.pdf'))), '<!DOCTYPE html');
+----
+true
+
+query I
+SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_5.pdf'))), '<!DOCTYPE html');
+----
+true
+
+# pdf_to_svg on distinct paths (requires page arg)
+query I
+SELECT bool_and(starts_with(pdf_to_svg(path, 1), '<?xml'))
+FROM leak_test_pdfs;
+----
+true
