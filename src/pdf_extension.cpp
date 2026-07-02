@@ -22,6 +22,7 @@
 
 // tesseract — OCR for scanned / image-only PDFs
 #include <tesseract/baseapi.h>
+#include <tesseract/resultiterator.h>
 
 // libharu — native PDF writer (C API) for write_pdf. No external processes.
 #include <hpdf.h>
@@ -351,6 +352,78 @@ static string OcrPage(poppler::page *page, const string &language, int dpi, int 
 	return text;
 }
 
+// Word-level OCR using tesseract ResultIterator at RIL_WORD. Reuses the exact
+// renderer + Init + SetImage pattern as OcrPage (do not change OcrPage itself).
+struct OcrWord {
+	string text;
+	double x0, y0, x1, y1;
+	float confidence;
+};
+
+static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &language, int dpi, int psm, int oem,
+                                         const string &tessdata_dir) {
+	poppler::page_renderer renderer;
+	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
+	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
+
+	poppler::image img = renderer.render_page(page, dpi, dpi);
+	if (!img.is_valid()) {
+		return {};
+	}
+
+	tesseract::TessBaseAPI api;
+	string datadir = ResolveTessdataDir(language, tessdata_dir);
+	const char *datapath = datadir.empty() ? nullptr : datadir.c_str();
+	if (api.Init(datapath, language.c_str(), static_cast<tesseract::OcrEngineMode>(oem)) != 0) {
+		throw IOException(
+		    "read_pdf OCR: could not load the Tesseract model for language '%s'. Install a language model — "
+		    "macOS: `brew install tesseract-lang`; Debian/Ubuntu: `apt-get install tesseract-ocr-%s`; Windows: "
+		    "the UB Mannheim installer; or download %s.traineddata from "
+		    "https://github.com/tesseract-ocr/tessdata_fast. Standard install locations are auto-detected; if "
+		    "yours is non-standard, pass `tessdata_dir := '/path/to/tessdata'` or set the TESSDATA_PREFIX env var.",
+		    language, language, language);
+	}
+	api.SetPageSegMode(static_cast<tesseract::PageSegMode>(psm));
+
+	const int bytes_per_pixel = 4; // poppler renders argb32; tesseract grayscales internally
+	api.SetImage(reinterpret_cast<const unsigned char *>(img.const_data()), img.width(), img.height(), bytes_per_pixel,
+	             img.bytes_per_row());
+
+	int rec = api.Recognize(0);
+	// rec==0 success; non-zero may still yield iterator words, so proceed.
+
+	tesseract::ResultIterator *ri = api.GetIterator();
+	std::vector<OcrWord> result;
+	if (ri) {
+		do {
+			if (ri->Empty(tesseract::RIL_WORD)) {
+				continue;
+			}
+			char *word_text = ri->GetUTF8Text(tesseract::RIL_WORD);
+			if (!word_text) {
+				continue;
+			}
+			float conf = ri->Confidence(tesseract::RIL_WORD);
+			int left = 0, top = 0, right = 0, bottom = 0;
+			ri->BoundingBox(tesseract::RIL_WORD, &left, &top, &right, &bottom);
+			OcrWord w;
+			w.text = string(word_text);
+			delete[] word_text;
+			w.x0 = left * 72.0 / dpi;
+			w.x1 = right * 72.0 / dpi;
+			w.y0 = (img.height() - bottom) * 72.0 / dpi;
+			w.y1 = (img.height() - top) * 72.0 / dpi;
+			w.confidence = conf;
+			if (!w.text.empty()) {
+				result.push_back(std::move(w));
+			}
+		} while (ri->Next(tesseract::RIL_WORD));
+		// ri is owned by api; do not delete
+	}
+	api.End();
+	return result;
+}
+
 //===--------------------------------------------------------------------===//
 // Common options bag (shared by read_pdf / read_pdf_words)
 //===--------------------------------------------------------------------===//
@@ -668,10 +741,10 @@ static unique_ptr<FunctionData> ReadPdfWordsBind(ClientContext &context, TableFu
 	auto result = make_uniq<ReadPdfWordsBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR,
 	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE};
-	names = {"filename", "page", "word", "x0", "y0", "x1", "y1", "font_name", "font_size"};
+	names = {"filename", "page", "word", "x0", "y0", "x1", "y1", "font_name", "font_size", "source", "confidence"};
 	return std::move(result);
 }
 
@@ -684,6 +757,8 @@ struct ReadPdfWordsState : public GlobalTableFunctionState {
 	string file_bytes;
 	unique_ptr<poppler::document> doc;
 	std::vector<poppler::text_box> boxes;
+	std::vector<OcrWord> ocr_boxes;
+	bool page_is_ocr = false;
 	string current_file;
 	idx_t MaxThreads() const override {
 		return 1;
@@ -698,11 +773,15 @@ static void WordsOpenFile(ClientContext &context, const ReadPdfWordsBindData &bi
 	g.page_idx = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
 	g.last_page_0 = bind.opt.last_page < 0 ? g.page_count : MinValue<int>(bind.opt.last_page, g.page_count);
 	g.boxes.clear();
+	g.ocr_boxes.clear();
+	g.page_is_ocr = false;
 	g.word_idx = 0;
 }
 
-static bool WordsLoadPage(ReadPdfWordsState &g) {
+static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 	g.boxes.clear();
+	g.ocr_boxes.clear();
+	g.page_is_ocr = false;
 	g.word_idx = 0;
 	if (g.page_idx >= g.last_page_0) {
 		return false;
@@ -710,6 +789,15 @@ static bool WordsLoadPage(ReadPdfWordsState &g) {
 	unique_ptr<poppler::page> page(g.doc->create_page(g.page_idx));
 	if (page) {
 		g.boxes = page->text_list(poppler::page::text_list_include_font);
+		if (!g.boxes.empty()) {
+			g.page_is_ocr = false;
+		} else if (opt.force_ocr || opt.auto_ocr) {
+			g.ocr_boxes =
+			    OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem, opt.tessdata_dir);
+			g.page_is_ocr = !g.ocr_boxes.empty();
+		} else {
+			g.page_is_ocr = false;
+		}
 	}
 	return true;
 }
@@ -719,7 +807,7 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfWordsInit(ClientContext &cont
 	auto g = make_uniq<ReadPdfWordsState>();
 	if (!bind.files.empty()) {
 		WordsOpenFile(context, bind, *g);
-		WordsLoadPage(*g);
+		WordsLoadPage(*g, bind.opt);
 	}
 	return std::move(g);
 }
@@ -732,7 +820,8 @@ static void ReadPdfWordsScan(ClientContext &context, TableFunctionInput &data_p,
 		if (!g.doc) {
 			break;
 		}
-		if (g.word_idx >= g.boxes.size()) {
+		bool page_done = g.page_is_ocr ? (g.word_idx >= g.ocr_boxes.size()) : (g.word_idx >= g.boxes.size());
+		if (page_done) {
 			// advance page, then file
 			g.page_idx++;
 			if (g.page_idx >= g.last_page_0) {
@@ -743,20 +832,36 @@ static void ReadPdfWordsScan(ClientContext &context, TableFunctionInput &data_p,
 				}
 				WordsOpenFile(context, bind, g);
 			}
-			WordsLoadPage(g);
+			WordsLoadPage(g, bind.opt);
 			continue;
 		}
-		auto &b = g.boxes[g.word_idx];
-		auto r = b.bbox();
 		output.SetValue(0, count, Value(g.current_file));
 		output.SetValue(1, count, Value::INTEGER(g.page_idx + 1));
-		output.SetValue(2, count, Value(UStringToUtf8(b.text())));
-		output.SetValue(3, count, Value::DOUBLE(r.x()));
-		output.SetValue(4, count, Value::DOUBLE(r.y()));
-		output.SetValue(5, count, Value::DOUBLE(r.x() + r.width()));
-		output.SetValue(6, count, Value::DOUBLE(r.y() + r.height()));
-		output.SetValue(7, count, b.has_font_info() ? Value(b.get_font_name()) : Value(LogicalType::VARCHAR));
-		output.SetValue(8, count, b.has_font_info() ? Value::DOUBLE(b.get_font_size()) : Value(LogicalType::DOUBLE));
+		if (g.page_is_ocr) {
+			auto &w = g.ocr_boxes[g.word_idx];
+			output.SetValue(2, count, Value(w.text));
+			output.SetValue(3, count, Value::DOUBLE(w.x0));
+			output.SetValue(4, count, Value::DOUBLE(w.y0));
+			output.SetValue(5, count, Value::DOUBLE(w.x1));
+			output.SetValue(6, count, Value::DOUBLE(w.y1));
+			output.SetValue(7, count, Value(LogicalType::VARCHAR)); // font_name NULL for OCR
+			output.SetValue(8, count, Value(LogicalType::DOUBLE));  // font_size NULL for OCR
+			output.SetValue(9, count, Value("ocr"));
+			output.SetValue(10, count, Value::DOUBLE(w.confidence));
+		} else {
+			auto &b = g.boxes[g.word_idx];
+			auto r = b.bbox();
+			output.SetValue(2, count, Value(UStringToUtf8(b.text())));
+			output.SetValue(3, count, Value::DOUBLE(r.x()));
+			output.SetValue(4, count, Value::DOUBLE(r.y()));
+			output.SetValue(5, count, Value::DOUBLE(r.x() + r.width()));
+			output.SetValue(6, count, Value::DOUBLE(r.y() + r.height()));
+			output.SetValue(7, count, b.has_font_info() ? Value(b.get_font_name()) : Value(LogicalType::VARCHAR));
+			output.SetValue(8, count,
+			                b.has_font_info() ? Value::DOUBLE(b.get_font_size()) : Value(LogicalType::DOUBLE));
+			output.SetValue(9, count, Value("text"));
+			output.SetValue(10, count, Value(LogicalType::DOUBLE)); // NULL confidence for native
+		}
 		g.word_idx++;
 		count++;
 	}
@@ -946,6 +1051,19 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 				w.yMax = r.y() + r.height();
 				w.text = UStringToUtf8(b.text());
 				words.push_back(std::move(w));
+			}
+			if (words.empty() && (bind.opt.force_ocr || bind.opt.auto_ocr)) {
+				auto ocr_words = OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
+				                              bind.opt.ocr_oem, bind.opt.tessdata_dir);
+				for (auto &ow : ocr_words) {
+					PdfWord w;
+					w.xMin = ow.x0;
+					w.yMin = ow.y0;
+					w.xMax = ow.x1;
+					w.yMax = ow.y1;
+					w.text = ow.text;
+					words.push_back(std::move(w));
+				}
 			}
 			auto grid = ReconstructPageGrid(std::move(words));
 			if (grid.size() < 2 || grid.front().size() < 2) {

@@ -366,6 +366,26 @@ SELECT page, text
 FROM read_pdf('german_doc.pdf', ocr := true, ocr_language := 'deu', ocr_dpi := 300);
 ```
 
+### OCR for `read_pdf_words` and `read_pdf_tables`
+
+`read_pdf_words` and `read_pdf_tables` now return results for scanned/image-only PDFs (no text layer) by using tesseract's word-level `ResultIterator`. Previously these functions returned zero rows for scanned PDFs when no embedded text was present.
+
+`read_pdf_words` emits two additional trailing columns:
+
+- `source` VARCHAR: `'text'` for native text-layer words, `'ocr'` for words recovered via OCR.
+- `confidence` DOUBLE: `NULL` for native words; a value in `[0, 100]` for OCR words.
+
+For OCR words, `font_name` and `font_size` are `NULL` (no font metadata from the image).
+
+```sql
+SELECT word, x0, y0, x1, y1, confidence
+FROM read_pdf_words('scanned.pdf')
+WHERE source = 'ocr'
+ORDER BY y1 DESC, x0;
+```
+
+Native-text PDFs continue to return `source = 'text'` with `confidence IS NULL` (no behavior change).
+
 ## Scope
 
 This extension targets the ~80% of everyday PDF extraction — page/line/word text, metadata, and simple tables — directly in SQL, using Poppler (parsing/rendering) and Tesseract (OCR). It deliberately does **not** attempt ML-based layout analysis or table-structure recognition. For state-of-the-art document understanding (reading order, complex/merged-cell tables, form fields, RAG-ready output), reach for purpose-built tools such as [docling](https://github.com/docling-project/docling), [marker](https://github.com/VikParuchuri/marker), or a cloud Document AI service. A Poppler/Tesseract expert can extend this extension's heuristics (e.g. Leptonica preprocessing, ruling-line table detection) from the same building blocks it already exposes.

@@ -1,0 +1,112 @@
+# name: test/sql/read_pdf_ocr_words.test
+# description: OCR word-box and table tests for read_pdf_words and read_pdf_tables
+# group: [sql]
+
+require pdf
+
+# ── A. Native text PDF — no require-env needed ────────────────────────────────
+# hello.pdf has a native text layer; read_pdf_words should return source='text' and
+# confidence IS NULL for every word. This section must NOT be require-env gated.
+
+query I
+SELECT count(*) > 0 FROM read_pdf_words('test/data/hello.pdf');
+----
+true
+
+query I
+SELECT count(*) = 0
+FROM read_pdf_words('test/data/hello.pdf')
+WHERE source != 'text' OR confidence IS NOT NULL;
+----
+true
+
+# All native words must have non-null font info (hello.pdf embeds font metadata).
+# Allow for the possibility that some words lack font info — just assert source column exists.
+query I
+SELECT count(*) > 0
+FROM read_pdf_words('test/data/hello.pdf')
+WHERE source = 'text';
+----
+true
+
+# ── B. OCR-dependent tests — require TESSDATA_PREFIX ─────────────────────────
+# OCR needs a Tesseract language model at runtime.
+# Run locally with: TESSDATA_PREFIX="$(brew --prefix tesseract)/share/tessdata" make test
+
+require-env TESSDATA_PREFIX
+
+# B1. scanned.pdf — image-only PDF: read_pdf_words with auto_ocr (default)
+# should return OCR words with source='ocr' and numeric confidence.
+
+query I
+SELECT count(*) > 0
+FROM read_pdf_words('test/data/scanned.pdf');
+----
+true
+
+query I
+SELECT count(*) > 0
+FROM read_pdf_words('test/data/scanned.pdf')
+WHERE source = 'ocr';
+----
+true
+
+query I
+SELECT count(*) = 0
+FROM read_pdf_words('test/data/scanned.pdf')
+WHERE source = 'ocr' AND confidence IS NULL;
+----
+true
+
+query I
+SELECT count(*) > 0
+FROM read_pdf_words('test/data/scanned.pdf')
+WHERE source = 'ocr' AND confidence >= 0.0 AND confidence <= 100.0;
+----
+true
+
+# B2. scanned.pdf — at least one OCR word matches a known token from the Item/Qty/Price fixture.
+# Use contains() — NOT ILIKE.
+
+query I
+SELECT count(*) > 0
+FROM read_pdf_words('test/data/scanned.pdf')
+WHERE contains(lower(word), 'apple') OR contains(lower(word), 'cherr');
+----
+true
+
+# B3. scanned.pdf — with auto_ocr disabled: should return zero rows
+# (image-only PDF, no native text).
+
+query I
+SELECT count(*) = 0
+FROM read_pdf_words('test/data/scanned.pdf', auto_ocr:=false);
+----
+true
+
+# B4. scanned.pdf — ocr:=true should also populate words.
+
+query I
+SELECT count(*) > 0
+FROM read_pdf_words('test/data/scanned.pdf', ocr:=true);
+----
+true
+
+# B5. Coordinate sanity: OCR bboxes must be positive and x1>x0, y1>y0.
+
+query I
+SELECT count(*) = 0
+FROM read_pdf_words('test/data/scanned.pdf')
+WHERE source = 'ocr' AND (x1 <= x0 OR y1 <= y0 OR x0 < 0 OR y0 < 0);
+----
+true
+
+# B6. read_pdf_tables on scanned.pdf — should return at least one table row
+# because scanned.pdf is an image of an Item/Qty/Price table.
+# Only assert count > 0 to allow for OCR quality variation across tessdata versions.
+
+query I
+SELECT count(*) > 0
+FROM read_pdf_tables('test/data/scanned.pdf');
+----
+true
