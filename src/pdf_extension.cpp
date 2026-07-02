@@ -1556,7 +1556,8 @@ static void HpdfErrorHandler(HPDF_STATUS error_no, HPDF_STATUS detail_no, void *
 // RAII: guarantee HPDF_Free even if we throw.
 struct HpdfDocGuard {
 	HPDF_Doc pdf = nullptr;
-	explicit HpdfDocGuard(HPDF_Doc p) : pdf(p) {}
+	explicit HpdfDocGuard(HPDF_Doc p) : pdf(p) {
+	}
 	~HpdfDocGuard() {
 		if (pdf) {
 			HPDF_Free(pdf);
@@ -1625,8 +1626,8 @@ static void RenderTextToPdf(const string &content, const string &output_path) {
 	HpdfError err_ctx;
 	HPDF_Doc pdf = HPDF_New(HpdfErrorHandler, &err_ctx);
 	if (!pdf) {
-		throw IOException("write_pdf: HPDF_New failed to create document (libharu error %u:%u).",
-		                  err_ctx.error_no, err_ctx.detail_no);
+		throw IOException("write_pdf: HPDF_New failed to create document (libharu error %u:%u).", err_ctx.error_no,
+		                  err_ctx.detail_no);
 	}
 	HpdfDocGuard guard(pdf);
 
@@ -1692,7 +1693,8 @@ static void RenderTextToPdf(const string &content, const string &output_path) {
 
 	st = HPDF_SaveToFile(pdf, output_path.c_str());
 	if (st != HPDF_OK) {
-		throw IOException("write_pdf: HPDF_SaveToFile('%s') failed (status %u) — check that the path is writable and the parent directory exists.",
+		throw IOException("write_pdf: HPDF_SaveToFile('%s') failed (status %u) — check that the path is writable and "
+		                  "the parent directory exists.",
 		                  output_path.c_str(), st);
 	}
 

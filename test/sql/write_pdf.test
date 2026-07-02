@@ -100,10 +100,12 @@ SELECT contains(pdf_to_text((SELECT write_pdf('Temp one arg roundtrip marker.'))
 true
 
 # empty content still produces a valid 1-page PDF
+# (auto_ocr := false — the blank page would otherwise trigger the OCR fallback,
+# which requires a tessdata model that CI containers don't have)
 statement ok
 SELECT write_pdf('', '__TEST_DIR__/empty.pdf');
 
 query I
-SELECT page_count = 1 FROM read_pdf('__TEST_DIR__/empty.pdf');
+SELECT page_count = 1 FROM read_pdf('__TEST_DIR__/empty.pdf', auto_ocr := false);
 ----
 true
