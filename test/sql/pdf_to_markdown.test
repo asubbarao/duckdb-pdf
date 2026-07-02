@@ -1,0 +1,96 @@
+# name: test/sql/pdf_to_markdown.test
+# description: pdf_to_markdown layout-aware GitHub Markdown extraction
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── NULL propagation ─────────────────────────────────────────────────────────
+
+query I
+SELECT pdf_to_markdown(NULL) IS NULL;
+----
+true
+
+# ── fixture: heading structure ───────────────────────────────────────────────
+
+# Output contains a level-1 heading (# ...) containing the title text
+query I
+SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '# Markdown Fixture Title');
+----
+true
+
+# Output contains a level-2 or level-3 heading containing the subheading text
+query I
+SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), 'Introduction Section')
+   AND (contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '## Introduction Section')
+     OR contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '### Introduction Section'));
+----
+true
+
+# ── fixture: body text present ───────────────────────────────────────────────
+
+query I
+SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), 'layout-aware markdown');
+----
+true
+
+# ── fixture: bold span ───────────────────────────────────────────────────────
+
+# The inline bold word "important" is wrapped in **
+query I
+SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '**important**')
+    OR contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '**important');
+----
+true
+
+# ── fixture: bullet list ─────────────────────────────────────────────────────
+
+# Output contains markdown list items (- prefix)
+query I
+SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '- item one');
+----
+true
+
+query I
+SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '- item two');
+----
+true
+
+query I
+SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '- item three');
+----
+true
+
+# ── fixture: table ───────────────────────────────────────────────────────────
+
+# Output contains a pipe table separator row
+query I
+SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '|---|');
+----
+true
+
+# Output contains at least one pipe-delimited data row
+query I
+SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '|');
+----
+true
+
+# Table cell values are present
+query I
+SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), 'Apples');
+----
+true
+
+query I
+SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), 'Cherries');
+----
+true
+
+# ── error: missing file ───────────────────────────────────────────────────────
+
+statement error
+SELECT pdf_to_markdown('test/data/does_not_exist.pdf');
+----

@@ -1939,6 +1939,435 @@ static void PdfCopyFinalize(ClientContext &context, FunctionData &bind_data, Glo
 }
 
 //===--------------------------------------------------------------------===//
+// pdf_to_markdown(path) — layout-aware GitHub-flavoured Markdown using
+// poppler's positioned word list + font info (no AI). Headings by relative
+// size, tables via ReconstructPageGrid, bold via "Bold" in font, lists by
+// prefix, paragraphs by vertical gap. Deterministic geometry only.
+//===--------------------------------------------------------------------===//
+
+struct MdWord {
+	double xMin = 0.0;
+	double yMin = 0.0;
+	double xMax = 0.0;
+	double yMax = 0.0;
+	string text;
+	string font_name;
+	double font_size = 0.0;
+};
+
+static string DocToMarkdown(const string &path) {
+	auto doc = LoadRenderDoc("pdf_to_markdown", path);
+	int n = doc->pages();
+
+	std::vector<std::vector<MdWord>> pages_words(n);
+	std::vector<double> all_font_sizes;
+	for (int p = 0; p < n; p++) {
+		unique_ptr<poppler::page> page(doc->create_page(p));
+		if (!page) {
+			continue;
+		}
+		std::vector<MdWord> page_words;
+		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
+			auto r = b.bbox();
+			MdWord w;
+			w.xMin = r.x();
+			w.yMin = r.y();
+			w.xMax = r.x() + r.width();
+			w.yMax = r.y() + r.height();
+			w.text = UStringToUtf8(b.text());
+			if (b.has_font_info()) {
+				w.font_name = b.get_font_name();
+				w.font_size = b.get_font_size();
+			} else {
+				w.font_size = (r.height() > 0 ? r.height() : 10.0);
+			}
+			if (w.font_size > 0) {
+				all_font_sizes.push_back(w.font_size);
+			}
+			page_words.push_back(std::move(w));
+		}
+		pages_words[p] = std::move(page_words);
+	}
+
+	// Phase 2: body = mode of sizes rounded to nearest 0.5pt; smallest on tie
+	double body_size = 10.0;
+	if (!all_font_sizes.empty()) {
+		std::vector<double> rounded;
+		rounded.reserve(all_font_sizes.size());
+		for (double fs : all_font_sizes) {
+			rounded.push_back(std::round(fs * 2.0) / 2.0);
+		}
+		std::sort(rounded.begin(), rounded.end());
+		double cur = rounded[0];
+		int cnt = 1;
+		int best_cnt = 1;
+		double best = cur;
+		for (size_t k = 1; k < rounded.size(); ++k) {
+			if (std::fabs(rounded[k] - cur) < 0.001) {
+				++cnt;
+			} else {
+				if (cnt > best_cnt || (cnt == best_cnt && cur < best)) {
+					best_cnt = cnt;
+					best = cur;
+				}
+				cur = rounded[k];
+				cnt = 1;
+			}
+		}
+		if (cnt > best_cnt || (cnt == best_cnt && cur < best)) {
+			best = cur;
+		}
+		body_size = best;
+	}
+
+	// Phase 3: distinct heading sizes (>=1.15*body), sorted descending
+	std::vector<double> heading_sizes;
+	for (double fs : all_font_sizes) {
+		double r = std::round(fs * 2.0) / 2.0;
+		if (r >= 1.15 * body_size) {
+			bool has = false;
+			for (double v : heading_sizes) {
+				if (std::fabs(v - r) < 0.01) {
+					has = true;
+					break;
+				}
+			}
+			if (!has) {
+				heading_sizes.push_back(r);
+			}
+		}
+	}
+	std::sort(heading_sizes.begin(), heading_sizes.end());
+	std::reverse(heading_sizes.begin(), heading_sizes.end());
+
+	auto get_heading_level = [&](double fs) -> int {
+		double r = std::round(fs * 2.0) / 2.0;
+		for (size_t i = 0; i < heading_sizes.size(); ++i) {
+			if (std::fabs(r - heading_sizes[i]) < 0.01) {
+				return (int)std::min<size_t>(i + 1, 4);
+			}
+		}
+		return 0;
+	};
+
+	auto join_plain = [](const std::vector<MdWord> &row) -> string {
+		string s;
+		for (size_t i = 0; i < row.size(); ++i) {
+			if (i > 0)
+				s += " ";
+			s += row[i].text;
+		}
+		return s;
+	};
+
+	auto format_row = [](const std::vector<MdWord> &row) -> string {
+		string s;
+		size_t i = 0;
+		size_t m = row.size();
+		while (i < m) {
+			bool is_bold = row[i].font_name.find("Bold") != string::npos;
+			if (is_bold) {
+				string bspan;
+				size_t j = i;
+				while (j < m && row[j].font_name.find("Bold") != string::npos) {
+					if (!bspan.empty())
+						bspan += " ";
+					bspan += row[j].text;
+					++j;
+				}
+				if (!s.empty())
+					s += " ";
+				s += "**" + bspan + "**";
+				i = j;
+			} else {
+				if (!s.empty())
+					s += " ";
+				s += row[i].text;
+				++i;
+			}
+		}
+		return s;
+	};
+
+	auto escape_pipe = [](const string &s) -> string {
+		string o;
+		o.reserve(s.size() + 4);
+		for (char c : s) {
+			if (c == '|')
+				o += "\\|";
+			else
+				o += c;
+		}
+		return o;
+	};
+
+	auto emit_grid_table = [&](const std::vector<std::vector<string>> &grid, string &out_ref) {
+		if (grid.empty())
+			return;
+		out_ref += "|";
+		for (const auto &c : grid[0]) {
+			out_ref += escape_pipe(c) + "|";
+		}
+		out_ref += "\n|";
+		for (size_t c = 0; c < grid[0].size(); ++c) {
+			out_ref += "---|";
+		}
+		out_ref += "\n";
+		for (size_t ri = 1; ri < grid.size(); ++ri) {
+			out_ref += "|";
+			for (const auto &c : grid[ri]) {
+				out_ref += escape_pipe(c) + "|";
+			}
+			out_ref += "\n";
+		}
+		out_ref += "\n";
+	};
+
+	string out;
+	for (int p = 0; p < n; p++) {
+		if (p > 0)
+			out += "\n\n";
+		auto page_words = pages_words[p];
+		if (page_words.empty())
+			continue;
+
+		// per-page row clustering (same rules as ReconstructPageGrid)
+		std::vector<double> heights;
+		for (const auto &w : page_words) {
+			double h = w.yMax - w.yMin;
+			if (h > 0)
+				heights.push_back(h);
+		}
+		double med_h = Median(heights);
+		if (med_h <= 0)
+			med_h = 10.0;
+		double row_tol = med_h * 0.5;
+
+		std::sort(page_words.begin(), page_words.end(),
+		          [](const MdWord &a, const MdWord &b) { return a.yMin < b.yMin; });
+
+		std::vector<std::vector<MdWord>> rows;
+		{
+			std::vector<MdWord> cur;
+			double row_anchor = page_words.front().yMin;
+			for (auto &w : page_words) {
+				if (cur.empty()) {
+					cur.push_back(w);
+					row_anchor = w.yMin;
+				} else if (std::fabs(w.yMin - row_anchor) <= row_tol) {
+					cur.push_back(w);
+				} else {
+					rows.push_back(cur);
+					cur.clear();
+					cur.push_back(w);
+					row_anchor = w.yMin;
+				}
+			}
+			if (!cur.empty())
+				rows.push_back(cur);
+		}
+		for (auto &r : rows) {
+			std::sort(r.begin(), r.end(), [](const MdWord &a, const MdWord &b) { return a.xMin < b.xMin; });
+		}
+
+		// table detection + y-suppression zone(s)
+		// Collect words only from blocks of *consecutive* rows that have large
+		// internal x-gaps (column-like spacing >100pt). This lets ReconstructPageGrid
+		// see a clean >=3-row multi-col block even on mixed pages (prose sentences
+		// and title have gaps too but isolated or <3 rows after y cluster -> gate fails).
+		std::vector<PdfWord> pw_vec;
+		std::vector<MdWord> cur_b;
+		int best_block_rows = 0;
+		for (size_t i = 0; i <= rows.size(); ++i) {
+			bool is_end = (i == rows.size());
+			bool is_cand = false;
+			if (!is_end) {
+				const auto &r = rows[i];
+				if (r.size() >= 2) {
+					std::vector<double> xs;
+					for (const auto &w : r)
+						xs.push_back(w.xMin);
+					std::sort(xs.begin(), xs.end());
+					double mg = 0;
+					for (size_t j = 1; j < xs.size(); ++j)
+						mg = std::max(mg, xs[j] - xs[j - 1]);
+					if (mg > 100.0)
+						is_cand = true;
+				}
+			}
+			if (is_cand) {
+				cur_b.insert(cur_b.end(), rows[i].begin(), rows[i].end());
+			} else if (!cur_b.empty()) {
+				std::vector<PdfWord> test_pw;
+				for (const auto &m : cur_b) {
+					PdfWord pw;
+					pw.xMin = m.xMin;
+					pw.yMin = m.yMin;
+					pw.xMax = m.xMax;
+					pw.yMax = m.yMax;
+					pw.text = m.text;
+					test_pw.push_back(pw);
+				}
+				auto test_g = ReconstructPageGrid(test_pw);
+				if ((int)test_g.size() > best_block_rows && (int)test_g.size() >= 3) {
+					best_block_rows = (int)test_g.size();
+					pw_vec = std::move(test_pw);
+				}
+				cur_b.clear();
+			}
+		}
+		auto grid = ReconstructPageGrid(pw_vec);
+		std::vector<std::pair<double, double>> table_zones;
+		if (!grid.empty()) {
+			std::vector<string> tblt;
+			for (const auto &rw : grid) {
+				for (const auto &cl : rw) {
+					if (cl.empty())
+						continue;
+					bool dup = false;
+					for (const auto &t : tblt) {
+						if (t == cl) {
+							dup = true;
+							break;
+						}
+					}
+					if (!dup)
+						tblt.push_back(cl);
+				}
+			}
+			double gy0 = 1e9, gy1 = -1e9;
+			for (const auto &w : page_words) {
+				for (const auto &t : tblt) {
+					if (w.text == t) {
+						gy0 = std::min(gy0, w.yMin);
+						gy1 = std::max(gy1, w.yMax);
+						break;
+					}
+				}
+			}
+			if (gy0 < 1e8) {
+				table_zones.emplace_back(gy0, gy1);
+			}
+		}
+
+		// per-row classification + emission
+		string para_buf;
+		double prev_ymax = -1e9;
+		bool table_emitted = false;
+		for (const auto &row : rows) {
+			if (row.empty())
+				continue;
+			double rymin = 1e9, rymax = -1e9;
+			for (const auto &w : row) {
+				rymin = std::min(rymin, w.yMin);
+				rymax = std::max(rymax, w.yMax);
+			}
+
+			bool suppressed = false;
+			for (const auto &z : table_zones) {
+				if (rymin >= z.first - row_tol && rymin <= z.second + row_tol) {
+					suppressed = true;
+					break;
+				}
+			}
+			if (suppressed) {
+				if (!para_buf.empty()) {
+					out += para_buf + "\n\n";
+					para_buf.clear();
+				}
+				if (!grid.empty() && !table_emitted) {
+					emit_grid_table(grid, out);
+					table_emitted = true;
+				}
+				prev_ymax = -1e9;
+				continue;
+			}
+
+			std::vector<double> fsr;
+			for (const auto &w : row) {
+				if (w.font_size > 0)
+					fsr.push_back(w.font_size);
+			}
+			double mfs = Median(fsr);
+			if (mfs <= 0)
+				mfs = 10.0;
+
+			string formatted = format_row(row);
+			string plain = join_plain(row);
+
+			int hl = 0;
+			if (mfs >= 1.15 * body_size) {
+				hl = get_heading_level(mfs);
+			}
+			bool is_h = hl > 0;
+
+			bool is_l = false;
+			if (plain.size() >= 2 && (plain.substr(0, 2) == "- " || plain.substr(0, 2) == "* ")) {
+				is_l = true;
+			} else {
+				size_t k = 0;
+				auto isdig = [](char c) {
+					return c >= '0' && c <= '9';
+				};
+				while (k < plain.size() && isdig(plain[k]))
+					++k;
+				if (k > 0 && k + 1 < plain.size() && plain[k] == '.' && plain[k + 1] == ' ') {
+					is_l = true;
+				}
+			}
+			if (plain.size() >= 2 && (plain.substr(0, 2) == "• " || plain.substr(0, 2) == "◦ ")) {
+				if (formatted.size() >= 2 && (formatted.substr(0, 2) == "• " || formatted.substr(0, 2) == "◦ ")) {
+					formatted = "- " + formatted.substr(2);
+				}
+				is_l = true;
+			}
+
+			if (is_h) {
+				if (!para_buf.empty()) {
+					out += para_buf + "\n\n";
+					para_buf.clear();
+				}
+				string htext = join_plain(row);
+				out += string(hl, '#') + " " + htext + "\n\n";
+				prev_ymax = -1e9;
+				continue;
+			}
+			if (is_l) {
+				if (!para_buf.empty()) {
+					out += para_buf + "\n\n";
+					para_buf.clear();
+				}
+				out += formatted + "\n";
+				prev_ymax = -1e9;
+				continue;
+			}
+
+			// body paragraph accumulation
+			double gap = (prev_ymax > -1e8) ? (rymin - prev_ymax) : 99999.0;
+			bool same_p = !para_buf.empty() && (gap < 1.5 * med_h);
+			if (!same_p && !para_buf.empty()) {
+				out += para_buf + "\n\n";
+				para_buf.clear();
+			}
+			if (!para_buf.empty())
+				para_buf += " ";
+			para_buf += formatted;
+			prev_ymax = rymax;
+		}
+		if (!para_buf.empty()) {
+			out += para_buf + "\n";
+		}
+	}
+	return out;
+}
+
+static void PdfToMarkdownFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
+		return StringVector::AddString(result, DocToMarkdown(path.GetString()));
+	});
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 static void LoadInternal(ExtensionLoader &loader) {
@@ -1974,6 +2403,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(ScalarFunction("pdf_to_html", {LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToHtmlFun));
 	loader.RegisterFunction(ScalarFunction("pdf_to_xml", {LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToXmlFun));
+	loader.RegisterFunction(
+	    ScalarFunction("pdf_to_markdown", {LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToMarkdownFun));
 
 	ScalarFunctionSet pdf_to_svg_set("pdf_to_svg");
 	pdf_to_svg_set.AddFunction(
