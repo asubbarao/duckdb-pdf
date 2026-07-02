@@ -1,0 +1,68 @@
+# name: test/sql/torture_copy_pdf.test
+# description: COPY edge cases with results from pdf readers (empty, nulls, wide, long) and roundtrip read of copies
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── empty result set from filtered pdf read, copy to csv (adapt for no FORMAT pdf) ─
+
+statement ok
+COPY (SELECT * FROM read_pdf('test/data/hello.pdf', auto_ocr := false) WHERE 1=0) TO '__TEST_DIR__/empty_copy.csv' (FORMAT csv, HEADER true);
+
+query I
+SELECT COUNT(*) = 0 FROM read_csv_auto('__TEST_DIR__/empty_copy.csv');
+----
+true
+
+# ── single NULL row copy ────────────────────────────────────────────────────
+
+statement ok
+COPY (SELECT NULL::VARCHAR AS col FROM read_pdf('test/data/hello.pdf', auto_ocr := false) LIMIT 1) TO '__TEST_DIR__/null_copy.csv' (FORMAT csv, HEADER true);
+
+query I
+SELECT COUNT(*) = 1 FROM read_csv_auto('__TEST_DIR__/null_copy.csv');
+----
+true
+
+# ── many columns (10) ───────────────────────────────────────────────────────
+
+statement ok
+COPY (SELECT 'a' AS c1, 'b' AS c2, 'c' AS c3, 'd' AS c4, 'e' AS c5, 'f' AS c6, 'g' AS c7, 'h' AS c8, 'i' AS c9, 'j' AS c10
+      FROM read_pdf('test/data/hello.pdf', auto_ocr := false) LIMIT 1)
+TO '__TEST_DIR__/wide.csv' (FORMAT csv, HEADER true);
+
+query I
+SELECT COUNT(*) = 1 FROM read_csv_auto('__TEST_DIR__/wide.csv');
+----
+true
+
+# ── wide/long VARCHAR value ─────────────────────────────────────────────────
+
+statement ok
+COPY (SELECT repeat('W', 500) AS longcol FROM read_pdf('test/data/hello.pdf', auto_ocr := false) LIMIT 1)
+TO '__TEST_DIR__/longval.csv' (FORMAT csv, HEADER true);
+
+query I
+SELECT length(longcol) = 500 FROM read_csv_auto('__TEST_DIR__/longval.csv');
+----
+true
+
+# ── read back a pdf-derived result after copy (use read_csv) ────────────────
+
+query I
+SELECT COUNT(*) = 0 FROM read_csv_auto('__TEST_DIR__/empty_copy.csv');
+----
+true
+
+# also copy a successful pdf table read and verify page_count in copy
+statement ok
+COPY (SELECT filename, page, page_count FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false))
+TO '__TEST_DIR__/pdfrows.csv' (FORMAT csv, HEADER true);
+
+query I
+SELECT COUNT(*) = 2 FROM read_csv_auto('__TEST_DIR__/pdfrows.csv');
+----
+true

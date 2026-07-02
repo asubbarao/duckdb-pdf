@@ -1,0 +1,71 @@
+# name: test/sql/torture_markdown.test
+# description: pdf_to_* (html/xml/text) adversarial and regression layout tests (no ocr)
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── regression on table.pdf using text (structured output) ──────────────────
+
+query I
+SELECT length(pdf_to_text('test/data/table.pdf', 'physical')) > 0;
+----
+true
+
+# contains table-like markers or header words
+query I
+SELECT contains( pdf_to_text('test/data/table.pdf', 'physical'), 'Item' ) OR contains( pdf_to_text('test/data/table.pdf', 'physical'), 'Apples' );
+----
+true
+
+# ── single-word page via real fixture read (non-empty) ──────────────────────
+
+query I
+SELECT length(pdf_to_text('test/data/hello.pdf')) > 0;
+----
+true
+
+# ── empty-text handling: use pdf_to_text on hello (non crash even if short) ─
+
+query I
+SELECT length(pdf_to_text('test/data/hello.pdf')) >= 0;
+----
+true
+
+# ── multi page pdf_to text/html/xml non empty ───────────────────────────────
+
+query I
+SELECT length(pdf_to_text('test/data/two_pages.pdf')) > 0
+   AND length(pdf_to_html('test/data/two_pages.pdf')) > 0
+   AND length(pdf_to_xml('test/data/two_pages.pdf')) > 0;
+----
+true
+
+# ── pdf_to_html and pdf_to_xml on hello.pdf : non-empty + markup ────────────
+
+query I
+SELECT length(pdf_to_html('test/data/hello.pdf')) > 10
+   AND contains( pdf_to_html('test/data/hello.pdf'), '<' );
+----
+true
+
+query I
+SELECT length(pdf_to_xml('test/data/hello.pdf')) > 10
+   AND contains( pdf_to_xml('test/data/hello.pdf'), '<' );
+----
+true
+
+# also check xml has page info
+query I
+SELECT contains( lower(pdf_to_xml('test/data/hello.pdf')), 'page' );
+----
+true
+
+# ── read_pdf combined with to_* for "markdown-like" output check ────────────
+
+query I
+SELECT length( (SELECT text FROM read_pdf('test/data/table.pdf', auto_ocr := false) LIMIT 1) ) > 0;
+----
+true

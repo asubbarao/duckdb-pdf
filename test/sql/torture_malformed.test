@@ -1,0 +1,187 @@
+# name: test/sql/torture_malformed.test
+# description: adversarial malformed / corrupt / bad-path inputs to all readers and scalars
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── runtime zero-byte fixture ───────────────────────────────────────────────
+
+statement ok
+COPY (SELECT 1 WHERE false) TO '__TEST_DIR__/zero.pdf' (FORMAT csv, HEADER false);
+
+# ── zero-byte on all readers ────────────────────────────────────────────────
+
+statement error
+SELECT * FROM read_pdf('__TEST_DIR__/zero.pdf');
+----
+could not open
+
+statement error
+SELECT * FROM read_pdf_lines('__TEST_DIR__/zero.pdf');
+----
+could not open
+
+statement error
+SELECT * FROM read_pdf_words('__TEST_DIR__/zero.pdf');
+----
+could not open
+
+statement error
+SELECT * FROM read_pdf_tables('__TEST_DIR__/zero.pdf');
+----
+Syntax Error
+
+# ── zero-byte on scalars ────────────────────────────────────────────────────
+
+statement error
+SELECT pdf_to_text('__TEST_DIR__/zero.pdf');
+----
+Syntax Error
+
+statement error
+SELECT pdf_to_html('__TEST_DIR__/zero.pdf');
+----
+Syntax Error
+
+statement error
+SELECT pdf_to_xml('__TEST_DIR__/zero.pdf');
+----
+Syntax Error
+
+statement error
+SELECT pdf_to_svg('__TEST_DIR__/zero.pdf', 1);
+----
+Syntax Error
+
+# ── text file renamed .pdf (committed fixture) ──────────────────────────────
+
+statement error
+SELECT * FROM read_pdf('test/data/text_as_pdf.pdf');
+----
+could not open
+
+statement error
+SELECT * FROM read_pdf_lines('test/data/text_as_pdf.pdf');
+----
+could not open
+
+statement error
+SELECT count(*) FROM read_pdf_words('test/data/text_as_pdf.pdf');
+----
+could not open
+
+statement error
+SELECT * FROM read_pdf_tables('test/data/text_as_pdf.pdf');
+----
+Syntax Error
+
+statement error
+SELECT pdf_to_text('test/data/text_as_pdf.pdf');
+----
+Syntax Error
+
+statement error
+SELECT pdf_to_html('test/data/text_as_pdf.pdf');
+----
+Syntax Error
+
+statement error
+SELECT pdf_to_xml('test/data/text_as_pdf.pdf');
+----
+Syntax Error
+
+statement error
+SELECT pdf_to_svg('test/data/text_as_pdf.pdf', 1);
+----
+Syntax Error
+
+# ── truncated PDF (committed partial bytes of hello) ────────────────────────
+
+statement error
+SELECT * FROM read_pdf('test/data/truncated.pdf');
+----
+could not open
+
+statement error
+SELECT * FROM read_pdf_words('test/data/truncated.pdf', auto_ocr := false);
+----
+could not open
+
+# ── garbage with %PDF- header (committed) ───────────────────────────────────
+
+statement error
+SELECT * FROM read_pdf('test/data/garbage_header.pdf');
+----
+could not open
+
+statement error
+SELECT length(pdf_to_xml('test/data/garbage_header.pdf')) > 0;
+----
+Syntax Error
+
+# ── nonexistent path ────────────────────────────────────────────────────────
+
+statement error
+SELECT * FROM read_pdf('test/data/does_not_exist_98765.pdf');
+----
+open file
+
+statement error
+SELECT * FROM read_pdf_lines('test/data/does_not_exist_98765.pdf');
+----
+open file
+
+statement error
+SELECT * FROM read_pdf_words('test/data/does_not_exist_98765.pdf');
+----
+open file
+
+statement error
+SELECT * FROM read_pdf_tables('test/data/does_not_exist_98765.pdf');
+----
+open file
+
+statement error
+SELECT pdf_to_text('test/data/does_not_exist_98765.pdf');
+----
+open file
+
+statement error
+SELECT pdf_to_svg('test/data/does_not_exist_98765.pdf', 1);
+----
+open file
+
+# ── directory as path ───────────────────────────────────────────────────────
+
+statement error
+SELECT * FROM read_pdf('test/data');
+----
+Is a directory
+
+statement error
+SELECT * FROM read_pdf_lines('test/data');
+----
+Is a directory
+
+statement error
+SELECT count(*) FROM read_pdf_words('test/data');
+----
+Is a directory
+
+statement error
+SELECT * FROM read_pdf_tables('test/data');
+----
+May not be a PDF
+
+statement error
+SELECT length(pdf_to_html('test/data')) > 0;
+----
+May not be a PDF
+
+statement error
+SELECT pdf_to_svg('test/data', 1);
+----
+May not be a PDF

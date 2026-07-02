@@ -1,0 +1,49 @@
+# name: test/sql/torture_concurrency.test
+# description: concurrent readers in single query (self join, multiple scalars, mixed table funcs)
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── self-join of read_pdf (same file twice) ─────────────────────────────────
+
+query I
+SELECT count(*) > 0 FROM read_pdf('test/data/hello.pdf', auto_ocr := false) a
+JOIN read_pdf('test/data/hello.pdf', auto_ocr := false) b ON a.page = b.page;
+----
+true
+
+# ── two different scalars on two fixtures in one SELECT ─────────────────────
+
+query I
+SELECT length(pdf_to_text('test/data/hello.pdf')) > 0
+   AND length(pdf_to_text('test/data/two_pages.pdf')) > 0;
+----
+true
+
+# ── read_pdf_words and read_pdf_lines on same file in one query ─────────────
+
+query I
+SELECT (SELECT count(*) FROM read_pdf_words('test/data/hello.pdf', auto_ocr := false)) > 0
+   AND (SELECT count(*) FROM read_pdf_lines('test/data/hello.pdf', auto_ocr := false)) > 0;
+----
+true
+
+# ── mixed three readers + scalar in one query ───────────────────────────────
+
+query I
+SELECT (SELECT page_count FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false) LIMIT 1) = 2
+   AND (SELECT count(*) > 0 FROM read_pdf_lines('test/data/two_pages.pdf', auto_ocr := false))
+   AND length(pdf_to_xml('test/data/two_pages.pdf')) > 0;
+----
+true
+
+# ── words + tables (if any) + lines ─────────────────────────────────────────
+
+query I
+SELECT (SELECT count(*) FROM read_pdf_words('test/data/table.pdf', auto_ocr := false)) > 0
+   AND (SELECT count(*) FROM read_pdf_lines('test/data/table.pdf', auto_ocr := false)) > 0;
+----
+true

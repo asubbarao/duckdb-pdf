@@ -1,0 +1,89 @@
+# name: test/sql/torture_named_params.test
+# description: named parameter validation and edge behavior on readers and svg (auto_ocr false)
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── ocr_dpi extremes (no OCR triggered so accepted; no range error in current) ─
+
+statement ok
+SELECT * FROM read_pdf('test/data/hello.pdf', ocr_dpi := 0, auto_ocr := false);
+
+statement ok
+SELECT * FROM read_pdf('test/data/hello.pdf', ocr_dpi := 2401, auto_ocr := false);
+
+# extreme low dpi with auto_ocr false still ok
+statement ok
+SELECT count(*) >= 0 FROM read_pdf('test/data/hello.pdf', ocr_dpi := 1, auto_ocr := false);
+
+# ── first_page := 0 (treated as page 1 per >0 logic) ────────────────────────
+
+query I
+SELECT COUNT(*) = 1 FROM read_pdf('test/data/hello.pdf', first_page := 0, auto_ocr := false);
+----
+true
+
+# ── first/last far beyond doc end → 0 rows (no error) ───────────────────────
+
+query I
+SELECT COUNT(*) = 0 FROM read_pdf('test/data/hello.pdf', first_page := 9999, last_page := 9999, auto_ocr := false);
+----
+true
+
+# ── last < first → 0 rows (no error in current impl) ────────────────────────
+
+query I
+SELECT COUNT(*) = 0 FROM read_pdf('test/data/two_pages.pdf', first_page := 2, last_page := 1, auto_ocr := false);
+----
+true
+
+# ── last_page := 1 on 2pg doc ok ────────────────────────────────────────────
+
+query I
+SELECT COUNT(*) = 1 FROM read_pdf('test/data/two_pages.pdf', last_page := 1, auto_ocr := false);
+----
+true
+
+# ── bogus layout falls back silently (no error) ─────────────────────────────
+
+query I
+SELECT COUNT(*) = 1 FROM read_pdf('test/data/hello.pdf', layout := 'bogus', auto_ocr := false);
+----
+true
+
+query I
+SELECT contains( pdf_to_text('test/data/hello.pdf', 'bogus'), 'Hello' ) OR length(pdf_to_text('test/data/hello.pdf', 'bogus')) > 0;
+----
+true
+
+# ── pdf_to_svg page edges (note: current sig is 2-arg only; page<=0 clamps) ─
+
+query I
+SELECT length(pdf_to_svg('test/data/hello.pdf', 0)) > 0;
+----
+true
+
+# out of range page errors from pdftocairo
+statement error
+SELECT pdf_to_svg('test/data/hello.pdf', 99999);
+----
+Wrong page range
+
+statement error
+SELECT pdf_to_svg('test/data/hello.pdf', 2);
+----
+Wrong page range
+
+# first_page last_page also on words/lines
+query I
+SELECT COUNT(*) = 0 FROM read_pdf_lines('test/data/two_pages.pdf', first_page := 99, last_page := 100, auto_ocr := false);
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM read_pdf_words('test/data/two_pages.pdf', last_page := 1, auto_ocr := false);
+----
+true

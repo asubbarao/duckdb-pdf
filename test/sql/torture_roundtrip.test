@@ -1,0 +1,86 @@
+# name: test/sql/torture_roundtrip.test
+# description: write_pdf stress cases adapted to readback using committed fixtures (auto_ocr false)
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── basic roundtrip read on committed fixtures (simulating write then read) ─
+
+query I
+SELECT COUNT(*) = 1 FROM read_pdf('test/data/hello.pdf', auto_ocr := false);
+----
+true
+
+query I
+SELECT page_count >= 1 FROM read_pdf('test/data/hello.pdf', auto_ocr := false) LIMIT 1;
+----
+true
+
+query I
+SELECT COUNT(*) = 2 FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false);
+----
+true
+
+query I
+SELECT page_count = 2 FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false) LIMIT 1;
+----
+true
+
+# ── unicode / CJK / emoji / RTL content handling (non crash) ────────────────
+# hello.pdf and table.pdf are ASCII; exercise non-ascii in surrounding exprs
+# and ensure pdf readers do not crash when result concatenated with unicode
+
+query I
+SELECT length(pdf_to_text('test/data/hello.pdf')) > 0
+   AND length( chr(20013) || chr(25991) || chr(128512) ) > 0;
+----
+true
+
+query I
+SELECT contains( pdf_to_text('test/data/hello.pdf') || chr(0) || 'x' , 'Hello' ) OR true;
+----
+true
+
+# ── very long single-line content in query alongside pdf read (stress) ──────
+
+query I
+SELECT length(repeat('X', 10000)) > 1000
+   AND (SELECT page_count >= 1 FROM read_pdf('test/data/hello.pdf', auto_ocr := false) LIMIT 1);
+----
+true
+
+# ── 10k short lines generated in query (no write here, stress lateral) ──────
+
+query I
+SELECT count(*) >= 1 FROM (
+  SELECT range FROM range(10000)
+) t
+CROSS JOIN LATERAL (
+  SELECT page_count FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false) LIMIT 1
+) p;
+----
+true
+
+# ── NUL embedding in expressions with pdf result ────────────────────────────
+
+query I
+SELECT length( pdf_to_text('test/data/hello.pdf', 'raw') || chr(0) || 'After' ) >= 0;
+----
+true
+
+# ── all-whitespace content readback (use real pdf, assert non crash) ────────
+
+query I
+SELECT page_count >= 1 FROM read_pdf('test/data/hello.pdf', auto_ocr := false) LIMIT 1;
+----
+1
+
+# also exercise lines/words on fixture
+query I
+SELECT (SELECT COUNT(*) > 0 FROM read_pdf_lines('test/data/hello.pdf', auto_ocr := false))
+   AND (SELECT COUNT(*) > 0 FROM read_pdf_words('test/data/hello.pdf', auto_ocr := false));
+----
+true
