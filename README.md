@@ -235,6 +235,34 @@ SELECT page, text FROM read_pdf('out.pdf');
 
 (Note: each result row is emitted as one text line with columns space-separated; Helvetica 10pt, word-wrapped + paginated exactly as `write_pdf`.)
 
+## Markdown extraction (layout mode)
+
+`pdf_to_markdown(path VARCHAR) → VARCHAR` converts a PDF to GitHub-flavoured Markdown
+using only poppler's word-level geometry — no AI, no external tools, fully deterministic
+and local. This is the open-source equivalent of Snowflake's `AI_PARSE_DOCUMENT` LAYOUT
+mode, without the API cost or privacy implications.
+
+```sql
+LOAD pdf;
+
+-- Convert a PDF to Markdown (headings, bold, bullets, pipe tables detected automatically)
+SELECT pdf_to_markdown('report.pdf');
+
+-- Pipeline: extract structured markdown then parse it further in SQL
+SELECT * FROM (
+    SELECT pdf_to_markdown('report.pdf') AS md
+) WHERE contains(md, '# ');
+```
+
+**What it detects:**
+- **Headings**: lines whose font size is ≥ 1.15× the body font size; level assigned by descending size rank (`#`, `##`, `###`, `####`).
+- **Tables**: aligned word columns detected by `ReconstructPageGrid`; emitted as GitHub pipe tables with a header-separator row.
+- **Bold spans**: consecutive words whose font name contains "Bold" wrapped in `**...**`.
+- **Lists**: lines starting with `-`, `*`, `•`, `◦`, or `^[0-9]+\.` converted to Markdown list items.
+- **Paragraphs**: consecutive same-indent body lines merged into one paragraph block; blank lines between blocks.
+
+Pages are joined with `\n\n`. NULL input → NULL output. Missing or encrypted PDFs raise an error.
+
 ## Saving / converting documents to PDF
 
 The reading functions above go *from* a PDF. To go the other way — turn a
