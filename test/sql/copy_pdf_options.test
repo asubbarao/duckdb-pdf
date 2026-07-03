@@ -71,6 +71,55 @@ COPY (SELECT 'DEFREG_MARKER' AS c) TO '__TEST_DIR__/copy_opts_def.pdf' (FORMAT p
 
 query I
 SELECT contains(pdf_to_text('__TEST_DIR__/copy_opts_def.pdf'), 'DEFREG_MARKER')
-   AND (SELECT page_count FROM read_pdf('__TEST_DIR__/copy_opts_def.pdf', auto_ocr := false) LIMIT 1) >= 1;
+   AND (SELECT page_count FROM read_pdf('__TEST_DIR__/copy_opts_def.pdf', auto_ocr := false) LIMIT 1) = 1;
+----
+true
+
+# --- HEADER coverage + multi-page per-page header/footer ---
+statement ok
+COPY (SELECT repeat('multi page filler content for header footer verification. ', 200) AS c)
+TO '__TEST_DIR__/copy_opts_hf2.pdf' (FORMAT pdf, HEADER 'HeadMarker7', FOOTER 'FootMarker7', USE_TMP_FILE false);
+
+# doc spans multiple pages and BOTH markers appear on EVERY page
+query I
+SELECT (SELECT max(page_count) FROM read_pdf('__TEST_DIR__/copy_opts_hf2.pdf', auto_ocr := false)) >= 2
+   AND bool_and(contains(text, 'HeadMarker7') AND contains(text, 'FootMarker7'))
+FROM read_pdf('__TEST_DIR__/copy_opts_hf2.pdf', auto_ocr := false);
+----
+true
+
+# --- {page} placeholder in footer (poppler text extraction drops the space: assert 'p1'/'p2') ---
+statement ok
+COPY (SELECT repeat('pagination filler for the page placeholder test. ', 200) AS c)
+TO '__TEST_DIR__/copy_opts_pageno.pdf' (FORMAT pdf, FOOTER 'p {page}', USE_TMP_FILE false);
+
+query I
+SELECT contains((SELECT text FROM read_pdf('__TEST_DIR__/copy_opts_pageno.pdf', auto_ocr := false) WHERE page = 1), 'p1')
+   AND contains((SELECT text FROM read_pdf('__TEST_DIR__/copy_opts_pageno.pdf', auto_ocr := false) WHERE page = 2), 'p2');
+----
+true
+
+# --- LEGAL page size ---
+statement ok
+COPY (SELECT 'legal size probe' AS c) TO '__TEST_DIR__/copy_opts_legal.pdf' (FORMAT pdf, PAGE_SIZE 'legal', USE_TMP_FILE false);
+
+query I
+SELECT round(width) = 612 AND round(height) = 1008
+FROM read_pdf('__TEST_DIR__/copy_opts_legal.pdf', auto_ocr := false);
+----
+true
+
+# --- MARGIN has an observable layout effect: bigger margin => more pages for same content ---
+statement ok
+COPY (SELECT repeat('margin effect filler content words here. ', 150) AS c)
+TO '__TEST_DIR__/copy_opts_m20.pdf' (FORMAT pdf, MARGIN 20, USE_TMP_FILE false);
+
+statement ok
+COPY (SELECT repeat('margin effect filler content words here. ', 150) AS c)
+TO '__TEST_DIR__/copy_opts_m150.pdf' (FORMAT pdf, MARGIN 150, USE_TMP_FILE false);
+
+query I
+SELECT (SELECT max(page_count) FROM read_pdf('__TEST_DIR__/copy_opts_m150.pdf', auto_ocr := false))
+     > (SELECT max(page_count) FROM read_pdf('__TEST_DIR__/copy_opts_m20.pdf', auto_ocr := false));
 ----
 true
