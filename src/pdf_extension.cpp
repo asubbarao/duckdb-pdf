@@ -1446,6 +1446,13 @@ static string TempDir() {
 // and pdf_to_png (to return raw BLOB). Exact same render hints, UUID naming, TempFileGuard,
 // image::save + binary read + magic validation as the original pdf_to_svg path.
 static string RenderPageToPngBytes(poppler::document &doc, int32_t page_no, int32_t dpi, const string &fn_name) {
+	// poppler's page_renderer is not guaranteed thread-safe across documents on
+	// all platforms (observed: nondeterministic renders on Windows when UNION ALL
+	// branches rasterize concurrently). Rendering is heavyweight anyway, so a
+	// global mutex around the rasterize+encode step costs nothing measurable.
+	static std::mutex render_mutex;
+	std::lock_guard<std::mutex> render_lock(render_mutex);
+
 	unique_ptr<poppler::page> page(doc.create_page(page_no - 1));
 	if (!page) {
 		throw IOException("%s: could not read page %d", fn_name.c_str(), (int)page_no);
