@@ -7,13 +7,17 @@ require pdf
 statement ok
 PRAGMA enable_verification
 
-# ── ocr_dpi extremes (no OCR triggered so accepted; no range error in current) ─
+# ── ocr_dpi extremes are range-validated (1–2400) even when OCR never fires ──
 
-statement ok
+statement error
 SELECT * FROM read_pdf('test/data/hello.pdf', ocr_dpi := 0, auto_ocr := false);
+----
+ocr_dpi must be between 1 and 2400
 
-statement ok
+statement error
 SELECT * FROM read_pdf('test/data/hello.pdf', ocr_dpi := 2401, auto_ocr := false);
+----
+ocr_dpi must be between 1 and 2400
 
 # extreme low dpi with auto_ocr false still ok
 statement ok
