@@ -46,6 +46,7 @@ The `pdf` extension exposes eight functions covering the full range of PDF extra
 | `pdf_to_html` | Scalar | Convert PDF to absolutely-positioned HTML (BLOB and path overloads; path uses DuckDB VFS). |
 | `pdf_to_xml` | Scalar | Convert PDF to pdftoxml-style XML with per-word bboxes (BLOB and path; VFS for paths). |
 | `pdf_to_svg` | Scalar | Render a page of the PDF to an SVG embedding a base64 PNG raster (BLOB and path; VFS for paths). |
+| `pdf_to_png` | Scalar | Render a page of the PDF to PNG bytes returned as BLOB (BLOB and path; VFS for paths). |
 | `write_pdf` | Scalar | **Native** (no LibreOffice) write of VARCHAR content to a PDF file using libharu (Letter, Helvetica 10pt, word-wrap + paginate). Returns the output path. |
 | `to_pdf` | Scalar | Convert an office/markup document (docx, odt, rtf, html, pptx, xlsx, ...) **to** a PDF via LibreOffice (runtime shell-out). Only needed for rich document conversion. |
 
@@ -191,7 +192,7 @@ WHERE pdf_to_text(f.filename) ILIKE '%quarterly earnings%';
 
 **Path-based scalars now support DuckDB VFS:** `pdf_to_text('s3://...')`, `pdf_to_html('https://...')` etc. work when the `httpfs` (or other VFS) extension is loaded, because all path scalars now use `ReadAllBytes` (DuckDB FileSystem) + in-memory poppler load.
 
-**BLOB overloads:** all four (`pdf_to_text`/`html`/`xml`/`svg` and their variants) accept `BLOB` for direct bytes input (no FS involved).
+**BLOB overloads:** all five (`pdf_to_text`/`html`/`xml`/`svg`/`png` and their variants) accept `BLOB` for direct bytes input (no FS involved).
 
 ```sql
 LOAD pdf;
@@ -202,6 +203,24 @@ FROM read_blob('s3://my-bucket/doc.pdf');   -- works with httpfs loaded
 -- BLOB column roundtrip
 SELECT pdf_to_text(content) FROM read_blob('local.pdf');
 ```
+
+### `pdf_to_png` — page raster as PNG BLOB
+
+`pdf_to_png(path, page[, dpi])` and the BLOB overload render a page exactly like the raster step of `pdf_to_svg` but return the raw PNG bytes as a `BLOB` (no SVG wrapper). Default DPI is 150; valid range 1–2400. Use for thumbnails, embedding, or feeding image tools.
+
+```sql
+LOAD pdf;
+
+-- Typical usage: inspect size or feed downstream
+SELECT octet_length(pdf_to_png('report.pdf', 1)) AS png_bytes;
+
+-- DPI controls output size (higher = larger raster)
+SELECT
+    octet_length(pdf_to_png('report.pdf', 1, 72))  AS small,
+    octet_length(pdf_to_png('report.pdf', 1, 300)) AS large;
+```
+
+BLOBs from `pdf_to_png` can be written out-of-band (e.g. via application code or `COPY` + post-processing) since DuckDB's `COPY` for BLOB columns performs text/CSV serialization.
 
 ## Writing PDFs natively (no LibreOffice)
 
