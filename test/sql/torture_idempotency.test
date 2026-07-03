@@ -1,5 +1,5 @@
 # name: test/sql/torture_idempotency.test
-# description: repeated calls (50x) to scalars and table functions for accumulation crash smoke test
+# description: repeated calls to scalars (50x correlated lateral) and table functions (UNION ALL of distinct paths) for accumulation crash smoke test
 # group: [sql]
 
 require pdf
@@ -14,12 +14,27 @@ SELECT count(*) FROM range(50) t, lateral (SELECT pdf_to_text(concat('test/data/
 ----
 50
 
-# ── table function scanned 50 times ─────────────────────────────────────────
+# ── table function bound+executed 12x via UNION ALL of distinct literal paths ─
+# (lateral correlation is binder-rejected for table functions; UNION ALL
+#  branches each bind+execute separately — result-level multiplicity proof)
 
 query I
-SELECT count(*) FROM range(50) t, lateral (SELECT count(*) AS n, t.range AS r FROM read_pdf('test/data/hello.pdf', auto_ocr := false)) s WHERE s.n >= 0;
+SELECT count(DISTINCT filename) = 4 AND count(*) = 15 FROM (
+  SELECT filename FROM read_pdf('test/data/hello.pdf', auto_ocr := false)
+  UNION ALL SELECT filename FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false)
+  UNION ALL SELECT filename FROM read_pdf('test/data/table.pdf', auto_ocr := false)
+  UNION ALL SELECT filename FROM read_pdf('test/data/scanned.pdf', auto_ocr := false)
+  UNION ALL SELECT filename FROM read_pdf('test/data/hello.pdf', auto_ocr := false)
+  UNION ALL SELECT filename FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false)
+  UNION ALL SELECT filename FROM read_pdf('test/data/table.pdf', auto_ocr := false)
+  UNION ALL SELECT filename FROM read_pdf('test/data/scanned.pdf', auto_ocr := false)
+  UNION ALL SELECT filename FROM read_pdf('test/data/hello.pdf', auto_ocr := false)
+  UNION ALL SELECT filename FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false)
+  UNION ALL SELECT filename FROM read_pdf('test/data/table.pdf', auto_ocr := false)
+  UNION ALL SELECT filename FROM read_pdf('test/data/scanned.pdf', auto_ocr := false)
+) u;
 ----
-50
+true
 
 # ── pdf_to_xml 50 times (markdown analog) ───────────────────────────────────
 
@@ -28,12 +43,32 @@ SELECT count(*) FROM range(50) t, lateral (SELECT pdf_to_xml(concat('test/data/h
 ----
 50
 
-# ── mix lines + words repeated ──────────────────────────────────────────────
+# ── lines + words each bound+executed 9x via UNION ALL of distinct paths ─────
+# (scanned.pdf excluded: yields 0 rows from lines/words, filename never appears)
 
 query I
-SELECT count(*) FROM range(10) t,
-  lateral (SELECT count(*) AS lw, t.range AS r1 FROM read_pdf_lines('test/data/two_pages.pdf', auto_ocr := false)) l,
-  lateral (SELECT count(*) AS ww, t.range AS r2 FROM read_pdf_words('test/data/two_pages.pdf', auto_ocr := false)) w
-WHERE l.lw > 0 AND w.ww > 0;
+SELECT l.dl = 3 AND l.nl = 84 AND w.dw = 3 AND w.nw = 117 FROM
+  (SELECT count(DISTINCT filename) AS dl, count(*) AS nl FROM (
+    SELECT filename FROM read_pdf_lines('test/data/hello.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_lines('test/data/two_pages.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_lines('test/data/table.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_lines('test/data/hello.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_lines('test/data/two_pages.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_lines('test/data/table.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_lines('test/data/hello.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_lines('test/data/two_pages.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_lines('test/data/table.pdf', auto_ocr := false)
+  )) l,
+  (SELECT count(DISTINCT filename) AS dw, count(*) AS nw FROM (
+    SELECT filename FROM read_pdf_words('test/data/hello.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_words('test/data/two_pages.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_words('test/data/table.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_words('test/data/hello.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_words('test/data/two_pages.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_words('test/data/table.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_words('test/data/hello.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_words('test/data/two_pages.pdf', auto_ocr := false)
+    UNION ALL SELECT filename FROM read_pdf_words('test/data/table.pdf', auto_ocr := false)
+  )) w;
 ----
-10
+true
