@@ -39,22 +39,22 @@ could not open
 statement error
 SELECT pdf_to_text('__TEST_DIR__/zero.pdf');
 ----
-Syntax Error
+could not open
 
 statement error
 SELECT pdf_to_html('__TEST_DIR__/zero.pdf');
 ----
-Syntax Error
+could not open
 
 statement error
 SELECT pdf_to_xml('__TEST_DIR__/zero.pdf');
 ----
-Syntax Error
+could not open
 
 statement error
 SELECT pdf_to_svg('__TEST_DIR__/zero.pdf', 1);
 ----
-Syntax Error
+could not open
 
 # ── text file renamed .pdf (committed fixture) ──────────────────────────────
 
@@ -76,27 +76,27 @@ could not open
 statement error
 SELECT * FROM read_pdf_tables('test/data/text_as_pdf.pdf');
 ----
-Syntax Error
+could not open
 
 statement error
 SELECT pdf_to_text('test/data/text_as_pdf.pdf');
 ----
-Syntax Error
+could not open
 
 statement error
 SELECT pdf_to_html('test/data/text_as_pdf.pdf');
 ----
-Syntax Error
+could not open
 
 statement error
 SELECT pdf_to_xml('test/data/text_as_pdf.pdf');
 ----
-Syntax Error
+could not open
 
 statement error
 SELECT pdf_to_svg('test/data/text_as_pdf.pdf', 1);
 ----
-Syntax Error
+could not open
 
 # ── truncated PDF (committed partial bytes of hello) ────────────────────────
 
@@ -120,7 +120,7 @@ could not open
 statement error
 SELECT length(pdf_to_xml('test/data/garbage_header.pdf')) > 0;
 ----
-Syntax Error
+could not open
 
 # ── nonexistent path ────────────────────────────────────────────────────────
 
@@ -152,7 +152,7 @@ open file
 statement error
 SELECT pdf_to_svg('test/data/does_not_exist_98765.pdf', 1);
 ----
-open file
+could not open
 
 # ── directory as path ───────────────────────────────────────────────────────
 
