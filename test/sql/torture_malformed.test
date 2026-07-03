@@ -159,22 +159,22 @@ could not open
 statement error
 SELECT * FROM read_pdf('test/data');
 ----
-Is a directory
+test/data
 
 statement error
 SELECT * FROM read_pdf_lines('test/data');
 ----
-Is a directory
+test/data
 
 statement error
 SELECT count(*) FROM read_pdf_words('test/data');
 ----
-Is a directory
+test/data
 
 statement error
 SELECT * FROM read_pdf_tables('test/data');
 ----
-Is a directory
+test/data
 
 statement error
 SELECT length(pdf_to_html('test/data')) > 0;

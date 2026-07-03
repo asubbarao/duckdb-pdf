@@ -1,3 +1,6 @@
+# name: test/sql/pdf_blob.test
+# group: [sql]
+
 # pdf_blob.test — BLOB overloads + VFS refactor regression
 # Verifies: BLOB input to pdf_to_text/html/xml/svg, roundtrip via read_blob,
 #            and that path-based scalars still work (VFS refactor regression).
