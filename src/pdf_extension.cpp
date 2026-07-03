@@ -4,6 +4,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
@@ -393,8 +394,11 @@ static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &lang
 	             img.bytes_per_row());
 
 	int rec = api.Recognize(0);
-	// rec==0 success; non-zero may still yield iterator words, so proceed.
-
+	if (rec != 0) {
+		// recognition failed; fall back cleanly to no words (avoid partial/broken results)
+		api.End();
+		return {};
+	}
 	tesseract::ResultIterator *ri = api.GetIterator();
 	std::vector<OcrWord> result;
 	if (ri) {
@@ -791,15 +795,22 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 	}
 	unique_ptr<poppler::page> page(g.doc->create_page(g.page_idx));
 	if (page) {
-		g.boxes = page->text_list(poppler::page::text_list_include_font);
-		if (!g.boxes.empty()) {
-			g.page_is_ocr = false;
-		} else if (opt.force_ocr || opt.auto_ocr) {
+		if (opt.force_ocr) {
+			// force_ocr runs OCR unconditionally, even if native text layer present
 			g.ocr_boxes =
 			    OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem, opt.tessdata_dir);
 			g.page_is_ocr = !g.ocr_boxes.empty();
 		} else {
-			g.page_is_ocr = false;
+			g.boxes = page->text_list(poppler::page::text_list_include_font);
+			if (!g.boxes.empty()) {
+				g.page_is_ocr = false;
+			} else if (opt.auto_ocr) {
+				g.ocr_boxes =
+				    OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem, opt.tessdata_dir);
+				g.page_is_ocr = !g.ocr_boxes.empty();
+			} else {
+				g.page_is_ocr = false;
+			}
 		}
 	}
 	return true;
@@ -1030,8 +1041,12 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 		try {
 			ReadAllBytes(context, f, bytes);
 			doc = LoadDoc(bytes, bind.opt.password, f);
-		} catch (std::exception &e) {
-			throw InvalidInputException("read_pdf_tables: %s", e.what());
+		} catch (const std::exception &e) {
+			// unwrap duckdb exceptions (their .what() is JSON) to expose the clean inner message
+			// e.g. "read_pdf_tables: read_pdf: could not open '...'"
+			ErrorData ed(e);
+			string msg = ed.HasError() ? ed.RawMessage() : string(e.what());
+			throw InvalidInputException("read_pdf_tables: %s", msg.c_str());
 		}
 		int page_count = doc->pages();
 		int first0 = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
@@ -1045,17 +1060,8 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 				continue;
 			}
 			std::vector<PdfWord> words;
-			for (auto &b : page->text_list()) {
-				auto r = b.bbox();
-				PdfWord w;
-				w.xMin = r.x();
-				w.yMin = r.y();
-				w.xMax = r.x() + r.width();
-				w.yMax = r.y() + r.height();
-				w.text = UStringToUtf8(b.text());
-				words.push_back(std::move(w));
-			}
-			if (words.empty() && (bind.opt.force_ocr || bind.opt.auto_ocr)) {
+			if (bind.opt.force_ocr) {
+				// force_ocr runs OCR unconditionally (bypasses native text layer)
 				auto ocr_words = OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
 				                              bind.opt.ocr_oem, bind.opt.tessdata_dir);
 				for (auto &ow : ocr_words) {
@@ -1066,6 +1072,30 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 					w.yMax = ow.y1;
 					w.text = ow.text;
 					words.push_back(std::move(w));
+				}
+			} else {
+				for (auto &b : page->text_list()) {
+					auto r = b.bbox();
+					PdfWord w;
+					w.xMin = r.x();
+					w.yMin = r.y();
+					w.xMax = r.x() + r.width();
+					w.yMax = r.y() + r.height();
+					w.text = UStringToUtf8(b.text());
+					words.push_back(std::move(w));
+				}
+				if (words.empty() && bind.opt.auto_ocr) {
+					auto ocr_words = OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
+					                              bind.opt.ocr_oem, bind.opt.tessdata_dir);
+					for (auto &ow : ocr_words) {
+						PdfWord w;
+						w.xMin = ow.x0;
+						w.yMin = ow.y0;
+						w.xMax = ow.x1;
+						w.yMax = ow.y1;
+						w.text = ow.text;
+						words.push_back(std::move(w));
+					}
 				}
 			}
 			auto grid = ReconstructPageGrid(std::move(words));
@@ -2288,7 +2318,7 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 	for (int p = 0; p < n; p++) {
 		if (p > 0)
 			out += "\n\n";
-		auto page_words = pages_words[p];
+		auto page_words = std::move(pages_words[p]);
 		if (page_words.empty())
 			continue;
 
@@ -2379,32 +2409,14 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 		}
 		auto grid = ReconstructPageGrid(pw_vec);
 		std::vector<std::pair<double, double>> table_zones;
-		if (!grid.empty()) {
-			std::vector<string> tblt;
-			for (const auto &rw : grid) {
-				for (const auto &cl : rw) {
-					if (cl.empty())
-						continue;
-					bool dup = false;
-					for (const auto &t : tblt) {
-						if (t == cl) {
-							dup = true;
-							break;
-						}
-					}
-					if (!dup)
-						tblt.push_back(cl);
-				}
-			}
+		// geometric y-range from the words of the detected table block (pw_vec);
+		// a prose line is suppressed iff its y-interval overlaps a table zone.
+		// (no text-value matching of cell contents)
+		if (!pw_vec.empty()) {
 			double gy0 = 1e9, gy1 = -1e9;
-			for (const auto &w : page_words) {
-				for (const auto &t : tblt) {
-					if (w.text == t) {
-						gy0 = std::min(gy0, w.yMin);
-						gy1 = std::max(gy1, w.yMax);
-						break;
-					}
-				}
+			for (const auto &w : pw_vec) {
+				gy0 = std::min(gy0, w.yMin);
+				gy1 = std::max(gy1, w.yMax);
 			}
 			if (gy0 < 1e8) {
 				table_zones.emplace_back(gy0, gy1);
