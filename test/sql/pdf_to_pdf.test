@@ -11,19 +11,20 @@ PRAGMA enable_verification
 #
 # When no LibreOffice converter is available, to_pdf must fail loudly with an
 # actionable message naming LibreOffice — never silently. This is the default
-# CI path: CI runners have no soffice, so the error path is what gets exercised.
-# (The positive conversion path is gated behind LIBREOFFICE_PATH below, the same
-# way the OCR suite gates on TESSDATA_PREFIX.)
+# Missing input errors BEFORE LibreOffice is ever resolved or launched — this
+# keeps the error path spawn-free on machines that DO have LibreOffice (a
+# headless soffice launch per call bounces the macOS Dock) and makes the test
+# uniform on CI runners that have no soffice at all.
 
 statement error
 SELECT to_pdf('test/data/does_not_exist.docx');
 ----
-LibreOffice
+does not exist
 
 statement error
 SELECT to_pdf('test/data/does_not_exist.docx', '/tmp/out.pdf');
 ----
-LibreOffice
+does not exist
 
 # ── positive path (opt-in; only runs when LibreOffice is wired up) ─────────
 #

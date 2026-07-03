@@ -1716,6 +1716,12 @@ static int RunCapture(const string &cmd, string &output) {
 // move the produced file to `output_path`. A unique per-call user-profile dir
 // avoids the "another LibreOffice instance is running" lock.
 static string ConvertToPdf(const string &input_path, const string &output_path) {
+	{
+		std::ifstream input_check(input_path.c_str(), std::ios::binary);
+		if (!input_check.good()) {
+			throw IOException("to_pdf: input file '%s' does not exist or is not readable", input_path);
+		}
+	}
 	string soffice = ResolveLibreOffice();
 
 #ifdef _WIN32
