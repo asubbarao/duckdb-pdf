@@ -1412,27 +1412,22 @@ static string TempDir() {
 	return ".";
 }
 
-static string DocToSvg(poppler::document &doc, int32_t page_no, int32_t dpi) {
-	int n = doc.pages();
-	if (page_no < 1 || page_no > n) {
-		throw IOException("pdf_to_svg: page %d is out of range (document has %d page%s)", (int)page_no, n,
-		                  n == 1 ? "" : "s");
-	}
-	if (dpi <= 0) {
-		throw InvalidInputException("pdf_to_svg: dpi must be positive (got %d)", (int)dpi);
-	}
+// Shared PNG rasterization + temp-file roundtrip used by BOTH pdf_to_svg (to embed base64 raster)
+// and pdf_to_png (to return raw BLOB). Exact same render hints, UUID naming, TempFileGuard,
+// image::save + binary read + magic validation as the original pdf_to_svg path.
+static string RenderPageToPngBytes(poppler::document &doc, int32_t page_no, int32_t dpi, const string &fn_name) {
 	unique_ptr<poppler::page> page(doc.create_page(page_no - 1));
 	if (!page) {
-		throw IOException("pdf_to_svg: could not read page %d", (int)page_no);
+		throw IOException("%s: could not read page %d", fn_name.c_str(), (int)page_no);
 	}
 
-	// Rasterize the page (same render hints as the OCR path).
+	// Rasterize the page (same render hints as the OCR path and original pdf_to_svg).
 	poppler::page_renderer renderer;
 	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
 	poppler::image img = renderer.render_page(page.get(), dpi, dpi);
 	if (!img.is_valid()) {
-		throw IOException("pdf_to_svg: failed to render page %d", (int)page_no);
+		throw IOException("%s: failed to render page %d", fn_name.c_str(), (int)page_no);
 	}
 
 	// Write the raster to a unique temp file as PNG. image::save() needs a real
@@ -1444,34 +1439,48 @@ static string DocToSvg(poppler::document &doc, int32_t page_no, int32_t dpi) {
 	const char sep = '/';
 #endif
 	string unique = BaseUUID::ToString(UUID::GenerateRandomUUID());
-	string tmp_path = TempDir() + sep + "pdf_to_svg_" + unique + ".png";
+	string tmp_path = TempDir() + sep + fn_name + "_" + unique + ".png";
 	TempFileGuard guard(tmp_path);
 
 	if (!img.save(tmp_path, "png", dpi)) {
 		// poppler returns false if it was built without a PNG writer, or on I/O
 		// failure. Fail loudly — never silently degrade.
-		throw IOException("pdf_to_svg: poppler could not write a PNG for page %d (this poppler build may lack "
+		throw IOException("%s: poppler could not write a PNG for page %d (this poppler build may lack "
 		                  "the PNG image writer)",
-		                  (int)page_no);
+		                  fn_name.c_str(), (int)page_no);
 	}
 
 	// Read the PNG bytes back.
 	std::ifstream in(tmp_path, std::ios::binary);
 	if (!in) {
-		throw IOException("pdf_to_svg: could not reopen rendered PNG for page %d", (int)page_no);
+		throw IOException("%s: could not reopen rendered PNG for page %d", fn_name.c_str(), (int)page_no);
 	}
 	string png((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 	in.close();
 	if (png.size() < 8 || static_cast<unsigned char>(png[0]) != 0x89 || png[1] != 'P' || png[2] != 'N' ||
 	    png[3] != 'G') {
-		throw IOException("pdf_to_svg: rendered output for page %d is not a valid PNG", (int)page_no);
+		throw IOException("%s: rendered output for page %d is not a valid PNG", fn_name.c_str(), (int)page_no);
 	}
+	return png;
+}
+
+static string DocToSvg(poppler::document &doc, int32_t page_no, int32_t dpi) {
+	int n = doc.pages();
+	if (page_no < 1 || page_no > n) {
+		throw IOException("pdf_to_svg: page %d is out of range (document has %d page%s)", (int)page_no, n,
+		                  n == 1 ? "" : "s");
+	}
+	if (dpi <= 0) {
+		throw InvalidInputException("pdf_to_svg: dpi must be positive (got %d)", (int)dpi);
+	}
+	// Delegate the actual raster + temp PNG + read bytes to the shared helper (no duplication).
+	string png = RenderPageToPngBytes(doc, page_no, dpi, "pdf_to_svg");
 
 	// Base64-encode the PNG via DuckDB's blob helper.
 	string b64 = Blob::ToBase64(string_t(png.data(), static_cast<uint32_t>(png.size())));
 
-	// Emit an SVG sized to the page's POINT dimensions; the embedded raster scales
-	// to fill the page box via the viewBox.
+	// We still need a page for the rect; recreate (cheap) or could thread the rect out of helper.
+	unique_ptr<poppler::page> page(doc.create_page(page_no - 1));
 	auto rect = page->page_rect();
 	string w = FmtCoord(rect.width());
 	string h = FmtCoord(rect.height());
@@ -1559,6 +1568,77 @@ static void PdfToSvgBlobDpiFun(DataChunk &args, ExpressionState &state, Vector &
 	    [&](string_t blob, int32_t page_no, int32_t dpi) {
 		    auto handle = LoadBlobDoc("pdf_to_svg", blob.GetDataUnsafe(), blob.GetSize());
 		    return StringVector::AddString(result, DocToSvg(*handle.doc, page_no, dpi));
+	    });
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_to_png(path VARCHAR, page INTEGER[, dpi INTEGER]) -> BLOB
+// pdf_to_png(data BLOB, page INTEGER[, dpi INTEGER]) -> BLOB
+//
+// Real raster render of a single 1-based page to PNG bytes (as BLOB).
+// Reuses LoadRenderDoc/LoadBlobDoc, RenderPageToPngBytes (the exact raster+
+// TempFileGuard+image::save path from pdf_to_svg), and error text conventions.
+// Default dpi matches pdf_to_svg (150). Validation 1..2400 per ocr_dpi style.
+//===--------------------------------------------------------------------===//
+
+static string DocToPng(poppler::document &doc, int32_t page_no, int32_t dpi) {
+	int n = doc.pages();
+	if (page_no < 1 || page_no > n) {
+		throw IOException("pdf_to_png: page %d is out of range (document has %d page%s)", (int)page_no, n,
+		                  n == 1 ? "" : "s");
+	}
+	if (dpi < 1 || dpi > 2400) {
+		throw InvalidInputException("pdf_to_png: dpi must be between 1 and 2400 (got %d)", (int)dpi);
+	}
+	return RenderPageToPngBytes(doc, page_no, dpi, "pdf_to_png");
+}
+
+static string DocToPng(ClientContext &ctx, const string &path, int32_t page_no, int32_t dpi) {
+	auto handle = LoadRenderDoc("pdf_to_png", path, ctx);
+	int n = handle.doc->pages();
+	if (page_no < 1 || page_no > n) {
+		throw IOException("pdf_to_png: page %d is out of range for '%s' (document has %d page%s)", (int)page_no, path,
+		                  n, n == 1 ? "" : "s");
+	}
+	if (dpi < 1 || dpi > 2400) {
+		throw InvalidInputException("pdf_to_png: dpi must be between 1 and 2400 (got %d)", (int)dpi);
+	}
+	return DocToPng(*handle.doc, page_no, dpi);
+}
+
+static void PdfToPngFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	BinaryExecutor::Execute<string_t, int32_t, string_t>(
+	    args.data[0], args.data[1], result, args.size(), [&](string_t path, int32_t page_no) {
+		    auto png = DocToPng(context, path.GetString(), page_no, 150);
+		    return StringVector::AddStringOrBlob(result, string_t(png.data(), static_cast<uint32_t>(png.size())));
+	    });
+}
+static void PdfToPngDpiFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	TernaryExecutor::Execute<string_t, int32_t, int32_t, string_t>(
+	    args.data[0], args.data[1], args.data[2], result, args.size(),
+	    [&](string_t path, int32_t page_no, int32_t dpi) {
+		    auto png = DocToPng(context, path.GetString(), page_no, dpi);
+		    return StringVector::AddStringOrBlob(result, string_t(png.data(), static_cast<uint32_t>(png.size())));
+	    });
+}
+
+static void PdfToPngBlobFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	BinaryExecutor::Execute<string_t, int32_t, string_t>(
+	    args.data[0], args.data[1], result, args.size(), [&](string_t blob, int32_t page_no) {
+		    auto handle = LoadBlobDoc("pdf_to_png", blob.GetDataUnsafe(), blob.GetSize());
+		    auto png = DocToPng(*handle.doc, page_no, 150);
+		    return StringVector::AddStringOrBlob(result, string_t(png.data(), static_cast<uint32_t>(png.size())));
+	    });
+}
+static void PdfToPngBlobDpiFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	TernaryExecutor::Execute<string_t, int32_t, int32_t, string_t>(
+	    args.data[0], args.data[1], args.data[2], result, args.size(),
+	    [&](string_t blob, int32_t page_no, int32_t dpi) {
+		    auto handle = LoadBlobDoc("pdf_to_png", blob.GetDataUnsafe(), blob.GetSize());
+		    auto png = DocToPng(*handle.doc, page_no, dpi);
+		    return StringVector::AddStringOrBlob(result, string_t(png.data(), static_cast<uint32_t>(png.size())));
 	    });
 }
 
@@ -2589,6 +2669,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_to_svg_set.AddFunction(ScalarFunction({LogicalType::BLOB, LogicalType::INTEGER, LogicalType::INTEGER},
 	                                          LogicalType::VARCHAR, PdfToSvgBlobDpiFun));
 	loader.RegisterFunction(pdf_to_svg_set);
+
+	ScalarFunctionSet pdf_to_png_set("pdf_to_png");
+	pdf_to_png_set.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::BLOB, PdfToPngFun));
+	pdf_to_png_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER},
+	                                          LogicalType::BLOB, PdfToPngDpiFun));
+	pdf_to_png_set.AddFunction(
+	    ScalarFunction({LogicalType::BLOB, LogicalType::INTEGER}, LogicalType::BLOB, PdfToPngBlobFun));
+	pdf_to_png_set.AddFunction(ScalarFunction({LogicalType::BLOB, LogicalType::INTEGER, LogicalType::INTEGER},
+	                                          LogicalType::BLOB, PdfToPngBlobDpiFun));
+	loader.RegisterFunction(pdf_to_png_set);
 
 	ScalarFunctionSet to_pdf_set("to_pdf");
 	to_pdf_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, ToPdfFun));
