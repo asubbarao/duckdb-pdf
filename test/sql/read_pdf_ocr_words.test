@@ -113,7 +113,6 @@ true
 
 # C. force_ocr overrides native text layer (hello.pdf has text) — must yield source='ocr'
 # Gated on TESSDATA_PREFIX (CI has none). Uses ocr:=true (force).
-require-env TESSDATA_PREFIX
 
 query I
 SELECT count(*) > 0
