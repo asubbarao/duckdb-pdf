@@ -174,14 +174,14 @@ Is a directory
 statement error
 SELECT * FROM read_pdf_tables('test/data');
 ----
-May not be a PDF
+Is a directory
 
 statement error
 SELECT length(pdf_to_html('test/data')) > 0;
 ----
-May not be a PDF
+could not open
 
 statement error
 SELECT pdf_to_svg('test/data', 1);
 ----
-May not be a PDF
+could not open
