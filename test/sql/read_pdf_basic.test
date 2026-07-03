@@ -29,13 +29,13 @@ SELECT page_count FROM read_pdf('test/data/hello.pdf');
 
 # filename column reflects the path
 query I
-SELECT filename ILIKE '%hello.pdf' FROM read_pdf('test/data/hello.pdf');
+SELECT contains(lower(filename), 'hello.pdf') FROM read_pdf('test/data/hello.pdf');
 ----
 true
 
 # text column contains the expected content
 query I
-SELECT text ILIKE '%Hello DuckDB%' FROM read_pdf('test/data/hello.pdf');
+SELECT contains(lower(text), 'hello duckdb') FROM read_pdf('test/data/hello.pdf');
 ----
 true
 
@@ -61,13 +61,13 @@ SELECT COUNT(*) FROM read_pdf('test/data/two_pages.pdf') WHERE page_count = 2;
 
 # Page 1 text contains "Alpha"
 query I
-SELECT text ILIKE '%Alpha%' FROM read_pdf('test/data/two_pages.pdf') WHERE page = 1;
+SELECT contains(lower(text), 'alpha') FROM read_pdf('test/data/two_pages.pdf') WHERE page = 1;
 ----
 true
 
 # Page 2 text contains "Beta"
 query I
-SELECT text ILIKE '%Beta%' FROM read_pdf('test/data/two_pages.pdf') WHERE page = 2;
+SELECT contains(lower(text), 'beta') FROM read_pdf('test/data/two_pages.pdf') WHERE page = 2;
 ----
 true
 

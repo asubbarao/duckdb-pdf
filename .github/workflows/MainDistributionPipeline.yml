@@ -29,4 +29,5 @@ jobs:
       duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
       extension_name: pdf
-      format_checks: 'format;tidy'
+      # disable 'tidy' (format_checks) because tidy-check container has no poppler-cpp for pkg-config REQUIRED in CMakeLists.txt
+      format_checks: 'format'

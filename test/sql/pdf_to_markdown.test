@@ -39,10 +39,9 @@ true
 
 # ── fixture: bold span ───────────────────────────────────────────────────────
 
-# The inline bold word "important" is wrapped in **
+# The inline bold text "important" (from gen_markdown_fixture.c) must be exactly **important**
 query I
-SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '**important**')
-    OR contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '**important');
+SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '**important**');
 ----
 true
 
