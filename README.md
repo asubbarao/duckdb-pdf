@@ -252,6 +252,36 @@ SELECT page, text FROM read_pdf('out.pdf');
 
 (Note: each result row is emitted as one text line with columns space-separated; Helvetica 10pt, word-wrapped + paginated exactly as `write_pdf`.)
 
+### COPY options (FORMAT pdf)
+
+Supported options (case-insensitive):
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| TITLE | VARCHAR | (none) | Sets PDF document metadata Title. |
+| AUTHOR | VARCHAR | (none) | Sets PDF document metadata Author. |
+| FONT_SIZE | DOUBLE | 10 | Body font size in points (4..72). |
+| PAGE_SIZE | VARCHAR | 'letter' | 'letter', 'a4' or 'legal'. |
+| MARGIN | DOUBLE | 54 | Margin in points (0..216). |
+| HEADER | VARCHAR | (none) | Centered line at top margin band of every page (uses font_size-2, min 6). |
+| FOOTER | VARCHAR | (none) | Centered line at bottom margin band of every page (supports literal `{page}` placeholder). |
+
+If HEADER or FOOTER is supplied, MARGIN must be >=24 (to fit in band).
+
+Example:
+
+```sql
+LOAD pdf;
+COPY (SELECT * FROM my_query)
+TO 'report.pdf' (FORMAT pdf,
+                 TITLE 'Q3 Report',
+                 AUTHOR 'Alok',
+                 PAGE_SIZE 'a4',
+                 FONT_SIZE 11,
+                 HEADER 'ACME Internal',
+                 FOOTER 'confidential - page {page}');
+```
+
 ## Markdown extraction (layout mode)
 
 `pdf_to_markdown(path VARCHAR) → VARCHAR` converts a PDF to GitHub-flavoured Markdown

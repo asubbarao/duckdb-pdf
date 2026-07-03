@@ -1897,10 +1897,22 @@ static std::vector<string> WrapLine(HPDF_Page page, const string &line, double m
 	return out;
 }
 
-// Core text->PDF renderer using libharu (Letter, Helvetica 10pt, wrap/paginate).
+struct PdfWriteOptions {
+	string title;
+	string author;
+	string header;
+	string footer;
+	double font_size = 10.0;
+	string page_size = "letter";
+	double margin = 54.0;
+};
+
+// Core text->PDF renderer using libharu.
 // Extracted so both write_pdf scalar AND the COPY (FORMAT pdf) CopyFunction
 // finalize can use exactly the same logic with no behavior divergence.
-static void RenderTextToPdf(const string &content, const string &output_path) {
+// Defaults (letter/10pt/54pt/no meta/hf) exactly reproduce prior behavior for BWC.
+static void RenderTextToPdf(const string &content, const string &output_path,
+                            const PdfWriteOptions &opts = PdfWriteOptions()) {
 	HpdfError err_ctx;
 	HPDF_Doc pdf = HPDF_New(HpdfErrorHandler, &err_ctx);
 	if (!pdf) {
@@ -1909,25 +1921,107 @@ static void RenderTextToPdf(const string &content, const string &output_path) {
 	}
 	HpdfDocGuard guard(pdf);
 
-	HPDF_Page page = HPDF_AddPage(pdf);
-	HPDF_STATUS st = HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_LETTER, HPDF_PAGE_PORTRAIT);
-	if (st != HPDF_OK) {
-		throw IOException("write_pdf: HPDF_Page_SetSize(LETTER) failed (status %u).", st);
+	HPDF_STATUS st;
+
+	// Set metadata (for COPY options; write_pdf defaults are empty -> no change)
+	if (!opts.title.empty()) {
+		HPDF_SetInfoAttr(pdf, HPDF_INFO_TITLE, opts.title.c_str());
+	}
+	if (!opts.author.empty()) {
+		HPDF_SetInfoAttr(pdf, HPDF_INFO_AUTHOR, opts.author.c_str());
 	}
 
-	const double MARGIN = 54.0; // 0.75 in
-	const double PAGE_W = 612.0;
-	const double PAGE_H = 792.0;
+	// Resolve page size (support letter/a4/legal); use HPDF_* enums for SetSize, known dims for layout math
+	string ps = StringUtil::Lower(opts.page_size);
+	double PAGE_W;
+	double PAGE_H;
+	HPDF_PageSizes hpdf_size;
+	if (ps == "letter") {
+		PAGE_W = 612.0;
+		PAGE_H = 792.0;
+		hpdf_size = HPDF_PAGE_SIZE_LETTER;
+	} else if (ps == "a4") {
+		PAGE_W = 595.276;
+		PAGE_H = 841.89;
+		hpdf_size = HPDF_PAGE_SIZE_A4;
+	} else if (ps == "legal") {
+		PAGE_W = 612.0;
+		PAGE_H = 1008.0;
+		hpdf_size = HPDF_PAGE_SIZE_LEGAL;
+	} else {
+		// Should be validated upstream for COPY; for safety fall back (keeps BWC for write_pdf default)
+		PAGE_W = 612.0;
+		PAGE_H = 792.0;
+		hpdf_size = HPDF_PAGE_SIZE_LETTER;
+	}
+
+	const double MARGIN = opts.margin;
 	const double TEXT_W = PAGE_W - 2.0 * MARGIN;
 	const double TOP = PAGE_H - MARGIN;
 	const double BOTTOM = MARGIN;
-	const double LINE_H = 14.0; // 10pt + leading
+	const double LINE_H = opts.font_size + 4.0; // preserve 14pt leading at default 10pt
 
 	HPDF_Font font = HPDF_GetFont(pdf, "Helvetica", NULL);
 	if (!font) {
 		throw IOException("write_pdf: HPDF_GetFont('Helvetica') failed.");
 	}
-	HPDF_Page_SetFontAndSize(page, font, 10.0);
+
+	// Header/footer font size (font_size-2, min 6) used inside margin bands
+	auto draw_centered = [&](HPDF_Page p, const string &text, double y, double fs) {
+		if (text.empty())
+			return;
+		HPDF_Page_SetFontAndSize(p, font, fs);
+		double tw = HPDF_Page_TextWidth(p, text.c_str());
+		double x = (PAGE_W - tw) / 2.0;
+		HPDF_STATUS bst = HPDF_Page_BeginText(p);
+		if (bst != HPDF_OK) {
+			throw IOException("write_pdf: HPDF_Page_BeginText failed (status %u).", bst);
+		}
+		bst = HPDF_Page_TextOut(p, x, y, text.c_str());
+		if (bst != HPDF_OK) {
+			throw IOException("write_pdf: HPDF_Page_TextOut failed (status %u).", bst);
+		}
+		bst = HPDF_Page_EndText(p);
+		if (bst != HPDF_OK) {
+			throw IOException("write_pdf: HPDF_Page_EndText failed (status %u).", bst);
+		}
+	};
+
+	int page_num = 0;
+
+	auto create_page = [&](HPDF_Page &pg) {
+		pg = HPDF_AddPage(pdf);
+		page_num++;
+		HPDF_STATUS st = HPDF_Page_SetSize(pg, hpdf_size, HPDF_PAGE_PORTRAIT);
+		if (st != HPDF_OK) {
+			throw IOException("write_pdf: HPDF_Page_SetSize on new page failed (status %u).", st);
+		}
+		HPDF_Page_SetFontAndSize(pg, font, opts.font_size);
+		// draw header inside top margin band (if any)
+		if (!opts.header.empty()) {
+			double hfsz = std::max(6.0, opts.font_size - 2.0);
+			draw_centered(pg, opts.header, PAGE_H - (MARGIN / 2.0), hfsz);
+			HPDF_Page_SetFontAndSize(pg, font, opts.font_size); // restore for body text
+		}
+	};
+
+	auto draw_footer = [&](HPDF_Page pg) {
+		if (opts.footer.empty())
+			return;
+		double hfsz = std::max(6.0, opts.font_size - 2.0);
+		string ftext = opts.footer;
+		// clean optional {page} placeholder support
+		size_t pos = 0;
+		while ((pos = ftext.find("{page}", pos)) != string::npos) {
+			ftext.replace(pos, 6, std::to_string(page_num));
+			pos += 1;
+		}
+		draw_centered(pg, ftext, MARGIN / 2.0, hfsz);
+		HPDF_Page_SetFontAndSize(pg, font, opts.font_size); // restore (harmless if no body after)
+	};
+
+	HPDF_Page page = nullptr;
+	create_page(page);
 
 	double y = TOP;
 
@@ -1941,12 +2035,8 @@ static void RenderTextToPdf(const string &content, const string &output_path) {
 		for (const auto &wline : wrapped) {
 			emitted_any = true;
 			if (y < BOTTOM + LINE_H * 0.5) {
-				page = HPDF_AddPage(pdf);
-				st = HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_LETTER, HPDF_PAGE_PORTRAIT);
-				if (st != HPDF_OK) {
-					throw IOException("write_pdf: HPDF_Page_SetSize on new page failed (status %u).", st);
-				}
-				HPDF_Page_SetFontAndSize(page, font, 10.0);
+				draw_footer(page);
+				create_page(page);
 				y = TOP;
 			}
 			st = HPDF_Page_BeginText(page);
@@ -1965,8 +2055,11 @@ static void RenderTextToPdf(const string &content, const string &output_path) {
 		}
 	}
 
+	// always draw footer on the (last) page; header already drawn at creation
+	draw_footer(page);
+
 	if (!emitted_any) {
-		// empty content: one blank page is already present — valid PDF
+		// empty content: one blank page (with possible header/footer) is already present — valid PDF
 	}
 
 	st = HPDF_SaveToFile(pdf, output_path.c_str());
@@ -2015,6 +2108,7 @@ struct PdfCopyBindData : public TableFunctionData {
 	string file_path;
 	vector<string> column_names;
 	vector<LogicalType> column_types;
+	PdfWriteOptions write_opts;
 };
 
 struct PdfCopyGlobalState : public GlobalFunctionData {
@@ -2026,14 +2120,99 @@ struct PdfCopyLocalState : public LocalFunctionData {
 	string buffer;
 };
 
+static string PdfGetStringOption(const vector<Value> &set, const string &lopt) {
+	if (set.empty()) {
+		return string();
+	}
+	Value v = set[0];
+	if (v.type().id() == LogicalTypeId::LIST) {
+		auto children = ListValue::GetChildren(v);
+		if (children.empty()) {
+			return string();
+		}
+		v = children[0];
+	}
+	if (v.IsNull()) {
+		return string();
+	}
+	if (v.type().id() != LogicalTypeId::VARCHAR) {
+		throw BinderException("\"%s\" expects a string argument", lopt.c_str());
+	}
+	return v.GetValue<string>();
+}
+
+static double PdfGetDoubleOption(const vector<Value> &set, const string &lopt) {
+	if (set.empty()) {
+		throw BinderException("\"%s\" expects a numeric argument", lopt.c_str());
+	}
+	Value v = set[0];
+	if (v.type().id() == LogicalTypeId::LIST) {
+		auto children = ListValue::GetChildren(v);
+		if (children.empty()) {
+			throw BinderException("\"%s\" expects a numeric argument", lopt.c_str());
+		}
+		v = children[0];
+	}
+	if (v.IsNull()) {
+		throw BinderException("\"%s\" expects a numeric argument", lopt.c_str());
+	}
+	try {
+		Value d = v.DefaultCastAs(LogicalType::DOUBLE);
+		return d.GetValue<double>();
+	} catch (...) {
+		throw BinderException("\"%s\" expects a numeric value", lopt.c_str());
+	}
+}
+
 static unique_ptr<FunctionData> PdfCopyBind(ClientContext &context, CopyFunctionBindInput &input,
                                             const vector<string> &names, const vector<LogicalType> &sql_types) {
 	auto result = make_uniq<PdfCopyBindData>();
 	result->file_path = input.info.file_path;
 	result->column_names = names;
 	result->column_types = sql_types;
-	// No custom options supported yet (HEADER etc.); FORMAT pdf alone is sufficient.
-	// Unknown options are ignored for minimal impl (no over-engineering).
+
+	// Parse (case-insensitive keys: DuckDB populates via Lower in places; we Lower explicitly)
+	// Unknown options now throw (house style); previously were silently ignored.
+	for (auto &option : input.info.options) {
+		string loption = StringUtil::Lower(option.first);
+		auto &set = option.second;
+		if (loption == "title") {
+			result->write_opts.title = PdfGetStringOption(set, loption);
+		} else if (loption == "author") {
+			result->write_opts.author = PdfGetStringOption(set, loption);
+		} else if (loption == "header") {
+			result->write_opts.header = PdfGetStringOption(set, loption);
+		} else if (loption == "footer") {
+			result->write_opts.footer = PdfGetStringOption(set, loption);
+		} else if (loption == "font_size") {
+			double fs = PdfGetDoubleOption(set, loption);
+			if (fs < 4.0 || fs > 72.0) {
+				throw BinderException("font_size must be between 4 and 72");
+			}
+			result->write_opts.font_size = fs;
+		} else if (loption == "page_size") {
+			string ps = StringUtil::Lower(PdfGetStringOption(set, loption));
+			if (ps != "letter" && ps != "a4" && ps != "legal") {
+				throw BinderException("page_size must be one of letter, a4, legal");
+			}
+			result->write_opts.page_size = ps;
+		} else if (loption == "margin") {
+			double m = PdfGetDoubleOption(set, loption);
+			if (m < 0.0 || m > 216.0) {
+				throw BinderException("margin must be between 0 and 216");
+			}
+			result->write_opts.margin = m;
+		} else {
+			throw BinderException("Unrecognized option \"%s\" for COPY ... (FORMAT pdf)", option.first.c_str());
+		}
+	}
+
+	// After options: if header or footer present, margin must be large enough to fit inside band
+	if ((!result->write_opts.header.empty() || !result->write_opts.footer.empty()) &&
+	    result->write_opts.margin < 24.0) {
+		throw BinderException("margin too small for header/footer");
+	}
+
 	return std::move(result);
 }
 
@@ -2095,7 +2274,7 @@ static void PdfCopyFinalize(ClientContext &context, FunctionData &bind_data, Glo
 	if (path.empty()) {
 		throw IOException("COPY ... TO (FORMAT pdf): output file path is empty");
 	}
-	RenderTextToPdf(global.buffer, path);
+	RenderTextToPdf(global.buffer, path, bind.write_opts);
 }
 
 //===--------------------------------------------------------------------===//

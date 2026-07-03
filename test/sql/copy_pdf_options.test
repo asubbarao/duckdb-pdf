@@ -1,0 +1,76 @@
+# name: test/sql/copy_pdf_options.test
+# description: COPY ... TO (FORMAT pdf, ...) options: title/author/page_size/font_size/margin/header/footer
+# group: [sql]
+
+require pdf
+
+# --- TITLE / AUTHOR roundtrip via read_pdf_meta ---
+statement ok
+COPY (SELECT 'tav' AS c) TO '__TEST_DIR__/copy_opts_ta.pdf' (FORMAT pdf, TITLE 'Q3 Report', AUTHOR 'Alok', USE_TMP_FILE false);
+
+query I
+SELECT title = 'Q3 Report' AND author = 'Alok' FROM read_pdf_meta('__TEST_DIR__/copy_opts_ta.pdf');
+----
+true
+
+# --- PAGE_SIZE a4 produces expected point dims (read_pdf width/height) ---
+statement ok
+COPY (SELECT 'a4s' AS c) TO '__TEST_DIR__/copy_opts_a4.pdf' (FORMAT pdf, PAGE_SIZE 'a4', USE_TMP_FILE false);
+
+query I
+SELECT round(width) BETWEEN 594 AND 596 AND round(height) BETWEEN 841 AND 843 FROM read_pdf('__TEST_DIR__/copy_opts_a4.pdf', auto_ocr := false) LIMIT 1;
+----
+true
+
+# --- FONT_SIZE effect: larger font yields more pages for same content ---
+statement ok
+COPY (SELECT repeat('The quick brown fox jumps over the lazy dog. Padding line for pagination wrap test. ', 80) AS longc) TO '__TEST_DIR__/copy_opts_fs10.pdf' (FORMAT pdf, FONT_SIZE 10, USE_TMP_FILE false);
+
+statement ok
+COPY (SELECT repeat('The quick brown fox jumps over the lazy dog. Padding line for pagination wrap test. ', 80) AS longc) TO '__TEST_DIR__/copy_opts_fs20.pdf' (FORMAT pdf, FONT_SIZE 20, USE_TMP_FILE false);
+
+query I
+SELECT (SELECT page_count FROM read_pdf('__TEST_DIR__/copy_opts_fs20.pdf', auto_ocr := false) LIMIT 1) >
+       (SELECT page_count FROM read_pdf('__TEST_DIR__/copy_opts_fs10.pdf', auto_ocr := false) LIMIT 1);
+----
+true
+
+# --- MARGIN validation ---
+statement ok
+COPY (SELECT 'm108' AS c) TO '__TEST_DIR__/copy_opts_m108.pdf' (FORMAT pdf, MARGIN 108, USE_TMP_FILE false);
+
+statement error
+COPY (SELECT 'm300' AS c) TO '__TEST_DIR__/copy_opts_m300.pdf' (FORMAT pdf, MARGIN 300);
+----
+margin must be between
+
+# --- FONT_SIZE validation ---
+statement error
+COPY (SELECT 'fs2' AS c) TO '__TEST_DIR__/copy_opts_fs2.pdf' (FORMAT pdf, FONT_SIZE 2);
+----
+font_size must be between
+
+# --- PAGE_SIZE validation ---
+statement error
+COPY (SELECT 'psbad' AS c) TO '__TEST_DIR__/copy_opts_psbad.pdf' (FORMAT pdf, PAGE_SIZE 'bogus');
+----
+page_size must be one of
+
+# --- HEADER / FOOTER (footer marker visible via pdf_to_text) ---
+statement ok
+COPY (SELECT 'hfbody' AS c) TO '__TEST_DIR__/copy_opts_hf.pdf' (FORMAT pdf, FOOTER 'FooterMarker42', USE_TMP_FILE false);
+
+query I
+SELECT contains(pdf_to_text('__TEST_DIR__/copy_opts_hf.pdf'), 'FooterMarker42');
+----
+true
+
+# --- Defaults regression (no options): still produces valid output identical to prior behavior ---
+statement ok
+COPY (SELECT 'DEFREG_MARKER' AS c) TO '__TEST_DIR__/copy_opts_def.pdf' (FORMAT pdf, USE_TMP_FILE false);
+
+query I
+SELECT contains(pdf_to_text('__TEST_DIR__/copy_opts_def.pdf'), 'DEFREG_MARKER')
+   AND (SELECT page_count FROM read_pdf('__TEST_DIR__/copy_opts_def.pdf', auto_ocr := false) LIMIT 1) >= 1;
+----
+true
