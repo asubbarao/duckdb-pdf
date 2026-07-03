@@ -17,46 +17,46 @@ true
 
 # Contains "Hello DuckDB" text
 query I
-SELECT pdf_to_text('test/data/hello.pdf') ILIKE '%Hello DuckDB%';
+SELECT contains(lower(pdf_to_text('test/data/hello.pdf')), 'hello duckdb');
 ----
 true
 
 # table.pdf: physical layout should include column header words
 query I
-SELECT pdf_to_text('test/data/table.pdf', 'physical') ILIKE '%Item%';
+SELECT contains(lower(pdf_to_text('test/data/table.pdf', 'physical')), 'item');
 ----
 true
 
 query I
-SELECT pdf_to_text('test/data/table.pdf', 'physical') ILIKE '%Apples%';
+SELECT contains(lower(pdf_to_text('test/data/table.pdf', 'physical')), 'apples');
 ----
 true
 
 query I
-SELECT pdf_to_text('test/data/table.pdf', 'physical') ILIKE '%Cherries%';
+SELECT contains(lower(pdf_to_text('test/data/table.pdf', 'physical')), 'cherries');
 ----
 true
 
 # reading layout also returns content
 query I
-SELECT pdf_to_text('test/data/hello.pdf', 'reading') ILIKE '%Hello DuckDB%';
+SELECT contains(lower(pdf_to_text('test/data/hello.pdf', 'reading')), 'hello duckdb');
 ----
 true
 
 # raw layout also returns content
 query I
-SELECT pdf_to_text('test/data/hello.pdf', 'raw') ILIKE '%Hello DuckDB%';
+SELECT contains(lower(pdf_to_text('test/data/hello.pdf', 'raw')), 'hello duckdb');
 ----
 true
 
 # two_pages.pdf: text contains content from both pages
 query I
-SELECT pdf_to_text('test/data/two_pages.pdf') ILIKE '%Alpha%';
+SELECT contains(lower(pdf_to_text('test/data/two_pages.pdf')), 'alpha');
 ----
 true
 
 query I
-SELECT pdf_to_text('test/data/two_pages.pdf') ILIKE '%Beta%';
+SELECT contains(lower(pdf_to_text('test/data/two_pages.pdf')), 'beta');
 ----
 true
 

@@ -32,13 +32,13 @@ true
 # reliably and match case-insensitively.
 
 query I
-SELECT text ILIKE '%Apples%'
+SELECT contains(lower(text), 'apples')
 FROM read_pdf('test/data/scanned.pdf', ocr:=true);
 ----
 true
 
 query I
-SELECT text ILIKE '%Cherries%'
+SELECT contains(lower(text), 'cherries')
 FROM read_pdf('test/data/scanned.pdf', ocr:=true);
 ----
 true
@@ -47,7 +47,7 @@ true
 
 # auto_ocr:=true on scanned.pdf should also trigger OCR (no text layer detected)
 query I
-SELECT text ILIKE '%Apples%'
+SELECT contains(lower(text), 'apples')
 FROM read_pdf('test/data/scanned.pdf', auto_ocr:=true);
 ----
 true
@@ -56,7 +56,7 @@ true
 
 # hello.pdf has a text layer; even with ocr:=true it should contain the text
 query I
-SELECT text ILIKE '%Hello DuckDB%'
+SELECT contains(lower(text), 'hello duckdb')
 FROM read_pdf('test/data/hello.pdf', ocr:=true);
 ----
 true

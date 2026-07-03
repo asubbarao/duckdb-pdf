@@ -71,6 +71,19 @@ static poppler::page::text_layout_enum LayoutFromString(const string &s, bool pa
 	return poppler::page::non_raw_non_physical_layout; // 'reading'
 }
 
+// poppler is not reliably thread-safe across independent documents on all
+// platforms (observed: intermittent hard crashes on Windows CI when UNION ALL
+// pipelines parse/extract concurrently). Every poppler entry point below takes
+// this global lock. Critical sections are per-call — never held across scan
+// chunks or stored in state — and the mutex is recursive so helpers that call
+// other guarded helpers (e.g. DocToSvg -> RenderPageToPngBytes) cannot
+// self-deadlock. This serializes poppler work; acceptable until a proper
+// parallel-scan design lands.
+static std::recursive_mutex &PopplerMutex() {
+	static std::recursive_mutex m;
+	return m;
+}
+
 static string UStringToUtf8(const poppler::ustring &u) {
 	poppler::byte_array b = u.to_utf8();
 	return string(b.begin(), b.end());
@@ -316,6 +329,7 @@ static string ResolveTessdataDir(const string &language, const string &explicit_
 // Render a poppler page and OCR it with tesseract, honoring engine knobs.
 static string OcrPage(poppler::page *page, const string &language, int dpi, int psm, int oem,
                       const string &tessdata_dir) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	poppler::page_renderer renderer;
 	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
@@ -366,6 +380,7 @@ struct OcrWord {
 
 static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &language, int dpi, int psm, int oem,
                                          const string &tessdata_dir) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	poppler::page_renderer renderer;
 	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
@@ -553,6 +568,7 @@ static void ReadAllBytes(ClientContext &context, const string &path, string &out
 }
 
 static unique_ptr<poppler::document> LoadDoc(const string &bytes, const string &password, const string &path) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	// poppler's load_from_raw_data takes an int length; guard against silent
 	// truncation (and the corresponding garbage read) for >2 GiB inputs.
 	if (bytes.size() > (size_t)NumericLimits<int>::Maximum()) {
@@ -606,6 +622,7 @@ static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctio
 }
 
 static void OpenForRead(ClientContext &context, const ReadPdfBindData &bind, ReadPdfGlobalState &g) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	g.current_file = bind.files[g.file_idx];
 	ReadAllBytes(context, g.current_file, g.file_bytes);
 	g.doc = LoadDoc(g.file_bytes, bind.opt.password, g.current_file);
@@ -624,6 +641,7 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfInitGlobal(ClientContext &con
 }
 
 static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	auto &bind = data_p.bind_data->Cast<ReadPdfBindData>();
 	auto &g = data_p.global_state->Cast<ReadPdfGlobalState>();
 	auto layout = LayoutFromString(bind.opt.layout, bind.opt.parse_tables);
@@ -707,6 +725,7 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfMetaInit(ClientContext &, Tab
 }
 
 static void ReadPdfMetaScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	auto &bind = data_p.bind_data->Cast<ReadPdfMetaBindData>();
 	auto &st = data_p.global_state->Cast<ReadPdfMetaState>();
 	idx_t count = 0;
@@ -773,6 +792,7 @@ struct ReadPdfWordsState : public GlobalTableFunctionState {
 };
 
 static void WordsOpenFile(ClientContext &context, const ReadPdfWordsBindData &bind, ReadPdfWordsState &g) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	g.current_file = bind.files[g.file_idx];
 	ReadAllBytes(context, g.current_file, g.file_bytes);
 	g.doc = LoadDoc(g.file_bytes, bind.opt.password, g.current_file);
@@ -786,6 +806,7 @@ static void WordsOpenFile(ClientContext &context, const ReadPdfWordsBindData &bi
 }
 
 static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	g.boxes.clear();
 	g.ocr_boxes.clear();
 	g.page_is_ocr = false;
@@ -918,6 +939,7 @@ struct ReadPdfLinesState : public GlobalTableFunctionState {
 };
 
 static void LinesOpenFile(ClientContext &context, const ReadPdfLinesBindData &bind, ReadPdfLinesState &g) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	g.current_file = bind.files[g.file_idx];
 	ReadAllBytes(context, g.current_file, g.file_bytes);
 	g.doc = LoadDoc(g.file_bytes, bind.opt.password, g.current_file);
@@ -929,6 +951,7 @@ static void LinesOpenFile(ClientContext &context, const ReadPdfLinesBindData &bi
 }
 
 static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	g.lines.clear();
 	g.line_idx = 0;
 	if (g.page_idx >= g.last_page_0) {
@@ -1033,6 +1056,7 @@ static unique_ptr<FunctionData> ReadPdfTablesBind(ClientContext &context, TableF
 }
 
 static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &context, TableFunctionInitInput &input) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	auto &bind = input.bind_data->Cast<ReadPdfTablesBindData>();
 	auto st = make_uniq<ReadPdfTablesState>();
 	for (auto &f : bind.files) {
@@ -1137,6 +1161,7 @@ static void ReadPdfTablesScan(ClientContext &context, TableFunctionInput &data_p
 // 'reading' (default) | 'physical' | 'raw'.
 //===--------------------------------------------------------------------===//
 static string DocToText(poppler::document &doc, const string &layout_str) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	auto layout = LayoutFromString(layout_str, false);
 	string out;
 	int n = doc.pages();
@@ -1220,6 +1245,7 @@ struct PdfDocHandle {
 // style (InvalidInputException for missing/corrupt, encrypted-without-password).
 // Now routes through DuckDB VFS via ReadAllBytes + LoadDoc (bytes) for s3:// etc.
 static PdfDocHandle LoadRenderDoc(const string &fn, const string &path, ClientContext &ctx) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	string bytes;
 	try {
 		ReadAllBytes(ctx, path, bytes);
@@ -1258,6 +1284,7 @@ static PdfDocHandle LoadRenderDoc(const string &fn, const string &path, ClientCo
 // (BLOBs arrive as string_t in executors). Mirrors LoadDoc validation but with BLOB-specific
 // InvalidInputException messages (no password support for BLOBs).
 static PdfDocHandle LoadBlobDoc(const string &fn, const char *data, idx_t size) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	if (size > (idx_t)NumericLimits<int>::Maximum()) {
 		throw InvalidInputException("%s: BLOB input is too large (%llu bytes; max ~2 GiB)", fn,
 		                            (unsigned long long)size);
@@ -1328,6 +1355,7 @@ static string FmtCoord(double v) {
 // pdf_to_xml(path) — pdftoxml-style: <pdf2xml><page ..><word ..>..</word>..
 //===--------------------------------------------------------------------===//
 static string DocToXml(poppler::document &doc) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	string out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<pdf2xml>\n";
 	int n = doc.pages();
 	for (int p = 0; p < n; p++) {
@@ -1368,6 +1396,7 @@ static void PdfToXmlFun(DataChunk &args, ExpressionState &state, Vector &result)
 // each word an absolutely-positioned <span> at its bbox (PDF points -> px).
 //===--------------------------------------------------------------------===//
 static string DocToHtml(poppler::document &doc) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	string out = "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\"/>\n"
 	             "<style>.page{position:relative;border:1px solid #ccc;margin:8px auto;}"
 	             ".page span{position:absolute;white-space:pre;}</style>\n</head>\n<body>\n";
@@ -1446,12 +1475,7 @@ static string TempDir() {
 // and pdf_to_png (to return raw BLOB). Exact same render hints, UUID naming, TempFileGuard,
 // image::save + binary read + magic validation as the original pdf_to_svg path.
 static string RenderPageToPngBytes(poppler::document &doc, int32_t page_no, int32_t dpi, const string &fn_name) {
-	// poppler's page_renderer is not guaranteed thread-safe across documents on
-	// all platforms (observed: nondeterministic renders on Windows when UNION ALL
-	// branches rasterize concurrently). Rendering is heavyweight anyway, so a
-	// global mutex around the rasterize+encode step costs nothing measurable.
-	static std::mutex render_mutex;
-	std::lock_guard<std::mutex> render_lock(render_mutex);
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 
 	unique_ptr<poppler::page> page(doc.create_page(page_no - 1));
 	if (!page) {
@@ -1502,6 +1526,7 @@ static string RenderPageToPngBytes(poppler::document &doc, int32_t page_no, int3
 }
 
 static string DocToSvg(poppler::document &doc, int32_t page_no, int32_t dpi) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	int n = doc.pages();
 	if (page_no < 1 || page_no > n) {
 		throw IOException("pdf_to_svg: page %d is out of range (document has %d page%s)", (int)page_no, n,
@@ -1518,6 +1543,9 @@ static string DocToSvg(poppler::document &doc, int32_t page_no, int32_t dpi) {
 
 	// We still need a page for the rect; recreate (cheap) or could thread the rect out of helper.
 	unique_ptr<poppler::page> page(doc.create_page(page_no - 1));
+	if (!page) {
+		throw IOException("pdf_to_svg: could not read page %d", (int)page_no);
+	}
 	auto rect = page->page_rect();
 	string w = FmtCoord(rect.width());
 	string h = FmtCoord(rect.height());
@@ -1619,6 +1647,7 @@ static void PdfToSvgBlobDpiFun(DataChunk &args, ExpressionState &state, Vector &
 //===--------------------------------------------------------------------===//
 
 static string DocToPng(poppler::document &doc, int32_t page_no, int32_t dpi) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	int n = doc.pages();
 	if (page_no < 1 || page_no > n) {
 		throw IOException("pdf_to_png: page %d is out of range (document has %d page%s)", (int)page_no, n,
@@ -2418,6 +2447,7 @@ struct MdWord {
 };
 
 static string DocToMarkdown(ClientContext &context, const string &path) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	auto handle = LoadRenderDoc("pdf_to_markdown", path, context);
 	auto &doc = handle.doc;
 	int n = doc->pages();

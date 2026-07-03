@@ -19,7 +19,7 @@ true
 query I
 SELECT COUNT(*) > 0
 FROM read_pdf_words('test/data/hello.pdf')
-WHERE word ILIKE 'Hello' AND page = 1;
+WHERE lower(word) = 'hello' AND page = 1;
 ----
 true
 
@@ -27,7 +27,7 @@ true
 query I
 SELECT COUNT(*) > 0
 FROM read_pdf_words('test/data/hello.pdf')
-WHERE word ILIKE 'DuckDB' AND page = 1;
+WHERE lower(word) = 'duckdb' AND page = 1;
 ----
 true
 
@@ -78,14 +78,14 @@ true
 query I
 SELECT COUNT(*) > 0
 FROM read_pdf_words('test/data/table.pdf')
-WHERE word ILIKE 'Apples';
+WHERE lower(word) = 'apples';
 ----
 true
 
 query I
 SELECT COUNT(*) > 0
 FROM read_pdf_words('test/data/table.pdf')
-WHERE word ILIKE 'Cherries';
+WHERE lower(word) = 'cherries';
 ----
 true
 

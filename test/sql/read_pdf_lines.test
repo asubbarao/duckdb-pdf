@@ -19,7 +19,7 @@ true
 query I
 SELECT COUNT(*) > 0
 FROM read_pdf_lines('test/data/hello.pdf')
-WHERE text ILIKE '%Hello DuckDB%';
+WHERE contains(lower(text), 'hello duckdb');
 ----
 true
 
@@ -27,7 +27,7 @@ true
 query I
 SELECT COUNT(*) = 0
 FROM read_pdf_lines('test/data/hello.pdf')
-WHERE filename NOT ILIKE '%hello.pdf';
+WHERE NOT ends_with(lower(filename), 'hello.pdf');
 ----
 true
 
@@ -51,14 +51,14 @@ true
 query I
 SELECT COUNT(*) > 0
 FROM read_pdf_lines('test/data/two_pages.pdf')
-WHERE page = 1 AND text ILIKE '%Alpha%';
+WHERE page = 1 AND contains(lower(text), 'alpha');
 ----
 true
 
 query I
 SELECT COUNT(*) > 0
 FROM read_pdf_lines('test/data/two_pages.pdf')
-WHERE page = 2 AND text ILIKE '%Beta%';
+WHERE page = 2 AND contains(lower(text), 'beta');
 ----
 true
 

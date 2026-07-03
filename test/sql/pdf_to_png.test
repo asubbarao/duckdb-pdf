@@ -14,7 +14,7 @@ SELECT octet_length(pdf_to_png('test/data/hello.pdf', 1)) > 100;
 ----
 true
 
-# PNG magic via slice (no LIKE/ILIKE anywhere in this file)
+# PNG magic via slice (no case-insens substr op anywhere in this file)
 query I
 SELECT pdf_to_png('test/data/hello.pdf', 1)[1:4] = '\x89PNG'::BLOB;
 ----

@@ -29,7 +29,7 @@ false
 
 # filename column is populated
 query I
-SELECT filename ILIKE '%hello.pdf' FROM read_pdf_meta('test/data/hello.pdf');
+SELECT ends_with(lower(filename), 'hello.pdf') FROM read_pdf_meta('test/data/hello.pdf');
 ----
 true
 

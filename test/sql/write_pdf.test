@@ -59,7 +59,7 @@ SELECT write_pdf(
   repeat('Additional lines to cross page boundary reliably. ', 25)
 , '__TEST_DIR__/roundtrip.pdf');
 
-# substring contains (per task: no ILIKE)
+# substring contains (per task: no case-insens substr op)
 query I
 SELECT contains(pdf_to_text('__TEST_DIR__/roundtrip.pdf'), 'DistinctiveMarkerOne')
    AND contains(pdf_to_text('__TEST_DIR__/roundtrip.pdf'), 'DistinctiveMarkerTwo');
