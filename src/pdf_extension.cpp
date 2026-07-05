@@ -32,10 +32,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -1071,6 +1074,409 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 		output.SetValue(2, count, Value::INTEGER((int)g.line_idx + 1));
 		output.SetValue(3, count, Value(g.lines[g.line_idx]));
 		g.line_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
+// read_pdf_elements -> one row per layout element
+//   (file, page_number, element_idx, element_type, text, font_size,
+//    bbox_x0, bbox_y0, bbox_x1, bbox_y1)
+//
+// Deterministic geometry over poppler-cpp's positioned word list
+// (page::text_list with font info). No OCR path in v1: pages without a
+// native text layer emit no elements. Pipeline: words -> lines -> blocks
+// -> classified elements. All thresholds live in the named constants
+// below; the rules are the spec.
+//
+// SEGMENTATION CONTRACT
+//  1. LINE CLUSTERING: words sorted by (y0, x0); a word joins the current
+//     line when its vertical overlap with the line bbox is at least
+//     ELEM_LINE_OVERLAP_MIN_RATIO of the shorter of the two heights.
+//     Words within a line are re-sorted by x0 and joined with spaces.
+//     (Multi-column pages: words on the same visual row across columns
+//     merge into one line — a documented v1 limitation.)
+//  2. BLOCK SEGMENTATION: lines in top-down order start a new block when
+//     any of these fire:
+//       a. GAP BREAK: vertical gap (line.y0 - prev.y1) exceeds
+//          ELEM_BLOCK_GAP_RATIO x the median line height on the page;
+//       b. FONT BREAK: the line's dominant font size differs from the
+//          previous line's by more than ELEM_FONT_CHANGE_RATIO
+//          (relative to the previous line's size);
+//       c. LIST BREAK: the line begins with a list marker (see rule 4)
+//          — every list item becomes its own block regardless of gaps.
+//  3. BODY SIZE: the document's body font size is the modal font size
+//     weighted by character count across every word in the scanned page
+//     range (the size that renders the most characters wins; ties go to
+//     the smaller size for determinism).
+//
+// CLASSIFICATION CONTRACT (first match wins, in this order)
+//  4. heading    : block's dominant font size >= ELEM_HEADING_SIZE_RATIO
+//                  x body size AND total text shorter than
+//                  ELEM_HEADING_MAX_CHARS characters.
+//  5. list_item  : block's first line starts with a bullet glyph
+//                  (one of • – ▪, or '-' / '*' followed by a space) or a
+//                  numeric marker: 1-3 digits then '.' or ')' then a
+//                  space / end of text.
+//  6. paragraph  : any remaining block with at least
+//                  ELEM_MIN_PARAGRAPH_WORDS words.
+//  7. other      : everything else (page numbers, isolated fragments).
+//
+// font_size is the block's dominant size (modal by character count) and
+// NULL when poppler reports no font info for any word in the block.
+//===--------------------------------------------------------------------===//
+
+// Rule 1: min vertical-overlap ratio for a word to join a line.
+static constexpr double ELEM_LINE_OVERLAP_MIN_RATIO = 0.5;
+// Rule 2a: vertical gap > this fraction of median line height starts a new block.
+static constexpr double ELEM_BLOCK_GAP_RATIO = 0.6;
+// Rule 2b: relative font-size change > this fraction starts a new block.
+static constexpr double ELEM_FONT_CHANGE_RATIO = 0.15;
+// Rule 4: heading must be at least this multiple of the body font size...
+static constexpr double ELEM_HEADING_SIZE_RATIO = 1.15;
+// ...and shorter than this many characters (long large-print runs are not headings).
+static constexpr size_t ELEM_HEADING_MAX_CHARS = 200;
+// Rule 6: blocks with fewer words than this fall through to 'other'.
+static constexpr size_t ELEM_MIN_PARAGRAPH_WORDS = 3;
+
+struct ElemWord {
+	double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+	string text;
+	double font_size = 0.0;
+	bool has_font = false;
+};
+
+struct ElemLine {
+	double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+	std::vector<ElemWord> words;
+	string text;
+	double font_size = 0.0; // dominant (modal by char count); 0 => unknown
+};
+
+struct PdfElementRow {
+	int page_number = 0;  // 1-based
+	int element_idx = 0;  // 1-based within page, reading order
+	string element_type;  // heading | paragraph | list_item | other
+	string text;
+	double font_size = 0.0;
+	bool has_font = false;
+	double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+};
+
+// Character-count-weighted font-size histogram; keys are sizes rounded to
+// 0.01pt so float jitter from poppler does not split one logical size.
+using ElemFontHistogram = std::map<long long, size_t>;
+
+static void ElemFontTally(ElemFontHistogram &hist, double font_size, size_t chars) {
+	hist[(long long)std::llround(font_size * 100.0)] += chars;
+}
+
+// Modal font size (rule 3): most characters wins; ties -> smaller size
+// (std::map iterates keys ascending, so the first strict max is the smallest).
+static double ElemModalFontSize(const ElemFontHistogram &hist) {
+	double best_size = 0.0;
+	size_t best_chars = 0;
+	for (auto &entry : hist) {
+		if (entry.second > best_chars) {
+			best_chars = entry.second;
+			best_size = entry.first / 100.0;
+		}
+	}
+	return best_size;
+}
+
+// Rule 5: does this line text open with a bullet glyph or numeric marker?
+static bool ElemIsListMarkerLine(const string &line_text) {
+	size_t i = line_text.find_first_not_of(" \t");
+	if (i == string::npos) {
+		return false;
+	}
+	// Multi-byte bullet glyphs (UTF-8): • U+2022, – U+2013, ▪ U+25AA.
+	static const char *kBulletGlyphs[] = {"\xE2\x80\xA2", "\xE2\x80\x93", "\xE2\x96\xAA"};
+	for (auto glyph : kBulletGlyphs) {
+		if (line_text.compare(i, strlen(glyph), glyph) == 0) {
+			return true;
+		}
+	}
+	// ASCII '-' / '*' count only when followed by a space ("-5 degrees" and
+	// "*emphasis*" are prose, "- item" is a bullet).
+	if ((line_text[i] == '-' || line_text[i] == '*') && i + 1 < line_text.size() && line_text[i + 1] == ' ') {
+		return true;
+	}
+	// Numeric marker: 1-3 digits, then '.' or ')', then space or end of text.
+	size_t d = i;
+	while (d < line_text.size() && isdigit((unsigned char)line_text[d]) && d - i < 3) {
+		d++;
+	}
+	if (d > i && d < line_text.size() && (line_text[d] == '.' || line_text[d] == ')')) {
+		return d + 1 >= line_text.size() || line_text[d + 1] == ' ';
+	}
+	return false;
+}
+
+// Rule 1: cluster one page's words into lines.
+static std::vector<ElemLine> ElemBuildLines(std::vector<ElemWord> words) {
+	std::vector<ElemLine> lines;
+	std::sort(words.begin(), words.end(), [](const ElemWord &a, const ElemWord &b) {
+		if (a.y0 != b.y0) {
+			return a.y0 < b.y0;
+		}
+		return a.x0 < b.x0;
+	});
+	for (auto &w : words) {
+		bool joined = false;
+		if (!lines.empty()) {
+			auto &line = lines.back();
+			double overlap = MinValue<double>(w.y1, line.y1) - MaxValue<double>(w.y0, line.y0);
+			double shorter = MinValue<double>(w.y1 - w.y0, line.y1 - line.y0);
+			if (shorter > 0 && overlap >= ELEM_LINE_OVERLAP_MIN_RATIO * shorter) {
+				line.x0 = MinValue<double>(line.x0, w.x0);
+				line.y0 = MinValue<double>(line.y0, w.y0);
+				line.x1 = MaxValue<double>(line.x1, w.x1);
+				line.y1 = MaxValue<double>(line.y1, w.y1);
+				line.words.push_back(std::move(w));
+				joined = true;
+			}
+		}
+		if (!joined) {
+			ElemLine line;
+			line.x0 = w.x0;
+			line.y0 = w.y0;
+			line.x1 = w.x1;
+			line.y1 = w.y1;
+			line.words.push_back(std::move(w));
+			lines.push_back(std::move(line));
+		}
+	}
+	// Finalize: order words by x0, join text, compute dominant font size.
+	for (auto &line : lines) {
+		std::sort(line.words.begin(), line.words.end(),
+		          [](const ElemWord &a, const ElemWord &b) { return a.x0 < b.x0; });
+		ElemFontHistogram line_hist;
+		for (auto &w : line.words) {
+			if (!line.text.empty()) {
+				line.text += " ";
+			}
+			line.text += w.text;
+			if (w.has_font) {
+				ElemFontTally(line_hist, w.font_size, w.text.size());
+			}
+		}
+		line.font_size = ElemModalFontSize(line_hist);
+	}
+	return lines;
+}
+
+// Rules 2 + 4-7: segment one page's lines into blocks and classify them.
+// body_size is the document-wide modal size (rule 3); rows are appended in
+// reading order with 1-based element_idx.
+static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_number, double body_size,
+                               std::vector<PdfElementRow> &rows) {
+	if (lines.empty()) {
+		return;
+	}
+	std::vector<double> heights;
+	heights.reserve(lines.size());
+	for (auto &line : lines) {
+		heights.push_back(line.y1 - line.y0);
+	}
+	double median_height = Median(heights);
+
+	// Group line indices into blocks.
+	std::vector<std::vector<size_t>> blocks;
+	for (size_t li = 0; li < lines.size(); li++) {
+		bool start_new = blocks.empty();
+		if (!start_new) {
+			const auto &prev = lines[blocks.back().back()];
+			const auto &cur = lines[li];
+			double gap = cur.y0 - prev.y1;
+			bool gap_break = median_height > 0 && gap > ELEM_BLOCK_GAP_RATIO * median_height; // rule 2a
+			bool font_break = prev.font_size > 0 && cur.font_size > 0 &&
+			                  std::fabs(cur.font_size - prev.font_size) >
+			                      ELEM_FONT_CHANGE_RATIO * prev.font_size; // rule 2b
+			bool list_break = ElemIsListMarkerLine(cur.text);              // rule 2c
+			start_new = gap_break || font_break || list_break;
+		}
+		if (start_new) {
+			blocks.emplace_back();
+		}
+		blocks.back().push_back(li);
+	}
+
+	int element_idx = 0;
+	for (auto &block : blocks) {
+		PdfElementRow row;
+		row.page_number = page_number;
+		row.element_idx = ++element_idx;
+		ElemFontHistogram block_hist;
+		size_t word_count = 0;
+		bool first = true;
+		for (auto li : block) {
+			const auto &line = lines[li];
+			if (first) {
+				row.x0 = line.x0;
+				row.y0 = line.y0;
+				row.x1 = line.x1;
+				row.y1 = line.y1;
+				first = false;
+			} else {
+				row.x0 = MinValue<double>(row.x0, line.x0);
+				row.y0 = MinValue<double>(row.y0, line.y0);
+				row.x1 = MaxValue<double>(row.x1, line.x1);
+				row.y1 = MaxValue<double>(row.y1, line.y1);
+				row.text += " ";
+			}
+			row.text += line.text;
+			word_count += line.words.size();
+			for (auto &w : line.words) {
+				if (w.has_font) {
+					ElemFontTally(block_hist, w.font_size, w.text.size());
+				}
+			}
+		}
+		row.font_size = ElemModalFontSize(block_hist);
+		row.has_font = row.font_size > 0;
+
+		const string &first_line_text = lines[block.front()].text;
+		if (row.has_font && body_size > 0 && row.font_size >= ELEM_HEADING_SIZE_RATIO * body_size &&
+		    row.text.size() < ELEM_HEADING_MAX_CHARS) {
+			row.element_type = "heading"; // rule 4
+		} else if (ElemIsListMarkerLine(first_line_text)) {
+			row.element_type = "list_item"; // rule 5
+		} else if (word_count >= ELEM_MIN_PARAGRAPH_WORDS) {
+			row.element_type = "paragraph"; // rule 6
+		} else {
+			row.element_type = "other"; // rule 7
+		}
+		rows.push_back(std::move(row));
+	}
+}
+
+// Load one file and materialize its full element list. Two passes over the
+// collected words: pass 1 builds per-page lines and the document font
+// histogram (rule 3 needs the whole document), pass 2 segments + classifies.
+// The poppler critical section covers this call only — the scan loop below
+// emits from the materialized vector without touching poppler.
+static void ElementsProcessFile(ClientContext &context, const string &path, const PdfOptions &opt,
+                                std::vector<PdfElementRow> &rows) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	rows.clear();
+	string bytes;
+	ReadAllBytes(context, path, bytes);
+	auto doc = LoadDoc(bytes, opt.password, path);
+	int page_count = doc->pages();
+	int first_0 = opt.first_page > 0 ? opt.first_page - 1 : 0;
+	int last_0 = opt.last_page < 0 ? page_count : MinValue<int>(opt.last_page, page_count);
+
+	std::vector<std::pair<int, std::vector<ElemLine>>> page_lines; // (1-based page, lines)
+	ElemFontHistogram doc_hist;
+	for (int p = first_0; p < last_0; p++) {
+		unique_ptr<poppler::page> page(doc->create_page(p));
+		if (!page) {
+			continue;
+		}
+		std::vector<ElemWord> words;
+		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
+			ElemWord w;
+			w.text = UStringToUtf8(b.text());
+			if (w.text.find_first_not_of(" \t\r\n\f\v") == string::npos) {
+				continue;
+			}
+			auto r = b.bbox();
+			w.x0 = r.x();
+			w.y0 = r.y();
+			w.x1 = r.x() + r.width();
+			w.y1 = r.y() + r.height();
+			w.has_font = b.has_font_info();
+			w.font_size = w.has_font ? b.get_font_size() : 0.0;
+			if (w.has_font) {
+				ElemFontTally(doc_hist, w.font_size, w.text.size());
+			}
+			words.push_back(std::move(w));
+		}
+		if (!words.empty()) {
+			page_lines.emplace_back(p + 1, ElemBuildLines(std::move(words)));
+		}
+	}
+	double body_size = ElemModalFontSize(doc_hist);
+	for (auto &pl : page_lines) {
+		ElemEmitPageBlocks(pl.second, pl.first, body_size, rows);
+	}
+}
+
+struct ReadPdfElementsBindData : public TableFunctionData {
+	vector<string> files;
+	PdfOptions opt;
+};
+
+struct ReadPdfElementsState : public GlobalTableFunctionState {
+	idx_t file_idx = 0;
+	idx_t row_idx = 0;
+	std::vector<PdfElementRow> rows;
+	string current_file;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> ReadPdfElementsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<ReadPdfElementsBindData>();
+	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	ParseNamed(input.named_parameters, result->opt);
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE};
+	names = {"file",      "page_number", "element_idx", "element_type", "text",
+	         "font_size", "bbox_x0",     "bbox_y0",     "bbox_x1",      "bbox_y1"};
+	return std::move(result);
+}
+
+static void ElementsOpenFile(ClientContext &context, const ReadPdfElementsBindData &bind, ReadPdfElementsState &g) {
+	g.current_file = bind.files[g.file_idx];
+	g.row_idx = 0;
+	ElementsProcessFile(context, g.current_file, bind.opt, g.rows);
+}
+
+static unique_ptr<GlobalTableFunctionState> ReadPdfElementsInit(ClientContext &context,
+                                                                TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<ReadPdfElementsBindData>();
+	auto g = make_uniq<ReadPdfElementsState>();
+	if (!bind.files.empty()) {
+		ElementsOpenFile(context, bind, *g);
+	}
+	return std::move(g);
+}
+
+static void ReadPdfElementsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<ReadPdfElementsBindData>();
+	auto &g = data_p.global_state->Cast<ReadPdfElementsState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE) {
+		if (g.file_idx >= bind.files.size()) {
+			break;
+		}
+		if (g.row_idx >= g.rows.size()) {
+			g.file_idx++;
+			if (g.file_idx >= bind.files.size()) {
+				break;
+			}
+			ElementsOpenFile(context, bind, g);
+			continue;
+		}
+		auto &row = g.rows[g.row_idx];
+		output.SetValue(0, count, Value(g.current_file));
+		output.SetValue(1, count, Value::INTEGER(row.page_number));
+		output.SetValue(2, count, Value::INTEGER(row.element_idx));
+		output.SetValue(3, count, Value(row.element_type));
+		output.SetValue(4, count, Value(row.text));
+		output.SetValue(5, count, row.has_font ? Value::DOUBLE(row.font_size) : Value(LogicalType::DOUBLE));
+		output.SetValue(6, count, Value::DOUBLE(row.x0));
+		output.SetValue(7, count, Value::DOUBLE(row.y0));
+		output.SetValue(8, count, Value::DOUBLE(row.x1));
+		output.SetValue(9, count, Value::DOUBLE(row.y1));
+		g.row_idx++;
 		count++;
 	}
 	output.SetCardinality(count);
@@ -2921,6 +3327,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             ReadPdfLinesInit);
 	AddCommonNamedParams(read_pdf_lines);
 	loader.RegisterFunction(read_pdf_lines);
+
+	// read_pdf_elements takes only the params it honors (native text layer
+	// only in v1 — no OCR/layout knobs).
+	TableFunction read_pdf_elements("read_pdf_elements", {LogicalType::VARCHAR}, ReadPdfElementsScan,
+	                                ReadPdfElementsBind, ReadPdfElementsInit);
+	read_pdf_elements.named_parameters["password"] = LogicalType::VARCHAR;
+	read_pdf_elements.named_parameters["first_page"] = LogicalType::INTEGER;
+	read_pdf_elements.named_parameters["last_page"] = LogicalType::INTEGER;
+	loader.RegisterFunction(read_pdf_elements);
 
 	TableFunction read_pdf_tables("read_pdf_tables", {LogicalType::VARCHAR}, ReadPdfTablesScan, ReadPdfTablesBind,
 	                              ReadPdfTablesInit);
