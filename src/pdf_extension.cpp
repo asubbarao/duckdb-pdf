@@ -15,6 +15,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 
 // poppler-cpp — text extraction + page rendering + metadata
 #include <poppler-document.h>
@@ -30,6 +31,7 @@
 #include <hpdf.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -71,18 +73,36 @@ static poppler::page::text_layout_enum LayoutFromString(const string &s, bool pa
 	return poppler::page::non_raw_non_physical_layout; // 'reading'
 }
 
-// poppler is not reliably thread-safe across independent documents on all
-// platforms (observed: intermittent hard crashes on Windows CI when UNION ALL
+// poppler is not thread-safe across independent documents ON WINDOWS
+// (observed: intermittent hard process crashes on Windows CI when UNION ALL
 // pipelines parse/extract concurrently). Every poppler entry point below takes
-// this global lock. Critical sections are per-call — never held across scan
-// chunks or stored in state — and the mutex is recursive so helpers that call
-// other guarded helpers (e.g. DocToSvg -> RenderPageToPngBytes) cannot
-// self-deadlock. This serializes poppler work; acceptable until a proper
-// parallel-scan design lands.
+// this global lock, with ONE carve-out: the parallel multi-file read_pdf scan
+// on macOS/Linux, where each thread owns its own poppler::document and
+// per-document page calls (create_page / page_rect / text) run unlocked.
+// Document OPEN (LoadDoc) and all rasterization (page_renderer, used by OCR /
+// png / svg) stay globally locked on every platform — those paths touch
+// poppler global/shared state (global params, font config caches) that we
+// cannot prove is per-document. Critical sections are per-call — never held
+// across scan chunks or stored in state — and the mutex is recursive so
+// helpers that call other guarded helpers (e.g. DocToSvg ->
+// RenderPageToPngBytes) cannot self-deadlock.
 static std::recursive_mutex &PopplerMutex() {
 	static std::recursive_mutex m;
 	return m;
 }
+
+// Compile-time platform switch for the parallel scan: Windows keeps FULL
+// serialization (the CI-proven cross-document crash), POSIX runs per-document
+// poppler calls from the scan lock-free. Declaring a guard is a no-op on
+// POSIX; on Windows it takes the global poppler lock for the enclosing scope.
+struct PopplerDocGuard {
+#ifdef _WIN32
+	std::lock_guard<std::recursive_mutex> lock {PopplerMutex()};
+#else
+	PopplerDocGuard() {
+	} // user-provided ctor: a declared-but-"unused" guard never warns
+#endif
+};
 
 static string UStringToUtf8(const poppler::ustring &u) {
 	poppler::byte_array b = u.to_utf8();
@@ -596,17 +616,26 @@ struct ReadPdfBindData : public TableFunctionData {
 	PdfOptions opt;
 };
 
+// Parallel multi-file scan: the global state only hands out file indices; every
+// worker thread owns its OWN poppler::document in its local state, so no
+// document is ever touched by two threads.
 struct ReadPdfGlobalState : public GlobalTableFunctionState {
-	idx_t file_idx = 0;
-	int page_idx = 0; // 0-based
+	explicit ReadPdfGlobalState(idx_t max_threads_p) : max_threads(max_threads_p) {
+	}
+	std::atomic<idx_t> next_file_idx {0};
+	const idx_t max_threads;
+	idx_t MaxThreads() const override {
+		return max_threads;
+	}
+};
+
+struct ReadPdfLocalState : public LocalTableFunctionState {
+	int page_idx = 0;    // 0-based
 	int page_count = 0;
 	int last_page_0 = 0; // exclusive upper bound (0-based)
 	string file_bytes;
-	unique_ptr<poppler::document> doc;
+	unique_ptr<poppler::document> doc; // owned by THIS thread only
 	string current_file;
-	idx_t MaxThreads() const override {
-		return 1;
-	}
 };
 
 static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctionBindInput &input,
@@ -621,73 +650,99 @@ static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctio
 	return std::move(result);
 }
 
-static void OpenForRead(ClientContext &context, const ReadPdfBindData &bind, ReadPdfGlobalState &g) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-	g.current_file = bind.files[g.file_idx];
-	ReadAllBytes(context, g.current_file, g.file_bytes);
-	g.doc = LoadDoc(g.file_bytes, bind.opt.password, g.current_file);
-	g.page_count = g.doc->pages();
-	g.page_idx = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
-	g.last_page_0 = bind.opt.last_page < 0 ? g.page_count : MinValue<int>(bind.opt.last_page, g.page_count);
+// Claim the next unscanned file for this thread and open it into LOCAL state.
+// Returns false when the file list is exhausted. Document open stays under the
+// global poppler lock on ALL platforms — LoadDoc itself takes PopplerMutex —
+// because load_from_raw_data walks shared font-config/global-params state we
+// cannot prove is per-document.
+static bool ClaimNextFile(ClientContext &context, const ReadPdfBindData &bind, ReadPdfGlobalState &g,
+                          ReadPdfLocalState &l) {
+	auto file_idx = g.next_file_idx.fetch_add(1, std::memory_order_relaxed);
+	if (file_idx >= bind.files.size()) {
+		l.doc.reset();
+		return false;
+	}
+	l.current_file = bind.files[file_idx];
+	ReadAllBytes(context, l.current_file, l.file_bytes);
+	l.doc = LoadDoc(l.file_bytes, bind.opt.password, l.current_file);
+	l.page_count = l.doc->pages();
+	l.page_idx = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
+	l.last_page_0 = bind.opt.last_page < 0 ? l.page_count : MinValue<int>(bind.opt.last_page, l.page_count);
+	return true;
 }
 
 static unique_ptr<GlobalTableFunctionState> ReadPdfInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<ReadPdfBindData>();
-	auto g = make_uniq<ReadPdfGlobalState>();
-	if (!bind.files.empty()) {
-		OpenForRead(context, bind, *g);
-	}
-	return std::move(g);
+#ifdef _WIN32
+	// Windows: poppler cross-document use crashes the process (CI-proven);
+	// keep the scan fully serial there.
+	idx_t max_threads = 1;
+	(void)bind;
+	(void)context;
+#else
+	auto scheduler_threads = (idx_t)TaskScheduler::GetScheduler(context).NumberOfThreads();
+	idx_t max_threads = MaxValue<idx_t>(1, MinValue<idx_t>((idx_t)bind.files.size(), scheduler_threads));
+#endif
+	return make_uniq<ReadPdfGlobalState>(max_threads);
+}
+
+static unique_ptr<LocalTableFunctionState> ReadPdfInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                            GlobalTableFunctionState *gstate) {
+	return make_uniq<ReadPdfLocalState>();
 }
 
 static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	auto &bind = data_p.bind_data->Cast<ReadPdfBindData>();
 	auto &g = data_p.global_state->Cast<ReadPdfGlobalState>();
+	auto &l = data_p.local_state->Cast<ReadPdfLocalState>();
 	auto layout = LayoutFromString(bind.opt.layout, bind.opt.parse_tables);
 
 	idx_t count = 0;
 	while (count < STANDARD_VECTOR_SIZE) {
-		while (g.doc && g.page_idx >= g.last_page_0) {
-			g.file_idx++;
-			if (g.file_idx >= bind.files.size()) {
-				g.doc.reset();
+		while (!l.doc || l.page_idx >= l.last_page_0) {
+			if (!ClaimNextFile(context, bind, g, l)) {
 				break;
 			}
-			OpenForRead(context, bind, g);
 		}
-		if (!g.doc) {
+		if (!l.doc) {
 			break;
 		}
 
-		unique_ptr<poppler::page> page(g.doc->create_page(g.page_idx));
 		string text;
 		double width = 0.0;
 		double height = 0.0;
-		if (page) {
-			auto rect = page->page_rect();
-			width = rect.width();
-			height = rect.height();
-			if (!bind.opt.force_ocr) {
-				text = UStringToUtf8(page->text(poppler::rectf(), layout));
-			}
-			bool blank = text.find_first_not_of(" \t\r\n\f\v") == string::npos;
-			if (bind.opt.force_ocr || (bind.opt.auto_ocr && blank)) {
-				string ocr = OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
-				                     bind.opt.ocr_oem, bind.opt.tessdata_dir);
-				if (!ocr.empty()) {
-					text = ocr;
+		{
+			// Per-document page work: lock-free on POSIX (this thread owns
+			// l.doc), globally locked on Windows via the guard. OCR inside is
+			// safe: OcrPage takes PopplerMutex itself (rasterization touches
+			// poppler globals) and the mutex is recursive.
+			PopplerDocGuard poppler_guard;
+			unique_ptr<poppler::page> page(l.doc->create_page(l.page_idx));
+			if (page) {
+				auto rect = page->page_rect();
+				width = rect.width();
+				height = rect.height();
+				if (!bind.opt.force_ocr) {
+					text = UStringToUtf8(page->text(poppler::rectf(), layout));
+				}
+				bool blank = text.find_first_not_of(" \t\r\n\f\v") == string::npos;
+				if (bind.opt.force_ocr || (bind.opt.auto_ocr && blank)) {
+					string ocr = OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
+					                     bind.opt.ocr_oem, bind.opt.tessdata_dir);
+					if (!ocr.empty()) {
+						text = ocr;
+					}
 				}
 			}
 		}
 
-		output.SetValue(0, count, Value(g.current_file));
-		output.SetValue(1, count, Value::INTEGER(g.page_idx + 1));
-		output.SetValue(2, count, Value::INTEGER(g.page_count));
+		output.SetValue(0, count, Value(l.current_file));
+		output.SetValue(1, count, Value::INTEGER(l.page_idx + 1));
+		output.SetValue(2, count, Value::INTEGER(l.page_count));
 		output.SetValue(3, count, Value(text));
 		output.SetValue(4, count, Value::DOUBLE(width));
 		output.SetValue(5, count, Value::DOUBLE(height));
-		g.page_idx++;
+		l.page_idx++;
 		count++;
 	}
 	output.SetCardinality(count);
@@ -2847,7 +2902,8 @@ static void PdfToMarkdownFun(DataChunk &args, ExpressionState &state, Vector &re
 // Registration
 //===--------------------------------------------------------------------===//
 static void LoadInternal(ExtensionLoader &loader) {
-	TableFunction read_pdf("read_pdf", {LogicalType::VARCHAR}, ReadPdfScan, ReadPdfBind, ReadPdfInitGlobal);
+	TableFunction read_pdf("read_pdf", {LogicalType::VARCHAR}, ReadPdfScan, ReadPdfBind, ReadPdfInitGlobal,
+	                       ReadPdfInitLocal);
 	AddCommonNamedParams(read_pdf);
 	loader.RegisterFunction(read_pdf);
 

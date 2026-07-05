@@ -1,0 +1,108 @@
+# name: test/sql/read_pdf_parallel_scan.test
+# description: parallel multi-file read_pdf scan — generate 8 PDFs with the extension's own
+#              writer, then prove the parallel glob scan returns EXACTLY the same rows as a
+#              UNION ALL of single-file scans (result-level equivalence, order-independent).
+#              On Windows the scan stays serial (MaxThreads=1) — same assertions must hold.
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# make sure the scheduler actually has workers to hand the scan
+statement ok
+SET threads=4;
+
+# ── generate 8 small PDFs via the extension's own COPY writer ─────────────
+
+loop i 0 8
+
+statement ok
+COPY (SELECT 'parallel_marker_${i}_' || j AS line FROM range(1, 4) t(j)) TO '__TEST_DIR__/pscan_${i}.pdf' (FORMAT pdf);
+
+endloop
+
+# ── row counts: 8 files, 8 distinct filenames, 1 page each ────────────────
+
+query III
+SELECT count(*), count(DISTINCT filename), max(page) FROM read_pdf('__TEST_DIR__/pscan_*.pdf');
+----
+8	8	1
+
+# ── content per file, ORDER BY (parallel scan order is nondeterministic) ──
+
+query TI
+SELECT regexp_extract(filename, 'pscan_([0-9])', 1) AS file_no, page
+FROM read_pdf('__TEST_DIR__/pscan_*.pdf')
+ORDER BY file_no, page;
+----
+0	1
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+
+# every file's text carries ITS OWN marker (right text landed on the right row)
+query I
+SELECT bool_and(contains(text, concat('parallel_marker_', regexp_extract(filename, 'pscan_([0-9])', 1), '_1'))
+            AND contains(text, concat('parallel_marker_', regexp_extract(filename, 'pscan_([0-9])', 1), '_3')))
+FROM read_pdf('__TEST_DIR__/pscan_*.pdf');
+----
+true
+
+# ── the equivalence proof: parallel glob scan == UNION ALL of serial single-file scans ──
+# Result-level, not plan-level: full row tuples compared both directions plus a
+# total-count pin (rows are unique per (filename, page), so set equality + equal
+# counts == multiset equality).
+
+query I
+WITH glob_scan AS (
+    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_*.pdf')
+), single_scans AS (
+    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_0.pdf')
+    UNION ALL
+    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_1.pdf')
+    UNION ALL
+    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_2.pdf')
+    UNION ALL
+    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_3.pdf')
+    UNION ALL
+    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_4.pdf')
+    UNION ALL
+    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_5.pdf')
+    UNION ALL
+    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_6.pdf')
+    UNION ALL
+    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_7.pdf')
+)
+SELECT (SELECT count(*) FROM (SELECT * FROM glob_scan EXCEPT SELECT * FROM single_scans)) = 0
+   AND (SELECT count(*) FROM (SELECT * FROM single_scans EXCEPT SELECT * FROM glob_scan)) = 0
+   AND (SELECT count(*) FROM glob_scan) = (SELECT count(*) FROM single_scans);
+----
+true
+
+# ── stability: repeat the glob scan under a fresh pipeline, ORDER BY, same rows ──
+
+query TI
+SELECT regexp_extract(filename, 'pscan_([0-9])', 1) AS file_no, page_count
+FROM read_pdf('__TEST_DIR__/pscan_*.pdf')
+ORDER BY file_no;
+----
+0	1
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+
+# named parameters still flow through the parallel scan (page bounds per thread-local doc)
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/pscan_*.pdf', first_page := 1, last_page := 1);
+----
+8
