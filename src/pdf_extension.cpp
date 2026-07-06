@@ -8,6 +8,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -19,9 +20,11 @@
 
 // poppler-cpp — text extraction + page rendering + metadata
 #include <poppler-document.h>
+#include <poppler-embedded-file.h>
 #include <poppler-page.h>
 #include <poppler-page-renderer.h>
 #include <poppler-image.h>
+#include <poppler-toc.h>
 
 // tesseract — OCR for scanned / image-only PDFs
 #include <tesseract/baseapi.h>
@@ -807,6 +810,274 @@ static void ReadPdfMetaScan(ClientContext &context, TableFunctionInput &data_p, 
 		output.SetValue(8, count, Value(to_string(major) + "." + to_string(minor)));
 		output.SetValue(9, count, Value::BOOLEAN(doc->is_encrypted()));
 		st.idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
+// Inspection suite: pdf_info / pdf_outline / pdf_attachments
+//
+// Read-only "folder census" functions. All three take the same files argument
+// as read_pdf (single path or glob), run serially per file, and follow the
+// same failure contract as read_pdf_meta: a corrupt/missing/locked file
+// throws (never silently yields zero rows). Poppler work stays inside the
+// per-call PopplerMutex critical section.
+//===--------------------------------------------------------------------===//
+struct PdfInspectBindData : public TableFunctionData {
+	vector<string> files;
+	PdfOptions opt; // only `password` is honored here
+};
+
+// Shared bind: resolve the file list and parse the password named parameter.
+static unique_ptr<FunctionData> PdfInspectBindCommon(ClientContext &context, TableFunctionBindInput &input) {
+	auto result = make_uniq<PdfInspectBindData>();
+	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	ParseNamed(input.named_parameters, result->opt);
+	return std::move(result);
+}
+
+// Empty/missing metadata strings surface as NULL, never as ''.
+static Value InspectStringOrNull(const string &s) {
+	if (s.empty()) {
+		return Value(LogicalType::VARCHAR);
+	}
+	return Value(s);
+}
+
+// poppler reports unset dates as <= 0; those surface as NULL.
+static Value InspectDateOrNull(time_t t) {
+	if (t <= 0) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	return Value::TIMESTAMP(Timestamp::FromEpochSeconds((int64_t)t));
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_info  -> one row per file (identity + geometry + storage census)
+//===--------------------------------------------------------------------===//
+struct PdfInfoState : public GlobalTableFunctionState {
+	idx_t idx = 0;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfInfoBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP,
+	                LogicalType::TIMESTAMP, LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::VARCHAR,   LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BIGINT};
+	names = {"file",        "title",         "author",   "subject",    "keywords",     "creator",
+	         "producer",    "creation_date", "mod_date", "page_count", "is_encrypted", "is_linearized",
+	         "pdf_version", "width",         "height",   "file_size"};
+	return PdfInspectBindCommon(context, input);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfInfoInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfInfoState>();
+}
+
+static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	auto &bind = data_p.bind_data->Cast<PdfInspectBindData>();
+	auto &st = data_p.global_state->Cast<PdfInfoState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && st.idx < bind.files.size()) {
+		auto &path = bind.files[st.idx];
+		string bytes;
+		ReadAllBytes(context, path, bytes);
+		auto doc = LoadDoc(bytes, bind.opt.password, path);
+
+		int major = 0, minor = 0;
+		doc->get_pdf_version(&major, &minor);
+
+		// first-page media box, in points; NULL if the page will not open
+		Value width_val(LogicalType::DOUBLE);
+		Value height_val(LogicalType::DOUBLE);
+		unique_ptr<poppler::page> first_page(doc->create_page(0));
+		if (first_page) {
+			auto rect = first_page->page_rect(poppler::media_box);
+			width_val = Value::DOUBLE(rect.width());
+			height_val = Value::DOUBLE(rect.height());
+		}
+
+		output.SetValue(0, count, Value(path));
+		output.SetValue(1, count, InspectStringOrNull(UStringToUtf8(doc->info_key("Title"))));
+		output.SetValue(2, count, InspectStringOrNull(UStringToUtf8(doc->info_key("Author"))));
+		output.SetValue(3, count, InspectStringOrNull(UStringToUtf8(doc->info_key("Subject"))));
+		output.SetValue(4, count, InspectStringOrNull(UStringToUtf8(doc->info_key("Keywords"))));
+		output.SetValue(5, count, InspectStringOrNull(UStringToUtf8(doc->info_key("Creator"))));
+		output.SetValue(6, count, InspectStringOrNull(UStringToUtf8(doc->info_key("Producer"))));
+		output.SetValue(7, count, InspectDateOrNull(doc->info_date_t("CreationDate")));
+		output.SetValue(8, count, InspectDateOrNull(doc->info_date_t("ModDate")));
+		output.SetValue(9, count, Value::INTEGER(doc->pages()));
+		output.SetValue(10, count, Value::BOOLEAN(doc->is_encrypted()));
+		output.SetValue(11, count, Value::BOOLEAN(doc->is_linearized()));
+		output.SetValue(12, count, Value(to_string(major) + "." + to_string(minor)));
+		output.SetValue(13, count, width_val);
+		output.SetValue(14, count, height_val);
+		output.SetValue(15, count, Value::BIGINT((int64_t)bytes.size()));
+		st.idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_outline  -> one row per bookmark (depth-first document order)
+//===--------------------------------------------------------------------===//
+struct PdfOutlineRow {
+	int ord = 0;   // 1-based, depth-first document order
+	int depth = 0; // 1 = top level
+	string title;
+};
+
+// Depth-first walk over the toc tree. poppler's root() is a synthetic node;
+// its children are the visible top-level bookmarks (depth 1).
+static void OutlineWalk(const poppler::toc_item *item, int depth, int &ord, std::vector<PdfOutlineRow> &rows) {
+	for (auto child : item->children()) {
+		PdfOutlineRow row;
+		row.ord = ++ord;
+		row.depth = depth;
+		row.title = UStringToUtf8(child->title());
+		rows.push_back(std::move(row));
+		OutlineWalk(child, depth + 1, ord, rows);
+	}
+}
+
+struct PdfOutlineState : public GlobalTableFunctionState {
+	idx_t file_idx = 0;
+	idx_t row_idx = 0;
+	string current_file;
+	std::vector<PdfOutlineRow> rows; // materialized per file; doc is not kept
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfOutlineBind(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR};
+	names = {"file", "ord", "depth", "title"};
+	return PdfInspectBindCommon(context, input);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfOutlineInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfOutlineState>();
+}
+
+static void PdfOutlineScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	auto &bind = data_p.bind_data->Cast<PdfInspectBindData>();
+	auto &st = data_p.global_state->Cast<PdfOutlineState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE) {
+		if (st.row_idx >= st.rows.size()) {
+			// advance to the next file; files without an outline yield no rows
+			if (st.file_idx >= bind.files.size()) {
+				break;
+			}
+			st.rows.clear();
+			st.row_idx = 0;
+			st.current_file = bind.files[st.file_idx++];
+			string bytes;
+			ReadAllBytes(context, st.current_file, bytes);
+			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+			unique_ptr<poppler::toc> toc(doc->create_toc());
+			if (toc && toc->root()) {
+				int ord = 0;
+				OutlineWalk(toc->root(), 1, ord, st.rows);
+			}
+			continue;
+		}
+		auto &row = st.rows[st.row_idx];
+		output.SetValue(0, count, Value(st.current_file));
+		output.SetValue(1, count, Value::INTEGER(row.ord));
+		output.SetValue(2, count, Value::INTEGER(row.depth));
+		output.SetValue(3, count, Value(row.title));
+		st.row_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_attachments  -> one row per embedded file
+//===--------------------------------------------------------------------===//
+struct PdfAttachmentRow {
+	string name;
+	string description;
+	int64_t size = -1; // poppler reports unknown size as < 0 -> NULL
+	string mime_type;
+	string data;
+};
+
+struct PdfAttachmentsState : public GlobalTableFunctionState {
+	idx_t file_idx = 0;
+	idx_t row_idx = 0;
+	string current_file;
+	std::vector<PdfAttachmentRow> rows; // materialized per file; doc is not kept
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfAttachmentsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::BLOB};
+	names = {"file", "name", "description", "size", "mime_type", "data"};
+	return PdfInspectBindCommon(context, input);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfAttachmentsInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfAttachmentsState>();
+}
+
+static void PdfAttachmentsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	auto &bind = data_p.bind_data->Cast<PdfInspectBindData>();
+	auto &st = data_p.global_state->Cast<PdfAttachmentsState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE) {
+		if (st.row_idx >= st.rows.size()) {
+			// advance to the next file; files without attachments yield no rows
+			if (st.file_idx >= bind.files.size()) {
+				break;
+			}
+			st.rows.clear();
+			st.row_idx = 0;
+			st.current_file = bind.files[st.file_idx++];
+			string bytes;
+			ReadAllBytes(context, st.current_file, bytes);
+			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+			// embedded_file objects are owned by the document — copy everything
+			// out while the document is alive.
+			for (auto attachment : doc->embedded_files()) {
+				if (!attachment || !attachment->is_valid()) {
+					continue;
+				}
+				PdfAttachmentRow row;
+				row.name = UStringToUtf8(attachment->unicodeName());
+				row.description = UStringToUtf8(attachment->description());
+				row.size = (int64_t)attachment->size();
+				row.mime_type = attachment->mime_type();
+				auto payload = attachment->data();
+				row.data = string(payload.begin(), payload.end());
+				st.rows.push_back(std::move(row));
+			}
+			continue;
+		}
+		auto &row = st.rows[st.row_idx];
+		output.SetValue(0, count, Value(st.current_file));
+		output.SetValue(1, count, InspectStringOrNull(row.name));
+		output.SetValue(2, count, InspectStringOrNull(row.description));
+		output.SetValue(3, count, row.size < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(row.size));
+		output.SetValue(4, count, InspectStringOrNull(row.mime_type));
+		output.SetValue(5, count, Value::BLOB(const_data_ptr_cast(row.data.data()), row.data.size()));
+		st.row_idx++;
 		count++;
 	}
 	output.SetCardinality(count);
@@ -3316,6 +3587,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                            ReadPdfMetaInit);
 	read_pdf_meta.named_parameters["password"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(read_pdf_meta);
+
+	// inspection suite — read-only, serial per file, password is the only knob
+	TableFunction pdf_info("pdf_info", {LogicalType::VARCHAR}, PdfInfoScan, PdfInfoBind, PdfInfoInit);
+	pdf_info.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_info);
+
+	TableFunction pdf_outline("pdf_outline", {LogicalType::VARCHAR}, PdfOutlineScan, PdfOutlineBind, PdfOutlineInit);
+	pdf_outline.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_outline);
+
+	TableFunction pdf_attachments("pdf_attachments", {LogicalType::VARCHAR}, PdfAttachmentsScan, PdfAttachmentsBind,
+	                              PdfAttachmentsInit);
+	pdf_attachments.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_attachments);
 
 	TableFunction read_pdf_words("read_pdf_words", {LogicalType::VARCHAR}, ReadPdfWordsScan, ReadPdfWordsBind,
 	                             ReadPdfWordsInit);

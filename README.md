@@ -125,6 +125,49 @@ ORDER BY pages DESC;
 
 Columns: `filename`, `title`, `author`, `subject`, `keywords`, `creator`, `producer`, `pages`, `pdf_version`, `encrypted`.
 
+### `pdf_info` — full per-file census
+
+One row per file: identity metadata plus the structural facts (a superset of `read_pdf_meta`). Unset metadata keys and dates are `NULL`, never `''`. `width`/`height` are the first-page media box in points; `file_size` is bytes on disk.
+
+```sql
+-- Census a folder of PDFs
+SELECT file, title, author, page_count, pdf_version, file_size
+FROM pdf_info('archive/*.pdf')
+ORDER BY file_size DESC;
+
+-- Which tool produced what, and when
+SELECT producer, count(*) AS n, min(creation_date) AS earliest
+FROM pdf_info('archive/*.pdf')
+GROUP BY producer;
+```
+
+Columns: `file`, `title`, `author`, `subject`, `keywords`, `creator`, `producer`, `creation_date` (`TIMESTAMP`), `mod_date` (`TIMESTAMP`), `page_count`, `is_encrypted`, `is_linearized`, `pdf_version`, `width`, `height`, `file_size`.
+
+### `pdf_outline` — bookmarks / table of contents
+
+One row per bookmark, in depth-first document order. Files without an outline yield zero rows (not an error).
+
+```sql
+-- Table of contents with indentation
+SELECT file, ord, repeat('  ', depth - 1) || title AS entry
+FROM pdf_outline('manual.pdf')
+ORDER BY ord;
+```
+
+Columns: `file`, `ord` (1-based document order), `depth` (1 = top level), `title`.
+
+### `pdf_attachments` — embedded files
+
+One row per embedded file. Files with no attachments yield zero rows. `data` carries the attachment bytes as a `BLOB`; `size` is `NULL` when the PDF does not declare it.
+
+```sql
+-- What is embedded across a folder?
+SELECT file, name, mime_type, size
+FROM pdf_attachments('invoices/*.pdf');
+```
+
+Columns: `file`, `name`, `description`, `size`, `mime_type`, `data` (`BLOB`).
+
 ### `read_pdf_words` — word-level extraction with bounding boxes
 
 Returns one row per word with columns `filename`, `page`, `word`, `x0`, `y0`, `x1`, `y1` (coordinates in PDF user-space points, origin at bottom-left).
