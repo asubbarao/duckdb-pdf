@@ -53,6 +53,12 @@ The `pdf` extension exposes eight functions covering the full range of PDF extra
 | `pdf_merge` | Scalar | **Document-level (qpdf)**: concatenate the input PDFs' pages, in list order, into one output file. Returns the output path. |
 | `pdf_split` | Table | **Document-level (qpdf)**: write one single-page PDF per page as `<output_dir>/<stem>_p<N>.pdf` (zero-padded); one row per emitted file: `page`, `file`. |
 | `pdf_rotate` | Scalar | **Document-level (qpdf)**: rotate pages by a multiple of 90°; `pages` is `'all'` (default) or a qpdf range like `'1-3,7'`. Returns the output path. |
+| `pdf_compress` | Scalar | **Document-level (qpdf)**: structural optimization — object streams, stream recompression, linearization. Does **not** downsample images. Returns the output path. |
+| `pdf_encrypt` | Scalar | **Document-level (qpdf)**: AES-256 (R6) password protection; optional distinct owner password. Returns the output path. |
+| `pdf_decrypt` | Scalar | **Document-level (qpdf)**: remove password protection given the password. Returns the output path. |
+| `pdf_pages` | Scalar | **Document-level (qpdf)**: extract a page subset (`'1-3,7'`, `'z'` = last, `'r2'` = second-to-last) into a new file, in range order. Returns the output path. |
+| `pdf_form_fields` | Table | One row per AcroForm field: `file`, `page`, `field_name`, `field_type` (`text`/`button`/`choice`/`signature`), `value`, `is_required`. |
+| `pdf_annotations` | Table | One row per page annotation: `file`, `page`, `subtype`, `contents`, `uri` (Link annotations), `rect_x0..rect_y1`. |
 
 ## Installation
 
@@ -350,6 +356,59 @@ SELECT page, file FROM pdf_split('combined.pdf', 'out');
 -- rotation); pages is 'all' or a qpdf-style range ('1-3,7', 'z' = last page)
 SELECT pdf_rotate('scan.pdf', 'upright.pdf', 90);
 SELECT pdf_rotate('scan.pdf', 'upright.pdf', -90, '2-4');
+```
+
+### The everyday suite: compress / encrypt / decrypt / pages
+
+Same conventions as above: local paths exactly as given, existing output
+overwritten, missing output directory is an error, and in-place operation
+(`input == output`) is refused because qpdf reads the source lazily during
+the write.
+
+```sql
+-- compress: object-stream generation + stream recompression + linearization
+-- ("fast web view"). This optimizes document STRUCTURE and stream encoding;
+-- it does NOT downsample or re-encode images — a scan-heavy PDF will not
+-- shrink much.
+SELECT pdf_compress('report.pdf', 'report_small.pdf');
+
+-- encrypt: AES-256 (R6, the only password scheme the PDF 2.0 spec still
+-- endorses), all permissions allowed. Omitted/empty owner password falls
+-- back to the user password. Uses qpdf's built-in native crypto — no
+-- external crypto library involved.
+SELECT pdf_encrypt('report.pdf', 'report_locked.pdf', 'user-secret');
+SELECT pdf_encrypt('report.pdf', 'report_locked.pdf', 'user-secret', 'owner-secret');
+
+-- decrypt: open with the (user or owner) password, write a plain copy.
+-- A wrong password raises an Invalid Input error ("invalid password").
+SELECT pdf_decrypt('report_locked.pdf', 'report_plain.pdf', 'user-secret');
+
+-- pages: extract a subset into a new document, in range order (qpdf range
+-- grammar: '1-3,7', 'z' = last page, 'r2' = second-to-last; repeats allowed)
+SELECT pdf_pages('report.pdf', 'summary.pdf', '1-3,7');
+```
+
+### Form fields and annotations
+
+`pdf_form_fields(files)` returns one row per AcroForm field; `pdf_annotations(files)`
+returns one row per page annotation. Both take a path or glob (resolved the same
+way as `read_pdf`) and return zero rows for PDFs without forms/annotations.
+
+```sql
+-- one row per AcroForm field
+-- file, page (NULL if the field has no widget on any page), field_name
+-- (fully qualified), field_type ('text'/'button'/'choice'/'signature',
+-- else qpdf's raw name), value (NULL if unset), is_required
+SELECT field_name, field_type, value, is_required
+FROM pdf_form_fields('forms/*.pdf');
+
+-- one row per annotation: subtype (Link, Highlight, Text, FreeText, ...),
+-- contents (NULL if none), uri (populated for Link annotations with an
+-- /A /URI action), rect_x0/y0/x1/y1
+SELECT page, subtype, contents FROM pdf_annotations('reviewed.pdf');
+
+-- the hyperlink-extraction recipe
+SELECT page, uri FROM pdf_annotations('reviewed.pdf') WHERE subtype = 'Link';
 ```
 
 ## Markdown extraction (layout mode)

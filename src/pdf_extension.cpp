@@ -33,6 +33,9 @@
 // qpdf — document-level operations (pdf_merge / pdf_split / pdf_rotate).
 // Content-preserving structural transforms; no rasterization, no poppler.
 #include <qpdf/QPDF.hh>
+#include <qpdf/QPDFAcroFormDocumentHelper.hh>
+#include <qpdf/QPDFAnnotationObjectHelper.hh>
+#include <qpdf/QPDFFormFieldObjectHelper.hh>
 #include <qpdf/QPDFPageDocumentHelper.hh>
 #include <qpdf/QPDFPageObjectHelper.hh>
 #include <qpdf/QPDFWriter.hh>
@@ -48,6 +51,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -3580,6 +3584,384 @@ static void PdfSplitScan(ClientContext &context, TableFunctionInput &data_p, Dat
 }
 
 //===--------------------------------------------------------------------===//
+// qpdf suite: pdf_compress / pdf_encrypt / pdf_decrypt / pdf_pages
+//
+// Same conventions as pdf_merge/pdf_rotate: local filesystem paths exactly as
+// given, existing output overwritten, missing output directory is an error,
+// in-place (input == output) refused because qpdf reads the source lazily
+// during write, and the whole operation runs under QpdfMutex.
+//===--------------------------------------------------------------------===//
+
+// Shared preamble for the single-input scalar ops.
+static void PdfOpsCheckInOut(const char *fn, const string &input, const string &output) {
+	PdfOpsCheckInputExists(fn, input);
+	PdfOpsCheckOutputDir(fn, PdfOpsParentDir(output));
+	if (input == output) {
+		// qpdf reads the source lazily during write; writing over it would corrupt.
+		throw InvalidInputException("%s: output path must differ from input path '%s'", fn, input);
+	}
+}
+
+// pdf_compress(input, output) -> VARCHAR (the output path).
+// Structural optimization only: object streams, stream recompression, and
+// linearization ("fast web view"). Image data is carried over as-is — this
+// does NOT downsample or re-encode images.
+static string PdfCompressImpl(const string &input, const string &output) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	PdfOpsCheckInOut("pdf_compress", input, output);
+	try {
+		QPDF doc;
+		doc.processFile(input.c_str());
+		QPDFWriter writer(doc, output.c_str());
+		writer.setObjectStreamMode(qpdf_o_generate);
+		writer.setCompressStreams(true);
+		writer.setRecompressFlate(true);
+		writer.setLinearization(true);
+		writer.write();
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_compress: %s", string(e.what()));
+	}
+	return output;
+}
+
+static void PdfCompressFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		Value in_val = args.GetValue(0, row);
+		Value out_val = args.GetValue(1, row);
+		if (in_val.IsNull() || out_val.IsNull()) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		result.SetValue(row, Value(PdfCompressImpl(StringValue::Get(in_val), StringValue::Get(out_val))));
+	}
+}
+
+// pdf_encrypt(input, output, user_password[, owner_password]) -> VARCHAR.
+// AES-256 (R6) — the only password scheme the PDF 2.0 spec still endorses;
+// qpdf's built-in native crypto provider implements it, so no external
+// crypto library is needed. All permissions are allowed; an empty owner
+// password falls back to the user password.
+static string PdfEncryptImpl(const string &input, const string &output, const string &user_password,
+                             const string &owner_password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	PdfOpsCheckInOut("pdf_encrypt", input, output);
+	const string &owner = owner_password.empty() ? user_password : owner_password;
+	try {
+		QPDF doc;
+		doc.processFile(input.c_str());
+		QPDFWriter writer(doc, output.c_str());
+		writer.setR6EncryptionParameters(user_password.c_str(), owner.c_str(), true /* accessibility */,
+		                                 true /* extract */, true /* assemble */, true /* annotate_and_form */,
+		                                 true /* form_filling */, true /* modify_other */, qpdf_r3p_full,
+		                                 true /* encrypt metadata */);
+		writer.write();
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_encrypt: %s", string(e.what()));
+	}
+	return output;
+}
+
+static void PdfEncryptFunInternal(DataChunk &args, Vector &result, bool has_owner_arg) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		Value in_val = args.GetValue(0, row);
+		Value out_val = args.GetValue(1, row);
+		Value user_val = args.GetValue(2, row);
+		Value owner_val = has_owner_arg ? args.GetValue(3, row) : Value("");
+		if (in_val.IsNull() || out_val.IsNull() || user_val.IsNull() || owner_val.IsNull()) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		result.SetValue(row, Value(PdfEncryptImpl(StringValue::Get(in_val), StringValue::Get(out_val),
+		                                          StringValue::Get(user_val), StringValue::Get(owner_val))));
+	}
+}
+
+static void PdfEncryptFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfEncryptFunInternal(args, result, false);
+}
+
+static void PdfEncryptOwnerFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfEncryptFunInternal(args, result, true);
+}
+
+// pdf_decrypt(input, output, password) -> VARCHAR. Opens with the password
+// (user or owner) and writes an unencrypted copy. A wrong password surfaces
+// qpdf's "invalid password" as an InvalidInput error.
+static string PdfDecryptImpl(const string &input, const string &output, const string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	PdfOpsCheckInOut("pdf_decrypt", input, output);
+	try {
+		QPDF doc;
+		doc.processFile(input.c_str(), password.c_str());
+		QPDFWriter writer(doc, output.c_str());
+		writer.setPreserveEncryption(false);
+		writer.write();
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_decrypt: %s", string(e.what()));
+	}
+	return output;
+}
+
+static void PdfDecryptFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		Value in_val = args.GetValue(0, row);
+		Value out_val = args.GetValue(1, row);
+		Value pw_val = args.GetValue(2, row);
+		if (in_val.IsNull() || out_val.IsNull() || pw_val.IsNull()) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		result.SetValue(
+		    row, Value(PdfDecryptImpl(StringValue::Get(in_val), StringValue::Get(out_val), StringValue::Get(pw_val))));
+	}
+}
+
+// pdf_pages(input, output, ranges) -> VARCHAR. Extracts the page subset
+// selected by a qpdf-style numeric range ('1-3,7' / 'z' = last / 'r2' =
+// second-to-last) into a new document, in range order (repeats allowed).
+static string PdfPagesImpl(const string &input, const string &output, const string &ranges) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	PdfOpsCheckInOut("pdf_pages", input, output);
+	try {
+		QPDF source;
+		source.processFile(input.c_str());
+		QPDFPageDocumentHelper source_pages(source);
+		auto pages = source_pages.getAllPages();
+		auto page_count = static_cast<int>(pages.size());
+		// qpdf's own CLI range grammar; throws with a descriptive message on
+		// malformed / out-of-range specs.
+		auto selected = QUtil::parse_numrange(ranges.c_str(), page_count);
+		QPDF subset;
+		subset.emptyPDF();
+		QPDFPageDocumentHelper subset_pages(subset);
+		// copyForeignObject caches per source object, so adding the SAME page
+		// twice would insert one object twice (an error); shallow-copy repeats.
+		std::set<QPDFObjGen> seen;
+		for (int page_no : selected) {
+			auto &page = pages[page_no - 1];
+			auto og = page.getObjectHandle().getObjGen();
+			if (seen.count(og)) {
+				subset_pages.addPage(page.shallowCopyPage(), false);
+			} else {
+				subset_pages.addPage(page, false);
+				seen.insert(og);
+			}
+		}
+		// source must outlive the write: foreign pages are pulled lazily.
+		QPDFWriter writer(subset, output.c_str());
+		writer.write();
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_pages: %s", string(e.what()));
+	}
+	return output;
+}
+
+static void PdfPagesFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		Value in_val = args.GetValue(0, row);
+		Value out_val = args.GetValue(1, row);
+		Value ranges_val = args.GetValue(2, row);
+		if (in_val.IsNull() || out_val.IsNull() || ranges_val.IsNull()) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		result.SetValue(row, Value(PdfPagesImpl(StringValue::Get(in_val), StringValue::Get(out_val),
+		                                        StringValue::Get(ranges_val))));
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// qpdf suite: pdf_form_fields / pdf_annotations (table functions)
+//
+// One VARCHAR path/glob argument resolved through the same ResolveFiles used
+// by read_pdf. Rows are materialized on the first scan call (side effects and
+// file reads at scan time, not bind — EXPLAIN touches nothing), serially,
+// under QpdfMutex.
+//===--------------------------------------------------------------------===//
+
+// Strip the leading '/' from a PDF name ('/Link' -> 'Link'); empty stays empty.
+static string PdfNameToText(const string &name) {
+	if (!name.empty() && name[0] == '/') {
+		return name.substr(1);
+	}
+	return name;
+}
+
+struct PdfQpdfRowsBindData : public TableFunctionData {
+	vector<string> files;
+};
+
+struct PdfQpdfRowsState : public GlobalTableFunctionState {
+	bool executed = false;
+	idx_t emit_idx = 0;
+	std::vector<std::vector<Value>> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<GlobalTableFunctionState> PdfQpdfRowsInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfQpdfRowsState>();
+}
+
+static void PdfQpdfRowsEmit(PdfQpdfRowsState &st, DataChunk &output) {
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && st.emit_idx < st.rows.size()) {
+		auto &row = st.rows[st.emit_idx];
+		for (idx_t col = 0; col < row.size(); col++) {
+			output.SetValue(col, count, row[col]);
+		}
+		st.emit_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+// pdf_form_fields(files) -> one row per AcroForm field. page is NULL when the
+// field has no widget annotation on any page; value is NULL when /V is unset.
+static unique_ptr<FunctionData> PdfFormFieldsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfQpdfRowsBindData>();
+	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN};
+	names = {"file", "page", "field_name", "field_type", "value", "is_required"};
+	return std::move(result);
+}
+
+static string PdfFormFieldTypeText(const string &raw_type) {
+	if (raw_type == "/Tx") {
+		return "text";
+	}
+	if (raw_type == "/Btn") {
+		return "button";
+	}
+	if (raw_type == "/Ch") {
+		return "choice";
+	}
+	if (raw_type == "/Sig") {
+		return "signature";
+	}
+	return raw_type; // unknown: pass qpdf's raw name through untouched
+}
+
+static void PdfFormFieldsExecute(const string &path, std::vector<std::vector<Value>> &rows) {
+	PdfOpsCheckInputExists("pdf_form_fields", path);
+	try {
+		QPDF doc;
+		doc.processFile(path.c_str());
+		QPDFAcroFormDocumentHelper acroform(doc);
+		if (!acroform.hasAcroForm()) {
+			return;
+		}
+		// Map field object -> 1-based page number via each page's widget
+		// annotations (a field with no widget keeps page NULL).
+		std::map<QPDFObjGen, int> field_page;
+		QPDFPageDocumentHelper doc_pages(doc);
+		auto pages = doc_pages.getAllPages();
+		for (size_t page_idx = 0; page_idx < pages.size(); page_idx++) {
+			for (auto &field : acroform.getFormFieldsForPage(pages[page_idx])) {
+				auto og = field.getObjectHandle().getObjGen();
+				if (!field_page.count(og)) {
+					field_page[og] = static_cast<int>(page_idx + 1);
+				}
+			}
+		}
+		for (auto &field : acroform.getFormFields()) {
+			auto og = field.getObjectHandle().getObjGen();
+			auto page_it = field_page.find(og);
+			Value page_val =
+			    page_it == field_page.end() ? Value(LogicalType::INTEGER) : Value::INTEGER(page_it->second);
+			auto value_handle = field.getValue();
+			Value value_val = value_handle.isNull() ? Value(LogicalType::VARCHAR) : Value(field.getValueAsString());
+			bool is_required = (field.getFlags() & ff_all_required) != 0;
+			rows.push_back({Value(path), page_val, Value(field.getFullyQualifiedName()),
+			                Value(PdfFormFieldTypeText(field.getFieldType())), value_val, Value::BOOLEAN(is_required)});
+		}
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_form_fields: %s", string(e.what()));
+	}
+}
+
+static void PdfFormFieldsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfQpdfRowsBindData>();
+	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
+	if (!st.executed) {
+		std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+		for (auto &path : bind.files) {
+			PdfFormFieldsExecute(path, st.rows);
+		}
+		st.executed = true;
+	}
+	PdfQpdfRowsEmit(st, output);
+}
+
+// pdf_annotations(files) -> one row per page annotation. uri is populated for
+// Link annotations with an /A /URI action; contents is NULL when absent. This
+// one function covers both "extract comments/highlights" and "extract
+// hyperlinks" (WHERE subtype = 'Link').
+static unique_ptr<FunctionData> PdfAnnotationsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfQpdfRowsBindData>();
+	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE};
+	names = {"file", "page", "subtype", "contents", "uri", "rect_x0", "rect_y0", "rect_x1", "rect_y1"};
+	return std::move(result);
+}
+
+static void PdfAnnotationsExecute(const string &path, std::vector<std::vector<Value>> &rows) {
+	PdfOpsCheckInputExists("pdf_annotations", path);
+	try {
+		QPDF doc;
+		doc.processFile(path.c_str());
+		QPDFPageDocumentHelper doc_pages(doc);
+		auto pages = doc_pages.getAllPages();
+		for (size_t page_idx = 0; page_idx < pages.size(); page_idx++) {
+			for (auto &annot : pages[page_idx].getAnnotations()) {
+				auto dict = annot.getObjectHandle();
+				Value contents_val(LogicalType::VARCHAR);
+				auto contents = dict.getKey("/Contents");
+				if (contents.isString()) {
+					contents_val = Value(contents.getUTF8Value());
+				}
+				Value uri_val(LogicalType::VARCHAR);
+				auto action = dict.getKey("/A");
+				if (action.isDictionary() && action.getKey("/S").isNameAndEquals("/URI") &&
+				    action.getKey("/URI").isString()) {
+					uri_val = Value(action.getKey("/URI").getUTF8Value());
+				}
+				auto rect = annot.getRect();
+				rows.push_back({Value(path), Value::INTEGER(static_cast<int>(page_idx + 1)),
+				                Value(PdfNameToText(annot.getSubtype())), contents_val, uri_val,
+				                Value::DOUBLE(rect.llx), Value::DOUBLE(rect.lly), Value::DOUBLE(rect.urx),
+				                Value::DOUBLE(rect.ury)});
+			}
+		}
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_annotations: %s", string(e.what()));
+	}
+}
+
+static void PdfAnnotationsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfQpdfRowsBindData>();
+	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
+	if (!st.executed) {
+		std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+		for (auto &path : bind.files) {
+			PdfAnnotationsExecute(path, st.rows);
+		}
+		st.executed = true;
+	}
+	PdfQpdfRowsEmit(st, output);
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 static void LoadInternal(ExtensionLoader &loader) {
@@ -3688,6 +4070,34 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction pdf_split("pdf_split", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfSplitScan, PdfSplitBind,
 	                        PdfSplitInit);
 	loader.RegisterFunction(pdf_split);
+
+	// qpdf everyday suite
+	loader.RegisterFunction(ScalarFunction("pdf_compress", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                       LogicalType::VARCHAR, PdfCompressFun));
+
+	ScalarFunctionSet pdf_encrypt_set("pdf_encrypt");
+	pdf_encrypt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                           LogicalType::VARCHAR, PdfEncryptFun));
+	pdf_encrypt_set.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                   LogicalType::VARCHAR, PdfEncryptOwnerFun));
+	loader.RegisterFunction(pdf_encrypt_set);
+
+	loader.RegisterFunction(ScalarFunction("pdf_decrypt",
+	                                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                       LogicalType::VARCHAR, PdfDecryptFun));
+
+	loader.RegisterFunction(ScalarFunction("pdf_pages",
+	                                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                       LogicalType::VARCHAR, PdfPagesFun));
+
+	TableFunction pdf_form_fields("pdf_form_fields", {LogicalType::VARCHAR}, PdfFormFieldsScan, PdfFormFieldsBind,
+	                              PdfQpdfRowsInit);
+	loader.RegisterFunction(pdf_form_fields);
+
+	TableFunction pdf_annotations("pdf_annotations", {LogicalType::VARCHAR}, PdfAnnotationsScan, PdfAnnotationsBind,
+	                              PdfQpdfRowsInit);
+	loader.RegisterFunction(pdf_annotations);
 
 	// COPY TO pdf
 	CopyFunction pdf_copy("pdf");

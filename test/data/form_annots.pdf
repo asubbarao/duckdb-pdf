@@ -1,0 +1,33 @@
+%PDF-1.7
+%¿÷¢þ
+1 0 obj
+<< /AcroForm << /Fields [ 2 0 R ] >> /Pages 3 0 R /Type /Catalog >>
+endobj
+2 0 obj
+<< /FT /Tx /Ff 2 /Rect [ 72 600 300 620 ] /Subtype /Widget /T (fixture_name) /Type /Annot /V (PrefilledValue) >>
+endobj
+3 0 obj
+<< /Count 1 /Kids [ 4 0 R ] /Type /Pages >>
+endobj
+4 0 obj
+<< /Annots [ 5 0 R 2 0 R 6 0 R ] /MediaBox [ 0 0 612 792 ] /Parent 3 0 R /Resources << >> /Type /Page >>
+endobj
+5 0 obj
+<< /A << /S /URI /URI (http://example.com/duck) >> /Border [ 0 0 0 ] /Rect [ 72 700 200 720 ] /Subtype /Link /Type /Annot >>
+endobj
+6 0 obj
+<< /Contents (SampleNoteMarker comment) /Rect [ 72 500 100 520 ] /Subtype /Text /Type /Annot >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000015 00000 n 
+0000000098 00000 n 
+0000000226 00000 n 
+0000000285 00000 n 
+0000000405 00000 n 
+0000000545 00000 n 
+trailer << /Root 1 0 R /Size 7 /ID [<5c3ba0e606986f39958fe55ec468cddb><5c3ba0e606986f39958fe55ec468cddb>] >>
+startxref
+656
+%%EOF
