@@ -1,0 +1,207 @@
+# name: test/sql/pdf_chunks.test
+# description: pdf_chunks retrieval-ready chunking over the element grain
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── fixtures built with the extension's own writer ───────────────────────────
+# chunks_caps.pdf: two ALL-CAPS section headers (classified heading by rule
+# 4b) each followed by body paragraphs — exercises heading attribution and
+# the headings-glue-forward rule.
+
+statement ok
+COPY (
+  SELECT line FROM (VALUES
+    ('PROFESSIONAL SUMMARY'),
+    (''),
+    ('First summary paragraph with a handful of words in it'),
+    (''),
+    ('Second summary paragraph also with several words inside'),
+    (''),
+    ('CAREER HIGHLIGHTS'),
+    (''),
+    ('Shipped many systems with a small team over many years')
+  ) t(line)
+) TO '__TEST_DIR__/chunks_caps.pdf' (FORMAT pdf);
+
+# chunks_med.pdf: one ~930-char paragraph -> fits a single default chunk.
+
+statement ok
+COPY (SELECT repeat('alpha bravo charlie delta echo ', 30) AS c)
+TO '__TEST_DIR__/chunks_med.pdf' (FORMAT pdf);
+
+# chunks_long.pdf: one ~1240-char paragraph -> a single element that
+# exceeds small chunk_size values and must be split at whitespace.
+
+statement ok
+COPY (SELECT repeat('alpha bravo charlie delta echo ', 40) AS c)
+TO '__TEST_DIR__/chunks_long.pdf' (FORMAT pdf);
+
+# ── param defaults: whole medium doc = exactly one chunk ─────────────────────
+
+query IIII
+SELECT chunk_idx, page_start, page_end, n_chars = length(text)
+FROM pdf_chunks('__TEST_DIR__/chunks_med.pdf');
+----
+1	1	1	true
+
+# Default chunk has no overlap prefix and starts at the document start
+query I
+SELECT starts_with(text, 'alpha bravo charlie')
+FROM pdf_chunks('__TEST_DIR__/chunks_med.pdf');
+----
+true
+
+# No heading anywhere in this fixture -> heading is NULL
+query I
+SELECT heading IS NULL FROM pdf_chunks('__TEST_DIR__/chunks_med.pdf');
+----
+true
+
+# ── single element exceeding chunk_size: split at whitespace ─────────────────
+
+query I
+SELECT COUNT(*) > 1 FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50);
+----
+true
+
+# SIZE INVARIANT (contract C5): n_chars <= chunk_size + overlap + 1
+query I
+SELECT COUNT(*) = 0
+FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50)
+WHERE n_chars > 200 + 50 + 1;
+----
+true
+
+# n_chars is the length of the full emitted text, overlap included
+query I
+SELECT COUNT(*) = 0
+FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50)
+WHERE n_chars != length(text);
+----
+true
+
+# chunk_idx is dense from 1
+query I
+SELECT MIN(chunk_idx) = 1 AND MAX(chunk_idx) = COUNT(*)
+FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50);
+----
+true
+
+# Whitespace-boundary splits: no chunk core starts or ends mid-word — every
+# chunk boundary piece is one of the five fixture words.
+query I
+SELECT COUNT(*) = 0 FROM (
+  SELECT split_part(split_part(text, chr(10), -1), ' ', -1) AS last_word
+  FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50)
+) WHERE last_word NOT IN ('alpha', 'bravo', 'charlie', 'delta', 'echo');
+----
+true
+
+# OVERLAP (contract C4): the first line of chunk N (its overlap prefix) is
+# a suffix of chunk N-1's emitted text, non-empty, and <= overlap chars.
+query I
+SELECT COUNT(*) = 0 FROM (
+  SELECT text, LAG(text) OVER (ORDER BY chunk_idx) AS prev_text
+  FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50)
+) WHERE prev_text IS NOT NULL
+    AND NOT (ends_with(prev_text, split_part(text, chr(10), 1))
+             AND length(split_part(text, chr(10), 1)) BETWEEN 1 AND 50);
+----
+true
+
+# overlap := 0 disables the prefix entirely (single-line chunks here)
+query I
+SELECT COUNT(*) = 0
+FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 0)
+WHERE contains(text, chr(10)) OR n_chars > 200;
+----
+true
+
+# ── heading attribution (contract C6) ────────────────────────────────────────
+
+# Default params: whole caps doc fits one chunk; the first element IS the
+# first heading, so it attributes.
+query I
+SELECT heading FROM pdf_chunks('__TEST_DIR__/chunks_caps.pdf');
+----
+PROFESSIONAL SUMMARY
+
+# Small chunks: each chunk reports the section it starts in
+query I
+SELECT heading FROM pdf_chunks('__TEST_DIR__/chunks_caps.pdf', chunk_size := 120, overlap := 0)
+WHERE contains(text, 'First summary paragraph');
+----
+PROFESSIONAL SUMMARY
+
+query I
+SELECT heading FROM pdf_chunks('__TEST_DIR__/chunks_caps.pdf', chunk_size := 120, overlap := 0)
+WHERE contains(text, 'Shipped many systems');
+----
+CAREER HIGHLIGHTS
+
+# HEADINGS GLUE FORWARD (contract C3): a heading followed by content never
+# ends a chunk — 'CAREER HIGHLIGHTS' starts the chunk that holds its body.
+query I
+SELECT COUNT(*) = 0
+FROM pdf_chunks('__TEST_DIR__/chunks_caps.pdf', chunk_size := 120, overlap := 0)
+WHERE ends_with(text, 'PROFESSIONAL SUMMARY') OR ends_with(text, 'CAREER HIGHLIGHTS');
+----
+true
+
+query I
+SELECT starts_with(text, 'CAREER HIGHLIGHTS')
+FROM pdf_chunks('__TEST_DIR__/chunks_caps.pdf', chunk_size := 120, overlap := 0)
+WHERE contains(text, 'Shipped many systems');
+----
+true
+
+# ── multi-page spans ─────────────────────────────────────────────────────────
+
+query I
+SELECT MIN(page_start) = 1 AND MAX(page_end) = 2
+FROM pdf_chunks('test/data/two_pages.pdf');
+----
+true
+
+query I
+SELECT MAX(page_end) = 1
+FROM pdf_chunks('test/data/two_pages.pdf', last_page := 1);
+----
+true
+
+# ── glob / multi-file: chunk_idx restarts per file ───────────────────────────
+
+statement ok
+COPY (SELECT 'first glob chunk body text here' AS c)
+TO '__TEST_DIR__/chunks_glob1.pdf' (FORMAT pdf);
+
+statement ok
+COPY (SELECT 'second glob chunk body text here' AS c)
+TO '__TEST_DIR__/chunks_glob2.pdf' (FORMAT pdf);
+
+query II
+SELECT COUNT(DISTINCT file), COUNT(*) FILTER (chunk_idx = 1)
+FROM pdf_chunks('__TEST_DIR__/chunks_glob*.pdf');
+----
+2	2
+
+# ── validation ───────────────────────────────────────────────────────────────
+
+statement error
+SELECT * FROM pdf_chunks('__TEST_DIR__/chunks_med.pdf', chunk_size := 0);
+----
+chunk_size
+
+statement error
+SELECT * FROM pdf_chunks('__TEST_DIR__/chunks_med.pdf', chunk_size := 100, overlap := 100);
+----
+overlap
+
+statement error
+SELECT * FROM pdf_chunks('test/data/no_such_file.pdf');
+----
+test/data/no_such_file.pdf

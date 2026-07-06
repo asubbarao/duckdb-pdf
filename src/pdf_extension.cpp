@@ -1112,9 +1112,19 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 //     the smaller size for determinism).
 //
 // CLASSIFICATION CONTRACT (first match wins, in this order)
-//  4. heading    : block's dominant font size >= ELEM_HEADING_SIZE_RATIO
-//                  x body size AND total text shorter than
-//                  ELEM_HEADING_MAX_CHARS characters.
+//  4. heading    : EITHER (a) block's dominant font size >=
+//                  ELEM_HEADING_SIZE_RATIO x body size AND total text
+//                  shorter than ELEM_HEADING_MAX_CHARS characters,
+//                  OR (b) ALL-CAPS rule: the block has fewer than
+//                  ELEM_CAPS_HEADING_MAX_WORDS words, at least
+//                  ELEM_CAPS_HEADING_MIN_ALPHA alphabetic (ASCII A-Za-z)
+//                  characters, and at least ELEM_CAPS_HEADING_UPPER_RATIO
+//                  of those alphabetic characters are uppercase —
+//                  REGARDLESS of font size. This catches short shouty
+//                  section headers ("PROFESSIONAL SUMMARY") set at body
+//                  size. Because heading is checked first, an all-caps
+//                  block that also opens with a list marker classifies
+//                  as heading, not list_item.
 //  5. list_item  : block's first line starts with a bullet glyph
 //                  (one of • – ▪, or '-' / '*' followed by a space) or a
 //                  numeric marker: 1-3 digits then '.' or ')' then a
@@ -1139,6 +1149,13 @@ static constexpr double ELEM_HEADING_SIZE_RATIO = 1.15;
 static constexpr size_t ELEM_HEADING_MAX_CHARS = 200;
 // Rule 6: blocks with fewer words than this fall through to 'other'.
 static constexpr size_t ELEM_MIN_PARAGRAPH_WORDS = 3;
+// Rule 4b (ALL-CAPS heading): a block with fewer than this many words...
+static constexpr size_t ELEM_CAPS_HEADING_MAX_WORDS = 6;
+// ...at least this many ASCII alphabetic characters (filters "42", "IV")...
+static constexpr size_t ELEM_CAPS_HEADING_MIN_ALPHA = 4;
+// ...where at least this fraction of the alphabetic characters are
+// uppercase is a heading regardless of font size.
+static constexpr double ELEM_CAPS_HEADING_UPPER_RATIO = 0.8;
 
 struct ElemWord {
 	double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
@@ -1184,6 +1201,27 @@ static double ElemModalFontSize(const ElemFontHistogram &hist) {
 		}
 	}
 	return best_size;
+}
+
+// Rule 4b: short ALL-CAPS block at any font size (see contract above).
+// Only ASCII letters are counted — multi-byte UTF-8 letters neither help
+// nor hurt the ratio (documented limitation: "RÉSUMÉ" counts 5 of its 6
+// letters).
+static bool ElemIsAllCapsHeading(const string &block_text, size_t word_count) {
+	if (word_count >= ELEM_CAPS_HEADING_MAX_WORDS) {
+		return false;
+	}
+	size_t alpha_chars = 0, upper_chars = 0;
+	for (unsigned char c : block_text) {
+		if (isalpha(c)) {
+			alpha_chars++;
+			if (isupper(c)) {
+				upper_chars++;
+			}
+		}
+	}
+	return alpha_chars >= ELEM_CAPS_HEADING_MIN_ALPHA &&
+	       (double)upper_chars >= ELEM_CAPS_HEADING_UPPER_RATIO * (double)alpha_chars;
 }
 
 // Rule 5: does this line text open with a bullet glyph or numeric marker?
@@ -1339,9 +1377,10 @@ static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_numb
 		row.has_font = row.font_size > 0;
 
 		const string &first_line_text = lines[block.front()].text;
-		if (row.has_font && body_size > 0 && row.font_size >= ELEM_HEADING_SIZE_RATIO * body_size &&
-		    row.text.size() < ELEM_HEADING_MAX_CHARS) {
-			row.element_type = "heading"; // rule 4
+		if ((row.has_font && body_size > 0 && row.font_size >= ELEM_HEADING_SIZE_RATIO * body_size &&
+		     row.text.size() < ELEM_HEADING_MAX_CHARS) ||
+		    ElemIsAllCapsHeading(row.text, word_count)) {
+			row.element_type = "heading"; // rule 4 (font size) or 4b (ALL-CAPS)
 		} else if (ElemIsListMarkerLine(first_line_text)) {
 			row.element_type = "list_item"; // rule 5
 		} else if (word_count >= ELEM_MIN_PARAGRAPH_WORDS) {
@@ -1475,6 +1514,332 @@ static void ReadPdfElementsScan(ClientContext &context, TableFunctionInput &data
 		output.SetValue(7, count, Value::DOUBLE(row.y0));
 		output.SetValue(8, count, Value::DOUBLE(row.x1));
 		output.SetValue(9, count, Value::DOUBLE(row.y1));
+		g.row_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_chunks -> retrieval-ready chunks over the element grain
+//   (file, chunk_idx, text, page_start, page_end, n_chars, heading)
+//
+// Deterministic packing of read_pdf_elements output (reuses
+// ElementsProcessFile — same segmentation, same classifier, same per-file
+// poppler critical section; chunking itself never touches poppler).
+//
+// CHUNKING CONTRACT
+//  C1. PACKING: elements are consumed in reading order and packed into a
+//      chunk until appending the next element (plus the 1-char '\n'
+//      joiner) would push the chunk's core text past chunk_size bytes.
+//  C2. NO MID-ELEMENT SPLITS: an element is never split across chunks —
+//      UNLESS the element alone exceeds chunk_size, in which case it is
+//      pre-split at the last ASCII whitespace at or before the limit,
+//      repeatedly, into pieces each <= chunk_size bytes. A whitespace-free
+//      run longer than chunk_size is hard-cut at a UTF-8 codepoint
+//      boundary.
+//  C3. HEADINGS GLUE FORWARD: a 'heading' element never ends a chunk. If
+//      packing would leave a heading last, the heading moves to the front
+//      of the next chunk instead. If the heading is the ONLY element in
+//      the chunk, the next element is glued to it even when that exceeds
+//      chunk_size (the one documented budget exception; a trailing
+//      heading at end-of-file is emitted as-is — there is no next chunk).
+//  C4. OVERLAP: each chunk after the first is prefixed with the trailing
+//      `overlap` bytes of the previous chunk's emitted text, trimmed
+//      forward to the next whitespace boundary so no word is cut, then
+//      joined to the core with '\n'. The prefix is always a suffix of the
+//      previous chunk's text column. Chunk 1 has no prefix.
+//  C5. SIZE INVARIANT: n_chars (UTF-8 codepoints of the full emitted
+//      text, overlap included) <= chunk_size + overlap + 1 (the +1 is the
+//      '\n' joining overlap to core), except when C3's glue exception
+//      fires (then core may reach one heading + '\n' + chunk_size).
+//      Budgets are counted in bytes; n_chars is codepoints, so the
+//      invariant holds a fortiori for non-ASCII text.
+//  C6. HEADING COLUMN: the text of the most recent 'heading' element at
+//      or before the chunk's first non-overlap element (a chunk that
+//      starts with a heading reports that heading). NULL before the
+//      first heading of the file.
+//  C7. chunk_idx is 1-based and dense per file; page_start/page_end are
+//      the min/max element pages contributing to the chunk's core.
+//===--------------------------------------------------------------------===//
+
+// Defaults for the pdf_chunks named parameters.
+static constexpr int32_t CHUNK_DEFAULT_SIZE = 1200;
+static constexpr int32_t CHUNK_DEFAULT_OVERLAP = 150;
+
+struct PdfChunkRow {
+	int chunk_idx = 0; // 1-based per file
+	string text;
+	int page_start = 0;
+	int page_end = 0;
+	int64_t n_chars = 0;
+	bool has_heading = false;
+	string heading;
+};
+
+// One packable piece: a whole element, or one slice of an oversized one.
+struct ChunkUnit {
+	string text;
+	int page = 0;
+	bool is_heading = false;
+	bool has_heading = false; // heading context (C6) at this unit
+	string heading;
+};
+
+static bool ChunkIsAsciiSpace(char c) {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static int64_t Utf8CodepointCount(const string &text) {
+	int64_t count = 0;
+	for (unsigned char c : text) {
+		if ((c & 0xC0) != 0x80) {
+			count++;
+		}
+	}
+	return count;
+}
+
+// C2: split one oversized element text into pieces each <= limit bytes,
+// cutting at the last ASCII whitespace at or before the limit (hard cut at
+// a codepoint boundary only when a single "word" exceeds the limit).
+static std::vector<string> ChunkSplitLongText(const string &text, size_t limit) {
+	std::vector<string> pieces;
+	size_t pos = 0;
+	while (text.size() - pos > limit) {
+		size_t cut = string::npos;
+		for (size_t i = pos + limit; i > pos; i--) {
+			if (ChunkIsAsciiSpace(text[i])) {
+				cut = i;
+				break;
+			}
+		}
+		if (cut == string::npos) {
+			// whitespace-free run: hard cut, backed up to a codepoint boundary
+			cut = pos + limit;
+			while (cut > pos && ((unsigned char)text[cut] & 0xC0) == 0x80) {
+				cut--;
+			}
+			if (cut == pos) {
+				// limit smaller than one codepoint: split it rather than loop
+				cut = pos + limit;
+			}
+			pieces.push_back(text.substr(pos, cut - pos));
+			pos = cut;
+		} else {
+			pieces.push_back(text.substr(pos, cut - pos));
+			pos = cut + 1; // skip the whitespace we cut at
+		}
+		while (pos < text.size() && ChunkIsAsciiSpace(text[pos])) {
+			pos++;
+		}
+	}
+	if (pos < text.size()) {
+		pieces.push_back(text.substr(pos));
+	}
+	return pieces;
+}
+
+// C4: trailing `overlap` bytes of the emitted text, advanced to the next
+// whitespace boundary so no word is cut. Always a suffix of `text`.
+static string ChunkComputeOverlap(const string &text, size_t overlap) {
+	if (overlap == 0) {
+		return string();
+	}
+	if (text.size() <= overlap) {
+		return text;
+	}
+	size_t start = text.size() - overlap;
+	if (!ChunkIsAsciiSpace(text[start - 1])) {
+		while (start < text.size() && !ChunkIsAsciiSpace(text[start])) {
+			start++;
+		}
+	}
+	while (start < text.size() && ChunkIsAsciiSpace(text[start])) {
+		start++;
+	}
+	return text.substr(start);
+}
+
+// Pack one file's elements into chunks (rules C1-C7 above).
+static void ChunksProcessFile(ClientContext &context, const string &path, const PdfOptions &opt, size_t chunk_size,
+                              size_t overlap, std::vector<PdfChunkRow> &out) {
+	out.clear();
+	std::vector<PdfElementRow> elements;
+	ElementsProcessFile(context, path, opt, elements);
+
+	// Elements -> units, tracking the running heading context (C6) and
+	// pre-splitting oversized elements (C2).
+	std::vector<ChunkUnit> units;
+	bool have_heading = false;
+	string current_heading;
+	for (auto &elem : elements) {
+		bool is_heading = elem.element_type == "heading";
+		if (is_heading) {
+			have_heading = true;
+			current_heading = elem.text;
+		}
+		for (auto &piece : elem.text.size() > chunk_size ? ChunkSplitLongText(elem.text, chunk_size)
+		                                                 : std::vector<string> {elem.text}) {
+			ChunkUnit unit;
+			unit.text = std::move(piece);
+			unit.page = elem.page_number;
+			unit.is_heading = is_heading;
+			unit.has_heading = have_heading;
+			unit.heading = current_heading;
+			units.push_back(std::move(unit));
+		}
+	}
+
+	std::vector<ChunkUnit> cur;
+	size_t cur_len = 0;
+	string prev_overlap;
+	int chunk_idx = 0;
+	auto flush = [&]() {
+		if (cur.empty()) {
+			return;
+		}
+		string core;
+		int page_start = cur.front().page, page_end = cur.front().page;
+		for (auto &unit : cur) {
+			if (!core.empty()) {
+				core += "\n";
+			}
+			core += unit.text;
+			page_start = MinValue<int>(page_start, unit.page);
+			page_end = MaxValue<int>(page_end, unit.page);
+		}
+		PdfChunkRow row;
+		row.chunk_idx = ++chunk_idx;
+		row.text = prev_overlap.empty() ? core : prev_overlap + "\n" + core;
+		row.page_start = page_start;
+		row.page_end = page_end;
+		row.n_chars = Utf8CodepointCount(row.text);
+		row.has_heading = cur.front().has_heading;
+		row.heading = cur.front().heading;
+		prev_overlap = ChunkComputeOverlap(row.text, overlap);
+		out.push_back(std::move(row));
+		cur.clear();
+		cur_len = 0;
+	};
+
+	for (auto &unit : units) {
+		size_t appended = cur.empty() ? unit.text.size() : cur_len + 1 + unit.text.size();
+		if (!cur.empty() && appended > chunk_size) {
+			if (cur.back().is_heading) {
+				if (cur.size() == 1) {
+					// C3 glue exception: lone heading takes the unit anyway
+					cur.push_back(unit);
+					cur_len = appended;
+					continue;
+				}
+				// C3: pop the trailing heading, flush, restart from it
+				ChunkUnit moved = std::move(cur.back());
+				cur.pop_back();
+				flush();
+				cur_len = moved.text.size();
+				cur.push_back(std::move(moved));
+				cur.push_back(unit);
+				cur_len += 1 + unit.text.size(); // may exceed (C3 glue)
+				continue;
+			}
+			flush();
+		}
+		cur_len = cur.empty() ? unit.text.size() : cur_len + 1 + unit.text.size();
+		cur.push_back(unit);
+	}
+	flush(); // a trailing heading at EOF is emitted as-is (C3)
+}
+
+struct PdfChunksBindData : public TableFunctionData {
+	vector<string> files;
+	PdfOptions opt;
+	size_t chunk_size = CHUNK_DEFAULT_SIZE;
+	size_t overlap = CHUNK_DEFAULT_OVERLAP;
+};
+
+struct PdfChunksState : public GlobalTableFunctionState {
+	idx_t file_idx = 0;
+	idx_t row_idx = 0;
+	std::vector<PdfChunkRow> rows;
+	string current_file;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfChunksBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfChunksBindData>();
+	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	ParseNamed(input.named_parameters, result->opt);
+	int32_t chunk_size = CHUNK_DEFAULT_SIZE;
+	int32_t overlap = CHUNK_DEFAULT_OVERLAP;
+	for (auto &kv : input.named_parameters) {
+		auto key = StringUtil::Lower(kv.first);
+		if (key == "chunk_size") {
+			chunk_size = IntegerValue::Get(kv.second);
+		} else if (key == "overlap") {
+			overlap = IntegerValue::Get(kv.second);
+		}
+	}
+	if (chunk_size < 1) {
+		throw InvalidInputException("pdf_chunks: chunk_size must be >= 1 (got %d)", chunk_size);
+	}
+	if (overlap < 0) {
+		throw InvalidInputException("pdf_chunks: overlap must be >= 0 (got %d)", overlap);
+	}
+	if (overlap >= chunk_size) {
+		throw InvalidInputException("pdf_chunks: overlap (%d) must be smaller than chunk_size (%d)", overlap,
+		                            chunk_size);
+	}
+	result->chunk_size = (size_t)chunk_size;
+	result->overlap = (size_t)overlap;
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER,
+	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR};
+	names = {"file", "chunk_idx", "text", "page_start", "page_end", "n_chars", "heading"};
+	return std::move(result);
+}
+
+static void PdfChunksOpenFile(ClientContext &context, const PdfChunksBindData &bind, PdfChunksState &g) {
+	g.current_file = bind.files[g.file_idx];
+	g.row_idx = 0;
+	ChunksProcessFile(context, g.current_file, bind.opt, bind.chunk_size, bind.overlap, g.rows);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfChunksInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<PdfChunksBindData>();
+	auto g = make_uniq<PdfChunksState>();
+	if (!bind.files.empty()) {
+		PdfChunksOpenFile(context, bind, *g);
+	}
+	return std::move(g);
+}
+
+static void PdfChunksScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfChunksBindData>();
+	auto &g = data_p.global_state->Cast<PdfChunksState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE) {
+		if (g.file_idx >= bind.files.size()) {
+			break;
+		}
+		if (g.row_idx >= g.rows.size()) {
+			g.file_idx++;
+			if (g.file_idx >= bind.files.size()) {
+				break;
+			}
+			PdfChunksOpenFile(context, bind, g);
+			continue;
+		}
+		auto &row = g.rows[g.row_idx];
+		output.SetValue(0, count, Value(g.current_file));
+		output.SetValue(1, count, Value::INTEGER(row.chunk_idx));
+		output.SetValue(2, count, Value(row.text));
+		output.SetValue(3, count, Value::INTEGER(row.page_start));
+		output.SetValue(4, count, Value::INTEGER(row.page_end));
+		output.SetValue(5, count, Value::INTEGER((int32_t)row.n_chars));
+		output.SetValue(6, count, row.has_heading ? Value(row.heading) : Value(LogicalType::VARCHAR));
 		g.row_idx++;
 		count++;
 	}
@@ -3335,6 +3700,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	read_pdf_elements.named_parameters["first_page"] = LogicalType::INTEGER;
 	read_pdf_elements.named_parameters["last_page"] = LogicalType::INTEGER;
 	loader.RegisterFunction(read_pdf_elements);
+
+	// pdf_chunks packs the element grain into retrieval-ready chunks; it
+	// honors the same file handling + page-range/password params as
+	// read_pdf_elements plus its own chunk_size / overlap knobs.
+	TableFunction pdf_chunks("pdf_chunks", {LogicalType::VARCHAR}, PdfChunksScan, PdfChunksBind, PdfChunksInit);
+	pdf_chunks.named_parameters["chunk_size"] = LogicalType::INTEGER;
+	pdf_chunks.named_parameters["overlap"] = LogicalType::INTEGER;
+	pdf_chunks.named_parameters["password"] = LogicalType::VARCHAR;
+	pdf_chunks.named_parameters["first_page"] = LogicalType::INTEGER;
+	pdf_chunks.named_parameters["last_page"] = LogicalType::INTEGER;
+	loader.RegisterFunction(pdf_chunks);
 
 	TableFunction read_pdf_tables("read_pdf_tables", {LogicalType::VARCHAR}, ReadPdfTablesScan, ReadPdfTablesBind,
 	                              ReadPdfTablesInit);
