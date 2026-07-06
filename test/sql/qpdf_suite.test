@@ -1,0 +1,262 @@
+# name: test/sql/qpdf_suite.test
+# description: qpdf everyday suite — pdf_compress / pdf_encrypt / pdf_decrypt /
+# group: [sql]
+
+#              pdf_pages / pdf_form_fields / pdf_annotations
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── fixtures: three single-page PDFs via the extension's own COPY writer ─────
+
+statement ok
+COPY (SELECT 'DeltaSuiteMarker page one content' AS t) TO '__TEST_DIR__/qs1.pdf' (FORMAT pdf);
+
+statement ok
+COPY (SELECT 'EchoSuiteMarker page two content' AS t) TO '__TEST_DIR__/qs2.pdf' (FORMAT pdf);
+
+statement ok
+COPY (SELECT 'FoxtrotSuiteMarker page three content' AS t) TO '__TEST_DIR__/qs3.pdf' (FORMAT pdf);
+
+query I
+SELECT ends_with(
+  pdf_merge(['__TEST_DIR__/qs1.pdf', '__TEST_DIR__/qs2.pdf', '__TEST_DIR__/qs3.pdf'],
+            '__TEST_DIR__/qs123.pdf'),
+  'qs123.pdf');
+----
+true
+
+# ── NULL propagation ─────────────────────────────────────────────────────────
+
+query I
+SELECT pdf_compress(NULL, '__TEST_DIR__/qsnull.pdf') IS NULL;
+----
+true
+
+query I
+SELECT pdf_encrypt('__TEST_DIR__/qs1.pdf', NULL, 'pw') IS NULL;
+----
+true
+
+query I
+SELECT pdf_decrypt('__TEST_DIR__/qs1.pdf', '__TEST_DIR__/qsnull.pdf', NULL) IS NULL;
+----
+true
+
+query I
+SELECT pdf_pages('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qsnull.pdf', NULL) IS NULL;
+----
+true
+
+# ── pdf_compress: round trip preserves page count and text ───────────────────
+
+query I
+SELECT ends_with(pdf_compress('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qscomp.pdf'), 'qscomp.pdf');
+----
+true
+
+query I
+SELECT max(page_count) FROM read_pdf('__TEST_DIR__/qscomp.pdf');
+----
+3
+
+# same text as the input, page for page
+query I
+SELECT bool_and(a.text = b.text)
+FROM read_pdf('__TEST_DIR__/qs123.pdf') a
+JOIN read_pdf('__TEST_DIR__/qscomp.pdf') b USING (page);
+----
+true
+
+# ── pdf_encrypt → pdf_decrypt round trip (AES-256 / R6) ──────────────────────
+
+query I
+SELECT ends_with(pdf_encrypt('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qsenc.pdf', 'hunter2'), 'qsenc.pdf');
+----
+true
+
+# reading the encrypted file WITHOUT the password errors
+statement error
+SELECT text FROM read_pdf('__TEST_DIR__/qsenc.pdf');
+----
+is encrypted; supply the correct password
+
+# reading WITH the password works (poppler decrypts AES-256)
+query I
+SELECT max(page_count) FROM read_pdf('__TEST_DIR__/qsenc.pdf', password := 'hunter2');
+----
+3
+
+query I
+SELECT encrypted FROM read_pdf_meta('__TEST_DIR__/qsenc.pdf', password := 'hunter2');
+----
+true
+
+# wrong password on decrypt: qpdf's stable "invalid password" message
+statement error
+SELECT pdf_decrypt('__TEST_DIR__/qsenc.pdf', '__TEST_DIR__/qswrong.pdf', 'wrongpw');
+----
+invalid password
+
+query I
+SELECT ends_with(pdf_decrypt('__TEST_DIR__/qsenc.pdf', '__TEST_DIR__/qsdec.pdf', 'hunter2'), 'qsdec.pdf');
+----
+true
+
+query I
+SELECT encrypted FROM read_pdf_meta('__TEST_DIR__/qsdec.pdf');
+----
+false
+
+# decrypted text equals the original, page for page
+query I
+SELECT bool_and(a.text = b.text)
+FROM read_pdf('__TEST_DIR__/qs123.pdf') a
+JOIN read_pdf('__TEST_DIR__/qsdec.pdf') b USING (page);
+----
+true
+
+# distinct owner password also opens the document
+query I
+SELECT ends_with(pdf_encrypt('__TEST_DIR__/qs1.pdf', '__TEST_DIR__/qsenc2.pdf', 'userpw', 'ownerpw'), 'qsenc2.pdf');
+----
+true
+
+query I
+SELECT ends_with(pdf_decrypt('__TEST_DIR__/qsenc2.pdf', '__TEST_DIR__/qsdec2.pdf', 'ownerpw'), 'qsdec2.pdf');
+----
+true
+
+# ── pdf_pages: subset extraction in range order ──────────────────────────────
+
+query I
+SELECT ends_with(pdf_pages('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qs13.pdf', '1,3'), 'qs13.pdf');
+----
+true
+
+query I
+SELECT max(page_count) FROM read_pdf('__TEST_DIR__/qs13.pdf');
+----
+2
+
+# extracted pages carry the texts of source pages 1 and 3, in range order
+query II
+SELECT page,
+       CASE WHEN page = 1 THEN contains(text, 'DeltaSuiteMarker')
+            ELSE contains(text, 'FoxtrotSuiteMarker') END
+FROM read_pdf('__TEST_DIR__/qs13.pdf')
+ORDER BY page;
+----
+1	true
+2	true
+
+# repeats in the range are allowed (shallow-copied)
+query I
+SELECT ends_with(pdf_pages('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qsdup.pdf', '2,2'), 'qsdup.pdf');
+----
+true
+
+query I
+SELECT max(page_count) FROM read_pdf('__TEST_DIR__/qsdup.pdf');
+----
+2
+
+query I
+SELECT bool_and(contains(text, 'EchoSuiteMarker')) FROM read_pdf('__TEST_DIR__/qsdup.pdf');
+----
+true
+
+# ── pdf_form_fields / pdf_annotations: zero rows on formless generated PDFs ──
+
+query I
+SELECT count(*) FROM pdf_form_fields('__TEST_DIR__/qs123.pdf');
+----
+0
+
+query I
+SELECT count(*) FROM pdf_annotations('__TEST_DIR__/qs123.pdf');
+----
+0
+
+# ── positive path: committed fixture with an AcroForm text field, a Link
+#    annotation (/A /URI action) and a Text annotation ────────────────────────
+
+query IIIIII
+SELECT ends_with(file, 'form_annots.pdf'), page, field_name, field_type, value, is_required
+FROM pdf_form_fields('test/data/form_annots.pdf');
+----
+true	1	fixture_name	text	PrefilledValue	true
+
+query IIIII
+SELECT page, subtype, contents, uri, rect_x1 - rect_x0
+FROM pdf_annotations('test/data/form_annots.pdf')
+ORDER BY subtype;
+----
+1	Link	NULL	http://example.com/duck	128.0
+1	Text	SampleNoteMarker comment	NULL	28.0
+1	Widget	NULL	NULL	228.0
+
+# the "extract hyperlinks" recipe
+query I
+SELECT uri FROM pdf_annotations('test/data/form_annots.pdf') WHERE subtype = 'Link';
+----
+http://example.com/duck
+
+# glob over the three formless single-pagers still yields zero rows
+query I
+SELECT count(*) FROM pdf_form_fields('__TEST_DIR__/qs?.pdf');
+----
+0
+
+# ── error cases ──────────────────────────────────────────────────────────────
+
+# missing input file
+statement error
+SELECT pdf_compress('__TEST_DIR__/qs_no_such_input.pdf', '__TEST_DIR__/qsnever.pdf');
+----
+qs_no_such_input.pdf' does not exist
+
+statement error
+SELECT pdf_encrypt('__TEST_DIR__/qs_no_such_input.pdf', '__TEST_DIR__/qsnever.pdf', 'pw');
+----
+qs_no_such_input.pdf' does not exist
+
+statement error
+SELECT * FROM pdf_form_fields('__TEST_DIR__/qs_no_such_input.pdf');
+----
+qs_no_such_input.pdf' does not exist
+
+statement error
+SELECT * FROM pdf_annotations('__TEST_DIR__/qs_no_such_input.pdf');
+----
+qs_no_such_input.pdf' does not exist
+
+# nonexistent output directory
+statement error
+SELECT pdf_compress('__TEST_DIR__/qs1.pdf', '__TEST_DIR__/qs_no_such_dir/out.pdf');
+----
+qs_no_such_dir' does not exist
+
+statement error
+SELECT pdf_pages('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qs_no_such_dir/out.pdf', '1');
+----
+qs_no_such_dir' does not exist
+
+# in-place operation is refused (qpdf reads the source lazily during write)
+statement error
+SELECT pdf_compress('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qs123.pdf');
+----
+output path must differ from input path
+
+statement error
+SELECT pdf_decrypt('__TEST_DIR__/qsenc.pdf', '__TEST_DIR__/qsenc.pdf', 'hunter2');
+----
+output path must differ from input path
+
+# out-of-range page spec
+statement error
+SELECT pdf_pages('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qsoor.pdf', '9');
+----
+out of range
