@@ -33,7 +33,7 @@ SELECT page, page_count, left(text, 60) AS head FROM read_pdf('resume_v2.pdf');
 
 ## What it does
 
-The `pdf` extension exposes eight functions covering the full range of PDF extraction tasks:
+The `pdf` extension exposes the following functions covering the full range of PDF extraction tasks:
 
 | Function | Kind | Description |
 |---|---|---|
@@ -43,6 +43,7 @@ The `pdf` extension exposes eight functions covering the full range of PDF extra
 | `read_pdf_words` | Table | One row per word with bounding box + font: `x0,y0,x1,y1`, `font_name`, `font_size` |
 | `read_pdf_tables` | Table | Tabular regions from digital PDFs: `page`, `table_index`, `row_index`, `cells VARCHAR[]` |
 | `read_pdf_elements` | Table | One row per layout element (`heading`/`paragraph`/`list_item`/`other`): `file`, `page_number`, `element_idx`, `element_type`, `text`, `font_size`, `bbox_x0..bbox_y1` |
+| `pdf_chunks` | Table | Retrieval-ready chunks packed from the element grain: `file`, `chunk_idx`, `text`, `page_start`, `page_end`, `n_chars`, `heading` (section context). `chunk_size` / `overlap` named params. |
 | `pdf_to_text` | Scalar | Convert a whole PDF to plain text (optionally with a `layout` argument: `reading`, `physical`, or `raw`). Path form routes through DuckDB's FileSystem (s3://, https://, VFS when httpfs etc loaded). Also has BLOB overloads. |
 | `pdf_to_html` | Scalar | Convert PDF to absolutely-positioned HTML (BLOB and path overloads; path uses DuckDB VFS). |
 | `pdf_to_xml` | Scalar | Convert PDF to pdftoxml-style XML with per-word bboxes (BLOB and path; VFS for paths). |
@@ -206,7 +207,7 @@ ORDER BY page, line_band DESC;
 
 Returns one row per layout element in reading order, with columns `file`, `page_number` (1-based), `element_idx` (1-based within page), `element_type`, `text`, `font_size` (dominant size of the element, NULL when the PDF carries no font info), and `bbox_x0`, `bbox_y0`, `bbox_x1`, `bbox_y1`.
 
-Elements are built by deterministic geometry over poppler's positioned word list — words cluster into lines by vertical overlap, lines into blocks by vertical gap (> 0.6× median line height), font-size change (> 15%), or a list marker starting a line. Classification: `heading` = dominant font ≥ 1.15× the document's modal body size and < 200 chars; `list_item` = first line starts with a bullet glyph (`•`, `–`, `▪`, or `-`/`*` + space) or an `N.` / `N)` marker; `paragraph` = any other block of ≥ 3 words; `other` = the rest (page numbers, isolated fragments). v1 reads the native text layer only (no OCR) and does not attempt table detection — table rows come out as paragraphs; use `read_pdf_tables` for tables.
+Elements are built by deterministic geometry over poppler's positioned word list — words cluster into lines by vertical overlap, lines into blocks by vertical gap (> 0.6× median line height), font-size change (> 15%), or a list marker starting a line. Classification: `heading` = dominant font ≥ 1.15× the document's modal body size and < 200 chars, OR a short ALL-CAPS block at any font size (< 6 words, ≥ 4 alphabetic chars, ≥ 80% of them uppercase — catches section headers like `PROFESSIONAL SUMMARY` set at body size); `list_item` = first line starts with a bullet glyph (`•`, `–`, `▪`, or `-`/`*` + space) or an `N.` / `N)` marker; `paragraph` = any other block of ≥ 3 words; `other` = the rest (page numbers, isolated fragments). v1 reads the native text layer only (no OCR) and does not attempt table detection — table rows come out as paragraphs; use `read_pdf_tables` for tables.
 
 ```sql
 -- Document outline: just the headings
@@ -220,6 +221,26 @@ SELECT file, page_number, element_idx, text, bbox_y0
 FROM read_pdf_elements('docs/*.pdf')
 WHERE element_type IN ('paragraph', 'list_item')
 ORDER BY file, page_number, element_idx;
+```
+
+### `pdf_chunks` — retrieval-ready chunking
+
+`pdf_chunks(files, chunk_size := 1200, overlap := 150)` packs the `read_pdf_elements` grain into retrieval-ready chunks — same file handling (single path or glob), plus `password` / `first_page` / `last_page`. Columns: `file`, `chunk_idx` (1-based per file), `text`, `page_start`, `page_end`, `n_chars` (length of the emitted text, overlap included), and `heading` (text of the nearest preceding `heading` element — every chunk carries its section context; NULL before the first heading).
+
+Deterministic chunking rules (no ML, no tokenizers):
+
+1. Elements pack into a chunk in reading order until the next one would push the chunk past `chunk_size`.
+2. An element is never split across chunks — unless it alone exceeds `chunk_size`, in which case it splits at the last whitespace before the limit (repeatedly for very long elements).
+3. A `heading` never ends a chunk: it glues forward to start the next one, keeping headers attached to their section.
+4. Each chunk after the first is prefixed with the trailing `overlap` characters of the previous chunk's text, trimmed to a whitespace boundary so no word is cut.
+
+```sql
+-- One statement from a folder of PDFs to a chunk table
+CREATE TABLE chunks AS FROM pdf_chunks('docs/*.pdf');
+
+-- Every chunk knows its section
+SELECT heading, chunk_idx, n_chars, text[:80]
+FROM pdf_chunks('report.pdf', chunk_size := 800, overlap := 100);
 ```
 
 ### `read_pdf_tables` — structured table extraction
@@ -481,6 +502,33 @@ SELECT * FROM (
 - **Paragraphs**: consecutive same-indent body lines merged into one paragraph block; blank lines between blocks.
 
 Pages are joined with `\n\n`. NULL input → NULL output. Missing or encrypted PDFs raise an error.
+
+## RAG over a folder of PDFs in three statements
+
+The extension stays a deterministic reader/writer — **it does not embed and it does not call models**. But `pdf_chunks` plus DuckDB's core [`vss`](https://duckdb.org/docs/stable/core_extensions/vss) extension is a complete local RAG substrate; you bring the embedder. The full runnable recipe lives in [`examples/rag_pdf_vss.sql`](examples/rag_pdf_vss.sql).
+
+```sql
+-- 1. chunk every PDF in the folder (deterministic, section-aware)
+CREATE TABLE chunks AS FROM pdf_chunks('docs/*.pdf');
+
+-- 2. add an embedding column and populate it with YOUR embedder of choice
+--    (the pdf extension does not embed — this is the shape, not the call;
+--    fill it from your embedding pipeline: an UDF, a COPY back in, etc.)
+ALTER TABLE chunks ADD COLUMN embedding FLOAT[384];
+-- UPDATE chunks SET embedding = <your_embedder>(text);
+
+-- 3. index and search with the core vss extension
+INSTALL vss; LOAD vss;
+SET hnsw_enable_experimental_persistence = true;
+CREATE INDEX chunks_hnsw ON chunks USING HNSW (embedding);
+
+SELECT file, heading, page_start, text
+FROM chunks
+ORDER BY array_distance(embedding, [/* query embedding */]::FLOAT[384])
+LIMIT 5;
+```
+
+Every hit comes back with its `file`, `page_start`/`page_end`, and the `heading` of the section it came from — citation-ready without a second lookup.
 
 ## Saving / converting documents to PDF
 

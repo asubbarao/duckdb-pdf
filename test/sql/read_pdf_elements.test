@@ -202,6 +202,62 @@ WHERE NOT contains(file, 'elements_glob');
 ----
 true
 
+# ── ALL-CAPS heading rule (rule 4b) ──────────────────────────────────────────
+# Short shouty section headers at BODY font size classify as heading:
+# < ELEM_CAPS_HEADING_MAX_WORDS words, >= ELEM_CAPS_HEADING_MIN_ALPHA alpha
+# chars, >= ELEM_CAPS_HEADING_UPPER_RATIO of alpha chars uppercase.
+
+statement ok
+COPY (
+  SELECT line FROM (VALUES
+    ('PROFESSIONAL SUMMARY'),
+    (''),
+    ('Body text paragraph in regular case with plenty of words'),
+    (''),
+    ('CAREER HIGHLIGHTS'),
+    (''),
+    ('More regular body prose follows the second caps header'),
+    (''),
+    ('IV'),
+    (''),
+    ('ALPHA BETA GAMMA DELTA EPSILON ZETA')
+  ) t(line)
+) TO '__TEST_DIR__/elements_caps.pdf' (FORMAT pdf);
+
+# Both caps headers are headings despite body-size font
+query I
+SELECT element_type FROM read_pdf_elements('__TEST_DIR__/elements_caps.pdf')
+WHERE text = 'PROFESSIONAL SUMMARY';
+----
+heading
+
+query I
+SELECT element_type FROM read_pdf_elements('__TEST_DIR__/elements_caps.pdf')
+WHERE text = 'CAREER HIGHLIGHTS';
+----
+heading
+
+# 'IV' has only 2 alphabetic chars (< ELEM_CAPS_HEADING_MIN_ALPHA) -> other
+query I
+SELECT element_type FROM read_pdf_elements('__TEST_DIR__/elements_caps.pdf')
+WHERE text = 'IV';
+----
+other
+
+# 6 caps words is not "fewer than ELEM_CAPS_HEADING_MAX_WORDS" -> paragraph
+query I
+SELECT element_type FROM read_pdf_elements('__TEST_DIR__/elements_caps.pdf')
+WHERE text = 'ALPHA BETA GAMMA DELTA EPSILON ZETA';
+----
+paragraph
+
+# Mixed-case body prose is untouched by the caps rule
+query I
+SELECT COUNT(*) FROM read_pdf_elements('__TEST_DIR__/elements_caps.pdf')
+WHERE element_type = 'paragraph';
+----
+3
+
 # ── error handling ────────────────────────────────────────────────────────────
 
 statement error
