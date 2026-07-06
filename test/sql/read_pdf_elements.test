@@ -1,0 +1,215 @@
+# name: test/sql/read_pdf_elements.test
+# description: read_pdf_elements layout-element grain (heading/paragraph/list_item/other)
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── deterministic fixture built with the extension's own writer ──────────────
+# Single-line blocks separated by blank lines: every text line is its own
+# element regardless of the gap-merge threshold, so per-type counts are exact.
+# Layout: 3 multi-word paragraphs, 2 list items ('- ' bullet + 'N.' marker),
+# 1 isolated fragment ('42' -> other). Single font size => no headings.
+
+statement ok
+COPY (
+  SELECT line FROM (VALUES
+    ('The quick brown fox jumps over the lazy dog'),
+    (''),
+    ('Pack my box with five dozen liquor jugs today'),
+    (''),
+    ('A third short paragraph sentence with several words here'),
+    (''),
+    ('- alpha beta gamma'),
+    (''),
+    ('1. numbered item text'),
+    (''),
+    ('42')
+  ) t(line)
+) TO '__TEST_DIR__/elements_fixture.pdf' (FORMAT pdf);
+
+# Exact element counts per type
+query II
+SELECT element_type, COUNT(*)
+FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+GROUP BY element_type
+ORDER BY element_type;
+----
+list_item	2
+other	1
+paragraph	3
+
+# No headings in a single-font document
+query I
+SELECT COUNT(*) FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+WHERE element_type = 'heading';
+----
+0
+
+# Reading order: element_idx is 1-based, dense, and follows top-down y order
+query I
+SELECT COUNT(*) = MAX(element_idx) AND MIN(element_idx) = 1
+FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf');
+----
+true
+
+query I
+SELECT COUNT(*) = 0 FROM (
+  SELECT element_idx, bbox_y0,
+         LAG(bbox_y0) OVER (PARTITION BY file, page_number ORDER BY element_idx) AS prev_y0
+  FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+) WHERE prev_y0 IS NOT NULL AND bbox_y0 < prev_y0;
+----
+true
+
+# First element in reading order is the topmost paragraph
+query I
+SELECT contains(lower(text), 'quick brown fox')
+FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+WHERE element_idx = 1 AND page_number = 1;
+----
+true
+
+# The bullet and numbered lines are the list items
+query I
+SELECT COUNT(*) = 2
+FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+WHERE element_type = 'list_item'
+  AND (starts_with(text, '- alpha') OR starts_with(text, '1. numbered'));
+----
+true
+
+# The isolated fragment is 'other'
+query I
+SELECT element_type FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+WHERE text = '42';
+----
+other
+
+# bbox monotonicity: x0 < x1 and y0 < y1 on every element
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+WHERE NOT (bbox_x0 < bbox_x1 AND bbox_y0 < bbox_y1);
+----
+true
+
+# Native text layer: font_size present and near the writer's 10pt default
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+WHERE font_size IS NULL OR font_size < 9 OR font_size > 11;
+----
+true
+
+# ── multi-font fixture: heading detection ─────────────────────────────────────
+# markdown_fixture.pdf: 24pt title, 14pt subheading, 10pt body/list/table.
+
+# Exactly the two oversized short blocks classify as headings
+query I
+SELECT COUNT(*) FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+WHERE element_type = 'heading';
+----
+2
+
+query I
+SELECT element_type FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+WHERE text = 'Markdown Fixture Title';
+----
+heading
+
+query I
+SELECT element_type FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+WHERE text = 'Introduction Section';
+----
+heading
+
+# The title is the first element in reading order
+query I
+SELECT text = 'Markdown Fixture Title'
+FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+WHERE page_number = 1 AND element_idx = 1;
+----
+true
+
+# The three '- item ...' bullets classify as list items
+query I
+SELECT COUNT(*) FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+WHERE element_type = 'list_item' AND starts_with(text, '- item');
+----
+3
+
+# Body prose classifies as paragraph
+query I
+SELECT element_type FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+WHERE contains(lower(text), 'layout-aware markdown');
+----
+paragraph
+
+# Font-size sanity: every heading is larger than every paragraph
+query I
+SELECT (SELECT MIN(font_size) FROM read_pdf_elements('test/data/markdown_fixture.pdf') WHERE element_type = 'heading')
+     > (SELECT MAX(font_size) FROM read_pdf_elements('test/data/markdown_fixture.pdf') WHERE element_type = 'paragraph');
+----
+true
+
+# bbox monotonicity holds on the multi-font fixture too
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+WHERE NOT (bbox_x0 < bbox_x1 AND bbox_y0 < bbox_y1);
+----
+true
+
+# ── multi-page + page-range params ───────────────────────────────────────────
+
+query I
+SELECT COUNT(DISTINCT page_number) FROM read_pdf_elements('test/data/two_pages.pdf');
+----
+2
+
+query I
+SELECT MAX(page_number) FROM read_pdf_elements('test/data/two_pages.pdf', last_page := 1);
+----
+1
+
+query I
+SELECT MIN(page_number) FROM read_pdf_elements('test/data/two_pages.pdf', first_page := 2);
+----
+2
+
+# ── glob / multi-file ─────────────────────────────────────────────────────────
+
+statement ok
+COPY (SELECT 'first glob file body text here' AS line)
+TO '__TEST_DIR__/elements_glob1.pdf' (FORMAT pdf);
+
+statement ok
+COPY (SELECT 'second glob file body text here' AS line)
+TO '__TEST_DIR__/elements_glob2.pdf' (FORMAT pdf);
+
+query I
+SELECT COUNT(DISTINCT file) FROM read_pdf_elements('__TEST_DIR__/elements_glob*.pdf');
+----
+2
+
+# Every row carries the file it came from
+query I
+SELECT COUNT(*) = 0 FROM read_pdf_elements('__TEST_DIR__/elements_glob*.pdf')
+WHERE NOT contains(file, 'elements_glob');
+----
+true
+
+# ── error handling ────────────────────────────────────────────────────────────
+
+statement error
+SELECT * FROM read_pdf_elements('test/data/no_such_file.pdf');
+----
+test/data/no_such_file.pdf
+
+statement error
+SELECT * FROM read_pdf_elements('test/data/two_pages.pdf', first_page := 0);
+----
+first_page

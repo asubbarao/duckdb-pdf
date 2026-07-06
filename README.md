@@ -42,6 +42,7 @@ The `pdf` extension exposes eight functions covering the full range of PDF extra
 | `read_pdf_meta` | Table | Document metadata: title, author, subject, keywords, creator, producer, pages, pdf_version, encrypted |
 | `read_pdf_words` | Table | One row per word with bounding box + font: `x0,y0,x1,y1`, `font_name`, `font_size` |
 | `read_pdf_tables` | Table | Tabular regions from digital PDFs: `page`, `table_index`, `row_index`, `cells VARCHAR[]` |
+| `read_pdf_elements` | Table | One row per layout element (`heading`/`paragraph`/`list_item`/`other`): `file`, `page_number`, `element_idx`, `element_type`, `text`, `font_size`, `bbox_x0..bbox_y1` |
 | `pdf_to_text` | Scalar | Convert a whole PDF to plain text (optionally with a `layout` argument: `reading`, `physical`, or `raw`). Path form routes through DuckDB's FileSystem (s3://, https://, VFS when httpfs etc loaded). Also has BLOB overloads. |
 | `pdf_to_html` | Scalar | Convert PDF to absolutely-positioned HTML (BLOB and path overloads; path uses DuckDB VFS). |
 | `pdf_to_xml` | Scalar | Convert PDF to pdftoxml-style XML with per-word bboxes (BLOB and path; VFS for paths). |
@@ -147,6 +148,26 @@ SELECT page,
 FROM read_pdf_words('report.pdf')
 GROUP BY page, line_band
 ORDER BY page, line_band DESC;
+```
+
+### `read_pdf_elements` — layout-element extraction
+
+Returns one row per layout element in reading order, with columns `file`, `page_number` (1-based), `element_idx` (1-based within page), `element_type`, `text`, `font_size` (dominant size of the element, NULL when the PDF carries no font info), and `bbox_x0`, `bbox_y0`, `bbox_x1`, `bbox_y1`.
+
+Elements are built by deterministic geometry over poppler's positioned word list — words cluster into lines by vertical overlap, lines into blocks by vertical gap (> 0.6× median line height), font-size change (> 15%), or a list marker starting a line. Classification: `heading` = dominant font ≥ 1.15× the document's modal body size and < 200 chars; `list_item` = first line starts with a bullet glyph (`•`, `–`, `▪`, or `-`/`*` + space) or an `N.` / `N)` marker; `paragraph` = any other block of ≥ 3 words; `other` = the rest (page numbers, isolated fragments). v1 reads the native text layer only (no OCR) and does not attempt table detection — table rows come out as paragraphs; use `read_pdf_tables` for tables.
+
+```sql
+-- Document outline: just the headings
+SELECT page_number, text, font_size
+FROM read_pdf_elements('report.pdf')
+WHERE element_type = 'heading'
+ORDER BY page_number, element_idx;
+
+-- Chunk a PDF for RAG at paragraph grain, keeping position
+SELECT file, page_number, element_idx, text, bbox_y0
+FROM read_pdf_elements('docs/*.pdf')
+WHERE element_type IN ('paragraph', 'list_item')
+ORDER BY file, page_number, element_idx;
 ```
 
 ### `read_pdf_tables` — structured table extraction
