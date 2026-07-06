@@ -62,23 +62,23 @@ true
 
 query I
 WITH glob_scan AS (
-    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_*.pdf')
+    SELECT replace(filename, chr(92), '/') AS filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_*.pdf')
 ), single_scans AS (
-    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_0.pdf')
+    SELECT replace(filename, chr(92), '/') AS filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_0.pdf')
     UNION ALL
-    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_1.pdf')
+    SELECT replace(filename, chr(92), '/') AS filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_1.pdf')
     UNION ALL
-    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_2.pdf')
+    SELECT replace(filename, chr(92), '/') AS filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_2.pdf')
     UNION ALL
-    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_3.pdf')
+    SELECT replace(filename, chr(92), '/') AS filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_3.pdf')
     UNION ALL
-    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_4.pdf')
+    SELECT replace(filename, chr(92), '/') AS filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_4.pdf')
     UNION ALL
-    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_5.pdf')
+    SELECT replace(filename, chr(92), '/') AS filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_5.pdf')
     UNION ALL
-    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_6.pdf')
+    SELECT replace(filename, chr(92), '/') AS filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_6.pdf')
     UNION ALL
-    SELECT filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_7.pdf')
+    SELECT replace(filename, chr(92), '/') AS filename, page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pscan_7.pdf')
 )
 SELECT (SELECT count(*) FROM (SELECT * FROM glob_scan EXCEPT SELECT * FROM single_scans)) = 0
    AND (SELECT count(*) FROM (SELECT * FROM single_scans EXCEPT SELECT * FROM glob_scan)) = 0
