@@ -1,0 +1,114 @@
+# name: test/sql/pdf_inspect.test
+# description: Inspection suite: pdf_info / pdf_outline / pdf_attachments
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── fixtures via the extension's own writer (round-trip proof) ──
+
+statement ok
+COPY (SELECT 'alpha doc body' AS c) TO '__TEST_DIR__/inspect_a.pdf' (FORMAT pdf, TITLE 'Census Alpha', AUTHOR 'Alok S', USE_TMP_FILE false);
+
+statement ok
+COPY (SELECT 'beta doc body' AS c) TO '__TEST_DIR__/inspect_b.pdf' (FORMAT pdf, TITLE 'Census Beta', USE_TMP_FILE false);
+
+statement ok
+COPY (SELECT repeat('gamma page filler text for pagination. ', 200) AS c) TO '__TEST_DIR__/inspect_c.pdf' (FORMAT pdf, FONT_SIZE 20, USE_TMP_FILE false);
+
+# ── pdf_info: TITLE / AUTHOR written by our COPY come back exactly ──
+
+query I
+SELECT title = 'Census Alpha' AND author = 'Alok S' FROM pdf_info('__TEST_DIR__/inspect_a.pdf');
+----
+true
+
+# unset metadata keys are NULL, never empty strings
+query I
+SELECT author IS NULL AND subject IS NULL AND keywords IS NULL FROM pdf_info('__TEST_DIR__/inspect_b.pdf');
+----
+true
+
+# structural facts: page count, encryption, first-page media box, on-disk size
+query I
+SELECT page_count = 1 AND is_encrypted = false AND width > 0 AND height > 0 AND file_size > 0
+FROM pdf_info('__TEST_DIR__/inspect_a.pdf');
+----
+true
+
+# is_linearized is a real boolean (our writer does not linearize)
+query I
+SELECT is_linearized FROM pdf_info('__TEST_DIR__/inspect_a.pdf');
+----
+false
+
+# pdf_version is dotted major.minor
+query I
+SELECT starts_with(pdf_version, '1.') FROM pdf_info('__TEST_DIR__/inspect_a.pdf');
+----
+true
+
+# the FONT_SIZE 20 filler doc paginated: page_count agrees with read_pdf
+query I
+SELECT i.page_count = (SELECT max(page) FROM read_pdf('__TEST_DIR__/inspect_c.pdf', auto_ocr := false))
+FROM pdf_info('__TEST_DIR__/inspect_c.pdf') i;
+----
+true
+
+# ── pdf_info over a glob: one row per file ──
+
+query I
+SELECT count(*) FROM pdf_info('__TEST_DIR__/inspect_*.pdf');
+----
+3
+
+query I
+SELECT count(DISTINCT file) FROM pdf_info('__TEST_DIR__/inspect_*.pdf');
+----
+3
+
+# ── pdf_outline: our writer emits no bookmarks — zero rows, not an error ──
+# (no repo fixture carries an outline; the zero-row contract plus the
+# glob NULL-safety pass below is the coverage.)
+
+query I
+SELECT count(*) FROM pdf_outline('__TEST_DIR__/inspect_a.pdf');
+----
+0
+
+statement ok
+SELECT file, ord, depth, title FROM pdf_outline('__TEST_DIR__/inspect_*.pdf');
+
+statement ok
+SELECT * FROM pdf_outline('test/data/two_pages.pdf');
+
+# ── pdf_attachments: no embedded files — zero rows, not an error ──
+
+query I
+SELECT count(*) FROM pdf_attachments('__TEST_DIR__/inspect_*.pdf');
+----
+0
+
+statement ok
+SELECT file, name, description, size, mime_type, octet_length(data) FROM pdf_attachments('test/data/hello.pdf');
+
+# ── failure contract matches read_pdf: corrupt / missing files throw ──
+
+statement error
+SELECT * FROM pdf_info('test/sql/pdf_inspect.test');
+----
+could not open
+
+statement error
+SELECT * FROM pdf_info('test/data/does_not_exist_census.pdf');
+----
+
+statement error
+SELECT * FROM pdf_outline('test/data/does_not_exist_census.pdf');
+----
+
+statement error
+SELECT * FROM pdf_attachments('test/data/does_not_exist_census.pdf');
+----
