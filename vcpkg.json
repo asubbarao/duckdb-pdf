@@ -9,7 +9,11 @@
 		},
 		"tesseract",
 		"leptonica",
-		"libharu"
+		"libharu",
+		{
+			"name": "qpdf",
+			"default-features": false
+		}
 	],
 	"vcpkg-configuration": {
 		"overlay-ports": [

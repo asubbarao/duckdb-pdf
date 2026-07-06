@@ -50,6 +50,9 @@ The `pdf` extension exposes eight functions covering the full range of PDF extra
 | `pdf_to_png` | Scalar | Render a page of the PDF to PNG bytes returned as BLOB (BLOB and path; VFS for paths). |
 | `write_pdf` | Scalar | **Native** (no LibreOffice) write of VARCHAR content to a PDF file using libharu (Letter, Helvetica 10pt, word-wrap + paginate). Returns the output path. |
 | `to_pdf` | Scalar | Convert an office/markup document (docx, odt, rtf, html, pptx, xlsx, ...) **to** a PDF via LibreOffice (runtime shell-out). Only needed for rich document conversion. |
+| `pdf_merge` | Scalar | **Document-level (qpdf)**: concatenate the input PDFs' pages, in list order, into one output file. Returns the output path. |
+| `pdf_split` | Table | **Document-level (qpdf)**: write one single-page PDF per page as `<output_dir>/<stem>_p<N>.pdf` (zero-padded); one row per emitted file: `page`, `file`. |
+| `pdf_rotate` | Scalar | **Document-level (qpdf)**: rotate pages by a multiple of 90°; `pages` is `'all'` (default) or a qpdf range like `'1-3,7'`. Returns the output path. |
 
 ## Installation
 
@@ -322,6 +325,33 @@ TO 'report.pdf' (FORMAT pdf,
                  FOOTER 'confidential - page {page}');
 ```
 
+## Document-level operations (qpdf)
+
+`pdf_merge`, `pdf_split`, and `pdf_rotate` are content-preserving structural
+transforms powered by [qpdf](https://qpdf.sourceforge.io/) — no rasterization,
+no re-typesetting; page content streams are carried over byte-identically.
+They operate on **local filesystem paths exactly as given** (like `write_pdf`):
+an existing output file is overwritten (COPY TO semantics), but a missing
+output *directory* is an error, never created.
+
+```sql
+-- merge: pages concatenate in list order
+SELECT pdf_merge(['a.pdf', 'b.pdf', 'c.pdf'], 'combined.pdf');
+
+-- the glob recipe: build the input list in SQL
+SELECT pdf_merge(list(DISTINCT filename ORDER BY filename), 'combined.pdf')
+FROM read_pdf('reports/*.pdf');
+
+-- split: one single-page PDF per page -> out/<stem>_p<N>.pdf (N zero-padded
+-- to the page-count width); returns one row per emitted file
+SELECT page, file FROM pdf_split('combined.pdf', 'out');
+
+-- rotate: degrees must be a multiple of 90 (added to each page's existing
+-- rotation); pages is 'all' or a qpdf-style range ('1-3,7', 'z' = last page)
+SELECT pdf_rotate('scan.pdf', 'upright.pdf', 90);
+SELECT pdf_rotate('scan.pdf', 'upright.pdf', -90, '2-4');
+```
+
 ## Markdown extraction (layout mode)
 
 `pdf_to_markdown(path VARCHAR) → VARCHAR` converts a PDF to GitHub-flavoured Markdown
@@ -421,10 +451,10 @@ Install native libraries before building:
 
 ```bash
 # macOS
-brew install poppler tesseract leptonica libharu
+brew install poppler tesseract leptonica libharu qpdf
 
 # Ubuntu / Debian
-sudo apt-get install libpoppler-dev libtesseract-dev libleptonica-dev libhpdf-dev
+sudo apt-get install libpoppler-dev libtesseract-dev libleptonica-dev libhpdf-dev libqpdf-dev
 ```
 
 ### Build
