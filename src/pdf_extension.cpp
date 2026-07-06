@@ -1072,7 +1072,9 @@ static void PdfAttachmentsScan(ClientContext &context, TableFunctionInput &data_
 					continue;
 				}
 				PdfAttachmentRow row;
-				row.name = UStringToUtf8(attachment->unicodeName());
+				// name() (not unicodeName()): CI's poppler predates unicodeName, and
+				// name() exists across all pinned poppler versions.
+				row.name = attachment->name();
 				row.description = UStringToUtf8(attachment->description());
 				row.size = (int64_t)attachment->size();
 				row.mime_type = attachment->mime_type();

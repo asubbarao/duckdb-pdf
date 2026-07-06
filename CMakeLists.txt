@@ -52,6 +52,12 @@ set(EXTENSION_SOURCES src/pdf_extension.cpp)
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+# qpdf headers require C++17 (std::string_view). The CACHE default above is
+# overridden when DuckDB's build drives this CMakeLists (-std=c++11 on Linux CI),
+# so pin the standard on the extension targets themselves.
+set_target_properties(${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME}
+                      PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
 if(NOT WIN32)
   # ---- POSIX path: pkg-config ----
   find_package(PkgConfig REQUIRED)
