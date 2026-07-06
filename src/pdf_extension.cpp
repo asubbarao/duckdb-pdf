@@ -633,7 +633,7 @@ struct ReadPdfGlobalState : public GlobalTableFunctionState {
 };
 
 struct ReadPdfLocalState : public LocalTableFunctionState {
-	int page_idx = 0;    // 0-based
+	int page_idx = 0; // 0-based
 	int page_count = 0;
 	int last_page_0 = 0; // exclusive upper bound (0-based)
 	string file_bytes;
@@ -1155,9 +1155,9 @@ struct ElemLine {
 };
 
 struct PdfElementRow {
-	int page_number = 0;  // 1-based
-	int element_idx = 0;  // 1-based within page, reading order
-	string element_type;  // heading | paragraph | list_item | other
+	int page_number = 0; // 1-based
+	int element_idx = 0; // 1-based within page, reading order
+	string element_type; // heading | paragraph | list_item | other
 	string text;
 	double font_size = 0.0;
 	bool has_font = false;
@@ -1292,10 +1292,10 @@ static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_numb
 			const auto &cur = lines[li];
 			double gap = cur.y0 - prev.y1;
 			bool gap_break = median_height > 0 && gap > ELEM_BLOCK_GAP_RATIO * median_height; // rule 2a
-			bool font_break = prev.font_size > 0 && cur.font_size > 0 &&
-			                  std::fabs(cur.font_size - prev.font_size) >
-			                      ELEM_FONT_CHANGE_RATIO * prev.font_size; // rule 2b
-			bool list_break = ElemIsListMarkerLine(cur.text);              // rule 2c
+			bool font_break =
+			    prev.font_size > 0 && cur.font_size > 0 &&
+			    std::fabs(cur.font_size - prev.font_size) > ELEM_FONT_CHANGE_RATIO * prev.font_size; // rule 2b
+			bool list_break = ElemIsListMarkerLine(cur.text);                                        // rule 2c
 			start_new = gap_break || font_break || list_break;
 		}
 		if (start_new) {
@@ -1439,8 +1439,7 @@ static void ElementsOpenFile(ClientContext &context, const ReadPdfElementsBindDa
 	ElementsProcessFile(context, g.current_file, bind.opt, g.rows);
 }
 
-static unique_ptr<GlobalTableFunctionState> ReadPdfElementsInit(ClientContext &context,
-                                                                TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> ReadPdfElementsInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<ReadPdfElementsBindData>();
 	auto g = make_uniq<ReadPdfElementsState>();
 	if (!bind.files.empty()) {

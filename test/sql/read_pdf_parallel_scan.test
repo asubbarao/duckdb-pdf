@@ -1,9 +1,10 @@
 # name: test/sql/read_pdf_parallel_scan.test
 # description: parallel multi-file read_pdf scan — generate 8 PDFs with the extension's own
+# group: [sql]
+
 #              writer, then prove the parallel glob scan returns EXACTLY the same rows as a
 #              UNION ALL of single-file scans (result-level equivalence, order-independent).
 #              On Windows the scan stays serial (MaxThreads=1) — same assertions must hold.
-# group: [sql]
 
 require pdf
 
