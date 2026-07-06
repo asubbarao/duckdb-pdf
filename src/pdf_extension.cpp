@@ -30,6 +30,14 @@
 // libharu — native PDF writer (C API) for write_pdf. No external processes.
 #include <hpdf.h>
 
+// qpdf — document-level operations (pdf_merge / pdf_split / pdf_rotate).
+// Content-preserving structural transforms; no rasterization, no poppler.
+#include <qpdf/QPDF.hh>
+#include <qpdf/QPDFPageDocumentHelper.hh>
+#include <qpdf/QPDFPageObjectHelper.hh>
+#include <qpdf/QPDFWriter.hh>
+#include <qpdf/QUtil.hh>
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -3304,6 +3312,274 @@ static void PdfToMarkdownFun(DataChunk &args, ExpressionState &state, Vector &re
 }
 
 //===--------------------------------------------------------------------===//
+// Document-level operations via qpdf: pdf_merge / pdf_split / pdf_rotate
+//
+// These are FILE-level structural transforms (like the write path): inputs
+// and outputs are local filesystem paths, kept exactly as given — no
+// normalization, no VFS. Overwrite semantics match COPY TO (existing output
+// is replaced); a missing output DIRECTORY is an error, never created.
+//
+// Locking: qpdf documents its C++ API as safe for concurrent use on distinct
+// QPDF objects, but we stay conservative and consistent with this codebase —
+// every whole operation runs under one dedicated global lock. This is
+// deliberately NOT PopplerMutex: qpdf and poppler share no state, so the two
+// libraries may run concurrently with each other, just not with themselves.
+//===--------------------------------------------------------------------===//
+static std::recursive_mutex &QpdfMutex() {
+	static std::recursive_mutex m;
+	return m;
+}
+
+// Parent directory of a path, honoring both separators; empty string means
+// "bare filename in the current directory" (nothing to validate).
+static string PdfOpsParentDir(const string &path) {
+	auto pos = path.find_last_of("/\\");
+	if (pos == string::npos) {
+		return string();
+	}
+	return path.substr(0, pos);
+}
+
+// Filename without directory and without the last extension: '/a/b/x.pdf' -> 'x'.
+static string PdfOpsStem(const string &path) {
+	auto slash = path.find_last_of("/\\");
+	string base = (slash == string::npos) ? path : path.substr(slash + 1);
+	auto dot = base.find_last_of('.');
+	if (dot != string::npos && dot > 0) {
+		base = base.substr(0, dot);
+	}
+	return base;
+}
+
+static void PdfOpsCheckInputExists(const char *fn, const string &path) {
+	auto fs = FileSystem::CreateLocal();
+	if (!fs->FileExists(path)) {
+		throw InvalidInputException("%s: input file '%s' does not exist", fn, path);
+	}
+}
+
+static void PdfOpsCheckOutputDir(const char *fn, const string &dir) {
+	if (dir.empty()) {
+		return; // bare filename resolves to the process working directory
+	}
+	auto fs = FileSystem::CreateLocal();
+	if (!fs->DirectoryExists(dir)) {
+		throw InvalidInputException("%s: output directory '%s' does not exist", fn, dir);
+	}
+}
+
+// pdf_merge(inputs LIST(VARCHAR), output VARCHAR) -> VARCHAR (the output path).
+// Concatenates the inputs' pages in list order. Build the list in SQL — the
+// glob recipe is: SELECT list(DISTINCT filename ORDER BY filename) FROM
+// read_pdf_meta('dir/*.pdf').
+static string PdfMergeImpl(const vector<string> &inputs, const string &output) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	if (inputs.empty()) {
+		throw InvalidInputException("pdf_merge: input list is empty");
+	}
+	for (auto &in_path : inputs) {
+		PdfOpsCheckInputExists("pdf_merge", in_path);
+	}
+	PdfOpsCheckOutputDir("pdf_merge", PdfOpsParentDir(output));
+	try {
+		QPDF merged;
+		merged.emptyPDF();
+		QPDFPageDocumentHelper merged_pages(merged);
+		// Sources must outlive the write: addPage on a foreign page copies
+		// lazily; objects are pulled from the source during QPDFWriter::write.
+		std::vector<std::unique_ptr<QPDF>> sources;
+		for (auto &in_path : inputs) {
+			auto source = std::make_unique<QPDF>();
+			source->processFile(in_path.c_str());
+			QPDFPageDocumentHelper source_pages(*source);
+			for (auto &page : source_pages.getAllPages()) {
+				merged_pages.addPage(page, false);
+			}
+			sources.push_back(std::move(source));
+		}
+		QPDFWriter writer(merged, output.c_str());
+		writer.write();
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_merge: %s", string(e.what()));
+	}
+	return output;
+}
+
+static void PdfMergeFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	// Value-based row loop: this is a file operation executed a handful of
+	// times per query, not a hot path — clarity over vectorized throughput.
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		Value list_val = args.GetValue(0, row);
+		Value out_val = args.GetValue(1, row);
+		if (list_val.IsNull() || out_val.IsNull()) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		vector<string> inputs;
+		for (auto &child : ListValue::GetChildren(list_val)) {
+			if (child.IsNull()) {
+				throw InvalidInputException("pdf_merge: input list contains a NULL path");
+			}
+			inputs.push_back(StringValue::Get(child));
+		}
+		result.SetValue(row, Value(PdfMergeImpl(inputs, StringValue::Get(out_val))));
+	}
+}
+
+// pdf_rotate(input, output, degrees[, pages]) -> VARCHAR (the output path).
+// degrees must be a multiple of 90 (added to each page's existing rotation);
+// pages is 'all' (default) or a qpdf-style numeric range like '1-3,7' /
+// 'z' (last page) / 'r2' (second-to-last).
+static string PdfRotateImpl(const string &input, const string &output, int32_t degrees, const string &pages_spec) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	if (degrees % 90 != 0) {
+		throw InvalidInputException("pdf_rotate: degrees must be a multiple of 90 (got %d)", degrees);
+	}
+	PdfOpsCheckInputExists("pdf_rotate", input);
+	PdfOpsCheckOutputDir("pdf_rotate", PdfOpsParentDir(output));
+	if (input == output) {
+		// qpdf reads the source lazily during write; writing over it would corrupt.
+		throw InvalidInputException("pdf_rotate: output path must differ from input path '%s'", input);
+	}
+	try {
+		QPDF doc;
+		doc.processFile(input.c_str());
+		QPDFPageDocumentHelper doc_pages(doc);
+		auto pages = doc_pages.getAllPages();
+		auto page_count = static_cast<int>(pages.size());
+		std::vector<int> selected;
+		if (StringUtil::Lower(pages_spec) == "all") {
+			for (int page_no = 1; page_no <= page_count; page_no++) {
+				selected.push_back(page_no);
+			}
+		} else {
+			// qpdf's own CLI range grammar; throws with a descriptive message
+			// on malformed / out-of-range specs.
+			selected = QUtil::parse_numrange(pages_spec.c_str(), page_count);
+		}
+		for (int page_no : selected) {
+			pages[page_no - 1].rotatePage(degrees, true /* relative to existing rotation */);
+		}
+		QPDFWriter writer(doc, output.c_str());
+		writer.write();
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_rotate: %s", string(e.what()));
+	}
+	return output;
+}
+
+static void PdfRotateFunInternal(DataChunk &args, Vector &result, bool has_pages_arg) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		Value in_val = args.GetValue(0, row);
+		Value out_val = args.GetValue(1, row);
+		Value deg_val = args.GetValue(2, row);
+		Value pages_val = has_pages_arg ? args.GetValue(3, row) : Value("all");
+		if (in_val.IsNull() || out_val.IsNull() || deg_val.IsNull() || pages_val.IsNull()) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		result.SetValue(row, Value(PdfRotateImpl(StringValue::Get(in_val), StringValue::Get(out_val),
+		                                         IntegerValue::Get(deg_val), StringValue::Get(pages_val))));
+	}
+}
+
+static void PdfRotateFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfRotateFunInternal(args, result, false);
+}
+
+static void PdfRotatePagesFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfRotateFunInternal(args, result, true);
+}
+
+// pdf_split(input, output_dir) -> TABLE(page INTEGER, file VARCHAR).
+// Writes one single-page PDF per page as <output_dir>/<input_stem>_p<N>.pdf
+// (N zero-padded to the page-count width); one row per emitted file.
+struct PdfSplitBindData : public TableFunctionData {
+	string input;
+	string output_dir;
+};
+
+struct PdfSplitState : public GlobalTableFunctionState {
+	bool executed = false;
+	idx_t emit_idx = 0;
+	std::vector<std::pair<int, string>> emitted; // (page, file)
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfSplitBind(ClientContext &context, TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfSplitBindData>();
+	result->input = StringValue::Get(input.inputs[0]);
+	result->output_dir = StringValue::Get(input.inputs[1]);
+	return_types = {LogicalType::INTEGER, LogicalType::VARCHAR};
+	names = {"page", "file"};
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfSplitInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfSplitState>();
+}
+
+static void PdfSplitExecute(const string &input, const string &output_dir,
+                            std::vector<std::pair<int, string>> &emitted) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	PdfOpsCheckInputExists("pdf_split", input);
+	{
+		auto fs = FileSystem::CreateLocal();
+		if (!fs->DirectoryExists(output_dir)) {
+			throw InvalidInputException("pdf_split: output directory '%s' does not exist", output_dir);
+		}
+	}
+	try {
+		QPDF doc;
+		doc.processFile(input.c_str());
+		QPDFPageDocumentHelper doc_pages(doc);
+		auto pages = doc_pages.getAllPages();
+		auto page_count = static_cast<int>(pages.size());
+		auto pad_width = to_string(page_count).size();
+		string stem = PdfOpsStem(input);
+		for (int page_idx = 0; page_idx < page_count; page_idx++) {
+			string page_no = to_string(page_idx + 1);
+			while (page_no.size() < pad_width) {
+				page_no = "0" + page_no;
+			}
+			string out_path = output_dir + "/" + stem + "_p" + page_no + ".pdf";
+			QPDF single;
+			single.emptyPDF();
+			QPDFPageDocumentHelper single_pages(single);
+			single_pages.addPage(pages[page_idx], false);
+			QPDFWriter writer(single, out_path.c_str());
+			writer.write();
+			emitted.emplace_back(page_idx + 1, out_path);
+		}
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_split: %s", string(e.what()));
+	}
+}
+
+static void PdfSplitScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfSplitBindData>();
+	auto &st = data_p.global_state->Cast<PdfSplitState>();
+	if (!st.executed) {
+		// Side effects happen at scan time (not bind), so EXPLAIN writes nothing.
+		PdfSplitExecute(bind.input, bind.output_dir, st.emitted);
+		st.executed = true;
+	}
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && st.emit_idx < st.emitted.size()) {
+		output.SetValue(0, count, Value::INTEGER(st.emitted[st.emit_idx].first));
+		output.SetValue(1, count, Value(st.emitted[st.emit_idx].second));
+		st.emit_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 static void LoadInternal(ExtensionLoader &loader) {
@@ -3396,6 +3672,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 	write_pdf_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, WritePdfOutFun));
 	loader.RegisterFunction(write_pdf_set);
+
+	// document-level qpdf operations
+	loader.RegisterFunction(ScalarFunction("pdf_merge", {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
+	                                       LogicalType::VARCHAR, PdfMergeFun));
+
+	ScalarFunctionSet pdf_rotate_set("pdf_rotate");
+	pdf_rotate_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER},
+	                                          LogicalType::VARCHAR, PdfRotateFun));
+	pdf_rotate_set.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR},
+	                   LogicalType::VARCHAR, PdfRotatePagesFun));
+	loader.RegisterFunction(pdf_rotate_set);
+
+	TableFunction pdf_split("pdf_split", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfSplitScan, PdfSplitBind,
+	                        PdfSplitInit);
+	loader.RegisterFunction(pdf_split);
 
 	// COPY TO pdf
 	CopyFunction pdf_copy("pdf");

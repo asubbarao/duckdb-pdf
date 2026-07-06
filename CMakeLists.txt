@@ -78,7 +78,13 @@ if(NOT WIN32)
     pkg_check_modules(POPPLER_CPP REQUIRED poppler-cpp)
     pkg_check_modules(TESSERACT   REQUIRED tesseract)
     pkg_check_modules(LEPTONICA   REQUIRED lept)
-    include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS})
+    # qpdf (pdf_merge/pdf_split/pdf_rotate): pkg-config only for headers —
+    # libqpdf.a joins the link via the GLOB over-link below like every other
+    # vcpkg archive. Built with default-features OFF, so qpdf uses its
+    # built-in native crypto (no openssl/gnutls in the closure).
+    pkg_check_modules(LIBQPDF REQUIRED libqpdf)
+    include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
+                        ${LIBQPDF_INCLUDE_DIRS})
 
     if(DEFINED TESSERACT_LIBDIR AND EXISTS "${TESSERACT_LIBDIR}")
       set(VCPKG_STATIC_LIBDIR "${TESSERACT_LIBDIR}")
@@ -144,12 +150,15 @@ if(NOT WIN32)
     pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
     pkg_check_modules(TESSERACT   REQUIRED IMPORTED_TARGET tesseract)
     pkg_check_modules(LEPTONICA   REQUIRED IMPORTED_TARGET lept)
-    include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS})
+    # qpdf (pdf_merge/pdf_split/pdf_rotate): brew/apt qpdf ships libqpdf.pc.
+    pkg_check_modules(LIBQPDF     REQUIRED IMPORTED_TARGET libqpdf)
+    include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
+                        ${LIBQPDF_INCLUDE_DIRS})
 
     target_link_libraries(${EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA)
+      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF)
     target_link_libraries(${LOADABLE_EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA)
+      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF)
 
     # libharu for write_pdf (local brew path). Dynamic dylib; find explicitly (no pkg-config).
     # Transitive (libpng, zlib) are satisfied by the dylib itself at runtime.
@@ -192,6 +201,16 @@ else()
   get_filename_component(POPPLER_INCLUDE_PARENT "${POPPLER_CPP_INCLUDE_DIR}" DIRECTORY)
   get_filename_component(VCPKG_INCLUDE_DIR "${POPPLER_INCLUDE_PARENT}" DIRECTORY)
   include_directories(${POPPLER_CPP_INCLUDE_DIR} ${POPPLER_INCLUDE_PARENT} ${VCPKG_INCLUDE_DIR})
+
+  # qpdf (pdf_merge/pdf_split/pdf_rotate): headers live under the same vcpkg
+  # include dir added above (<prefix>/include/qpdf/...), and qpdf.lib joins the
+  # link via the whole-directory GLOB below. Probe for it here only so a
+  # missing vcpkg qpdf install fails at configure time with a clear message
+  # instead of at link time.
+  find_library(QPDF_LIBRARY NAMES qpdf libqpdf)
+  if(NOT QPDF_LIBRARY)
+    message(FATAL_ERROR "pdf: qpdf not found in the vcpkg installed tree (is \"qpdf\" in vcpkg.json?)")
+  endif()
 
   # poppler-cpp/poppler/tesseract/leptonica are static libs; on Windows the
   # transitive dependency closure (freetype, libpng, jpeg, iconv/charset, zlib,
