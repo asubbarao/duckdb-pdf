@@ -35,14 +35,12 @@
 
 // qpdf — document-level operations (pdf_merge / pdf_split / pdf_rotate).
 // Content-preserving structural transforms; no rasterization, no poppler.
-#include <qpdf/QPDF.hh>
-#include <qpdf/QPDFAcroFormDocumentHelper.hh>
-#include <qpdf/QPDFAnnotationObjectHelper.hh>
-#include <qpdf/QPDFFormFieldObjectHelper.hh>
-#include <qpdf/QPDFPageDocumentHelper.hh>
-#include <qpdf/QPDFPageObjectHelper.hh>
-#include <qpdf/QPDFWriter.hh>
-#include <qpdf/QUtil.hh>
+// The qpdf implementation lives in its own C++17 translation unit
+// (qpdf_ops.cpp) because qpdf headers require C++17 while this TU must build
+// at whatever standard DuckDB drives (C++11 on the Linux registry CI) — see
+// qpdf_ops.hpp for the ODR story. Only the plain-std-types interface is
+// visible here; NO qpdf header may be included in this file.
+#include "qpdf_ops.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -3961,16 +3959,11 @@ static void PdfToMarkdownFun(DataChunk &args, ExpressionState &state, Vector &re
 // normalization, no VFS. Overwrite semantics match COPY TO (existing output
 // is replaced); a missing output DIRECTORY is an error, never created.
 //
-// Locking: qpdf documents its C++ API as safe for concurrent use on distinct
-// QPDF objects, but we stay conservative and consistent with this codebase —
-// every whole operation runs under one dedicated global lock. This is
-// deliberately NOT PopplerMutex: qpdf and poppler share no state, so the two
-// libraries may run concurrently with each other, just not with themselves.
+// Locking: every whole qpdf operation runs under one dedicated global lock
+// (QpdfMutex, inside qpdf_ops.cpp). This is deliberately NOT PopplerMutex:
+// qpdf and poppler share no state, so the two libraries may run concurrently
+// with each other, just not with themselves.
 //===--------------------------------------------------------------------===//
-static std::recursive_mutex &QpdfMutex() {
-	static std::recursive_mutex m;
-	return m;
-}
 
 // Parent directory of a path, honoring both separators; empty string means
 // "bare filename in the current directory" (nothing to validate).
@@ -4015,7 +4008,6 @@ static void PdfOpsCheckOutputDir(const char *fn, const string &dir) {
 // glob recipe is: SELECT list(DISTINCT filename ORDER BY filename) FROM
 // read_pdf_meta('dir/*.pdf').
 static string PdfMergeImpl(const vector<string> &inputs, const string &output) {
-	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	if (inputs.empty()) {
 		throw InvalidInputException("pdf_merge: input list is empty");
 	}
@@ -4024,23 +4016,7 @@ static string PdfMergeImpl(const vector<string> &inputs, const string &output) {
 	}
 	PdfOpsCheckOutputDir("pdf_merge", PdfOpsParentDir(output));
 	try {
-		QPDF merged;
-		merged.emptyPDF();
-		QPDFPageDocumentHelper merged_pages(merged);
-		// Sources must outlive the write: addPage on a foreign page copies
-		// lazily; objects are pulled from the source during QPDFWriter::write.
-		std::vector<std::unique_ptr<QPDF>> sources;
-		for (auto &in_path : inputs) {
-			auto source = std::make_unique<QPDF>();
-			source->processFile(in_path.c_str());
-			QPDFPageDocumentHelper source_pages(*source);
-			for (auto &page : source_pages.getAllPages()) {
-				merged_pages.addPage(page, false);
-			}
-			sources.push_back(std::move(source));
-		}
-		QPDFWriter writer(merged, output.c_str());
-		writer.write();
+		pdf_qpdf::Merge(inputs, output);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_merge: %s", string(e.what()));
 	}
@@ -4074,7 +4050,6 @@ static void PdfMergeFun(DataChunk &args, ExpressionState &state, Vector &result)
 // pages is 'all' (default) or a qpdf-style numeric range like '1-3,7' /
 // 'z' (last page) / 'r2' (second-to-last).
 static string PdfRotateImpl(const string &input, const string &output, int32_t degrees, const string &pages_spec) {
-	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	if (degrees % 90 != 0) {
 		throw InvalidInputException("pdf_rotate: degrees must be a multiple of 90 (got %d)", degrees);
 	}
@@ -4085,26 +4060,11 @@ static string PdfRotateImpl(const string &input, const string &output, int32_t d
 		throw InvalidInputException("pdf_rotate: output path must differ from input path '%s'", input);
 	}
 	try {
-		QPDF doc;
-		doc.processFile(input.c_str());
-		QPDFPageDocumentHelper doc_pages(doc);
-		auto pages = doc_pages.getAllPages();
-		auto page_count = static_cast<int>(pages.size());
-		std::vector<int> selected;
-		if (StringUtil::Lower(pages_spec) == "all") {
-			for (int page_no = 1; page_no <= page_count; page_no++) {
-				selected.push_back(page_no);
-			}
-		} else {
-			// qpdf's own CLI range grammar; throws with a descriptive message
-			// on malformed / out-of-range specs.
-			selected = QUtil::parse_numrange(pages_spec.c_str(), page_count);
-		}
-		for (int page_no : selected) {
-			pages[page_no - 1].rotatePage(degrees, true /* relative to existing rotation */);
-		}
-		QPDFWriter writer(doc, output.c_str());
-		writer.write();
+		// 'all' short-circuits here; anything else is qpdf's own CLI range
+		// grammar, parsed inside pdf_qpdf::Rotate (throws with a descriptive
+		// message on malformed / out-of-range specs).
+		bool all_pages = StringUtil::Lower(pages_spec) == "all";
+		pdf_qpdf::Rotate(input, output, degrees, all_pages, pages_spec);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_rotate: %s", string(e.what()));
 	}
@@ -4168,7 +4128,6 @@ static unique_ptr<GlobalTableFunctionState> PdfSplitInit(ClientContext &, TableF
 
 static void PdfSplitExecute(const string &input, const string &output_dir,
                             std::vector<std::pair<int, string>> &emitted) {
-	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	PdfOpsCheckInputExists("pdf_split", input);
 	{
 		auto fs = FileSystem::CreateLocal();
@@ -4177,27 +4136,7 @@ static void PdfSplitExecute(const string &input, const string &output_dir,
 		}
 	}
 	try {
-		QPDF doc;
-		doc.processFile(input.c_str());
-		QPDFPageDocumentHelper doc_pages(doc);
-		auto pages = doc_pages.getAllPages();
-		auto page_count = static_cast<int>(pages.size());
-		auto pad_width = to_string(page_count).size();
-		string stem = PdfOpsStem(input);
-		for (int page_idx = 0; page_idx < page_count; page_idx++) {
-			string page_no = to_string(page_idx + 1);
-			while (page_no.size() < pad_width) {
-				page_no = "0" + page_no;
-			}
-			string out_path = output_dir + "/" + stem + "_p" + page_no + ".pdf";
-			QPDF single;
-			single.emptyPDF();
-			QPDFPageDocumentHelper single_pages(single);
-			single_pages.addPage(pages[page_idx], false);
-			QPDFWriter writer(single, out_path.c_str());
-			writer.write();
-			emitted.emplace_back(page_idx + 1, out_path);
-		}
+		pdf_qpdf::Split(input, output_dir, PdfOpsStem(input), emitted);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_split: %s", string(e.what()));
 	}
@@ -4227,7 +4166,7 @@ static void PdfSplitScan(ClientContext &context, TableFunctionInput &data_p, Dat
 // Same conventions as pdf_merge/pdf_rotate: local filesystem paths exactly as
 // given, existing output overwritten, missing output directory is an error,
 // in-place (input == output) refused because qpdf reads the source lazily
-// during write, and the whole operation runs under QpdfMutex.
+// during write, and the whole operation runs under QpdfMutex (in qpdf_ops.cpp).
 //===--------------------------------------------------------------------===//
 
 // Shared preamble for the single-input scalar ops.
@@ -4245,17 +4184,9 @@ static void PdfOpsCheckInOut(const char *fn, const string &input, const string &
 // linearization ("fast web view"). Image data is carried over as-is — this
 // does NOT downsample or re-encode images.
 static string PdfCompressImpl(const string &input, const string &output) {
-	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	PdfOpsCheckInOut("pdf_compress", input, output);
 	try {
-		QPDF doc;
-		doc.processFile(input.c_str());
-		QPDFWriter writer(doc, output.c_str());
-		writer.setObjectStreamMode(qpdf_o_generate);
-		writer.setCompressStreams(true);
-		writer.setRecompressFlate(true);
-		writer.setLinearization(true);
-		writer.write();
+		pdf_qpdf::Compress(input, output);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_compress: %s", string(e.what()));
 	}
@@ -4282,18 +4213,10 @@ static void PdfCompressFun(DataChunk &args, ExpressionState &state, Vector &resu
 // password falls back to the user password.
 static string PdfEncryptImpl(const string &input, const string &output, const string &user_password,
                              const string &owner_password) {
-	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	PdfOpsCheckInOut("pdf_encrypt", input, output);
 	const string &owner = owner_password.empty() ? user_password : owner_password;
 	try {
-		QPDF doc;
-		doc.processFile(input.c_str());
-		QPDFWriter writer(doc, output.c_str());
-		writer.setR6EncryptionParameters(user_password.c_str(), owner.c_str(), true /* accessibility */,
-		                                 true /* extract */, true /* assemble */, true /* annotate_and_form */,
-		                                 true /* form_filling */, true /* modify_other */, qpdf_r3p_full,
-		                                 true /* encrypt metadata */);
-		writer.write();
+		pdf_qpdf::Encrypt(input, output, user_password, owner);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_encrypt: %s", string(e.what()));
 	}
@@ -4328,14 +4251,9 @@ static void PdfEncryptOwnerFun(DataChunk &args, ExpressionState &state, Vector &
 // (user or owner) and writes an unencrypted copy. A wrong password surfaces
 // qpdf's "invalid password" as an InvalidInput error.
 static string PdfDecryptImpl(const string &input, const string &output, const string &password) {
-	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	PdfOpsCheckInOut("pdf_decrypt", input, output);
 	try {
-		QPDF doc;
-		doc.processFile(input.c_str(), password.c_str());
-		QPDFWriter writer(doc, output.c_str());
-		writer.setPreserveEncryption(false);
-		writer.write();
+		pdf_qpdf::Decrypt(input, output, password);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_decrypt: %s", string(e.what()));
 	}
@@ -4361,36 +4279,9 @@ static void PdfDecryptFun(DataChunk &args, ExpressionState &state, Vector &resul
 // selected by a qpdf-style numeric range ('1-3,7' / 'z' = last / 'r2' =
 // second-to-last) into a new document, in range order (repeats allowed).
 static string PdfPagesImpl(const string &input, const string &output, const string &ranges) {
-	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	PdfOpsCheckInOut("pdf_pages", input, output);
 	try {
-		QPDF source;
-		source.processFile(input.c_str());
-		QPDFPageDocumentHelper source_pages(source);
-		auto pages = source_pages.getAllPages();
-		auto page_count = static_cast<int>(pages.size());
-		// qpdf's own CLI range grammar; throws with a descriptive message on
-		// malformed / out-of-range specs.
-		auto selected = QUtil::parse_numrange(ranges.c_str(), page_count);
-		QPDF subset;
-		subset.emptyPDF();
-		QPDFPageDocumentHelper subset_pages(subset);
-		// copyForeignObject caches per source object, so adding the SAME page
-		// twice would insert one object twice (an error); shallow-copy repeats.
-		std::set<QPDFObjGen> seen;
-		for (int page_no : selected) {
-			auto &page = pages[page_no - 1];
-			auto og = page.getObjectHandle().getObjGen();
-			if (seen.count(og)) {
-				subset_pages.addPage(page.shallowCopyPage(), false);
-			} else {
-				subset_pages.addPage(page, false);
-				seen.insert(og);
-			}
-		}
-		// source must outlive the write: foreign pages are pulled lazily.
-		QPDFWriter writer(subset, output.c_str());
-		writer.write();
+		pdf_qpdf::Pages(input, output, ranges);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_pages: %s", string(e.what()));
 	}
@@ -4418,7 +4309,7 @@ static void PdfPagesFun(DataChunk &args, ExpressionState &state, Vector &result)
 // One VARCHAR path/glob argument resolved through the same ResolveFiles used
 // by read_pdf. Rows are materialized on the first scan call (side effects and
 // file reads at scan time, not bind — EXPLAIN touches nothing), serially,
-// under QpdfMutex.
+// under QpdfMutex (in qpdf_ops.cpp).
 //===--------------------------------------------------------------------===//
 
 // Strip the leading '/' from a PDF name ('/Link' -> 'Link'); empty stays empty.
@@ -4489,39 +4380,18 @@ static string PdfFormFieldTypeText(const string &raw_type) {
 
 static void PdfFormFieldsExecute(const string &path, std::vector<std::vector<Value>> &rows) {
 	PdfOpsCheckInputExists("pdf_form_fields", path);
+	std::vector<pdf_qpdf::FormField> fields;
 	try {
-		QPDF doc;
-		doc.processFile(path.c_str());
-		QPDFAcroFormDocumentHelper acroform(doc);
-		if (!acroform.hasAcroForm()) {
-			return;
-		}
-		// Map field object -> 1-based page number via each page's widget
-		// annotations (a field with no widget keeps page NULL).
-		std::map<QPDFObjGen, int> field_page;
-		QPDFPageDocumentHelper doc_pages(doc);
-		auto pages = doc_pages.getAllPages();
-		for (size_t page_idx = 0; page_idx < pages.size(); page_idx++) {
-			for (auto &field : acroform.getFormFieldsForPage(pages[page_idx])) {
-				auto og = field.getObjectHandle().getObjGen();
-				if (!field_page.count(og)) {
-					field_page[og] = static_cast<int>(page_idx + 1);
-				}
-			}
-		}
-		for (auto &field : acroform.getFormFields()) {
-			auto og = field.getObjectHandle().getObjGen();
-			auto page_it = field_page.find(og);
-			Value page_val =
-			    page_it == field_page.end() ? Value(LogicalType::INTEGER) : Value::INTEGER(page_it->second);
-			auto value_handle = field.getValue();
-			Value value_val = value_handle.isNull() ? Value(LogicalType::VARCHAR) : Value(field.getValueAsString());
-			bool is_required = (field.getFlags() & ff_all_required) != 0;
-			rows.push_back({Value(path), page_val, Value(field.getFullyQualifiedName()),
-			                Value(PdfFormFieldTypeText(field.getFieldType())), value_val, Value::BOOLEAN(is_required)});
-		}
+		fields = pdf_qpdf::ReadFormFields(path);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_form_fields: %s", string(e.what()));
+	}
+	for (auto &field : fields) {
+		// A field with no widget annotation on any page keeps page NULL.
+		Value page_val = field.has_page ? Value::INTEGER(field.page) : Value(LogicalType::INTEGER);
+		Value value_val = field.has_value ? Value(field.value) : Value(LogicalType::VARCHAR);
+		rows.push_back({Value(path), page_val, Value(field.name), Value(PdfFormFieldTypeText(field.type)), value_val,
+		                Value::BOOLEAN(field.is_required)});
 	}
 }
 
@@ -4529,7 +4399,6 @@ static void PdfFormFieldsScan(ClientContext &context, TableFunctionInput &data_p
 	auto &bind = data_p.bind_data->Cast<PdfQpdfRowsBindData>();
 	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
 	if (!st.executed) {
-		std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 		for (auto &path : bind.files) {
 			PdfFormFieldsExecute(path, st.rows);
 		}
@@ -4555,34 +4424,18 @@ static unique_ptr<FunctionData> PdfAnnotationsBind(ClientContext &context, Table
 
 static void PdfAnnotationsExecute(const string &path, std::vector<std::vector<Value>> &rows) {
 	PdfOpsCheckInputExists("pdf_annotations", path);
+	std::vector<pdf_qpdf::Annotation> annotations;
 	try {
-		QPDF doc;
-		doc.processFile(path.c_str());
-		QPDFPageDocumentHelper doc_pages(doc);
-		auto pages = doc_pages.getAllPages();
-		for (size_t page_idx = 0; page_idx < pages.size(); page_idx++) {
-			for (auto &annot : pages[page_idx].getAnnotations()) {
-				auto dict = annot.getObjectHandle();
-				Value contents_val(LogicalType::VARCHAR);
-				auto contents = dict.getKey("/Contents");
-				if (contents.isString()) {
-					contents_val = Value(contents.getUTF8Value());
-				}
-				Value uri_val(LogicalType::VARCHAR);
-				auto action = dict.getKey("/A");
-				if (action.isDictionary() && action.getKey("/S").isNameAndEquals("/URI") &&
-				    action.getKey("/URI").isString()) {
-					uri_val = Value(action.getKey("/URI").getUTF8Value());
-				}
-				auto rect = annot.getRect();
-				rows.push_back({Value(path), Value::INTEGER(static_cast<int>(page_idx + 1)),
-				                Value(PdfNameToText(annot.getSubtype())), contents_val, uri_val,
-				                Value::DOUBLE(rect.llx), Value::DOUBLE(rect.lly), Value::DOUBLE(rect.urx),
-				                Value::DOUBLE(rect.ury)});
-			}
-		}
+		annotations = pdf_qpdf::ReadAnnotations(path);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_annotations: %s", string(e.what()));
+	}
+	for (auto &annot : annotations) {
+		Value contents_val = annot.has_contents ? Value(annot.contents) : Value(LogicalType::VARCHAR);
+		Value uri_val = annot.has_uri ? Value(annot.uri) : Value(LogicalType::VARCHAR);
+		rows.push_back({Value(path), Value::INTEGER(annot.page), Value(PdfNameToText(annot.subtype)), contents_val,
+		                uri_val, Value::DOUBLE(annot.rect_x0), Value::DOUBLE(annot.rect_y0),
+		                Value::DOUBLE(annot.rect_x1), Value::DOUBLE(annot.rect_y1)});
 	}
 }
 
@@ -4590,7 +4443,6 @@ static void PdfAnnotationsScan(ClientContext &context, TableFunctionInput &data_
 	auto &bind = data_p.bind_data->Cast<PdfQpdfRowsBindData>();
 	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
 	if (!st.executed) {
-		std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 		for (auto &path : bind.files) {
 			PdfAnnotationsExecute(path, st.rows);
 		}
