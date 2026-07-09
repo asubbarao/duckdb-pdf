@@ -8,6 +8,8 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -128,11 +130,25 @@ static string UStringToUtf8(const poppler::ustring &u) {
 static string TempDir();
 
 //===--------------------------------------------------------------------===//
-// Table reconstruction (pure geometry over positioned words)
+// Table reconstruction (geometry over positioned words + optional ruling lines)
 //
-// Words come straight from poppler-cpp's page::text_list() — no external
-// `pdftotext` process. The clustering below is coordinate-system agnostic: it
-// only uses relative positions, so poppler's page coordinates work unchanged.
+// Words come from poppler-cpp page::text_list() (or OCR). poppler-cpp does not
+// expose path/graphics operators, so lattice (ruled) tables are recovered by
+// parsing the page content stream with qpdf (already a hard dependency) for
+// axis-aligned stroke segments and rectangles. That qpdf parse lives in the
+// isolated C++17 translation unit (qpdf_ops.cpp) and returns raw RuledSegment
+// values; ALL of the geometry below — including turning those segments into
+// clustered rule positions — is pure std/poppler math with no qpdf types.
+//
+// Strategy:
+//  1. LATTICE (preferred when present): vertical/horizontal stroke rules become
+//     the authoritative column/row separators.
+//  2. STREAM / whitespace (fallback): provisional per-row cells + a *global*
+//     column model that votes on both left (xMin) and right (xMax) alignment so
+//     right- / decimal-aligned numeric columns are not shattered.
+//  3. MULTI-LINE CELLS: continuation rows (sparse rows continuing a previous
+//     cell) are merged; the regularity gate is looser than the old "identical
+//     filled-count majority" check while still rejecting body prose.
 //===--------------------------------------------------------------------===//
 struct PdfWord {
 	double xMin = 0.0;
@@ -140,6 +156,14 @@ struct PdfWord {
 	double xMax = 0.0;
 	double yMax = 0.0;
 	string text;
+};
+
+struct RulingLines {
+	std::vector<double> v_rules; // vertical rule x positions (sorted)
+	std::vector<double> h_rules; // horizontal rule y positions (sorted)
+	bool Usable() const {
+		return v_rules.size() >= 3 && h_rules.size() >= 3; // outer box + ≥1 internal
+	}
 };
 
 static double Median(std::vector<double> v) {
@@ -154,38 +178,554 @@ static double Median(std::vector<double> v) {
 	return 0.5 * (v[m - 1] + v[m]);
 }
 
+// Cluster 1-D positions that fall within `tol` of an existing cluster centroid.
+// Returns sorted cluster centroids.
+static std::vector<double> Cluster1D(std::vector<double> vals, double tol) {
+	std::vector<double> centers;
+	if (vals.empty()) {
+		return centers;
+	}
+	std::sort(vals.begin(), vals.end());
+	std::vector<double> bucket;
+	for (double v : vals) {
+		if (bucket.empty() || (v - bucket.back()) <= tol) {
+			bucket.push_back(v);
+		} else {
+			centers.push_back(Median(bucket));
+			bucket.clear();
+			bucket.push_back(v);
+		}
+	}
+	if (!bucket.empty()) {
+		centers.push_back(Median(bucket));
+	}
+	return centers;
+}
+
+// Geometry consumer for the qpdf-collected ruling segments — no qpdf here.
+// Converts raw stroke segments on one page (0-based `page_index0`) into
+// clustered vertical/horizontal rule positions in poppler text_list space
+// (top-down y). qpdf reports segments in PDF user space (origin bottom-left);
+// horizontal rules are flipped with y' = page_height - y so they share the word
+// coordinate system. Segments below a minimum length (tick marks / fragments)
+// are ignored, and rules within 1.5pt are merged. This is exactly the geometry
+// the old inline ExtractRulingLines performed after the qpdf content parse.
+static RulingLines RulesForPage(const std::vector<pdf_qpdf::RuledSegment> &segments, int page_index0) {
+	RulingLines rules;
+	int target_page = page_index0 + 1;
+	std::vector<double> v_raw, h_raw;
+	for (const auto &seg : segments) {
+		if (seg.page != target_page) {
+			continue;
+		}
+		double x0 = seg.x0, y0 = seg.y0, x1 = seg.x1, y1 = seg.y1;
+		double dx = std::fabs(x1 - x0), dy = std::fabs(y1 - y0);
+		double len = std::sqrt(dx * dx + dy * dy);
+		if (len < 8.0) {
+			continue; // ignore tick marks / short fragments
+		}
+		if (dx <= 1.5 || dx * 20 < dy) {
+			// vertical — x unchanged
+			v_raw.push_back(0.5 * (x0 + x1));
+		} else if (dy <= 1.5 || dy * 20 < dx) {
+			// horizontal — flip y into poppler text_list space
+			double y_pdf = 0.5 * (y0 + y1);
+			h_raw.push_back(seg.page_height - y_pdf);
+		}
+	}
+	rules.v_rules = Cluster1D(std::move(v_raw), 1.5);
+	rules.h_rules = Cluster1D(std::move(h_raw), 1.5);
+	return rules;
+}
+
+struct ProvCell {
+	double xMin = 0, xMax = 0, yMin = 0, yMax = 0;
+	string text;
+	size_t row = 0;
+};
+
+// Group words of one geometric row into provisional cells by small x-gaps.
+static std::vector<ProvCell> GroupRowIntoCells(std::vector<PdfWord> row, double gap_tol, size_t row_idx) {
+	std::vector<ProvCell> cells;
+	if (row.empty()) {
+		return cells;
+	}
+	std::sort(row.begin(), row.end(), [](const PdfWord &a, const PdfWord &b) { return a.xMin < b.xMin; });
+	ProvCell cur;
+	cur.xMin = row[0].xMin;
+	cur.xMax = row[0].xMax;
+	cur.yMin = row[0].yMin;
+	cur.yMax = row[0].yMax;
+	cur.text = row[0].text;
+	cur.row = row_idx;
+	for (size_t i = 1; i < row.size(); ++i) {
+		double gap = row[i].xMin - cur.xMax;
+		if (gap <= gap_tol) {
+			if (!cur.text.empty()) {
+				cur.text.push_back(' ');
+			}
+			cur.text += row[i].text;
+			cur.xMax = std::max(cur.xMax, row[i].xMax);
+			cur.xMin = std::min(cur.xMin, row[i].xMin);
+			cur.yMin = std::min(cur.yMin, row[i].yMin);
+			cur.yMax = std::max(cur.yMax, row[i].yMax);
+		} else {
+			cells.push_back(std::move(cur));
+			cur = ProvCell {};
+			cur.xMin = row[i].xMin;
+			cur.xMax = row[i].xMax;
+			cur.yMin = row[i].yMin;
+			cur.yMax = row[i].yMax;
+			cur.text = row[i].text;
+			cur.row = row_idx;
+		}
+	}
+	cells.push_back(std::move(cur));
+	return cells;
+}
+
+// Build a global column model from provisional cells by left- AND right-edge
+// recurrence across rows. Returns sorted column center x positions.
+static std::vector<double> DetectColumnsGlobal(const std::vector<std::vector<ProvCell>> &row_cells, double col_tol) {
+	const size_t n_rows = row_cells.size();
+	if (n_rows == 0) {
+		return {};
+	}
+
+	// Vote for alignment positions (xMin left, xMax right) that recur across rows.
+	// Key is quantized x; value is set of row indices that voted.
+	std::map<long, std::set<size_t>> left_votes;
+	std::map<long, std::set<size_t>> right_votes;
+	auto quant = [&](double x) -> long {
+		return static_cast<long>(std::llround(x / std::max(col_tol, 0.5)));
+	};
+
+	for (size_t r = 0; r < n_rows; ++r) {
+		for (const auto &c : row_cells[r]) {
+			left_votes[quant(c.xMin)].insert(r);
+			right_votes[quant(c.xMax)].insert(r);
+		}
+	}
+
+	int min_support = std::max(2, static_cast<int>(std::ceil(0.35 * static_cast<double>(n_rows))));
+
+	// Collect supported edge positions (de-quantize to mean of raw edges near key)
+	std::vector<double> supported_edges;
+	auto collect = [&](const std::map<long, std::set<size_t>> &votes, bool is_left) {
+		for (const auto &kv : votes) {
+			if (static_cast<int>(kv.second.size()) < min_support) {
+				continue;
+			}
+			// average the actual edges for cells that voted this bucket
+			std::vector<double> xs;
+			for (size_t r : kv.second) {
+				for (const auto &c : row_cells[r]) {
+					long q = is_left ? quant(c.xMin) : quant(c.xMax);
+					if (q == kv.first) {
+						xs.push_back(is_left ? c.xMin : c.xMax);
+					}
+				}
+			}
+			if (!xs.empty()) {
+				supported_edges.push_back(Median(xs));
+			}
+		}
+	};
+	collect(left_votes, true);
+	collect(right_votes, false);
+
+	// Also always include cell midpoints that co-occur in many rows (center-aligned)
+	std::map<long, std::set<size_t>> mid_votes;
+	for (size_t r = 0; r < n_rows; ++r) {
+		for (const auto &c : row_cells[r]) {
+			mid_votes[quant(0.5 * (c.xMin + c.xMax))].insert(r);
+		}
+	}
+	for (const auto &kv : mid_votes) {
+		if (static_cast<int>(kv.second.size()) < min_support) {
+			continue;
+		}
+		std::vector<double> xs;
+		for (size_t r : kv.second) {
+			for (const auto &c : row_cells[r]) {
+				double mid = 0.5 * (c.xMin + c.xMax);
+				if (quant(mid) == kv.first) {
+					xs.push_back(mid);
+				}
+			}
+		}
+		if (!xs.empty()) {
+			supported_edges.push_back(Median(xs));
+		}
+	}
+
+	if (supported_edges.empty()) {
+		// Fallback: use modal per-row cell midpoints from rows with modal cell count
+		std::map<int, int> count_hist;
+		for (const auto &rc : row_cells) {
+			count_hist[static_cast<int>(rc.size())]++;
+		}
+		int modal_n = 0, modal_c = 0;
+		for (const auto &kv : count_hist) {
+			if (kv.second > modal_c && kv.first >= 2) {
+				modal_c = kv.second;
+				modal_n = kv.first;
+			}
+		}
+		if (modal_n < 2) {
+			return {};
+		}
+		std::vector<std::vector<double>> col_mids(static_cast<size_t>(modal_n));
+		for (const auto &rc : row_cells) {
+			if (static_cast<int>(rc.size()) != modal_n) {
+				continue;
+			}
+			for (int i = 0; i < modal_n; ++i) {
+				col_mids[static_cast<size_t>(i)].push_back(
+				    0.5 * (rc[static_cast<size_t>(i)].xMin + rc[static_cast<size_t>(i)].xMax));
+			}
+		}
+		std::vector<double> cols;
+		for (auto &m : col_mids) {
+			if (!m.empty()) {
+				cols.push_back(Median(m));
+			}
+		}
+		return cols;
+	}
+
+	// Cluster supported edges into column anchors. Edges that are close belong
+	// to the same column (left+right of a narrow column, or left-only/right-only).
+	// Then derive one center per column from provisional cells matching that anchor.
+	auto edge_clusters = Cluster1D(supported_edges, col_tol * 1.5);
+
+	// Assign each provisional cell to nearest edge-cluster by min(|xMin-e|,|xMax-e|,|mid-e|).
+	// Columns are the clusters that receive cells from ≥ min_support rows.
+	std::vector<std::set<size_t>> cluster_rows(edge_clusters.size());
+	std::vector<std::vector<double>> cluster_mids(edge_clusters.size());
+	for (size_t r = 0; r < n_rows; ++r) {
+		// Greedy L→R assignment so two cells in one row don't share a column.
+		std::vector<bool> used(edge_clusters.size(), false);
+		std::vector<ProvCell> cells = row_cells[r];
+		std::sort(cells.begin(), cells.end(), [](const ProvCell &a, const ProvCell &b) { return a.xMin < b.xMin; });
+		for (const auto &c : cells) {
+			double mid = 0.5 * (c.xMin + c.xMax);
+			size_t best = edge_clusters.size();
+			double best_d = 1e300;
+			for (size_t k = 0; k < edge_clusters.size(); ++k) {
+				if (used[k]) {
+					continue;
+				}
+				double e = edge_clusters[k];
+				double d = std::min({std::fabs(c.xMin - e), std::fabs(c.xMax - e), std::fabs(mid - e)});
+				// Prefer columns to the right as we scan L→R only when distances tie-ish
+				if (d < best_d - 1e-6 ||
+				    (std::fabs(d - best_d) < 1e-6 && (best == edge_clusters.size() || e > edge_clusters[best]))) {
+					// actually prefer smaller e for L→R stability
+					if (d < best_d) {
+						best_d = d;
+						best = k;
+					}
+				}
+			}
+			// Accept only if reasonably close (wide numeric columns: right edge may be far from left)
+			double width = std::max(c.xMax - c.xMin, col_tol);
+			if (best < edge_clusters.size() && best_d <= std::max(col_tol * 2.5, width * 0.6)) {
+				used[best] = true;
+				cluster_rows[best].insert(r);
+				cluster_mids[best].push_back(mid);
+			}
+		}
+	}
+
+	std::vector<double> cols;
+	for (size_t k = 0; k < edge_clusters.size(); ++k) {
+		if (static_cast<int>(cluster_rows[k].size()) >= min_support && !cluster_mids[k].empty()) {
+			cols.push_back(Median(cluster_mids[k]));
+		}
+	}
+	std::sort(cols.begin(), cols.end());
+	// Final merge of columns that ended up nearly identical
+	return Cluster1D(cols, col_tol);
+}
+
+// Assign a provisional cell to a global column by left/right/center alignment.
+static size_t AssignCellToColumn(const ProvCell &c, const std::vector<double> &col_centers, double col_tol) {
+	double mid = 0.5 * (c.xMin + c.xMax);
+	size_t best = 0;
+	double best_score = 1e300;
+	for (size_t k = 0; k < col_centers.size(); ++k) {
+		double center = col_centers[k];
+		// score: best of left-align, right-align, center-align distance
+		double d = std::min({std::fabs(c.xMin - center), std::fabs(c.xMax - center), std::fabs(mid - center)});
+		// Also score by how well the cell "covers" the column center
+		if (c.xMin - col_tol <= center && center <= c.xMax + col_tol) {
+			d = std::min(d, 0.25 * std::fabs(mid - center));
+		}
+		if (d < best_score) {
+			best_score = d;
+			best = k;
+		}
+	}
+	return best;
+}
+
+// Merge sparse multi-line continuation rows into the previous row.
+static void MergeContinuationRows(std::vector<std::vector<string>> &grid) {
+	if (grid.size() < 2) {
+		return;
+	}
+	std::vector<std::vector<string>> out;
+	out.reserve(grid.size());
+	out.push_back(grid[0]);
+	for (size_t i = 1; i < grid.size(); ++i) {
+		const auto &prev = out.back();
+		const auto &cur = grid[i];
+		if (prev.size() != cur.size() || cur.empty()) {
+			out.push_back(cur);
+			continue;
+		}
+		int filled_cur = 0, filled_prev = 0;
+		int shared_nonempty = 0;
+		int only_cur = 0;
+		for (size_t c = 0; c < cur.size(); ++c) {
+			bool pc = !prev[c].empty();
+			bool cc = !cur[c].empty();
+			if (pc) {
+				filled_prev++;
+			}
+			if (cc) {
+				filled_cur++;
+			}
+			if (pc && cc) {
+				shared_nonempty++;
+			}
+			if (!pc && cc) {
+				only_cur++;
+			}
+		}
+		// Continuation: sparse row whose non-empty cells continue columns that
+		// already have text in the previous row (wrapped multi-line cell), and
+		// that does not introduce many brand-new columns.
+		bool is_cont = filled_cur > 0 && filled_cur < filled_prev && shared_nonempty >= filled_cur && only_cur == 0 &&
+		               filled_cur <= std::max(1, filled_prev / 2);
+		if (is_cont) {
+			for (size_t c = 0; c < cur.size(); ++c) {
+				if (cur[c].empty()) {
+					continue;
+				}
+				if (!out.back()[c].empty()) {
+					out.back()[c].push_back(' ');
+				}
+				out.back()[c] += cur[c];
+			}
+		} else {
+			out.push_back(cur);
+		}
+	}
+	grid = std::move(out);
+}
+
+// Regularity gate: keep precision against prose while allowing sparse/merged cells.
+// Returns true if the grid looks tabular.
+static bool PassesTabularGate(const std::vector<std::vector<string>> &grid, bool lattice) {
+	if (grid.size() < 3) {
+		return false;
+	}
+	if (grid.front().size() < 2) {
+		return false;
+	}
+	std::vector<int> filled_per_row;
+	filled_per_row.reserve(grid.size());
+	int total_filled = 0;
+	for (const auto &row : grid) {
+		int filled = 0;
+		for (const auto &cell : row) {
+			if (!cell.empty()) {
+				filled++;
+			}
+		}
+		filled_per_row.push_back(filled);
+		total_filled += filled;
+	}
+	int modal_filled = 0;
+	int modal_count = 0;
+	for (size_t i = 0; i < filled_per_row.size(); ++i) {
+		int c = 0;
+		for (size_t j = 0; j < filled_per_row.size(); ++j) {
+			if (filled_per_row[j] == filled_per_row[i]) {
+				c++;
+			}
+		}
+		if (c > modal_count) {
+			modal_count = c;
+			modal_filled = filled_per_row[i];
+		}
+	}
+	// Near-modal: rows whose filled count is within 1 of modal (spanning/merged cells)
+	int near_modal = 0;
+	for (int f : filled_per_row) {
+		if (std::abs(f - modal_filled) <= 1 && f >= 2) {
+			near_modal++;
+		}
+	}
+	double modal_fraction = static_cast<double>(modal_count) / static_cast<double>(grid.size());
+	double near_fraction = static_cast<double>(near_modal) / static_cast<double>(grid.size());
+	double density = static_cast<double>(total_filled) / static_cast<double>(grid.size() * grid.front().size());
+
+	if (lattice) {
+		// Rules already prove structure; only reject nearly empty grids.
+		return modal_filled >= 1 && density >= 0.15 && grid.size() >= 2;
+	}
+	// Whitespace path: still precision-first — reject prose (one long column of
+	// sentences rarely has modal_filled >= 2 with near_fraction high).
+	if (modal_filled < 2) {
+		return false;
+	}
+	// Old gate was modal_fraction >= 0.6 exact match. Allow near-modal majority
+	// so multi-line / lightly sparse rows do not discard the whole table.
+	if (modal_fraction >= 0.45 || near_fraction >= 0.55) {
+		return density >= 0.25;
+	}
+	return false;
+}
+
+// Lattice reconstruction: rules define row/column bands.
+static std::vector<std::vector<string>> ReconstructLatticeGrid(const std::vector<PdfWord> &page_words,
+                                                               const RulingLines &rules) {
+	std::vector<std::vector<string>> grid;
+	if (!rules.Usable() || page_words.empty()) {
+		return grid;
+	}
+	// Bands between consecutive rules. n rules => n-1 bands.
+	const size_t ncols = rules.v_rules.size() - 1;
+	const size_t nrows = rules.h_rules.size() - 1;
+	if (ncols < 2 || nrows < 2) {
+		return grid;
+	}
+
+	// h_rules are in poppler text_list space (top-down y, sorted ascending):
+	// band 0 is the topmost row band.
+	std::vector<std::vector<string>> bands(nrows, std::vector<string>(ncols));
+	std::vector<std::vector<std::vector<PdfWord>>> band_words(nrows, std::vector<std::vector<PdfWord>>(ncols));
+
+	auto col_of = [&](double x) -> int {
+		for (size_t i = 0; i + 1 < rules.v_rules.size(); ++i) {
+			if (x >= rules.v_rules[i] - 0.5 && x < rules.v_rules[i + 1] + 0.5) {
+				return static_cast<int>(i);
+			}
+		}
+		return -1;
+	};
+	auto row_of = [&](double y) -> int {
+		for (size_t i = 0; i + 1 < rules.h_rules.size(); ++i) {
+			if (y >= rules.h_rules[i] - 0.5 && y < rules.h_rules[i + 1] + 0.5) {
+				return static_cast<int>(i);
+			}
+		}
+		return -1;
+	};
+
+	for (const auto &w : page_words) {
+		double mx = 0.5 * (w.xMin + w.xMax);
+		double my = 0.5 * (w.yMin + w.yMax);
+		int c = col_of(mx);
+		int r = row_of(my);
+		if (c < 0 || r < 0) {
+			continue;
+		}
+		band_words[static_cast<size_t>(r)][static_cast<size_t>(c)].push_back(w);
+	}
+
+	for (size_t r = 0; r < nrows; ++r) {
+		for (size_t c = 0; c < ncols; ++c) {
+			auto &ws = band_words[r][c];
+			if (ws.empty()) {
+				continue;
+			}
+			// reading order within cell: top-to-bottom, then left-to-right
+			std::sort(ws.begin(), ws.end(), [](const PdfWord &a, const PdfWord &b) {
+				if (std::fabs(a.yMin - b.yMin) > 1.0) {
+					return a.yMin < b.yMin; // smaller y first (top-down)
+				}
+				return a.xMin < b.xMin;
+			});
+			string cell;
+			for (auto &w : ws) {
+				if (!cell.empty()) {
+					cell.push_back(' ');
+				}
+				cell += w.text;
+			}
+			bands[r][c] = std::move(cell);
+		}
+	}
+
+	// Emit top-to-bottom (band 0 = top)
+	for (size_t ri = 0; ri < nrows; ++ri) {
+		bool any = false;
+		for (const auto &cell : bands[ri]) {
+			if (!cell.empty()) {
+				any = true;
+				break;
+			}
+		}
+		if (any) {
+			grid.push_back(bands[ri]);
+		}
+	}
+	return grid;
+}
+
 // Reconstruct one page's words into a grid of text cells. Returns an empty grid
 // for non-tabular pages (prose, single column/row, irregular cell counts).
-//
-// HEURISTICS:
-//  1. ROW CLUSTERING: sort by yMin; two words share a row if their yMin differs
-//     by less than half the median line height.
-//  2. COLUMN DETECTION: cluster all xMins within ~1.5 median char-widths into
-//     column left-edges.
-//  3. CELL ASSIGNMENT: each word joins the column whose left edge is the
-//     greatest edge <= its xMin; same-cell words join with a space.
-//  4. TABULAR GATE (precision over recall): require >=3 rows and a strong
-//     majority of rows sharing the same non-empty cell count (modal count >= 2).
-static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord> page_words) {
+// When `rules` is non-null and usable, lattice separators are authoritative.
+static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord> page_words,
+                                                            const RulingLines *rules = nullptr) {
 	std::vector<std::vector<string>> grid;
 	if (page_words.size() < 2) {
 		return grid;
 	}
 
-	// --- median line height ---
+	// --- lattice path ---
+	if (rules && rules->Usable()) {
+		grid = ReconstructLatticeGrid(page_words, *rules);
+		MergeContinuationRows(grid);
+		if (!PassesTabularGate(grid, /*lattice=*/true)) {
+			grid.clear();
+		}
+		if (!grid.empty()) {
+			return grid;
+		}
+		// fall through to whitespace if lattice produced nothing usable
+	}
+
+	// --- median line height / char width ---
 	std::vector<double> heights;
+	std::vector<double> widths;
 	heights.reserve(page_words.size());
 	for (const auto &w : page_words) {
 		double h = w.yMax - w.yMin;
 		if (h > 0) {
 			heights.push_back(h);
 		}
+		double ww = w.xMax - w.xMin;
+		size_t len = w.text.size();
+		if (ww > 0 && len > 0) {
+			widths.push_back(ww / static_cast<double>(len));
+		}
 	}
 	double med_h = Median(heights);
 	if (med_h <= 0) {
 		med_h = 10.0;
 	}
+	double char_w = Median(widths);
+	if (char_w <= 0) {
+		char_w = med_h * 0.5;
+	}
 	double row_tol = med_h * 0.5;
+	double col_tol = char_w * 1.5;
+	double cell_gap_tol = char_w * 1.8; // words closer than this share a cell
 
 	// --- cluster into rows by yMin ---
 	std::sort(page_words.begin(), page_words.end(), [](const PdfWord &a, const PdfWord &b) { return a.yMin < b.yMin; });
@@ -212,96 +752,72 @@ static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord>
 		}
 	}
 
-	// --- detect column left-edges from all xMins ---
-	std::vector<double> xs;
-	std::vector<double> widths;
-	for (const auto &w : page_words) {
-		xs.push_back(w.xMin);
-		double ww = w.xMax - w.xMin;
-		size_t len = w.text.size();
-		if (ww > 0 && len > 0) {
-			widths.push_back(ww / static_cast<double>(len));
-		}
-	}
-	double char_w = Median(widths);
-	if (char_w <= 0) {
-		char_w = med_h * 0.5;
-	}
-	double col_tol = char_w * 1.5;
-
-	std::sort(xs.begin(), xs.end());
-	std::vector<double> col_edges;
-	for (double x : xs) {
-		if (col_edges.empty() || (x - col_edges.back()) > col_tol) {
-			col_edges.push_back(x);
-		}
-	}
-
-	if (col_edges.size() < 2 || rows.size() < 2) {
+	if (rows.size() < 2) {
 		return grid;
 	}
 
-	auto col_for = [&](double xMin) -> size_t {
-		size_t chosen = 0;
-		for (size_t c = 0; c < col_edges.size(); ++c) {
-			if (xMin + col_tol * 0.5 >= col_edges[c]) {
-				chosen = c;
-			} else {
-				break;
-			}
-		}
-		return chosen;
-	};
+	// poppler-cpp text_list bboxes use a top-down y axis on the pages we see
+	// (smaller yMin = higher on the page), so ascending yMin is reading order.
 
-	const size_t ncols = col_edges.size();
-	for (auto &row : rows) {
-		std::sort(row.begin(), row.end(), [](const PdfWord &a, const PdfWord &b) { return a.xMin < b.xMin; });
-		std::vector<string> cells(ncols);
-		for (auto &w : row) {
-			size_t c = col_for(w.xMin);
-			if (!cells[c].empty()) {
-				cells[c].push_back(' ');
-			}
-			cells[c] += w.text;
-		}
-		grid.push_back(std::move(cells));
+	// --- provisional cells per row ---
+	std::vector<std::vector<ProvCell>> row_cells;
+	row_cells.reserve(rows.size());
+	for (size_t r = 0; r < rows.size(); ++r) {
+		row_cells.push_back(GroupRowIntoCells(std::move(rows[r]), cell_gap_tol, r));
 	}
 
-	// --- tabular regularity gate ---
-	if (grid.size() < 3) {
-		grid.clear();
+	// --- global column model (left + right alignment recurrence) ---
+	std::vector<double> col_centers = DetectColumnsGlobal(row_cells, col_tol);
+	if (col_centers.size() < 2) {
 		return grid;
 	}
-	std::vector<int> filled_per_row;
-	filled_per_row.reserve(grid.size());
-	for (const auto &row : grid) {
-		int filled = 0;
-		for (const auto &cell : row) {
-			if (!cell.empty()) {
-				filled++;
+
+	const size_t ncols = col_centers.size();
+	for (auto &cells : row_cells) {
+		std::vector<string> line(ncols);
+		// Assign L→R so same-row cells never collide on one column when possible
+		std::sort(cells.begin(), cells.end(), [](const ProvCell &a, const ProvCell &b) { return a.xMin < b.xMin; });
+		std::vector<bool> used(ncols, false);
+		for (auto &c : cells) {
+			size_t best = 0;
+			double best_score = 1e300;
+			for (size_t k = 0; k < ncols; ++k) {
+				if (used[k]) {
+					continue;
+				}
+				// temporary un-mark: score as if free
+				ProvCell tmp = c;
+				// reuse AssignCellToColumn logic inline with used mask
+				double mid = 0.5 * (c.xMin + c.xMax);
+				double center = col_centers[k];
+				double d = std::min({std::fabs(c.xMin - center), std::fabs(c.xMax - center), std::fabs(mid - center)});
+				if (c.xMin - col_tol <= center && center <= c.xMax + col_tol) {
+					d = std::min(d, 0.25 * std::fabs(mid - center));
+				}
+				if (d < best_score) {
+					best_score = d;
+					best = k;
+				}
+				(void)tmp;
 			}
-		}
-		filled_per_row.push_back(filled);
-	}
-	int modal_filled = 0;
-	int modal_count = 0;
-	for (size_t i = 0; i < filled_per_row.size(); ++i) {
-		int c = 0;
-		for (size_t j = 0; j < filled_per_row.size(); ++j) {
-			if (filled_per_row[j] == filled_per_row[i]) {
-				c++;
+			// If all columns used, fall back to absolute best including collisions
+			if (used[best] || best_score > col_tol * 8) {
+				best = AssignCellToColumn(c, col_centers, col_tol);
 			}
+			used[best] = true;
+			if (!line[best].empty()) {
+				line[best].push_back(' ');
+			}
+			line[best] += c.text;
 		}
-		if (c > modal_count) {
-			modal_count = c;
-			modal_filled = filled_per_row[i];
-		}
-	}
-	double modal_fraction = static_cast<double>(modal_count) / static_cast<double>(grid.size());
-	if (modal_filled < 2 || modal_fraction < 0.6) {
-		grid.clear();
+		grid.push_back(std::move(line));
 	}
 
+	// --- multi-line cell merge + regularity gate ---
+	MergeContinuationRows(grid);
+	if (!PassesTabularGate(grid, /*lattice=*/false)) {
+		grid.clear();
+	}
 	return grid;
 }
 
@@ -498,6 +1014,12 @@ struct PdfOptions {
 	string password;
 	int32_t first_page = 1;
 	int32_t last_page = -1; // -1 => through end
+	// Folder-scan fault isolation: when a glob matches many files, skip the ones
+	// that cannot be opened (corrupt / not-a-PDF / encrypted-without-password /
+	// truncated) instead of aborting the whole query on the first bad file.
+	// Default false preserves the strict "one bad file throws" contract. Skipped
+	// files are recoverable in SQL: glob(pattern) EXCEPT SELECT DISTINCT filename.
+	bool ignore_errors = false;
 };
 
 static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
@@ -527,6 +1049,8 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 			o.first_page = IntegerValue::Get(kv.second);
 		} else if (key == "last_page") {
 			o.last_page = IntegerValue::Get(kv.second);
+		} else if (key == "ignore_errors") {
+			o.ignore_errors = BooleanValue::Get(kv.second);
 		}
 	}
 
@@ -673,18 +1197,30 @@ static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctio
 // cannot prove is per-document.
 static bool ClaimNextFile(ClientContext &context, const ReadPdfBindData &bind, ReadPdfGlobalState &g,
                           ReadPdfLocalState &l) {
-	auto file_idx = g.next_file_idx.fetch_add(1, std::memory_order_relaxed);
-	if (file_idx >= bind.files.size()) {
-		l.doc.reset();
-		return false;
+	// Loop so that, under ignore_errors, an unopenable file is skipped and this
+	// thread simply claims the next index rather than returning failure.
+	for (;;) {
+		auto file_idx = g.next_file_idx.fetch_add(1, std::memory_order_relaxed);
+		if (file_idx >= bind.files.size()) {
+			l.doc.reset();
+			return false;
+		}
+		l.current_file = bind.files[file_idx];
+		try {
+			ReadAllBytes(context, l.current_file, l.file_bytes);
+			l.doc = LoadDoc(l.file_bytes, bind.opt.password, l.current_file);
+		} catch (const std::exception &) {
+			// Strict by default; opt in to skipping bad files with ignore_errors.
+			if (!bind.opt.ignore_errors) {
+				throw;
+			}
+			continue; // skip this file, claim the next
+		}
+		l.page_count = l.doc->pages();
+		l.page_idx = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
+		l.last_page_0 = bind.opt.last_page < 0 ? l.page_count : MinValue<int>(bind.opt.last_page, l.page_count);
+		return true;
 	}
-	l.current_file = bind.files[file_idx];
-	ReadAllBytes(context, l.current_file, l.file_bytes);
-	l.doc = LoadDoc(l.file_bytes, bind.opt.password, l.current_file);
-	l.page_count = l.doc->pages();
-	l.page_idx = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
-	l.last_page_0 = bind.opt.last_page < 0 ? l.page_count : MinValue<int>(bind.opt.last_page, l.page_count);
-	return true;
 }
 
 static unique_ptr<GlobalTableFunctionState> ReadPdfInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -803,8 +1339,18 @@ static void ReadPdfMetaScan(ClientContext &context, TableFunctionInput &data_p, 
 	while (count < STANDARD_VECTOR_SIZE && st.idx < bind.files.size()) {
 		auto &path = bind.files[st.idx];
 		string bytes;
-		ReadAllBytes(context, path, bytes);
-		auto doc = LoadDoc(bytes, bind.opt.password, path);
+		unique_ptr<poppler::document> doc;
+		try {
+			ReadAllBytes(context, path, bytes);
+			doc = LoadDoc(bytes, bind.opt.password, path);
+		} catch (const std::exception &) {
+			// Strict by default; opt in to skipping bad files with ignore_errors.
+			if (!bind.opt.ignore_errors) {
+				throw;
+			}
+			st.idx++;
+			continue; // skip this file, advance to the next
+		}
 
 		int major = 0, minor = 0;
 		doc->get_pdf_version(&major, &minor);
@@ -1089,6 +1635,371 @@ static void PdfAttachmentsScan(ClientContext &context, TableFunctionInput &data_
 		output.SetValue(3, count, row.size < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(row.size));
 		output.SetValue(4, count, InspectStringOrNull(row.mime_type));
 		output.SetValue(5, count, Value::BLOB(const_data_ptr_cast(row.data.data()), row.data.size()));
+		st.row_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_revisions -> one row per PDF revision (oldest first)
+//
+// PDFs support incremental updates: editors append a new xref + trailer +
+// %%EOF rather than rewriting the file. Trailers chain via /Prev (byte offset
+// of the previous xref). Each chain entry is one "revision"; revision 0 is the
+// original document, later indexes are appended updates.
+//
+// Implemented by scanning the raw bytes for startxref/%%EOF sections and
+// walking the trailer /Prev chain. qpdf's QPDF::processFile merges revisions
+// into one logical document (getXRefTable is the final table only), so it does
+// not expose a clean multi-revision enumeration API — byte-level parsing is
+// the right tool for this forensic signal. Handles classic xref tables and
+// PDF 1.5+ xref streams (/Type /XRef). Password is accepted for API parity
+// with the rest of the inspection suite (trailers are plaintext even when
+// streams are encrypted).
+//===--------------------------------------------------------------------===//
+struct PdfRevisionRow {
+	int32_t revision_index = 0;
+	int64_t startxref_offset = 0;
+	int64_t eof_offset = 0;
+	int64_t size_bytes = 0;
+	bool is_incremental = false;
+};
+
+struct PdfStartxrefSection {
+	int64_t xref_offset = 0; // value after the startxref keyword
+	int64_t eof_offset = 0;  // byte offset just past this section's %%EOF
+	size_t kw_pos = 0;       // offset of the "startxref" keyword
+};
+
+static bool PdfIsAsciiSpace(unsigned char c) {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\0';
+}
+
+// Locate every startxref <offset> %%EOF section in document order.
+static vector<PdfStartxrefSection> PdfFindStartxrefSections(const string &bytes) {
+	vector<PdfStartxrefSection> out;
+	const string needle = "startxref";
+	size_t pos = 0;
+	while (pos < bytes.size()) {
+		size_t found = bytes.find(needle, pos);
+		if (found == string::npos) {
+			break;
+		}
+		// Keyword boundary: start of buffer or preceding whitespace.
+		if (found > 0 && !PdfIsAsciiSpace((unsigned char)bytes[found - 1])) {
+			pos = found + 1;
+			continue;
+		}
+		size_t i = found + needle.size();
+		while (i < bytes.size() && PdfIsAsciiSpace((unsigned char)bytes[i])) {
+			i++;
+		}
+		if (i >= bytes.size() || !std::isdigit((unsigned char)bytes[i])) {
+			pos = found + 1;
+			continue;
+		}
+		int64_t xref_off = 0;
+		while (i < bytes.size() && std::isdigit((unsigned char)bytes[i])) {
+			xref_off = xref_off * 10 + (bytes[i] - '0');
+			i++;
+		}
+		while (i < bytes.size() && PdfIsAsciiSpace((unsigned char)bytes[i])) {
+			i++;
+		}
+		if (i + 5 > bytes.size() || bytes.compare(i, 5, "%%EOF") != 0) {
+			pos = found + 1;
+			continue;
+		}
+		i += 5;
+		// Optional single CRLF / LF after %%EOF is still part of this revision.
+		if (i < bytes.size() && bytes[i] == '\r') {
+			i++;
+		}
+		if (i < bytes.size() && bytes[i] == '\n') {
+			i++;
+		}
+		PdfStartxrefSection sec;
+		sec.xref_offset = xref_off;
+		sec.eof_offset = (int64_t)i;
+		sec.kw_pos = found;
+		out.push_back(sec);
+		pos = i;
+	}
+	return out;
+}
+
+// Scan a trailer-like dictionary byte range for `/Prev <int>`.
+// Returns true when /Prev is present.
+static bool PdfDictGetPrev(const string &bytes, size_t dict_start, size_t dict_end, int64_t &prev_out) {
+	if (dict_end <= dict_start || dict_end > bytes.size()) {
+		return false;
+	}
+	const string region = bytes.substr(dict_start, dict_end - dict_start);
+	size_t p = 0;
+	while (p < region.size()) {
+		size_t found = region.find("/Prev", p);
+		if (found == string::npos) {
+			return false;
+		}
+		// Ensure "/Prev" is a name token (not /Previously...).
+		size_t after = found + 5;
+		if (after < region.size()) {
+			unsigned char c = (unsigned char)region[after];
+			// PDF name continues with regular characters; whitespace or delimiter ends it.
+			if (!PdfIsAsciiSpace(c) && c != '/' && c != '[' && c != ']' && c != '<' && c != '>' && c != '(' &&
+			    c != ')' && c != '{' && c != '}' && c != '%') {
+				p = found + 1;
+				continue;
+			}
+		}
+		size_t i = after;
+		while (i < region.size() && PdfIsAsciiSpace((unsigned char)region[i])) {
+			i++;
+		}
+		if (i >= region.size() || !std::isdigit((unsigned char)region[i])) {
+			p = found + 1;
+			continue;
+		}
+		int64_t v = 0;
+		while (i < region.size() && std::isdigit((unsigned char)region[i])) {
+			v = v * 10 + (region[i] - '0');
+			i++;
+		}
+		prev_out = v;
+		return true;
+	}
+	return false;
+}
+
+// Given a startxref offset, locate the trailer dictionary (classic) or the
+// xref-stream dictionary (PDF 1.5+) and read /Prev when present.
+static bool PdfReadPrevAtXref(const string &bytes, int64_t xref_offset, int64_t &prev_out) {
+	if (xref_offset < 0 || (size_t)xref_offset >= bytes.size()) {
+		return false;
+	}
+	const size_t off = (size_t)xref_offset;
+
+	// Classic cross-reference table: "xref" ... "trailer" << ... >>
+	if (off + 4 <= bytes.size() && bytes.compare(off, 4, "xref") == 0) {
+		// "xref" must be a keyword (end boundary).
+		bool classic_ok = (off + 4 >= bytes.size()) || PdfIsAsciiSpace((unsigned char)bytes[off + 4]);
+		if (classic_ok) {
+			size_t search_from = off + 4;
+			// Stay inside a reasonable window before the matching startxref keyword.
+			size_t search_limit = std::min(bytes.size(), off + 2 * 1024 * 1024);
+			while (search_from < search_limit) {
+				size_t tpos = bytes.find("trailer", search_from);
+				if (tpos == string::npos || tpos >= search_limit) {
+					break;
+				}
+				if (tpos > 0 && !PdfIsAsciiSpace((unsigned char)bytes[tpos - 1])) {
+					search_from = tpos + 1;
+					continue;
+				}
+				size_t after = tpos + 7;
+				if (after < bytes.size() && !PdfIsAsciiSpace((unsigned char)bytes[after]) && bytes[after] != '<') {
+					search_from = tpos + 1;
+					continue;
+				}
+				size_t d0 = bytes.find("<<", tpos);
+				if (d0 == string::npos || d0 >= search_limit) {
+					break;
+				}
+				// Match nested dict depth for the trailer dictionary.
+				size_t i = d0;
+				int depth = 0;
+				size_t d1 = string::npos;
+				while (i + 1 < bytes.size() && i < search_limit) {
+					if (bytes[i] == '<' && bytes[i + 1] == '<') {
+						depth++;
+						i += 2;
+						continue;
+					}
+					if (bytes[i] == '>' && bytes[i + 1] == '>') {
+						depth--;
+						i += 2;
+						if (depth == 0) {
+							d1 = i;
+							break;
+						}
+						continue;
+					}
+					i++;
+				}
+				if (d1 == string::npos) {
+					search_from = tpos + 1;
+					continue;
+				}
+				return PdfDictGetPrev(bytes, d0, d1, prev_out);
+			}
+			return false;
+		}
+	}
+
+	// XRef stream: object dictionary with /Type /XRef and optional /Prev.
+	size_t search_limit = std::min(bytes.size(), off + 256 * 1024);
+	size_t d0 = bytes.find("<<", off);
+	if (d0 == string::npos || d0 >= search_limit) {
+		return false;
+	}
+	size_t i = d0;
+	int depth = 0;
+	size_t d1 = string::npos;
+	while (i + 1 < bytes.size() && i < search_limit) {
+		if (bytes[i] == '<' && bytes[i + 1] == '<') {
+			depth++;
+			i += 2;
+			continue;
+		}
+		if (bytes[i] == '>' && bytes[i + 1] == '>') {
+			depth--;
+			i += 2;
+			if (depth == 0) {
+				d1 = i;
+				break;
+			}
+			continue;
+		}
+		i++;
+	}
+	if (d1 == string::npos) {
+		return false;
+	}
+	// Prefer dictionaries that look like xref streams (/Type /XRef), but still
+	// accept /Prev from the first dict at this offset when Type is omitted.
+	const string dict = bytes.substr(d0, d1 - d0);
+	if (dict.find("/XRef") == string::npos && dict.find("/Prev") == string::npos) {
+		return false;
+	}
+	return PdfDictGetPrev(bytes, d0, d1, prev_out);
+}
+
+// Enumerate revisions oldest-first by walking the trailer /Prev chain from the
+// last startxref section. Falls back to every startxref/%%EOF pair in file
+// order when the chain cannot be reconstructed.
+static vector<PdfRevisionRow> EnumeratePdfRevisions(const string &bytes) {
+	vector<PdfRevisionRow> rows;
+	auto sections = PdfFindStartxrefSections(bytes);
+	if (sections.empty()) {
+		return rows;
+	}
+
+	// Map xref offset -> section (last occurrence wins — matches the final view).
+	std::map<int64_t, PdfStartxrefSection> by_xref;
+	for (auto &s : sections) {
+		by_xref[s.xref_offset] = s;
+	}
+
+	// Walk /Prev from the last section in the file.
+	vector<PdfStartxrefSection> chain;
+	std::set<int64_t> seen;
+	int64_t cur = sections.back().xref_offset;
+	while (true) {
+		if (seen.count(cur)) {
+			break; // cycle guard
+		}
+		seen.insert(cur);
+		auto it = by_xref.find(cur);
+		if (it == by_xref.end()) {
+			// Chain points at an xref we did not observe via startxref — stop.
+			break;
+		}
+		chain.push_back(it->second);
+		int64_t prev = -1;
+		if (!PdfReadPrevAtXref(bytes, cur, prev)) {
+			break;
+		}
+		if (prev < 0) {
+			break;
+		}
+		cur = prev;
+	}
+
+	// chain is newest-first; reverse to oldest-first.
+	if (chain.empty()) {
+		// Fallback: all sections in document order.
+		chain = sections;
+	} else {
+		std::reverse(chain.begin(), chain.end());
+	}
+
+	rows.reserve(chain.size());
+	for (size_t i = 0; i < chain.size(); i++) {
+		PdfRevisionRow row;
+		row.revision_index = (int32_t)i;
+		row.startxref_offset = chain[i].xref_offset;
+		row.eof_offset = chain[i].eof_offset;
+		int64_t prev_eof = (i == 0) ? 0 : chain[i - 1].eof_offset;
+		row.size_bytes = row.eof_offset - prev_eof;
+		if (row.size_bytes < 0) {
+			row.size_bytes = 0;
+		}
+		row.is_incremental = (i > 0);
+		rows.push_back(row);
+	}
+	return rows;
+}
+
+struct PdfRevisionsState : public GlobalTableFunctionState {
+	idx_t file_idx = 0;
+	idx_t row_idx = 0;
+	std::vector<PdfRevisionRow> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfRevisionsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
+	                LogicalType::BOOLEAN};
+	names = {"revision_index", "startxref_offset", "eof_offset", "size_bytes", "is_incremental"};
+	return PdfInspectBindCommon(context, input);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfRevisionsInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfRevisionsState>();
+}
+
+static void PdfRevisionsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfInspectBindData>();
+	auto &st = data_p.global_state->Cast<PdfRevisionsState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE) {
+		if (st.row_idx >= st.rows.size()) {
+			if (st.file_idx >= bind.files.size()) {
+				break;
+			}
+			st.rows.clear();
+			st.row_idx = 0;
+			string path = bind.files[st.file_idx++];
+			string bytes;
+			ReadAllBytes(context, path, bytes);
+			// Password is accepted for API parity; trailers sit outside encrypted
+			// streams so revision discovery does not require decryption. Skip
+			// LoadDoc so a structured incremental tail remains visible even when
+			// the body is damaged.
+			(void)bind.opt.password;
+			if (bytes.size() < 5 || bytes.compare(0, 5, "%PDF-") != 0) {
+				// Tolerate leading junk (see garbage_header.pdf) by searching.
+				size_t magic = bytes.find("%PDF-");
+				if (magic == string::npos) {
+					throw IOException("pdf_revisions: '%s' is not a PDF (missing %PDF- header)", path);
+				}
+			}
+			st.rows = EnumeratePdfRevisions(bytes);
+			if (st.rows.empty()) {
+				throw IOException("pdf_revisions: '%s' has no startxref/%%EOF revision markers", path);
+			}
+			continue;
+		}
+		auto &row = st.rows[st.row_idx];
+		output.SetValue(0, count, Value::INTEGER(row.revision_index));
+		output.SetValue(1, count, Value::BIGINT(row.startxref_offset));
+		output.SetValue(2, count, Value::BIGINT(row.eof_offset));
+		output.SetValue(3, count, Value::BIGINT(row.size_bytes));
+		output.SetValue(4, count, Value::BOOLEAN(row.is_incremental));
 		st.row_idx++;
 		count++;
 	}
@@ -2183,6 +3094,15 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 		int page_count = doc->pages();
 		int first0 = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
 		int last0 = bind.opt.last_page < 0 ? page_count : MinValue<int>(bind.opt.last_page, page_count);
+		// Lattice ruling lines: collect axis-aligned rules from every page content
+		// stream once via qpdf (poppler-cpp exposes no path API). Best-effort — any
+		// failure leaves the whitespace/stream column model as the sole path.
+		std::vector<pdf_qpdf::RuledSegment> ruling_segments;
+		try {
+			ruling_segments = pdf_qpdf::ExtractRulingLines(bytes, bind.opt.password);
+		} catch (...) {
+			ruling_segments.clear();
+		}
 		// table_index is a running counter over the tabular pages of this document
 		// (each tabular page yields one reconstructed grid).
 		int table_index = 0;
@@ -2230,7 +3150,10 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 					}
 				}
 			}
-			auto grid = ReconstructPageGrid(std::move(words));
+			// Lattice first when the page content stream has ruling lines (qpdf);
+			// ReconstructPageGrid falls back to the whitespace/stream model.
+			RulingLines rules = RulesForPage(ruling_segments, p);
+			auto grid = ReconstructPageGrid(std::move(words), &rules);
 			if (grid.size() < 2 || grid.front().size() < 2) {
 				continue;
 			}
@@ -4452,17 +5375,149 @@ static void PdfAnnotationsScan(ClientContext &context, TableFunctionInput &data_
 }
 
 //===--------------------------------------------------------------------===//
+// pdf_signatures(files) -> one row per filled AcroForm /Sig field.
+//
+// The qpdf signature-dictionary walk, ByteRange coverage, and OpenSSL CMS
+// verification all live in qpdf_ops.cpp (the C++17 qpdf/openssl TU). This file
+// only resolves the file glob, parses the raw /M date into a TIMESTAMP, and
+// shapes the plain SignatureInfo structs into rows.
+//===--------------------------------------------------------------------===//
+
+struct PdfSignaturesBindData : public TableFunctionData {
+	vector<string> files;
+	string password;
+};
+
+// Parse a PDF date string (D:YYYYMMDDHHmmSS[offset...]) into a TIMESTAMP.
+// Returns NULL on missing/unparseable input. Offset is ignored — values are
+// surfaced as naive local timestamps matching the wall-clock fields in /M.
+static Value PdfParseDateOrNull(const string &raw) {
+	if (raw.empty()) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	// Strip optional leading "D:"
+	const char *p = raw.c_str();
+	if (raw.size() >= 2 && (p[0] == 'D' || p[0] == 'd') && p[1] == ':') {
+		p += 2;
+	}
+	// Need at least YYYYMMDD
+	size_t len = strlen(p);
+	if (len < 8) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	auto take = [&](int n, int &out) -> bool {
+		if (len < (size_t)n) {
+			return false;
+		}
+		int v = 0;
+		for (int i = 0; i < n; i++) {
+			if (!std::isdigit(static_cast<unsigned char>(p[i]))) {
+				return false;
+			}
+			v = v * 10 + (p[i] - '0');
+		}
+		out = v;
+		p += n;
+		len -= n;
+		return true;
+	};
+	int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+	if (!take(4, year) || !take(2, month) || !take(2, day)) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	if (len >= 2) {
+		take(2, hour);
+	}
+	if (len >= 2) {
+		take(2, minute);
+	}
+	if (len >= 2) {
+		take(2, second);
+	}
+	if (month < 1 || month > 12 || day < 1 || day > 31) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	date_t date;
+	if (!Date::TryFromDate((int32_t)year, (int32_t)month, (int32_t)day, date)) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	dtime_t time = Time::FromTime((int32_t)hour, (int32_t)minute, (int32_t)second, 0);
+	timestamp_t ts;
+	if (!Timestamp::TryFromDatetime(date, time, ts)) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	return Value::TIMESTAMP(ts);
+}
+
+static unique_ptr<FunctionData> PdfSignaturesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfSignaturesBindData>();
+	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	for (auto &kv : input.named_parameters) {
+		auto key = StringUtil::Lower(kv.first);
+		if (key == "password") {
+			result->password = StringValue::Get(kv.second);
+		}
+	}
+	// `file` is included for glob parity with pdf_form_fields / pdf_annotations.
+	return_types = {LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::TIMESTAMP, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,   LogicalType::BOOLEAN, LogicalType::BOOLEAN};
+	names = {"file",   "field_name", "subfilter",         "signing_time", "signer_name",
+	         "reason", "location",   "covers_whole_file", "verified"};
+	return std::move(result);
+}
+
+static void PdfSignaturesExecute(const string &path, const string &password, std::vector<std::vector<Value>> &rows) {
+	PdfOpsCheckInputExists("pdf_signatures", path);
+	std::vector<pdf_qpdf::SignatureInfo> sigs;
+	try {
+		sigs = pdf_qpdf::ReadSignatures(path, password);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_signatures: %s", string(e.what()));
+	}
+	for (auto &sig : sigs) {
+		// Empty string from the boundary means SQL NULL.
+		Value subfilter = sig.subfilter.empty() ? Value(LogicalType::VARCHAR) : Value(sig.subfilter);
+		Value signing_time = PdfParseDateOrNull(sig.signing_time_raw);
+		Value signer_name = sig.signer_name.empty() ? Value(LogicalType::VARCHAR) : Value(sig.signer_name);
+		Value reason = sig.reason.empty() ? Value(LogicalType::VARCHAR) : Value(sig.reason);
+		Value location = sig.location.empty() ? Value(LogicalType::VARCHAR) : Value(sig.location);
+		// verified is NULL when the signature dict carried no usable /Contents.
+		Value verified = sig.has_verified ? Value::BOOLEAN(sig.verified) : Value(LogicalType::BOOLEAN);
+		rows.push_back({Value(path), Value(sig.field_name), subfilter, signing_time, signer_name, reason, location,
+		                Value::BOOLEAN(sig.covers_whole_file), verified});
+	}
+}
+
+static void PdfSignaturesScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfSignaturesBindData>();
+	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
+	if (!st.executed) {
+		for (auto &path : bind.files) {
+			PdfSignaturesExecute(path, bind.password, st.rows);
+		}
+		st.executed = true;
+	}
+	PdfQpdfRowsEmit(st, output);
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction read_pdf("read_pdf", {LogicalType::VARCHAR}, ReadPdfScan, ReadPdfBind, ReadPdfInitGlobal,
 	                       ReadPdfInitLocal);
 	AddCommonNamedParams(read_pdf);
+	// Registered individually (not in AddCommonNamedParams) so it is only
+	// advertised on functions that actually implement the skip behavior.
+	read_pdf.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(read_pdf);
 
 	TableFunction read_pdf_meta("read_pdf_meta", {LogicalType::VARCHAR}, ReadPdfMetaScan, ReadPdfMetaBind,
 	                            ReadPdfMetaInit);
 	read_pdf_meta.named_parameters["password"] = LogicalType::VARCHAR;
+	read_pdf_meta.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(read_pdf_meta);
 
 	// inspection suite — read-only, serial per file, password is the only knob
@@ -4478,6 +5533,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                              PdfAttachmentsInit);
 	pdf_attachments.named_parameters["password"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(pdf_attachments);
+
+	// Forensic incremental-update revisions (byte-level startxref / /Prev walk)
+	TableFunction pdf_revisions("pdf_revisions", {LogicalType::VARCHAR}, PdfRevisionsScan, PdfRevisionsBind,
+	                            PdfRevisionsInit);
+	pdf_revisions.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_revisions);
 
 	TableFunction read_pdf_words("read_pdf_words", {LogicalType::VARCHAR}, ReadPdfWordsScan, ReadPdfWordsBind,
 	                             ReadPdfWordsInit);
@@ -4613,6 +5674,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction pdf_annotations("pdf_annotations", {LogicalType::VARCHAR}, PdfAnnotationsScan, PdfAnnotationsBind,
 	                              PdfQpdfRowsInit);
 	loader.RegisterFunction(pdf_annotations);
+
+	// pdf_signatures: detect + verify existing digital signatures (no signing).
+	TableFunction pdf_signatures("pdf_signatures", {LogicalType::VARCHAR}, PdfSignaturesScan, PdfSignaturesBind,
+	                             PdfQpdfRowsInit);
+	pdf_signatures.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_signatures);
 
 	// COPY TO pdf
 	CopyFunction pdf_copy("pdf");

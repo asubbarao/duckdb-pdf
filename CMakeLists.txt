@@ -96,8 +96,14 @@ if(NOT WIN32)
     # vcpkg archive. Built with default-features OFF, so qpdf uses its
     # built-in native crypto (no openssl/gnutls in the closure).
     pkg_check_modules(LIBQPDF REQUIRED libqpdf)
+    # OpenSSL for pdf_signatures CMS/PKCS#7 verification (tier 2). We need only
+    # the headers here — vcpkg installs libssl.a / libcrypto.a into the same lib
+    # dir, so they join the link via the GLOB over-link below like every other
+    # vcpkg archive. (This is OUR dependency, not qpdf's; qpdf still uses its
+    # built-in native crypto with default-features OFF.)
+    pkg_check_modules(OPENSSL REQUIRED openssl)
     include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
-                        ${LIBQPDF_INCLUDE_DIRS})
+                        ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
 
     if(DEFINED TESSERACT_LIBDIR AND EXISTS "${TESSERACT_LIBDIR}")
       set(VCPKG_STATIC_LIBDIR "${TESSERACT_LIBDIR}")
@@ -165,13 +171,16 @@ if(NOT WIN32)
     pkg_check_modules(LEPTONICA   REQUIRED IMPORTED_TARGET lept)
     # qpdf (pdf_merge/pdf_split/pdf_rotate): brew/apt qpdf ships libqpdf.pc.
     pkg_check_modules(LIBQPDF     REQUIRED IMPORTED_TARGET libqpdf)
+    # OpenSSL for pdf_signatures CMS/PKCS#7 verification (tier 2). Dynamic on the
+    # shared path, so link the IMPORTED_TARGET explicitly.
+    pkg_check_modules(OPENSSL     REQUIRED IMPORTED_TARGET openssl)
     include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
-                        ${LIBQPDF_INCLUDE_DIRS})
+                        ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
 
     target_link_libraries(${EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF)
+      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL)
     target_link_libraries(${LOADABLE_EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF)
+      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL)
 
     # libharu for write_pdf (local brew path). Dynamic dylib; find explicitly (no pkg-config).
     # Transitive (libpng, zlib) are satisfied by the dylib itself at runtime.

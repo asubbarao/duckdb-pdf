@@ -1,6 +1,6 @@
 # duckdb-pdf
 
-**Everything PDF, in SQL.** A DuckDB community extension (`pdf`) that turns PDFs into tables and tables into PDFs: read text at every grain (page, line, word, layout element, retrieval chunk), inspect metadata / outlines / attachments / form fields / annotations, and do the everyday document operations people open Adobe Acrobat for — merge, split, rotate, compress, encrypt, decrypt, extract pages, write new PDFs. Built on [Poppler](https://poppler.freedesktop.org/) (parsing/rendering), [Tesseract](https://github.com/tesseract-ocr/tesseract) (OCR for scanned documents), [qpdf](https://qpdf.sourceforge.io/) (document surgery), and [libharu](https://github.com/libharu/libharu) (native PDF writing) — all in the DuckDB process, no external tools required at runtime.
+**Everything PDF, in SQL.** A DuckDB community extension (`pdf`) that turns PDFs into tables and tables into PDFs: read text at every grain (page, line, word, layout element, retrieval chunk), inspect metadata / outlines / attachments / form fields / annotations / revisions / digital signatures, and do the everyday document operations people open Adobe Acrobat for — merge, split, rotate, compress, encrypt, decrypt, extract pages, write new PDFs. Built on [Poppler](https://poppler.freedesktop.org/) (parsing/rendering), [Tesseract](https://github.com/tesseract-ocr/tesseract) (OCR for scanned documents), [qpdf](https://qpdf.sourceforge.io/) (document surgery), and [libharu](https://github.com/libharu/libharu) (native PDF writing) — all in the DuckDB process, no external tools required at runtime.
 
 Every function accepts a single path **or a glob**, so the natural unit of work is a folder of PDFs:
 
@@ -56,6 +56,7 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 | `ocr_dpi` | INTEGER | 300 | Render DPI for the OCR raster (1–2400). |
 | `ocr_psm` / `ocr_oem` | INTEGER | Tesseract defaults | Page segmentation mode / OCR engine mode. |
 | `tessdata_dir` | VARCHAR | auto-detected | Explicit Tesseract model directory (see [OCR support](#ocr-support)). |
+| `ignore_errors` | BOOLEAN | false | `read_pdf` / `read_pdf_meta` only: skip unopenable files in a multi-file scan instead of aborting it. |
 
 `read_pdf_elements` and `pdf_chunks` accept only `password`, `first_page`, `last_page` (plus `pdf_chunks`' own `chunk_size` / `overlap`) — they read the native text layer only.
 
@@ -64,6 +65,15 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 Columns: `filename`, `page`, `page_count`, `text`, `width`, `height` (page size in PDF points).
 
 The multi-file scan is **parallel**: each worker thread takes whole files, so a glob over a folder uses all your cores. (On Windows the scan runs serially — Poppler is not thread-safe across documents there.)
+
+By default one corrupt or password-protected file aborts the whole scan. Pass `ignore_errors := true` (also on `read_pdf_meta`) to skip unopenable files and keep the good ones; the skipped set stays recoverable in SQL:
+
+```sql
+-- Which files were skipped?
+SELECT file FROM glob('docs/*.pdf')
+EXCEPT
+SELECT DISTINCT filename FROM read_pdf('docs/*.pdf', ignore_errors := true);
+```
 
 ```sql
 -- Read all pages of a single PDF
@@ -123,7 +133,12 @@ ORDER BY y1 DESC, x0;
 
 Columns: `filename`, `page`, `table_index`, `row_index`, `cells` (a `VARCHAR[]` of the row's cells). Works on scanned PDFs too, via the OCR word layer.
 
-It uses a precision-first geometric heuristic (word bounding-box column clustering with a regularity gate): it favors not emitting spurious tables from prose over catching every table. Clean, aligned tables work well; merged cells, borderless/sparse tables are out of scope — see [Scope](#scope).
+Two detectors run per page:
+
+- **Lattice (ruled) tables** — horizontal/vertical rule segments are collected from the page content streams and, when they form a usable grid, used as authoritative cell separators. Bordered tables are cut exactly along their lines, including cells whose text alignment alone would mis-cluster.
+- **Unruled tables** — a precision-first geometric heuristic (word bounding-box column clustering with a regularity gate, plus document-wide column-edge voting so **right-aligned numeric columns** cluster correctly). It favors not emitting spurious tables from prose over catching every table.
+
+Merged cells and borderless/sparse tables remain out of scope — see [Scope](#scope).
 
 ```sql
 -- Extract all tables from a PDF
@@ -218,7 +233,7 @@ SELECT pdf_to_markdown('report.pdf') AS md;
 
 ## Inspect
 
-Five table functions answer "what is in this file?" without extracting body text. All take a path or glob; `password := '...'` is accepted by `pdf_info`, `read_pdf_meta`, `pdf_outline`, and `pdf_attachments`.
+These table functions answer "what is in this file?" without extracting body text. All take a path or glob; `password := '...'` is accepted by `pdf_info`, `read_pdf_meta`, `pdf_outline`, `pdf_attachments`, `pdf_revisions`, and `pdf_signatures`.
 
 ### `pdf_info` — full per-file census
 
@@ -291,6 +306,42 @@ SELECT page, subtype, contents FROM pdf_annotations('forms/*.pdf');
 SELECT file, page, uri
 FROM pdf_annotations('forms/*.pdf')
 WHERE subtype = 'Link';
+```
+
+### `pdf_revisions` — incremental-update forensics
+
+PDFs are append-only: editing a file with most tools adds an *incremental update* (a new body + xref + `%%EOF`) after the original bytes, leaving every earlier revision intact and recoverable. `pdf_revisions` enumerates those revisions by parsing the raw bytes (`startxref` / `%%EOF` markers and the trailer `/Prev` chain — classic xref tables and xref streams alike), oldest first.
+
+One row per revision. Columns: `revision_index` (0 = original document), `startxref_offset`, `eof_offset` (byte offset just past this revision's `%%EOF`), `size_bytes` (bytes this revision added), `is_incremental` (`false` only for revision 0).
+
+```sql
+-- Has this contract been modified after it was first written?
+SELECT count(*) - 1 AS updates_after_original
+FROM pdf_revisions('contract.pdf');
+
+-- Timeline of what each edit added
+SELECT revision_index, size_bytes, eof_offset
+FROM pdf_revisions('contract.pdf')
+ORDER BY revision_index;
+```
+
+A single-revision file yields exactly one row. Truncating a file at any earlier `eof_offset` reconstructs that revision — useful for "what did this document say before the last edit?" forensics.
+
+### `pdf_signatures` — digital signatures: detect + verify
+
+One row per filled AcroForm signature field (unsigned files and empty signature fields yield zero rows, not an error). Columns: `file`, `field_name`, `subfilter` (e.g. `adbe.pkcs7.detached`), `signing_time` (`TIMESTAMP`), `signer_name`, `reason`, `location`, `covers_whole_file`, `verified`.
+
+`verified` is a real cryptographic check: the detached CMS/PKCS#7 blob (`/Contents`) is verified with OpenSSL over the exact `/ByteRange` spans it signs. It attests **integrity** — the signed bytes have not been altered — but does not validate certificate-chain trust (no CA store is consulted). `covers_whole_file = false` means the file was extended after signing (see `pdf_revisions`): the signature can still verify over its own range while later revisions changed the visible document.
+
+```sql
+-- Are these contracts signed, by whom, and are the signatures intact?
+SELECT file, signer_name, signing_time, verified, covers_whole_file
+FROM pdf_signatures('contracts/*.pdf');
+
+-- Signed-then-modified documents (signature valid but not covering the file)
+SELECT file, field_name
+FROM pdf_signatures('contracts/*.pdf')
+WHERE verified AND NOT covers_whole_file;
 ```
 
 ## Transform & write
@@ -530,7 +581,7 @@ FROM read_pdf('scan.pdf', ocr := true, ocr_language := 'eng', ocr_dpi := 300);
 
 ## Scope
 
-This extension targets the everyday PDF operations — reading at every grain, inspection, and document surgery — deterministically, using Poppler, Tesseract, qpdf, and libharu. It deliberately does **not** attempt ML-based layout analysis or table-structure recognition: table extraction is a precision-first geometric heuristic, so merged cells and borderless/sparse tables are out of scope. For state-of-the-art document understanding (complex tables, reading-order models), reach for purpose-built tools such as [docling](https://github.com/docling-project/docling), [marker](https://github.com/VikParuchuri/marker), or a cloud Document AI service. A Poppler/Tesseract expert can extend this extension's heuristics (e.g. Leptonica preprocessing, ruling-line table detection) from the same building blocks it already exposes.
+This extension targets the everyday PDF operations — reading at every grain, inspection, and document surgery — deterministically, using Poppler, Tesseract, qpdf, and libharu. It deliberately does **not** attempt ML-based layout analysis or table-structure recognition: table extraction combines ruled-line (lattice) detection with a precision-first geometric heuristic, so merged cells and borderless/sparse tables are out of scope. For state-of-the-art document understanding (complex tables, reading-order models), reach for purpose-built tools such as [docling](https://github.com/docling-project/docling), [marker](https://github.com/VikParuchuri/marker), or a cloud Document AI service. A Poppler/Tesseract expert can extend this extension's heuristics (e.g. Leptonica preprocessing) from the same building blocks it already exposes.
 
 ## Building from source
 
@@ -538,10 +589,10 @@ This extension targets the everyday PDF operations — reading at every grain, i
 
 ```bash
 # macOS
-brew install poppler tesseract leptonica libharu qpdf
+brew install poppler tesseract leptonica libharu qpdf openssl
 
 # Ubuntu / Debian
-sudo apt-get install libpoppler-dev libtesseract-dev libleptonica-dev libhpdf-dev libqpdf-dev
+sudo apt-get install libpoppler-dev libtesseract-dev libleptonica-dev libhpdf-dev libqpdf-dev libssl-dev
 ```
 
 ### Build
@@ -576,7 +627,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 
 | Function | Type | Description |
 |---|---|---|
-| `read_pdf(files)` | Table | One row per page: text plus page dimensions. Parallel multi-file scan. |
+| `read_pdf(files)` | Table | One row per page: text plus page dimensions. Parallel multi-file scan; `ignore_errors` skips bad files. |
 | `read_pdf_lines(files)` | Table | One row per layout-preserving line. |
 | `read_pdf_words(files)` | Table | One row per word with bounding box, font, and OCR source/confidence. |
 | `read_pdf_tables(files)` | Table | One row per detected table row; cells as `VARCHAR[]`. |
@@ -588,6 +639,8 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_attachments(files)` | Table | One row per embedded file, bytes as `BLOB`. |
 | `pdf_form_fields(files)` | Table | One row per AcroForm field with type and value. |
 | `pdf_annotations(files)` | Table | One row per annotation; `WHERE subtype = 'Link'` extracts hyperlinks. |
+| `pdf_revisions(file)` | Table | One row per incremental-update revision, oldest first. |
+| `pdf_signatures(files)` | Table | One row per digital signature: metadata + OpenSSL CMS verification. |
 | `pdf_split(file, dir)` | Table | One single-page PDF per page; one row per emitted file. |
 | `pdf_to_text(src [, layout])` | Scalar | Whole document as plain text. Path or `BLOB`. |
 | `pdf_to_markdown(path)` | Scalar | Whole document as GitHub-flavoured Markdown. |

@@ -88,4 +88,53 @@ struct Annotation {
 };
 std::vector<Annotation> ReadAnnotations(const std::string &path);
 
+// One axis-aligned-ish ruled line segment collected from a page content stream,
+// used to recover lattice (bordered) tables. Endpoints are in PDF user space
+// (origin bottom-left) as produced by the content-stream path interpreter after
+// applying the CTM. `page_height` is that page's MediaBox height, carried so the
+// geometry consumer can flip horizontal rules into poppler's top-down text_list
+// coordinate space. All length filtering, axis classification, y-flipping, and
+// clustering into rule positions happen in the caller (pure geometry, no qpdf);
+// this struct is only the raw qpdf-collected boundary.
+struct RuledSegment {
+	int page = 0; // 1-based
+	double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+	double page_height = 0;
+};
+
+// Parse every page's content stream and return the axis-aligned stroke/rectangle
+// segments usable as table ruling lines, each tagged with its 1-based page and
+// that page's MediaBox height. The document is read from an in-memory byte
+// buffer so the caller keeps reading files through its own filesystem; an empty
+// `password` opens an unencrypted document. Best-effort per page: a page whose
+// content stream fails to parse contributes no segments rather than aborting the
+// whole document. A fundamental open failure (bad password / corrupt file) is
+// reported via the error contract (throws).
+std::vector<RuledSegment> ExtractRulingLines(const std::string &pdf_bytes, const std::string &password);
+
+// One entry per filled AcroForm /Sig field (empty/unsigned signature fields
+// are skipped). Detection metadata plus OpenSSL CMS verification of the
+// detached PKCS#7/CMS blob (/Contents) over the /ByteRange spans.
+//
+// Empty-string means SQL NULL for subfilter / signer_name / reason / location
+// / signing_time_raw. `signing_time_raw` is the raw PDF /M date string
+// (D:YYYYMMDD...) which the caller parses into a TIMESTAMP. `has_verified`
+// distinguishes a real CMS true/false result from "no /Contents blob", in
+// which case `verified` stays undefined and the caller emits NULL.
+struct SignatureInfo {
+	std::string field_name;         // fully qualified field name
+	std::string subfilter;          // /SubFilter display text ('' = NULL)
+	std::string signing_time_raw;   // raw /M date string ('' = NULL)
+	std::string signer_name;        // /Name, else CMS signer CN ('' = NULL)
+	std::string reason;             // /Reason ('' = NULL)
+	std::string location;           // /Location ('' = NULL)
+	bool covers_whole_file = false; // ByteRange starts at 0 and ends at EOF
+	bool has_verified = false;      // false = no /Contents → verified is NULL
+	bool verified = false;          // CMS_verify result when has_verified
+};
+// `password` may be empty (unencrypted / owner-open). The caller validates the
+// path exists; a wrong password or unreadable file surfaces via the error
+// contract (thrown std::exception).
+std::vector<SignatureInfo> ReadSignatures(const std::string &path, const std::string &password);
+
 } // namespace pdf_qpdf

@@ -1,0 +1,71 @@
+# name: test/sql/pdf_signatures.test
+# description: pdf_signatures — detect ByteRange coverage + CMS verify
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── unsigned fixtures emit zero rows (not an error) ──
+
+query I
+SELECT count(*) FROM pdf_signatures('test/data/hello.pdf');
+----
+0
+
+query I
+SELECT count(*) FROM pdf_signatures('test/data/form_annots.pdf');
+----
+0
+
+# ── signed.pdf: one adbe.pkcs7.detached signature covering the whole file ──
+
+query I
+SELECT count(*) FROM pdf_signatures('test/data/signed.pdf');
+----
+1
+
+query IIII
+SELECT field_name, subfilter, covers_whole_file, verified
+FROM pdf_signatures('test/data/signed.pdf');
+----
+Signature1	adbe.pkcs7.detached	true	true
+
+# dictionary metadata from /M /Name /Reason /Location
+query IIII
+SELECT signer_name, reason, location, signing_time IS NOT NULL
+FROM pdf_signatures('test/data/signed.pdf');
+----
+Test Signer	Fixture signature	Test Suite	true
+
+# signing_time parses the PDF date D:20240615120000+00'00'
+query I
+SELECT signing_time = TIMESTAMP '2024-06-15 12:00:00'
+FROM pdf_signatures('test/data/signed.pdf');
+----
+true
+
+# ── tampered: trailing bytes after %%EOF → covers_whole_file false ──
+# Cryptographic verify still passes over the original ByteRange spans (the
+# appended bytes sit outside the signed ranges); the whole-file coverage
+# flag is the cheap "something was added after signing" signal.
+
+query II
+SELECT covers_whole_file, verified
+FROM pdf_signatures('test/data/signed_tampered.pdf');
+----
+false	true
+
+# ── glob: both fixtures, one row each ──
+
+query I
+SELECT count(*) FROM pdf_signatures('test/data/signed*.pdf');
+----
+2
+
+# ── failure contract: missing file throws ──
+
+statement error
+SELECT * FROM pdf_signatures('test/data/does_not_exist_sig.pdf');
+----
