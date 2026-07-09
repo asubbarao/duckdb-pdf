@@ -1,0 +1,91 @@
+# name: test/sql/read_pdf_ignore_errors.test
+# description: ignore_errors folder-scan fault isolation for read_pdf / read_pdf_meta
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# Fixture dir test/data/mixed_glob/ holds 2 good PDFs (good1.pdf = 1 page,
+# good2.pdf = 2 pages) and 3 unopenable files (not-a-PDF, truncated, garbage
+# header). Good pages total = 3; distinct good files = 2; bad files = 3.
+
+# ── default: one bad file in the glob aborts the whole query ─────────────────
+
+statement error
+SELECT * FROM read_pdf('test/data/mixed_glob/*.pdf');
+----
+could not open
+
+statement error
+SELECT * FROM read_pdf_meta('test/data/mixed_glob/*.pdf');
+----
+could not open
+
+# ── ignore_errors := false is explicit strict mode (same as default) ────────
+
+statement error
+SELECT * FROM read_pdf('test/data/mixed_glob/*.pdf', ignore_errors := false);
+----
+could not open
+
+# ── ignore_errors := true skips the bad files, keeps the good ones ──────────
+
+# one row per good page (1 + 2 = 3), no error
+query I
+SELECT COUNT(*) FROM read_pdf('test/data/mixed_glob/*.pdf', ignore_errors := true);
+----
+3
+
+# exactly the 2 good files survive
+query I
+SELECT COUNT(DISTINCT filename) FROM read_pdf('test/data/mixed_glob/*.pdf', ignore_errors := true);
+----
+2
+
+# good content is intact (order-independent: parallel scan yields rows in any order)
+query I
+SELECT bool_or(contains(lower(text), 'hello duckdb'))
+FROM read_pdf('test/data/mixed_glob/*.pdf', ignore_errors := true);
+----
+true
+
+# no bad file leaked a row
+query I
+SELECT COUNT(*) FROM read_pdf('test/data/mixed_glob/*.pdf', ignore_errors := true)
+WHERE contains(filename, 'bad_');
+----
+0
+
+# read_pdf_meta: one row per good file (2), no error
+query I
+SELECT COUNT(*) FROM read_pdf_meta('test/data/mixed_glob/*.pdf', ignore_errors := true);
+----
+2
+
+# ── all-good glob is unaffected: ignore_errors never drops a readable file ───
+
+query I
+SELECT COUNT(*) FROM read_pdf('test/data/mixed_glob/good*.pdf', ignore_errors := true);
+----
+3
+
+# ── a glob (or path) matching only bad files yields 0 rows, not an error ─────
+
+query I
+SELECT COUNT(*) FROM read_pdf('test/data/mixed_glob/bad_text.pdf', ignore_errors := true);
+----
+0
+
+# ── skipped files stay recoverable in pure SQL (no lossy silent drop) ────────
+# glob(pattern) minus the files read_pdf actually returned = the skipped set.
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT file FROM glob('test/data/mixed_glob/*.pdf')
+  EXCEPT
+  SELECT DISTINCT filename FROM read_pdf('test/data/mixed_glob/*.pdf', ignore_errors := true)
+);
+----
+3

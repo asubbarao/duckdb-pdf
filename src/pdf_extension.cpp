@@ -498,6 +498,12 @@ struct PdfOptions {
 	string password;
 	int32_t first_page = 1;
 	int32_t last_page = -1; // -1 => through end
+	// Folder-scan fault isolation: when a glob matches many files, skip the ones
+	// that cannot be opened (corrupt / not-a-PDF / encrypted-without-password /
+	// truncated) instead of aborting the whole query on the first bad file.
+	// Default false preserves the strict "one bad file throws" contract. Skipped
+	// files are recoverable in SQL: glob(pattern) EXCEPT SELECT DISTINCT filename.
+	bool ignore_errors = false;
 };
 
 static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
@@ -527,6 +533,8 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 			o.first_page = IntegerValue::Get(kv.second);
 		} else if (key == "last_page") {
 			o.last_page = IntegerValue::Get(kv.second);
+		} else if (key == "ignore_errors") {
+			o.ignore_errors = BooleanValue::Get(kv.second);
 		}
 	}
 
@@ -673,18 +681,30 @@ static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctio
 // cannot prove is per-document.
 static bool ClaimNextFile(ClientContext &context, const ReadPdfBindData &bind, ReadPdfGlobalState &g,
                           ReadPdfLocalState &l) {
-	auto file_idx = g.next_file_idx.fetch_add(1, std::memory_order_relaxed);
-	if (file_idx >= bind.files.size()) {
-		l.doc.reset();
-		return false;
+	// Loop so that, under ignore_errors, an unopenable file is skipped and this
+	// thread simply claims the next index rather than returning failure.
+	for (;;) {
+		auto file_idx = g.next_file_idx.fetch_add(1, std::memory_order_relaxed);
+		if (file_idx >= bind.files.size()) {
+			l.doc.reset();
+			return false;
+		}
+		l.current_file = bind.files[file_idx];
+		try {
+			ReadAllBytes(context, l.current_file, l.file_bytes);
+			l.doc = LoadDoc(l.file_bytes, bind.opt.password, l.current_file);
+		} catch (const std::exception &) {
+			// Strict by default; opt in to skipping bad files with ignore_errors.
+			if (!bind.opt.ignore_errors) {
+				throw;
+			}
+			continue; // skip this file, claim the next
+		}
+		l.page_count = l.doc->pages();
+		l.page_idx = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
+		l.last_page_0 = bind.opt.last_page < 0 ? l.page_count : MinValue<int>(bind.opt.last_page, l.page_count);
+		return true;
 	}
-	l.current_file = bind.files[file_idx];
-	ReadAllBytes(context, l.current_file, l.file_bytes);
-	l.doc = LoadDoc(l.file_bytes, bind.opt.password, l.current_file);
-	l.page_count = l.doc->pages();
-	l.page_idx = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
-	l.last_page_0 = bind.opt.last_page < 0 ? l.page_count : MinValue<int>(bind.opt.last_page, l.page_count);
-	return true;
 }
 
 static unique_ptr<GlobalTableFunctionState> ReadPdfInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -803,8 +823,18 @@ static void ReadPdfMetaScan(ClientContext &context, TableFunctionInput &data_p, 
 	while (count < STANDARD_VECTOR_SIZE && st.idx < bind.files.size()) {
 		auto &path = bind.files[st.idx];
 		string bytes;
-		ReadAllBytes(context, path, bytes);
-		auto doc = LoadDoc(bytes, bind.opt.password, path);
+		unique_ptr<poppler::document> doc;
+		try {
+			ReadAllBytes(context, path, bytes);
+			doc = LoadDoc(bytes, bind.opt.password, path);
+		} catch (const std::exception &) {
+			// Strict by default; opt in to skipping bad files with ignore_errors.
+			if (!bind.opt.ignore_errors) {
+				throw;
+			}
+			st.idx++;
+			continue; // skip this file, advance to the next
+		}
 
 		int major = 0, minor = 0;
 		doc->get_pdf_version(&major, &minor);
@@ -4458,11 +4488,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction read_pdf("read_pdf", {LogicalType::VARCHAR}, ReadPdfScan, ReadPdfBind, ReadPdfInitGlobal,
 	                       ReadPdfInitLocal);
 	AddCommonNamedParams(read_pdf);
+	// Registered individually (not in AddCommonNamedParams) so it is only
+	// advertised on functions that actually implement the skip behavior.
+	read_pdf.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(read_pdf);
 
 	TableFunction read_pdf_meta("read_pdf_meta", {LogicalType::VARCHAR}, ReadPdfMetaScan, ReadPdfMetaBind,
 	                            ReadPdfMetaInit);
 	read_pdf_meta.named_parameters["password"] = LogicalType::VARCHAR;
+	read_pdf_meta.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(read_pdf_meta);
 
 	// inspection suite — read-only, serial per file, password is the only knob
