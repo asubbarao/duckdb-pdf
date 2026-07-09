@@ -1126,6 +1126,371 @@ static void PdfAttachmentsScan(ClientContext &context, TableFunctionInput &data_
 }
 
 //===--------------------------------------------------------------------===//
+// pdf_revisions -> one row per PDF revision (oldest first)
+//
+// PDFs support incremental updates: editors append a new xref + trailer +
+// %%EOF rather than rewriting the file. Trailers chain via /Prev (byte offset
+// of the previous xref). Each chain entry is one "revision"; revision 0 is the
+// original document, later indexes are appended updates.
+//
+// Implemented by scanning the raw bytes for startxref/%%EOF sections and
+// walking the trailer /Prev chain. qpdf's QPDF::processFile merges revisions
+// into one logical document (getXRefTable is the final table only), so it does
+// not expose a clean multi-revision enumeration API — byte-level parsing is
+// the right tool for this forensic signal. Handles classic xref tables and
+// PDF 1.5+ xref streams (/Type /XRef). Password is accepted for API parity
+// with the rest of the inspection suite (trailers are plaintext even when
+// streams are encrypted).
+//===--------------------------------------------------------------------===//
+struct PdfRevisionRow {
+	int32_t revision_index = 0;
+	int64_t startxref_offset = 0;
+	int64_t eof_offset = 0;
+	int64_t size_bytes = 0;
+	bool is_incremental = false;
+};
+
+struct PdfStartxrefSection {
+	int64_t xref_offset = 0;  // value after the startxref keyword
+	int64_t eof_offset = 0;   // byte offset just past this section's %%EOF
+	size_t kw_pos = 0;        // offset of the "startxref" keyword
+};
+
+static bool PdfIsAsciiSpace(unsigned char c) {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\0';
+}
+
+// Locate every startxref <offset> %%EOF section in document order.
+static vector<PdfStartxrefSection> PdfFindStartxrefSections(const string &bytes) {
+	vector<PdfStartxrefSection> out;
+	const string needle = "startxref";
+	size_t pos = 0;
+	while (pos < bytes.size()) {
+		size_t found = bytes.find(needle, pos);
+		if (found == string::npos) {
+			break;
+		}
+		// Keyword boundary: start of buffer or preceding whitespace.
+		if (found > 0 && !PdfIsAsciiSpace((unsigned char)bytes[found - 1])) {
+			pos = found + 1;
+			continue;
+		}
+		size_t i = found + needle.size();
+		while (i < bytes.size() && PdfIsAsciiSpace((unsigned char)bytes[i])) {
+			i++;
+		}
+		if (i >= bytes.size() || !std::isdigit((unsigned char)bytes[i])) {
+			pos = found + 1;
+			continue;
+		}
+		int64_t xref_off = 0;
+		while (i < bytes.size() && std::isdigit((unsigned char)bytes[i])) {
+			xref_off = xref_off * 10 + (bytes[i] - '0');
+			i++;
+		}
+		while (i < bytes.size() && PdfIsAsciiSpace((unsigned char)bytes[i])) {
+			i++;
+		}
+		if (i + 5 > bytes.size() || bytes.compare(i, 5, "%%EOF") != 0) {
+			pos = found + 1;
+			continue;
+		}
+		i += 5;
+		// Optional single CRLF / LF after %%EOF is still part of this revision.
+		if (i < bytes.size() && bytes[i] == '\r') {
+			i++;
+		}
+		if (i < bytes.size() && bytes[i] == '\n') {
+			i++;
+		}
+		PdfStartxrefSection sec;
+		sec.xref_offset = xref_off;
+		sec.eof_offset = (int64_t)i;
+		sec.kw_pos = found;
+		out.push_back(sec);
+		pos = i;
+	}
+	return out;
+}
+
+// Scan a trailer-like dictionary byte range for `/Prev <int>`.
+// Returns true when /Prev is present.
+static bool PdfDictGetPrev(const string &bytes, size_t dict_start, size_t dict_end, int64_t &prev_out) {
+	if (dict_end <= dict_start || dict_end > bytes.size()) {
+		return false;
+	}
+	const string region = bytes.substr(dict_start, dict_end - dict_start);
+	size_t p = 0;
+	while (p < region.size()) {
+		size_t found = region.find("/Prev", p);
+		if (found == string::npos) {
+			return false;
+		}
+		// Ensure "/Prev" is a name token (not /Previously...).
+		size_t after = found + 5;
+		if (after < region.size()) {
+			unsigned char c = (unsigned char)region[after];
+			// PDF name continues with regular characters; whitespace or delimiter ends it.
+			if (!PdfIsAsciiSpace(c) && c != '/' && c != '[' && c != ']' && c != '<' && c != '>' && c != '(' &&
+			    c != ')' && c != '{' && c != '}' && c != '%') {
+				p = found + 1;
+				continue;
+			}
+		}
+		size_t i = after;
+		while (i < region.size() && PdfIsAsciiSpace((unsigned char)region[i])) {
+			i++;
+		}
+		if (i >= region.size() || !std::isdigit((unsigned char)region[i])) {
+			p = found + 1;
+			continue;
+		}
+		int64_t v = 0;
+		while (i < region.size() && std::isdigit((unsigned char)region[i])) {
+			v = v * 10 + (region[i] - '0');
+			i++;
+		}
+		prev_out = v;
+		return true;
+	}
+	return false;
+}
+
+// Given a startxref offset, locate the trailer dictionary (classic) or the
+// xref-stream dictionary (PDF 1.5+) and read /Prev when present.
+static bool PdfReadPrevAtXref(const string &bytes, int64_t xref_offset, int64_t &prev_out) {
+	if (xref_offset < 0 || (size_t)xref_offset >= bytes.size()) {
+		return false;
+	}
+	const size_t off = (size_t)xref_offset;
+
+	// Classic cross-reference table: "xref" ... "trailer" << ... >>
+	if (off + 4 <= bytes.size() && bytes.compare(off, 4, "xref") == 0) {
+		// "xref" must be a keyword (end boundary).
+		bool classic_ok = (off + 4 >= bytes.size()) || PdfIsAsciiSpace((unsigned char)bytes[off + 4]);
+		if (classic_ok) {
+			size_t search_from = off + 4;
+			// Stay inside a reasonable window before the matching startxref keyword.
+			size_t search_limit = std::min(bytes.size(), off + 2 * 1024 * 1024);
+			while (search_from < search_limit) {
+				size_t tpos = bytes.find("trailer", search_from);
+				if (tpos == string::npos || tpos >= search_limit) {
+					break;
+				}
+				if (tpos > 0 && !PdfIsAsciiSpace((unsigned char)bytes[tpos - 1])) {
+					search_from = tpos + 1;
+					continue;
+				}
+				size_t after = tpos + 7;
+				if (after < bytes.size() && !PdfIsAsciiSpace((unsigned char)bytes[after]) && bytes[after] != '<') {
+					search_from = tpos + 1;
+					continue;
+				}
+				size_t d0 = bytes.find("<<", tpos);
+				if (d0 == string::npos || d0 >= search_limit) {
+					break;
+				}
+				// Match nested dict depth for the trailer dictionary.
+				size_t i = d0;
+				int depth = 0;
+				size_t d1 = string::npos;
+				while (i + 1 < bytes.size() && i < search_limit) {
+					if (bytes[i] == '<' && bytes[i + 1] == '<') {
+						depth++;
+						i += 2;
+						continue;
+					}
+					if (bytes[i] == '>' && bytes[i + 1] == '>') {
+						depth--;
+						i += 2;
+						if (depth == 0) {
+							d1 = i;
+							break;
+						}
+						continue;
+					}
+					i++;
+				}
+				if (d1 == string::npos) {
+					search_from = tpos + 1;
+					continue;
+				}
+				return PdfDictGetPrev(bytes, d0, d1, prev_out);
+			}
+			return false;
+		}
+	}
+
+	// XRef stream: object dictionary with /Type /XRef and optional /Prev.
+	size_t search_limit = std::min(bytes.size(), off + 256 * 1024);
+	size_t d0 = bytes.find("<<", off);
+	if (d0 == string::npos || d0 >= search_limit) {
+		return false;
+	}
+	size_t i = d0;
+	int depth = 0;
+	size_t d1 = string::npos;
+	while (i + 1 < bytes.size() && i < search_limit) {
+		if (bytes[i] == '<' && bytes[i + 1] == '<') {
+			depth++;
+			i += 2;
+			continue;
+		}
+		if (bytes[i] == '>' && bytes[i + 1] == '>') {
+			depth--;
+			i += 2;
+			if (depth == 0) {
+				d1 = i;
+				break;
+			}
+			continue;
+		}
+		i++;
+	}
+	if (d1 == string::npos) {
+		return false;
+	}
+	// Prefer dictionaries that look like xref streams (/Type /XRef), but still
+	// accept /Prev from the first dict at this offset when Type is omitted.
+	const string dict = bytes.substr(d0, d1 - d0);
+	if (dict.find("/XRef") == string::npos && dict.find("/Prev") == string::npos) {
+		return false;
+	}
+	return PdfDictGetPrev(bytes, d0, d1, prev_out);
+}
+
+// Enumerate revisions oldest-first by walking the trailer /Prev chain from the
+// last startxref section. Falls back to every startxref/%%EOF pair in file
+// order when the chain cannot be reconstructed.
+static vector<PdfRevisionRow> EnumeratePdfRevisions(const string &bytes) {
+	vector<PdfRevisionRow> rows;
+	auto sections = PdfFindStartxrefSections(bytes);
+	if (sections.empty()) {
+		return rows;
+	}
+
+	// Map xref offset -> section (last occurrence wins — matches the final view).
+	std::map<int64_t, PdfStartxrefSection> by_xref;
+	for (auto &s : sections) {
+		by_xref[s.xref_offset] = s;
+	}
+
+	// Walk /Prev from the last section in the file.
+	vector<PdfStartxrefSection> chain;
+	std::set<int64_t> seen;
+	int64_t cur = sections.back().xref_offset;
+	while (true) {
+		if (seen.count(cur)) {
+			break; // cycle guard
+		}
+		seen.insert(cur);
+		auto it = by_xref.find(cur);
+		if (it == by_xref.end()) {
+			// Chain points at an xref we did not observe via startxref — stop.
+			break;
+		}
+		chain.push_back(it->second);
+		int64_t prev = -1;
+		if (!PdfReadPrevAtXref(bytes, cur, prev)) {
+			break;
+		}
+		if (prev < 0) {
+			break;
+		}
+		cur = prev;
+	}
+
+	// chain is newest-first; reverse to oldest-first.
+	if (chain.empty()) {
+		// Fallback: all sections in document order.
+		chain = sections;
+	} else {
+		std::reverse(chain.begin(), chain.end());
+	}
+
+	rows.reserve(chain.size());
+	for (size_t i = 0; i < chain.size(); i++) {
+		PdfRevisionRow row;
+		row.revision_index = (int32_t)i;
+		row.startxref_offset = chain[i].xref_offset;
+		row.eof_offset = chain[i].eof_offset;
+		int64_t prev_eof = (i == 0) ? 0 : chain[i - 1].eof_offset;
+		row.size_bytes = row.eof_offset - prev_eof;
+		if (row.size_bytes < 0) {
+			row.size_bytes = 0;
+		}
+		row.is_incremental = (i > 0);
+		rows.push_back(row);
+	}
+	return rows;
+}
+
+struct PdfRevisionsState : public GlobalTableFunctionState {
+	idx_t file_idx = 0;
+	idx_t row_idx = 0;
+	std::vector<PdfRevisionRow> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfRevisionsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
+	                LogicalType::BOOLEAN};
+	names = {"revision_index", "startxref_offset", "eof_offset", "size_bytes", "is_incremental"};
+	return PdfInspectBindCommon(context, input);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfRevisionsInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfRevisionsState>();
+}
+
+static void PdfRevisionsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfInspectBindData>();
+	auto &st = data_p.global_state->Cast<PdfRevisionsState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE) {
+		if (st.row_idx >= st.rows.size()) {
+			if (st.file_idx >= bind.files.size()) {
+				break;
+			}
+			st.rows.clear();
+			st.row_idx = 0;
+			string path = bind.files[st.file_idx++];
+			string bytes;
+			ReadAllBytes(context, path, bytes);
+			// Password is accepted for API parity; trailers sit outside encrypted
+			// streams so revision discovery does not require decryption. Skip
+			// LoadDoc so a structured incremental tail remains visible even when
+			// the body is damaged.
+			(void)bind.opt.password;
+			if (bytes.size() < 5 || bytes.compare(0, 5, "%PDF-") != 0) {
+				// Tolerate leading junk (see garbage_header.pdf) by searching.
+				size_t magic = bytes.find("%PDF-");
+				if (magic == string::npos) {
+					throw IOException("pdf_revisions: '%s' is not a PDF (missing %PDF- header)", path);
+				}
+			}
+			st.rows = EnumeratePdfRevisions(bytes);
+			if (st.rows.empty()) {
+				throw IOException("pdf_revisions: '%s' has no startxref/%%EOF revision markers", path);
+			}
+			continue;
+		}
+		auto &row = st.rows[st.row_idx];
+		output.SetValue(0, count, Value::INTEGER(row.revision_index));
+		output.SetValue(1, count, Value::BIGINT(row.startxref_offset));
+		output.SetValue(2, count, Value::BIGINT(row.eof_offset));
+		output.SetValue(3, count, Value::BIGINT(row.size_bytes));
+		output.SetValue(4, count, Value::BOOLEAN(row.is_incremental));
+		st.row_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
 // read_pdf_words  -> one row per word with bbox + font (layout/table substrate)
 //===--------------------------------------------------------------------===//
 struct ReadPdfWordsBindData : public TableFunctionData {
@@ -4512,6 +4877,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                              PdfAttachmentsInit);
 	pdf_attachments.named_parameters["password"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(pdf_attachments);
+
+	// Forensic incremental-update revisions (byte-level startxref / /Prev walk)
+	TableFunction pdf_revisions("pdf_revisions", {LogicalType::VARCHAR}, PdfRevisionsScan, PdfRevisionsBind,
+	                            PdfRevisionsInit);
+	pdf_revisions.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_revisions);
 
 	TableFunction read_pdf_words("read_pdf_words", {LogicalType::VARCHAR}, ReadPdfWordsScan, ReadPdfWordsBind,
 	                             ReadPdfWordsInit);
