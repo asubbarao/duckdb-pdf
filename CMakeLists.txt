@@ -47,16 +47,23 @@ else()
 	endif()
 endif()
 
-set(EXTENSION_SOURCES src/pdf_extension.cpp)
+set(EXTENSION_SOURCES src/pdf_extension.cpp src/qpdf_ops.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-# qpdf headers require C++17 (std::string_view). The CACHE default above is
-# overridden when DuckDB's build drives this CMakeLists (-std=c++11 on Linux CI),
-# so pin the standard on the extension targets themselves.
-set_target_properties(${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME}
-                      PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+# qpdf headers require C++17 (std::string_view), but the main TU
+# (pdf_extension.cpp) MUST build at whatever standard DuckDB drives
+# (-std=c++11 on the Linux registry CI): duckdb headers define
+# `static constexpr` members that libduckdb_static.a carries as out-of-line
+# definitions at C++11, while a C++17 TU makes the same members implicitly
+# inline and emits its own — GNU ld then fails with "multiple definition of
+# duckdb::FileFlags::FILE_FLAGS_READ" (and friends). So the qpdf code lives in
+# its own duckdb-free translation unit (src/qpdf_ops.cpp) and ONLY that file
+# gets C++17. A per-source flag (not CXX_STANDARD, which is target-level) is
+# the mechanism; MSVC defaults to C++14 so it needs the flag spelled /std:c++17.
+set_source_files_properties(src/qpdf_ops.cpp PROPERTIES
+                            COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/std:c++17,-std=c++17>")
 
 if(NOT WIN32)
   # ---- POSIX path: pkg-config ----
