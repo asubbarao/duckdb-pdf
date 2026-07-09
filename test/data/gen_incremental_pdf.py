@@ -7,6 +7,7 @@ PDF revisions (original + one appended update chained via trailer /Prev).
 Usage (from repo root):
   python3 test/data/gen_incremental_pdf.py
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -36,13 +37,9 @@ def main() -> None:
     xref_offset = obj_offset + len(obj)
     xref_section = (
         b"xref\n"
-        b"8 1\n"
-        + f"{obj_offset:010d} 00000 n \n".encode("ascii")
-        + b"trailer\n"
+        b"8 1\n" + f"{obj_offset:010d} 00000 n \n".encode("ascii") + b"trailer\n"
         b"<< /Size 9 /Root 2 0 R /Prev 669 >>\n"
-        b"startxref\n"
-        + f"{xref_offset}\n".encode("ascii")
-        + b"%%EOF\n"
+        b"startxref\n" + f"{xref_offset}\n".encode("ascii") + b"%%EOF\n"
     )
     out = base + obj + xref_section
     OUT.write_bytes(out)

@@ -1667,9 +1667,9 @@ struct PdfRevisionRow {
 };
 
 struct PdfStartxrefSection {
-	int64_t xref_offset = 0;  // value after the startxref keyword
-	int64_t eof_offset = 0;   // byte offset just past this section's %%EOF
-	size_t kw_pos = 0;        // offset of the "startxref" keyword
+	int64_t xref_offset = 0; // value after the startxref keyword
+	int64_t eof_offset = 0;  // byte offset just past this section's %%EOF
+	size_t kw_pos = 0;       // offset of the "startxref" keyword
 };
 
 static bool PdfIsAsciiSpace(unsigned char c) {
