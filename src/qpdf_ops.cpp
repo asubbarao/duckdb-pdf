@@ -19,17 +19,27 @@
 #include <qpdf/QPDFAcroFormDocumentHelper.hh>
 #include <qpdf/QPDFAnnotationObjectHelper.hh>
 #include <qpdf/QPDFFormFieldObjectHelper.hh>
+#include <qpdf/QPDFObjGen.hh>
 #include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFPageDocumentHelper.hh>
 #include <qpdf/QPDFPageObjectHelper.hh>
 #include <qpdf/QPDFWriter.hh>
 #include <qpdf/QUtil.hh>
 
+// OpenSSL — CMS/PKCS#7 verification for pdf_signatures (tier 2). Plain C API;
+// touches neither duckdb nor poppler, so it is safe to include in this TU.
+#include <openssl/bio.h>
+#include <openssl/cms.h>
+#include <openssl/err.h>
+#include <openssl/x509.h>
+
 #include <cmath>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -452,6 +462,247 @@ std::vector<RuledSegment> ExtractRulingLines(const std::string &pdf_bytes, const
 		}
 	}
 	return out;
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_signatures — detect + cryptographically verify existing PDF signatures.
+//
+// One SignatureInfo per filled AcroForm /Sig field. Tier 1: parse the signature
+// dictionary (/SubFilter, /M, /Name, /Reason, /Location, /ByteRange) and compute
+// covers_whole_file (ByteRange starts at 0 and ends at EOF — the cheap "nothing
+// was appended after signing" tamper signal). Tier 2: rebuild the signed message
+// from the ByteRange spans and CMS_verify the /Contents PKCS#7/CMS blob with
+// OpenSSL. Signing (creation) is out of scope; detection + verification only.
+//===--------------------------------------------------------------------===//
+
+// Reads the whole file into memory for ByteRange coverage + CMS message rebuild.
+// qpdf's processFile reads the local filesystem, so pdf_signatures is already
+// local-path-only; a plain std::ifstream matches that constraint.
+static std::string ReadFileBytes(const std::string &path) {
+	std::ifstream f(path, std::ios::binary);
+	if (!f) {
+		throw std::runtime_error("could not read '" + path + "'");
+	}
+	std::ostringstream ss;
+	ss << f.rdbuf();
+	return ss.str();
+}
+
+// Read a PDF-string value from a dict key as UTF-8; empty string means absent
+// (the caller maps empty to SQL NULL).
+static std::string DictStringOrEmpty(QPDFObjectHandle dict, const char *key) {
+	if (!dict.isDictionary()) {
+		return std::string();
+	}
+	auto v = dict.getKey(key);
+	if (!v.isString()) {
+		return std::string();
+	}
+	return v.getUTF8Value();
+}
+
+// Extract CN= from an X509 subject name; empty if none.
+static std::string X509CommonName(X509 *cert) {
+	if (!cert) {
+		return std::string();
+	}
+	X509_NAME *name = X509_get_subject_name(cert);
+	if (!name) {
+		return std::string();
+	}
+	char buf[256];
+	int n = X509_NAME_get_text_by_NID(name, NID_commonName, buf, sizeof(buf));
+	if (n <= 0) {
+		return std::string();
+	}
+	return std::string(buf, static_cast<size_t>(n));
+}
+
+// Tier 2: verify a detached (or attached) CMS/PKCS#7 signature over the
+// ByteRange-covered bytes. Returns true only when CMS_verify succeeds.
+static bool CmsVerify(const std::string &message, const std::string &cms_der) {
+	if (cms_der.empty() || message.empty()) {
+		return false;
+	}
+	const unsigned char *p = reinterpret_cast<const unsigned char *>(cms_der.data());
+	CMS_ContentInfo *cms = d2i_CMS_ContentInfo(nullptr, &p, static_cast<long>(cms_der.size()));
+	if (!cms) {
+		ERR_clear_error();
+		return false;
+	}
+	BIO *data_bio = BIO_new_mem_buf(message.data(), static_cast<int>(message.size()));
+	if (!data_bio) {
+		CMS_ContentInfo_free(cms);
+		return false;
+	}
+	// CMS_NO_SIGNER_CERT_VERIFY: do not require a trusted CA chain — we only
+	// check that the digest over ByteRange matches the SignedData (integrity).
+	// CMS_BINARY: PDF bytes are raw, not canonicalized text.
+	// CMS_DETACHED: eContent is absent; message is the ByteRange concatenation.
+	unsigned flags = CMS_NO_SIGNER_CERT_VERIFY | CMS_BINARY | CMS_DETACHED;
+	int rc = CMS_verify(cms, nullptr, nullptr, data_bio, nullptr, flags);
+	if (rc != 1) {
+		// Some writers embed content (non-detached). Retry without DETACHED.
+		ERR_clear_error();
+		BIO_reset(data_bio);
+		flags = CMS_NO_SIGNER_CERT_VERIFY | CMS_BINARY;
+		rc = CMS_verify(cms, nullptr, nullptr, data_bio, nullptr, flags);
+	}
+	BIO_free(data_bio);
+	CMS_ContentInfo_free(cms);
+	ERR_clear_error();
+	return rc == 1;
+}
+
+// Best-effort CN from the CMS signer certificate (for signer_name fallback).
+static std::string CmsSignerCN(const std::string &cms_der) {
+	if (cms_der.empty()) {
+		return std::string();
+	}
+	const unsigned char *p = reinterpret_cast<const unsigned char *>(cms_der.data());
+	CMS_ContentInfo *cms = d2i_CMS_ContentInfo(nullptr, &p, static_cast<long>(cms_der.size()));
+	if (!cms) {
+		ERR_clear_error();
+		return std::string();
+	}
+	std::string cn;
+	STACK_OF(X509) *signers = CMS_get0_signers(cms);
+	if (signers && sk_X509_num(signers) > 0) {
+		cn = X509CommonName(sk_X509_value(signers, 0));
+	}
+	// CMS_get0_signers may be empty until verify; fall back to embedded certs.
+	if (cn.empty()) {
+		STACK_OF(X509) *certs = CMS_get1_certs(cms);
+		if (certs) {
+			if (sk_X509_num(certs) > 0) {
+				cn = X509CommonName(sk_X509_value(certs, 0));
+			}
+			sk_X509_pop_free(certs, X509_free);
+		}
+	}
+	CMS_ContentInfo_free(cms);
+	ERR_clear_error();
+	return cn;
+}
+
+std::vector<SignatureInfo> ReadSignatures(const std::string &path, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	std::vector<SignatureInfo> sigs;
+
+	// File length + raw bytes for ByteRange coverage and CMS message rebuild.
+	std::string file_bytes = ReadFileBytes(path);
+	const int64_t file_size = static_cast<int64_t>(file_bytes.size());
+
+	QPDF doc;
+	if (password.empty()) {
+		doc.processFile(path.c_str());
+	} else {
+		doc.processFile(path.c_str(), password.c_str());
+	}
+	QPDFAcroFormDocumentHelper acroform(doc);
+	if (!acroform.hasAcroForm()) {
+		return sigs;
+	}
+	for (auto &field : acroform.getFormFields()) {
+		if (field.getFieldType() != "/Sig") {
+			continue;
+		}
+		auto value = field.getValue();
+		// Empty / unsigned signature field: skip (no signature dictionary).
+		if (!value.isDictionary()) {
+			continue;
+		}
+		SignatureInfo out;
+		out.field_name = field.getFullyQualifiedName();
+
+		// /SubFilter is a name (/adbe.pkcs7.detached); strip the leading slash.
+		auto sf = value.getKey("/SubFilter");
+		if (sf.isName()) {
+			std::string n = sf.getName();
+			out.subfilter = (!n.empty() && n[0] == '/') ? n.substr(1) : n;
+		} else if (sf.isString()) {
+			out.subfilter = sf.getUTF8Value();
+		}
+
+		out.signing_time_raw = DictStringOrEmpty(value, "/M");
+		// Prefer dictionary /Name; fall back to CMS cert CN after parsing Contents.
+		out.signer_name = DictStringOrEmpty(value, "/Name");
+		out.reason = DictStringOrEmpty(value, "/Reason");
+		out.location = DictStringOrEmpty(value, "/Location");
+
+		// /ByteRange: array of integers [off0 len0 off1 len1 ...]
+		std::vector<int64_t> byte_range;
+		auto br = value.getKey("/ByteRange");
+		if (br.isArray()) {
+			int n = br.getArrayNItems();
+			for (int i = 0; i < n; i++) {
+				auto item = br.getArrayItem(i);
+				if (item.isInteger()) {
+					byte_range.push_back(item.getIntValue());
+				}
+			}
+		}
+
+		std::string message; // concatenation of ByteRange spans
+		if (byte_range.size() >= 2 && byte_range.size() % 2 == 0) {
+			out.covers_whole_file = (byte_range[0] == 0);
+			int64_t last_off = byte_range[byte_range.size() - 2];
+			int64_t last_len = byte_range[byte_range.size() - 1];
+			if (last_off < 0 || last_len < 0 || last_off > file_size || last_len > file_size - last_off) {
+				out.covers_whole_file = false;
+			} else if (last_off + last_len != file_size) {
+				out.covers_whole_file = false;
+			}
+			// Build the signed message; also validates each span.
+			bool spans_ok = true;
+			for (size_t i = 0; i + 1 < byte_range.size(); i += 2) {
+				int64_t off = byte_range[i];
+				int64_t len = byte_range[i + 1];
+				if (off < 0 || len < 0 || off > file_size || len > file_size - off) {
+					spans_ok = false;
+					break;
+				}
+				message.append(file_bytes.data() + off, static_cast<size_t>(len));
+			}
+			if (!spans_ok) {
+				out.covers_whole_file = false;
+				message.clear();
+			}
+		}
+
+		// /Contents: hex (or binary) string holding the CMS/PKCS#7 blob.
+		std::string cms_der;
+		auto contents = value.getKey("/Contents");
+		if (contents.isString()) {
+			// qpdf returns the decoded string bytes (hex already unhexed).
+			cms_der = contents.getStringValue();
+			// Strip trailing NUL padding writers leave in the fixed-width hex hole.
+			while (!cms_der.empty() && cms_der.back() == '\0') {
+				cms_der.pop_back();
+			}
+		}
+
+		// Tier 2 cryptographic verification.
+		if (!cms_der.empty() && !message.empty()) {
+			out.has_verified = true;
+			out.verified = CmsVerify(message, cms_der);
+		} else if (!cms_der.empty() && message.empty()) {
+			// Have a signature blob but an unusable ByteRange → not verified.
+			out.has_verified = true;
+			out.verified = false;
+		}
+		// else: no Contents → leave verified NULL (empty/incomplete sig dict).
+
+		if (out.signer_name.empty() && !cms_der.empty()) {
+			std::string cn = CmsSignerCN(cms_der);
+			if (!cn.empty()) {
+				out.signer_name = cn;
+			}
+		}
+
+		sigs.push_back(std::move(out));
+	}
+	return sigs;
 }
 
 } // namespace pdf_qpdf

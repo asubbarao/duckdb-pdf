@@ -8,6 +8,8 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -5373,6 +5375,134 @@ static void PdfAnnotationsScan(ClientContext &context, TableFunctionInput &data_
 }
 
 //===--------------------------------------------------------------------===//
+// pdf_signatures(files) -> one row per filled AcroForm /Sig field.
+//
+// The qpdf signature-dictionary walk, ByteRange coverage, and OpenSSL CMS
+// verification all live in qpdf_ops.cpp (the C++17 qpdf/openssl TU). This file
+// only resolves the file glob, parses the raw /M date into a TIMESTAMP, and
+// shapes the plain SignatureInfo structs into rows.
+//===--------------------------------------------------------------------===//
+
+struct PdfSignaturesBindData : public TableFunctionData {
+	vector<string> files;
+	string password;
+};
+
+// Parse a PDF date string (D:YYYYMMDDHHmmSS[offset...]) into a TIMESTAMP.
+// Returns NULL on missing/unparseable input. Offset is ignored — values are
+// surfaced as naive local timestamps matching the wall-clock fields in /M.
+static Value PdfParseDateOrNull(const string &raw) {
+	if (raw.empty()) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	// Strip optional leading "D:"
+	const char *p = raw.c_str();
+	if (raw.size() >= 2 && (p[0] == 'D' || p[0] == 'd') && p[1] == ':') {
+		p += 2;
+	}
+	// Need at least YYYYMMDD
+	size_t len = strlen(p);
+	if (len < 8) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	auto take = [&](int n, int &out) -> bool {
+		if (len < (size_t)n) {
+			return false;
+		}
+		int v = 0;
+		for (int i = 0; i < n; i++) {
+			if (!std::isdigit(static_cast<unsigned char>(p[i]))) {
+				return false;
+			}
+			v = v * 10 + (p[i] - '0');
+		}
+		out = v;
+		p += n;
+		len -= n;
+		return true;
+	};
+	int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+	if (!take(4, year) || !take(2, month) || !take(2, day)) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	if (len >= 2) {
+		take(2, hour);
+	}
+	if (len >= 2) {
+		take(2, minute);
+	}
+	if (len >= 2) {
+		take(2, second);
+	}
+	if (month < 1 || month > 12 || day < 1 || day > 31) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	date_t date;
+	if (!Date::TryFromDate((int32_t)year, (int32_t)month, (int32_t)day, date)) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	dtime_t time = Time::FromTime((int32_t)hour, (int32_t)minute, (int32_t)second, 0);
+	timestamp_t ts;
+	if (!Timestamp::TryFromDatetime(date, time, ts)) {
+		return Value(LogicalType::TIMESTAMP);
+	}
+	return Value::TIMESTAMP(ts);
+}
+
+static unique_ptr<FunctionData> PdfSignaturesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfSignaturesBindData>();
+	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	for (auto &kv : input.named_parameters) {
+		auto key = StringUtil::Lower(kv.first);
+		if (key == "password") {
+			result->password = StringValue::Get(kv.second);
+		}
+	}
+	// `file` is included for glob parity with pdf_form_fields / pdf_annotations.
+	return_types = {LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::TIMESTAMP, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,   LogicalType::BOOLEAN, LogicalType::BOOLEAN};
+	names = {"file",   "field_name", "subfilter",         "signing_time", "signer_name",
+	         "reason", "location",   "covers_whole_file", "verified"};
+	return std::move(result);
+}
+
+static void PdfSignaturesExecute(const string &path, const string &password, std::vector<std::vector<Value>> &rows) {
+	PdfOpsCheckInputExists("pdf_signatures", path);
+	std::vector<pdf_qpdf::SignatureInfo> sigs;
+	try {
+		sigs = pdf_qpdf::ReadSignatures(path, password);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_signatures: %s", string(e.what()));
+	}
+	for (auto &sig : sigs) {
+		// Empty string from the boundary means SQL NULL.
+		Value subfilter = sig.subfilter.empty() ? Value(LogicalType::VARCHAR) : Value(sig.subfilter);
+		Value signing_time = PdfParseDateOrNull(sig.signing_time_raw);
+		Value signer_name = sig.signer_name.empty() ? Value(LogicalType::VARCHAR) : Value(sig.signer_name);
+		Value reason = sig.reason.empty() ? Value(LogicalType::VARCHAR) : Value(sig.reason);
+		Value location = sig.location.empty() ? Value(LogicalType::VARCHAR) : Value(sig.location);
+		// verified is NULL when the signature dict carried no usable /Contents.
+		Value verified = sig.has_verified ? Value::BOOLEAN(sig.verified) : Value(LogicalType::BOOLEAN);
+		rows.push_back({Value(path), Value(sig.field_name), subfilter, signing_time, signer_name, reason, location,
+		                Value::BOOLEAN(sig.covers_whole_file), verified});
+	}
+}
+
+static void PdfSignaturesScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfSignaturesBindData>();
+	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
+	if (!st.executed) {
+		for (auto &path : bind.files) {
+			PdfSignaturesExecute(path, bind.password, st.rows);
+		}
+		st.executed = true;
+	}
+	PdfQpdfRowsEmit(st, output);
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 static void LoadInternal(ExtensionLoader &loader) {
@@ -5544,6 +5674,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction pdf_annotations("pdf_annotations", {LogicalType::VARCHAR}, PdfAnnotationsScan, PdfAnnotationsBind,
 	                              PdfQpdfRowsInit);
 	loader.RegisterFunction(pdf_annotations);
+
+	// pdf_signatures: detect + verify existing digital signatures (no signing).
+	TableFunction pdf_signatures("pdf_signatures", {LogicalType::VARCHAR}, PdfSignaturesScan, PdfSignaturesBind,
+	                             PdfQpdfRowsInit);
+	pdf_signatures.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_signatures);
 
 	// COPY TO pdf
 	CopyFunction pdf_copy("pdf");

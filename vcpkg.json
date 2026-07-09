@@ -13,7 +13,8 @@
 		{
 			"name": "qpdf",
 			"default-features": false
-		}
+		},
+		"openssl"
 	],
 	"vcpkg-configuration": {
 		"overlay-ports": [

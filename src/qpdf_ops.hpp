@@ -112,4 +112,29 @@ struct RuledSegment {
 // reported via the error contract (throws).
 std::vector<RuledSegment> ExtractRulingLines(const std::string &pdf_bytes, const std::string &password);
 
+// One entry per filled AcroForm /Sig field (empty/unsigned signature fields
+// are skipped). Detection metadata plus OpenSSL CMS verification of the
+// detached PKCS#7/CMS blob (/Contents) over the /ByteRange spans.
+//
+// Empty-string means SQL NULL for subfilter / signer_name / reason / location
+// / signing_time_raw. `signing_time_raw` is the raw PDF /M date string
+// (D:YYYYMMDD...) which the caller parses into a TIMESTAMP. `has_verified`
+// distinguishes a real CMS true/false result from "no /Contents blob", in
+// which case `verified` stays undefined and the caller emits NULL.
+struct SignatureInfo {
+	std::string field_name;         // fully qualified field name
+	std::string subfilter;          // /SubFilter display text ('' = NULL)
+	std::string signing_time_raw;   // raw /M date string ('' = NULL)
+	std::string signer_name;        // /Name, else CMS signer CN ('' = NULL)
+	std::string reason;             // /Reason ('' = NULL)
+	std::string location;           // /Location ('' = NULL)
+	bool covers_whole_file = false; // ByteRange starts at 0 and ends at EOF
+	bool has_verified = false;      // false = no /Contents → verified is NULL
+	bool verified = false;          // CMS_verify result when has_verified
+};
+// `password` may be empty (unencrypted / owner-open). The caller validates the
+// path exists; a wrong password or unreadable file surfaces via the error
+// contract (thrown std::exception).
+std::vector<SignatureInfo> ReadSignatures(const std::string &path, const std::string &password);
+
 } // namespace pdf_qpdf
