@@ -128,11 +128,25 @@ static string UStringToUtf8(const poppler::ustring &u) {
 static string TempDir();
 
 //===--------------------------------------------------------------------===//
-// Table reconstruction (pure geometry over positioned words)
+// Table reconstruction (geometry over positioned words + optional ruling lines)
 //
-// Words come straight from poppler-cpp's page::text_list() — no external
-// `pdftotext` process. The clustering below is coordinate-system agnostic: it
-// only uses relative positions, so poppler's page coordinates work unchanged.
+// Words come from poppler-cpp page::text_list() (or OCR). poppler-cpp does not
+// expose path/graphics operators, so lattice (ruled) tables are recovered by
+// parsing the page content stream with qpdf (already a hard dependency) for
+// axis-aligned stroke segments and rectangles. That qpdf parse lives in the
+// isolated C++17 translation unit (qpdf_ops.cpp) and returns raw RuledSegment
+// values; ALL of the geometry below — including turning those segments into
+// clustered rule positions — is pure std/poppler math with no qpdf types.
+//
+// Strategy:
+//  1. LATTICE (preferred when present): vertical/horizontal stroke rules become
+//     the authoritative column/row separators.
+//  2. STREAM / whitespace (fallback): provisional per-row cells + a *global*
+//     column model that votes on both left (xMin) and right (xMax) alignment so
+//     right- / decimal-aligned numeric columns are not shattered.
+//  3. MULTI-LINE CELLS: continuation rows (sparse rows continuing a previous
+//     cell) are merged; the regularity gate is looser than the old "identical
+//     filled-count majority" check while still rejecting body prose.
 //===--------------------------------------------------------------------===//
 struct PdfWord {
 	double xMin = 0.0;
@@ -140,6 +154,14 @@ struct PdfWord {
 	double xMax = 0.0;
 	double yMax = 0.0;
 	string text;
+};
+
+struct RulingLines {
+	std::vector<double> v_rules; // vertical rule x positions (sorted)
+	std::vector<double> h_rules; // horizontal rule y positions (sorted)
+	bool Usable() const {
+		return v_rules.size() >= 3 && h_rules.size() >= 3; // outer box + ≥1 internal
+	}
 };
 
 static double Median(std::vector<double> v) {
@@ -154,38 +176,554 @@ static double Median(std::vector<double> v) {
 	return 0.5 * (v[m - 1] + v[m]);
 }
 
+// Cluster 1-D positions that fall within `tol` of an existing cluster centroid.
+// Returns sorted cluster centroids.
+static std::vector<double> Cluster1D(std::vector<double> vals, double tol) {
+	std::vector<double> centers;
+	if (vals.empty()) {
+		return centers;
+	}
+	std::sort(vals.begin(), vals.end());
+	std::vector<double> bucket;
+	for (double v : vals) {
+		if (bucket.empty() || (v - bucket.back()) <= tol) {
+			bucket.push_back(v);
+		} else {
+			centers.push_back(Median(bucket));
+			bucket.clear();
+			bucket.push_back(v);
+		}
+	}
+	if (!bucket.empty()) {
+		centers.push_back(Median(bucket));
+	}
+	return centers;
+}
+
+// Geometry consumer for the qpdf-collected ruling segments — no qpdf here.
+// Converts raw stroke segments on one page (0-based `page_index0`) into
+// clustered vertical/horizontal rule positions in poppler text_list space
+// (top-down y). qpdf reports segments in PDF user space (origin bottom-left);
+// horizontal rules are flipped with y' = page_height - y so they share the word
+// coordinate system. Segments below a minimum length (tick marks / fragments)
+// are ignored, and rules within 1.5pt are merged. This is exactly the geometry
+// the old inline ExtractRulingLines performed after the qpdf content parse.
+static RulingLines RulesForPage(const std::vector<pdf_qpdf::RuledSegment> &segments, int page_index0) {
+	RulingLines rules;
+	int target_page = page_index0 + 1;
+	std::vector<double> v_raw, h_raw;
+	for (const auto &seg : segments) {
+		if (seg.page != target_page) {
+			continue;
+		}
+		double x0 = seg.x0, y0 = seg.y0, x1 = seg.x1, y1 = seg.y1;
+		double dx = std::fabs(x1 - x0), dy = std::fabs(y1 - y0);
+		double len = std::sqrt(dx * dx + dy * dy);
+		if (len < 8.0) {
+			continue; // ignore tick marks / short fragments
+		}
+		if (dx <= 1.5 || dx * 20 < dy) {
+			// vertical — x unchanged
+			v_raw.push_back(0.5 * (x0 + x1));
+		} else if (dy <= 1.5 || dy * 20 < dx) {
+			// horizontal — flip y into poppler text_list space
+			double y_pdf = 0.5 * (y0 + y1);
+			h_raw.push_back(seg.page_height - y_pdf);
+		}
+	}
+	rules.v_rules = Cluster1D(std::move(v_raw), 1.5);
+	rules.h_rules = Cluster1D(std::move(h_raw), 1.5);
+	return rules;
+}
+
+struct ProvCell {
+	double xMin = 0, xMax = 0, yMin = 0, yMax = 0;
+	string text;
+	size_t row = 0;
+};
+
+// Group words of one geometric row into provisional cells by small x-gaps.
+static std::vector<ProvCell> GroupRowIntoCells(std::vector<PdfWord> row, double gap_tol, size_t row_idx) {
+	std::vector<ProvCell> cells;
+	if (row.empty()) {
+		return cells;
+	}
+	std::sort(row.begin(), row.end(), [](const PdfWord &a, const PdfWord &b) { return a.xMin < b.xMin; });
+	ProvCell cur;
+	cur.xMin = row[0].xMin;
+	cur.xMax = row[0].xMax;
+	cur.yMin = row[0].yMin;
+	cur.yMax = row[0].yMax;
+	cur.text = row[0].text;
+	cur.row = row_idx;
+	for (size_t i = 1; i < row.size(); ++i) {
+		double gap = row[i].xMin - cur.xMax;
+		if (gap <= gap_tol) {
+			if (!cur.text.empty()) {
+				cur.text.push_back(' ');
+			}
+			cur.text += row[i].text;
+			cur.xMax = std::max(cur.xMax, row[i].xMax);
+			cur.xMin = std::min(cur.xMin, row[i].xMin);
+			cur.yMin = std::min(cur.yMin, row[i].yMin);
+			cur.yMax = std::max(cur.yMax, row[i].yMax);
+		} else {
+			cells.push_back(std::move(cur));
+			cur = ProvCell {};
+			cur.xMin = row[i].xMin;
+			cur.xMax = row[i].xMax;
+			cur.yMin = row[i].yMin;
+			cur.yMax = row[i].yMax;
+			cur.text = row[i].text;
+			cur.row = row_idx;
+		}
+	}
+	cells.push_back(std::move(cur));
+	return cells;
+}
+
+// Build a global column model from provisional cells by left- AND right-edge
+// recurrence across rows. Returns sorted column center x positions.
+static std::vector<double> DetectColumnsGlobal(const std::vector<std::vector<ProvCell>> &row_cells, double col_tol) {
+	const size_t n_rows = row_cells.size();
+	if (n_rows == 0) {
+		return {};
+	}
+
+	// Vote for alignment positions (xMin left, xMax right) that recur across rows.
+	// Key is quantized x; value is set of row indices that voted.
+	std::map<long, std::set<size_t>> left_votes;
+	std::map<long, std::set<size_t>> right_votes;
+	auto quant = [&](double x) -> long {
+		return static_cast<long>(std::llround(x / std::max(col_tol, 0.5)));
+	};
+
+	for (size_t r = 0; r < n_rows; ++r) {
+		for (const auto &c : row_cells[r]) {
+			left_votes[quant(c.xMin)].insert(r);
+			right_votes[quant(c.xMax)].insert(r);
+		}
+	}
+
+	int min_support = std::max(2, static_cast<int>(std::ceil(0.35 * static_cast<double>(n_rows))));
+
+	// Collect supported edge positions (de-quantize to mean of raw edges near key)
+	std::vector<double> supported_edges;
+	auto collect = [&](const std::map<long, std::set<size_t>> &votes, bool is_left) {
+		for (const auto &kv : votes) {
+			if (static_cast<int>(kv.second.size()) < min_support) {
+				continue;
+			}
+			// average the actual edges for cells that voted this bucket
+			std::vector<double> xs;
+			for (size_t r : kv.second) {
+				for (const auto &c : row_cells[r]) {
+					long q = is_left ? quant(c.xMin) : quant(c.xMax);
+					if (q == kv.first) {
+						xs.push_back(is_left ? c.xMin : c.xMax);
+					}
+				}
+			}
+			if (!xs.empty()) {
+				supported_edges.push_back(Median(xs));
+			}
+		}
+	};
+	collect(left_votes, true);
+	collect(right_votes, false);
+
+	// Also always include cell midpoints that co-occur in many rows (center-aligned)
+	std::map<long, std::set<size_t>> mid_votes;
+	for (size_t r = 0; r < n_rows; ++r) {
+		for (const auto &c : row_cells[r]) {
+			mid_votes[quant(0.5 * (c.xMin + c.xMax))].insert(r);
+		}
+	}
+	for (const auto &kv : mid_votes) {
+		if (static_cast<int>(kv.second.size()) < min_support) {
+			continue;
+		}
+		std::vector<double> xs;
+		for (size_t r : kv.second) {
+			for (const auto &c : row_cells[r]) {
+				double mid = 0.5 * (c.xMin + c.xMax);
+				if (quant(mid) == kv.first) {
+					xs.push_back(mid);
+				}
+			}
+		}
+		if (!xs.empty()) {
+			supported_edges.push_back(Median(xs));
+		}
+	}
+
+	if (supported_edges.empty()) {
+		// Fallback: use modal per-row cell midpoints from rows with modal cell count
+		std::map<int, int> count_hist;
+		for (const auto &rc : row_cells) {
+			count_hist[static_cast<int>(rc.size())]++;
+		}
+		int modal_n = 0, modal_c = 0;
+		for (const auto &kv : count_hist) {
+			if (kv.second > modal_c && kv.first >= 2) {
+				modal_c = kv.second;
+				modal_n = kv.first;
+			}
+		}
+		if (modal_n < 2) {
+			return {};
+		}
+		std::vector<std::vector<double>> col_mids(static_cast<size_t>(modal_n));
+		for (const auto &rc : row_cells) {
+			if (static_cast<int>(rc.size()) != modal_n) {
+				continue;
+			}
+			for (int i = 0; i < modal_n; ++i) {
+				col_mids[static_cast<size_t>(i)].push_back(
+				    0.5 * (rc[static_cast<size_t>(i)].xMin + rc[static_cast<size_t>(i)].xMax));
+			}
+		}
+		std::vector<double> cols;
+		for (auto &m : col_mids) {
+			if (!m.empty()) {
+				cols.push_back(Median(m));
+			}
+		}
+		return cols;
+	}
+
+	// Cluster supported edges into column anchors. Edges that are close belong
+	// to the same column (left+right of a narrow column, or left-only/right-only).
+	// Then derive one center per column from provisional cells matching that anchor.
+	auto edge_clusters = Cluster1D(supported_edges, col_tol * 1.5);
+
+	// Assign each provisional cell to nearest edge-cluster by min(|xMin-e|,|xMax-e|,|mid-e|).
+	// Columns are the clusters that receive cells from ≥ min_support rows.
+	std::vector<std::set<size_t>> cluster_rows(edge_clusters.size());
+	std::vector<std::vector<double>> cluster_mids(edge_clusters.size());
+	for (size_t r = 0; r < n_rows; ++r) {
+		// Greedy L→R assignment so two cells in one row don't share a column.
+		std::vector<bool> used(edge_clusters.size(), false);
+		std::vector<ProvCell> cells = row_cells[r];
+		std::sort(cells.begin(), cells.end(), [](const ProvCell &a, const ProvCell &b) { return a.xMin < b.xMin; });
+		for (const auto &c : cells) {
+			double mid = 0.5 * (c.xMin + c.xMax);
+			size_t best = edge_clusters.size();
+			double best_d = 1e300;
+			for (size_t k = 0; k < edge_clusters.size(); ++k) {
+				if (used[k]) {
+					continue;
+				}
+				double e = edge_clusters[k];
+				double d = std::min({std::fabs(c.xMin - e), std::fabs(c.xMax - e), std::fabs(mid - e)});
+				// Prefer columns to the right as we scan L→R only when distances tie-ish
+				if (d < best_d - 1e-6 ||
+				    (std::fabs(d - best_d) < 1e-6 && (best == edge_clusters.size() || e > edge_clusters[best]))) {
+					// actually prefer smaller e for L→R stability
+					if (d < best_d) {
+						best_d = d;
+						best = k;
+					}
+				}
+			}
+			// Accept only if reasonably close (wide numeric columns: right edge may be far from left)
+			double width = std::max(c.xMax - c.xMin, col_tol);
+			if (best < edge_clusters.size() && best_d <= std::max(col_tol * 2.5, width * 0.6)) {
+				used[best] = true;
+				cluster_rows[best].insert(r);
+				cluster_mids[best].push_back(mid);
+			}
+		}
+	}
+
+	std::vector<double> cols;
+	for (size_t k = 0; k < edge_clusters.size(); ++k) {
+		if (static_cast<int>(cluster_rows[k].size()) >= min_support && !cluster_mids[k].empty()) {
+			cols.push_back(Median(cluster_mids[k]));
+		}
+	}
+	std::sort(cols.begin(), cols.end());
+	// Final merge of columns that ended up nearly identical
+	return Cluster1D(cols, col_tol);
+}
+
+// Assign a provisional cell to a global column by left/right/center alignment.
+static size_t AssignCellToColumn(const ProvCell &c, const std::vector<double> &col_centers, double col_tol) {
+	double mid = 0.5 * (c.xMin + c.xMax);
+	size_t best = 0;
+	double best_score = 1e300;
+	for (size_t k = 0; k < col_centers.size(); ++k) {
+		double center = col_centers[k];
+		// score: best of left-align, right-align, center-align distance
+		double d = std::min({std::fabs(c.xMin - center), std::fabs(c.xMax - center), std::fabs(mid - center)});
+		// Also score by how well the cell "covers" the column center
+		if (c.xMin - col_tol <= center && center <= c.xMax + col_tol) {
+			d = std::min(d, 0.25 * std::fabs(mid - center));
+		}
+		if (d < best_score) {
+			best_score = d;
+			best = k;
+		}
+	}
+	return best;
+}
+
+// Merge sparse multi-line continuation rows into the previous row.
+static void MergeContinuationRows(std::vector<std::vector<string>> &grid) {
+	if (grid.size() < 2) {
+		return;
+	}
+	std::vector<std::vector<string>> out;
+	out.reserve(grid.size());
+	out.push_back(grid[0]);
+	for (size_t i = 1; i < grid.size(); ++i) {
+		const auto &prev = out.back();
+		const auto &cur = grid[i];
+		if (prev.size() != cur.size() || cur.empty()) {
+			out.push_back(cur);
+			continue;
+		}
+		int filled_cur = 0, filled_prev = 0;
+		int shared_nonempty = 0;
+		int only_cur = 0;
+		for (size_t c = 0; c < cur.size(); ++c) {
+			bool pc = !prev[c].empty();
+			bool cc = !cur[c].empty();
+			if (pc) {
+				filled_prev++;
+			}
+			if (cc) {
+				filled_cur++;
+			}
+			if (pc && cc) {
+				shared_nonempty++;
+			}
+			if (!pc && cc) {
+				only_cur++;
+			}
+		}
+		// Continuation: sparse row whose non-empty cells continue columns that
+		// already have text in the previous row (wrapped multi-line cell), and
+		// that does not introduce many brand-new columns.
+		bool is_cont = filled_cur > 0 && filled_cur < filled_prev && shared_nonempty >= filled_cur && only_cur == 0 &&
+		               filled_cur <= std::max(1, filled_prev / 2);
+		if (is_cont) {
+			for (size_t c = 0; c < cur.size(); ++c) {
+				if (cur[c].empty()) {
+					continue;
+				}
+				if (!out.back()[c].empty()) {
+					out.back()[c].push_back(' ');
+				}
+				out.back()[c] += cur[c];
+			}
+		} else {
+			out.push_back(cur);
+		}
+	}
+	grid = std::move(out);
+}
+
+// Regularity gate: keep precision against prose while allowing sparse/merged cells.
+// Returns true if the grid looks tabular.
+static bool PassesTabularGate(const std::vector<std::vector<string>> &grid, bool lattice) {
+	if (grid.size() < 3) {
+		return false;
+	}
+	if (grid.front().size() < 2) {
+		return false;
+	}
+	std::vector<int> filled_per_row;
+	filled_per_row.reserve(grid.size());
+	int total_filled = 0;
+	for (const auto &row : grid) {
+		int filled = 0;
+		for (const auto &cell : row) {
+			if (!cell.empty()) {
+				filled++;
+			}
+		}
+		filled_per_row.push_back(filled);
+		total_filled += filled;
+	}
+	int modal_filled = 0;
+	int modal_count = 0;
+	for (size_t i = 0; i < filled_per_row.size(); ++i) {
+		int c = 0;
+		for (size_t j = 0; j < filled_per_row.size(); ++j) {
+			if (filled_per_row[j] == filled_per_row[i]) {
+				c++;
+			}
+		}
+		if (c > modal_count) {
+			modal_count = c;
+			modal_filled = filled_per_row[i];
+		}
+	}
+	// Near-modal: rows whose filled count is within 1 of modal (spanning/merged cells)
+	int near_modal = 0;
+	for (int f : filled_per_row) {
+		if (std::abs(f - modal_filled) <= 1 && f >= 2) {
+			near_modal++;
+		}
+	}
+	double modal_fraction = static_cast<double>(modal_count) / static_cast<double>(grid.size());
+	double near_fraction = static_cast<double>(near_modal) / static_cast<double>(grid.size());
+	double density = static_cast<double>(total_filled) / static_cast<double>(grid.size() * grid.front().size());
+
+	if (lattice) {
+		// Rules already prove structure; only reject nearly empty grids.
+		return modal_filled >= 1 && density >= 0.15 && grid.size() >= 2;
+	}
+	// Whitespace path: still precision-first — reject prose (one long column of
+	// sentences rarely has modal_filled >= 2 with near_fraction high).
+	if (modal_filled < 2) {
+		return false;
+	}
+	// Old gate was modal_fraction >= 0.6 exact match. Allow near-modal majority
+	// so multi-line / lightly sparse rows do not discard the whole table.
+	if (modal_fraction >= 0.45 || near_fraction >= 0.55) {
+		return density >= 0.25;
+	}
+	return false;
+}
+
+// Lattice reconstruction: rules define row/column bands.
+static std::vector<std::vector<string>> ReconstructLatticeGrid(const std::vector<PdfWord> &page_words,
+                                                               const RulingLines &rules) {
+	std::vector<std::vector<string>> grid;
+	if (!rules.Usable() || page_words.empty()) {
+		return grid;
+	}
+	// Bands between consecutive rules. n rules => n-1 bands.
+	const size_t ncols = rules.v_rules.size() - 1;
+	const size_t nrows = rules.h_rules.size() - 1;
+	if (ncols < 2 || nrows < 2) {
+		return grid;
+	}
+
+	// h_rules are in poppler text_list space (top-down y, sorted ascending):
+	// band 0 is the topmost row band.
+	std::vector<std::vector<string>> bands(nrows, std::vector<string>(ncols));
+	std::vector<std::vector<std::vector<PdfWord>>> band_words(nrows, std::vector<std::vector<PdfWord>>(ncols));
+
+	auto col_of = [&](double x) -> int {
+		for (size_t i = 0; i + 1 < rules.v_rules.size(); ++i) {
+			if (x >= rules.v_rules[i] - 0.5 && x < rules.v_rules[i + 1] + 0.5) {
+				return static_cast<int>(i);
+			}
+		}
+		return -1;
+	};
+	auto row_of = [&](double y) -> int {
+		for (size_t i = 0; i + 1 < rules.h_rules.size(); ++i) {
+			if (y >= rules.h_rules[i] - 0.5 && y < rules.h_rules[i + 1] + 0.5) {
+				return static_cast<int>(i);
+			}
+		}
+		return -1;
+	};
+
+	for (const auto &w : page_words) {
+		double mx = 0.5 * (w.xMin + w.xMax);
+		double my = 0.5 * (w.yMin + w.yMax);
+		int c = col_of(mx);
+		int r = row_of(my);
+		if (c < 0 || r < 0) {
+			continue;
+		}
+		band_words[static_cast<size_t>(r)][static_cast<size_t>(c)].push_back(w);
+	}
+
+	for (size_t r = 0; r < nrows; ++r) {
+		for (size_t c = 0; c < ncols; ++c) {
+			auto &ws = band_words[r][c];
+			if (ws.empty()) {
+				continue;
+			}
+			// reading order within cell: top-to-bottom, then left-to-right
+			std::sort(ws.begin(), ws.end(), [](const PdfWord &a, const PdfWord &b) {
+				if (std::fabs(a.yMin - b.yMin) > 1.0) {
+					return a.yMin < b.yMin; // smaller y first (top-down)
+				}
+				return a.xMin < b.xMin;
+			});
+			string cell;
+			for (auto &w : ws) {
+				if (!cell.empty()) {
+					cell.push_back(' ');
+				}
+				cell += w.text;
+			}
+			bands[r][c] = std::move(cell);
+		}
+	}
+
+	// Emit top-to-bottom (band 0 = top)
+	for (size_t ri = 0; ri < nrows; ++ri) {
+		bool any = false;
+		for (const auto &cell : bands[ri]) {
+			if (!cell.empty()) {
+				any = true;
+				break;
+			}
+		}
+		if (any) {
+			grid.push_back(bands[ri]);
+		}
+	}
+	return grid;
+}
+
 // Reconstruct one page's words into a grid of text cells. Returns an empty grid
 // for non-tabular pages (prose, single column/row, irregular cell counts).
-//
-// HEURISTICS:
-//  1. ROW CLUSTERING: sort by yMin; two words share a row if their yMin differs
-//     by less than half the median line height.
-//  2. COLUMN DETECTION: cluster all xMins within ~1.5 median char-widths into
-//     column left-edges.
-//  3. CELL ASSIGNMENT: each word joins the column whose left edge is the
-//     greatest edge <= its xMin; same-cell words join with a space.
-//  4. TABULAR GATE (precision over recall): require >=3 rows and a strong
-//     majority of rows sharing the same non-empty cell count (modal count >= 2).
-static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord> page_words) {
+// When `rules` is non-null and usable, lattice separators are authoritative.
+static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord> page_words,
+                                                            const RulingLines *rules = nullptr) {
 	std::vector<std::vector<string>> grid;
 	if (page_words.size() < 2) {
 		return grid;
 	}
 
-	// --- median line height ---
+	// --- lattice path ---
+	if (rules && rules->Usable()) {
+		grid = ReconstructLatticeGrid(page_words, *rules);
+		MergeContinuationRows(grid);
+		if (!PassesTabularGate(grid, /*lattice=*/true)) {
+			grid.clear();
+		}
+		if (!grid.empty()) {
+			return grid;
+		}
+		// fall through to whitespace if lattice produced nothing usable
+	}
+
+	// --- median line height / char width ---
 	std::vector<double> heights;
+	std::vector<double> widths;
 	heights.reserve(page_words.size());
 	for (const auto &w : page_words) {
 		double h = w.yMax - w.yMin;
 		if (h > 0) {
 			heights.push_back(h);
 		}
+		double ww = w.xMax - w.xMin;
+		size_t len = w.text.size();
+		if (ww > 0 && len > 0) {
+			widths.push_back(ww / static_cast<double>(len));
+		}
 	}
 	double med_h = Median(heights);
 	if (med_h <= 0) {
 		med_h = 10.0;
 	}
+	double char_w = Median(widths);
+	if (char_w <= 0) {
+		char_w = med_h * 0.5;
+	}
 	double row_tol = med_h * 0.5;
+	double col_tol = char_w * 1.5;
+	double cell_gap_tol = char_w * 1.8; // words closer than this share a cell
 
 	// --- cluster into rows by yMin ---
 	std::sort(page_words.begin(), page_words.end(), [](const PdfWord &a, const PdfWord &b) { return a.yMin < b.yMin; });
@@ -212,96 +750,72 @@ static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord>
 		}
 	}
 
-	// --- detect column left-edges from all xMins ---
-	std::vector<double> xs;
-	std::vector<double> widths;
-	for (const auto &w : page_words) {
-		xs.push_back(w.xMin);
-		double ww = w.xMax - w.xMin;
-		size_t len = w.text.size();
-		if (ww > 0 && len > 0) {
-			widths.push_back(ww / static_cast<double>(len));
-		}
-	}
-	double char_w = Median(widths);
-	if (char_w <= 0) {
-		char_w = med_h * 0.5;
-	}
-	double col_tol = char_w * 1.5;
-
-	std::sort(xs.begin(), xs.end());
-	std::vector<double> col_edges;
-	for (double x : xs) {
-		if (col_edges.empty() || (x - col_edges.back()) > col_tol) {
-			col_edges.push_back(x);
-		}
-	}
-
-	if (col_edges.size() < 2 || rows.size() < 2) {
+	if (rows.size() < 2) {
 		return grid;
 	}
 
-	auto col_for = [&](double xMin) -> size_t {
-		size_t chosen = 0;
-		for (size_t c = 0; c < col_edges.size(); ++c) {
-			if (xMin + col_tol * 0.5 >= col_edges[c]) {
-				chosen = c;
-			} else {
-				break;
-			}
-		}
-		return chosen;
-	};
+	// poppler-cpp text_list bboxes use a top-down y axis on the pages we see
+	// (smaller yMin = higher on the page), so ascending yMin is reading order.
 
-	const size_t ncols = col_edges.size();
-	for (auto &row : rows) {
-		std::sort(row.begin(), row.end(), [](const PdfWord &a, const PdfWord &b) { return a.xMin < b.xMin; });
-		std::vector<string> cells(ncols);
-		for (auto &w : row) {
-			size_t c = col_for(w.xMin);
-			if (!cells[c].empty()) {
-				cells[c].push_back(' ');
-			}
-			cells[c] += w.text;
-		}
-		grid.push_back(std::move(cells));
+	// --- provisional cells per row ---
+	std::vector<std::vector<ProvCell>> row_cells;
+	row_cells.reserve(rows.size());
+	for (size_t r = 0; r < rows.size(); ++r) {
+		row_cells.push_back(GroupRowIntoCells(std::move(rows[r]), cell_gap_tol, r));
 	}
 
-	// --- tabular regularity gate ---
-	if (grid.size() < 3) {
-		grid.clear();
+	// --- global column model (left + right alignment recurrence) ---
+	std::vector<double> col_centers = DetectColumnsGlobal(row_cells, col_tol);
+	if (col_centers.size() < 2) {
 		return grid;
 	}
-	std::vector<int> filled_per_row;
-	filled_per_row.reserve(grid.size());
-	for (const auto &row : grid) {
-		int filled = 0;
-		for (const auto &cell : row) {
-			if (!cell.empty()) {
-				filled++;
+
+	const size_t ncols = col_centers.size();
+	for (auto &cells : row_cells) {
+		std::vector<string> line(ncols);
+		// Assign L→R so same-row cells never collide on one column when possible
+		std::sort(cells.begin(), cells.end(), [](const ProvCell &a, const ProvCell &b) { return a.xMin < b.xMin; });
+		std::vector<bool> used(ncols, false);
+		for (auto &c : cells) {
+			size_t best = 0;
+			double best_score = 1e300;
+			for (size_t k = 0; k < ncols; ++k) {
+				if (used[k]) {
+					continue;
+				}
+				// temporary un-mark: score as if free
+				ProvCell tmp = c;
+				// reuse AssignCellToColumn logic inline with used mask
+				double mid = 0.5 * (c.xMin + c.xMax);
+				double center = col_centers[k];
+				double d = std::min({std::fabs(c.xMin - center), std::fabs(c.xMax - center), std::fabs(mid - center)});
+				if (c.xMin - col_tol <= center && center <= c.xMax + col_tol) {
+					d = std::min(d, 0.25 * std::fabs(mid - center));
+				}
+				if (d < best_score) {
+					best_score = d;
+					best = k;
+				}
+				(void)tmp;
 			}
-		}
-		filled_per_row.push_back(filled);
-	}
-	int modal_filled = 0;
-	int modal_count = 0;
-	for (size_t i = 0; i < filled_per_row.size(); ++i) {
-		int c = 0;
-		for (size_t j = 0; j < filled_per_row.size(); ++j) {
-			if (filled_per_row[j] == filled_per_row[i]) {
-				c++;
+			// If all columns used, fall back to absolute best including collisions
+			if (used[best] || best_score > col_tol * 8) {
+				best = AssignCellToColumn(c, col_centers, col_tol);
 			}
+			used[best] = true;
+			if (!line[best].empty()) {
+				line[best].push_back(' ');
+			}
+			line[best] += c.text;
 		}
-		if (c > modal_count) {
-			modal_count = c;
-			modal_filled = filled_per_row[i];
-		}
-	}
-	double modal_fraction = static_cast<double>(modal_count) / static_cast<double>(grid.size());
-	if (modal_filled < 2 || modal_fraction < 0.6) {
-		grid.clear();
+		grid.push_back(std::move(line));
 	}
 
+	// --- multi-line cell merge + regularity gate ---
+	MergeContinuationRows(grid);
+	if (!PassesTabularGate(grid, /*lattice=*/false)) {
+		grid.clear();
+	}
 	return grid;
 }
 
@@ -2578,6 +3092,15 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 		int page_count = doc->pages();
 		int first0 = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
 		int last0 = bind.opt.last_page < 0 ? page_count : MinValue<int>(bind.opt.last_page, page_count);
+		// Lattice ruling lines: collect axis-aligned rules from every page content
+		// stream once via qpdf (poppler-cpp exposes no path API). Best-effort — any
+		// failure leaves the whitespace/stream column model as the sole path.
+		std::vector<pdf_qpdf::RuledSegment> ruling_segments;
+		try {
+			ruling_segments = pdf_qpdf::ExtractRulingLines(bytes, bind.opt.password);
+		} catch (...) {
+			ruling_segments.clear();
+		}
 		// table_index is a running counter over the tabular pages of this document
 		// (each tabular page yields one reconstructed grid).
 		int table_index = 0;
@@ -2625,7 +3148,10 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 					}
 				}
 			}
-			auto grid = ReconstructPageGrid(std::move(words));
+			// Lattice first when the page content stream has ruling lines (qpdf);
+			// ReconstructPageGrid falls back to the whitespace/stream model.
+			RulingLines rules = RulesForPage(ruling_segments, p);
+			auto grid = ReconstructPageGrid(std::move(words), &rules);
 			if (grid.size() < 2 || grid.front().size() < 2) {
 				continue;
 			}

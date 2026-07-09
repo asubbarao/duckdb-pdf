@@ -19,11 +19,13 @@
 #include <qpdf/QPDFAcroFormDocumentHelper.hh>
 #include <qpdf/QPDFAnnotationObjectHelper.hh>
 #include <qpdf/QPDFFormFieldObjectHelper.hh>
+#include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFPageDocumentHelper.hh>
 #include <qpdf/QPDFPageObjectHelper.hh>
 #include <qpdf/QPDFWriter.hh>
 #include <qpdf/QUtil.hh>
 
+#include <cmath>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -251,6 +253,205 @@ std::vector<Annotation> ReadAnnotations(const std::string &path) {
 		}
 	}
 	return annotations;
+}
+
+namespace {
+
+// Lightweight content-stream path interpreter: collects axis-aligned stroke
+// segments (and rectangle strokes/fills used as borders). Tracks CTM for `cm`.
+// poppler-cpp has no path API; qpdf's page content parser supplies the tokens.
+struct RulingPathCollector : public QPDFObjectHandle::ParserCallbacks {
+	struct Pt {
+		double x = 0, y = 0;
+	};
+	// CTM as [a b c d e f] mapping user space -> device (page) space.
+	double ctm[6] = {1, 0, 0, 1, 0, 0};
+	std::vector<double> stack; // operand stack (numeric only; others ignored)
+	Pt cur;
+	Pt path_start;
+	bool has_cur = false;
+	std::vector<std::pair<Pt, Pt>> segments; // stroke segments in page space
+
+	void ApplyCtm(double x, double y, double &ox, double &oy) const {
+		ox = ctm[0] * x + ctm[2] * y + ctm[4];
+		oy = ctm[1] * x + ctm[3] * y + ctm[5];
+	}
+
+	void MultiplyCtm(double a, double b, double c, double d, double e, double f) {
+		// new = T * current  (PDF: cm concatenates T onto CTM)
+		double na = a * ctm[0] + b * ctm[2];
+		double nb = a * ctm[1] + b * ctm[3];
+		double nc = c * ctm[0] + d * ctm[2];
+		double nd = c * ctm[1] + d * ctm[3];
+		double ne = e * ctm[0] + f * ctm[2] + ctm[4];
+		double nf = e * ctm[1] + f * ctm[3] + ctm[5];
+		ctm[0] = na;
+		ctm[1] = nb;
+		ctm[2] = nc;
+		ctm[3] = nd;
+		ctm[4] = ne;
+		ctm[5] = nf;
+	}
+
+	void AddSeg(Pt a, Pt b) {
+		// Keep near-axis-aligned segments only (table rules).
+		double dx = std::fabs(a.x - b.x);
+		double dy = std::fabs(a.y - b.y);
+		if (dx < 0.5 && dy < 0.5) {
+			return; // point
+		}
+		// allow ~3° skew: |dx| or |dy| dominates
+		if (dx < 1.0 || dy < 1.0 || dx > 20 * dy || dy > 20 * dx) {
+			segments.emplace_back(a, b);
+		}
+	}
+
+	void AddRect(double x, double y, double w, double h) {
+		Pt p0, p1, p2, p3;
+		ApplyCtm(x, y, p0.x, p0.y);
+		ApplyCtm(x + w, y, p1.x, p1.y);
+		ApplyCtm(x + w, y + h, p2.x, p2.y);
+		ApplyCtm(x, y + h, p3.x, p3.y);
+		AddSeg(p0, p1);
+		AddSeg(p1, p2);
+		AddSeg(p2, p3);
+		AddSeg(p3, p0);
+	}
+
+	void handleObject(QPDFObjectHandle obj, size_t, size_t) override {
+		if (obj.isInteger() || obj.isReal()) {
+			stack.push_back(obj.getNumericValue());
+			return;
+		}
+		if (!obj.isOperator()) {
+			// names, strings, arrays used by non-path ops — leave stack alone for
+			// mixed operands; path ops only consume numbers we push above.
+			return;
+		}
+		std::string op = obj.getOperatorValue();
+		auto need = [&](size_t n) -> bool {
+			return stack.size() >= n;
+		};
+		auto popn = [&](size_t n) {
+			std::vector<double> out(n);
+			for (size_t i = 0; i < n; ++i) {
+				out[n - 1 - i] = stack.back();
+				stack.pop_back();
+			}
+			return out;
+		};
+
+		if (op == "cm" && need(6)) {
+			auto v = popn(6);
+			MultiplyCtm(v[0], v[1], v[2], v[3], v[4], v[5]);
+		} else if (op == "m" && need(2)) {
+			auto v = popn(2);
+			ApplyCtm(v[0], v[1], cur.x, cur.y);
+			path_start = cur;
+			has_cur = true;
+		} else if (op == "l" && need(2)) {
+			auto v = popn(2);
+			Pt nxt;
+			ApplyCtm(v[0], v[1], nxt.x, nxt.y);
+			if (has_cur) {
+				AddSeg(cur, nxt);
+			}
+			cur = nxt;
+			has_cur = true;
+		} else if (op == "re" && need(4)) {
+			auto v = popn(4);
+			AddRect(v[0], v[1], v[2], v[3]);
+			// PDF: after re, current point is undefined for further path construction
+			has_cur = false;
+		} else if (op == "h") {
+			if (has_cur) {
+				AddSeg(cur, path_start);
+				cur = path_start;
+			}
+		} else if (op == "S" || op == "s" || op == "f" || op == "F" || op == "f*" || op == "B" || op == "B*" ||
+		           op == "b" || op == "b*") {
+			// stroke / fill ends the path; segments already recorded on construction
+			if (op == "s" || op == "b" || op == "b*") {
+				if (has_cur) {
+					AddSeg(cur, path_start);
+				}
+			}
+			has_cur = false;
+			// leave stack as-is (these take no operands)
+		} else if (op == "n" || op == "W" || op == "W*") {
+			has_cur = false;
+		} else if (op == "q" || op == "Q") {
+			// ignore graphics-state stack for rules (CTM save/restore not modelled fully);
+			// most table drawers set CTM once or use identity.
+			stack.clear();
+		} else {
+			// unknown operator: drop its would-be numeric leftovers by clearing
+			// when the operator is a common text/state op that consumes the stack.
+			// Heuristic: clear stack after any non-path operator to avoid pollution.
+			if (op == "Tj" || op == "TJ" || op == "'" || op == "\"" || op == "Td" || op == "TD" || op == "Tm" ||
+			    op == "T*" || op == "Tc" || op == "Tw" || op == "Tz" || op == "TL" || op == "Tf" || op == "Tr" ||
+			    op == "Ts" || op == "rg" || op == "RG" || op == "g" || op == "G" || op == "k" || op == "K" ||
+			    op == "w" || op == "J" || op == "j" || op == "M" || op == "d" || op == "gs" || op == "cs" ||
+			    op == "CS" || op == "scn" || op == "SCN" || op == "sc" || op == "SC" || op == "Do" || op == "BT" ||
+			    op == "ET" || op == "BMC" || op == "BDC" || op == "EMC" || op == "MP" || op == "DP") {
+				stack.clear();
+			}
+		}
+	}
+
+	void handleEOF() override {
+	}
+};
+
+} // namespace
+
+// Collect axis-aligned ruling segments from every page's content stream. Uses a
+// fresh interpreter per page and reads each page's MediaBox height so the caller
+// can flip horizontal rules into poppler's top-down text_list space. Parsing is
+// best-effort per page: a page whose content stream fails to parse contributes
+// no segments rather than aborting the document. processMemoryFile failures
+// (bad password / corrupt input) propagate per the error contract.
+std::vector<RuledSegment> ExtractRulingLines(const std::string &pdf_bytes, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	std::vector<RuledSegment> out;
+	QPDF qpdf;
+	qpdf.processMemoryFile("read_pdf_tables", pdf_bytes.data(), pdf_bytes.size(),
+	                       password.empty() ? nullptr : password.c_str());
+	auto pages = QPDFPageDocumentHelper(qpdf).getAllPages();
+	for (size_t pi = 0; pi < pages.size(); ++pi) {
+		auto &page = pages[pi];
+		// MediaBox [llx lly urx ury] — page height for the caller's y flip.
+		double page_h = 792.0;
+		try {
+			auto mb = page.getObjectHandle().getKey("/MediaBox");
+			if (mb.isArray() && mb.getArrayNItems() >= 4) {
+				double lly = mb.getArrayItem(1).getNumericValue();
+				double ury = mb.getArrayItem(3).getNumericValue();
+				if (ury > lly) {
+					page_h = ury - lly;
+				}
+			}
+		} catch (...) {
+		}
+
+		RulingPathCollector collector;
+		try {
+			page.parseContents(&collector);
+		} catch (...) {
+			continue; // best-effort: skip pages whose content stream won't parse
+		}
+		for (auto &seg : collector.segments) {
+			RuledSegment rs;
+			rs.page = static_cast<int>(pi + 1);
+			rs.x0 = seg.first.x;
+			rs.y0 = seg.first.y;
+			rs.x1 = seg.second.x;
+			rs.y1 = seg.second.y;
+			rs.page_height = page_h;
+			out.push_back(rs);
+		}
+	}
+	return out;
 }
 
 } // namespace pdf_qpdf
