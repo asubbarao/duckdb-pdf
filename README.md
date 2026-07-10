@@ -406,6 +406,21 @@ SELECT pdf_rotate('scan.pdf', 'upright2.pdf', -90, '1');
 SELECT pdf_pages('report.pdf', 'summary.pdf', '1');
 ```
 
+### `pdf_split_blank` — mailroom batch splitting on blank-page separators
+
+An office scanner often produces ONE PDF that is really N documents separated by blank sheets dropped in as dividers. `pdf_split_blank` detects those separator pages (no extractable text **and** a (near-)white raster — text-empty alone would false-positive on a full-page-image scan) and writes each logical document to its own file, dropping the separators.
+
+```sql
+-- batch.pdf = [invoice A (2pp), blank, invoice B (1pp), blank, blank, invoice C (1pp)]
+-- -> 3 documents written to out/<stem>_doc<K>.pdf; separators are dropped, never emitted as empty docs
+SELECT document, first_page, last_page, page_count, file
+FROM pdf_split_blank('batch.pdf', 'out');
+
+-- tune sensitivity: raise blank_threshold to require an even purer white page
+-- before treating it as a separator (default 0.995 = 99.5% near-white pixels)
+SELECT * FROM pdf_split_blank('batch.pdf', 'out', blank_threshold := 0.999);
+```
+
 ### `pdf_compress` / `pdf_encrypt` / `pdf_decrypt`
 
 ```sql
@@ -677,6 +692,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_signatures(files)` | Table | One row per digital signature: metadata + OpenSSL CMS verification. |
 | `pdf_images(files)` | Table | One row per embedded image XObject; `data` is JPEG/JP2/PNG/raw bytes per `format`. |
 | `pdf_split(file, dir)` | Table | One single-page PDF per page; one row per emitted file. |
+| `pdf_split_blank(file, dir[, blank_threshold])` | Table | Splits on blank-page separators (mailroom batches); one row per emitted document. |
 | `pdf_to_text(src [, layout])` | Scalar | Whole document as plain text. Path or `BLOB`. |
 | `pdf_to_markdown(path)` | Scalar | Whole document as GitHub-flavoured Markdown. |
 | `pdf_to_html(src)` | Scalar | Whole document as positioned HTML. Path or `BLOB`. |

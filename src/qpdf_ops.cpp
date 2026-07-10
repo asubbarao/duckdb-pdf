@@ -131,6 +131,41 @@ void Split(const std::string &input, const std::string &output_dir, const std::s
 	}
 }
 
+void SplitRanges(const std::string &input, const std::string &output_dir, const std::string &stem,
+                 const std::vector<std::pair<int, int>> &ranges, std::vector<std::string> &emitted) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	doc.processFile(input.c_str());
+	QPDFPageDocumentHelper doc_pages(doc);
+	auto pages = doc_pages.getAllPages();
+	auto page_count = static_cast<int>(pages.size());
+	auto pad_width = std::to_string(ranges.size()).size();
+	int doc_idx = 0;
+	for (auto &range : ranges) {
+		doc_idx++;
+		int first = range.first;
+		int last = range.second;
+		if (first < 1 || last > page_count || first > last) {
+			throw std::runtime_error("SplitRanges: invalid page range [" + std::to_string(first) + "," +
+			                         std::to_string(last) + "] for a " + std::to_string(page_count) + "-page document");
+		}
+		std::string doc_no = std::to_string(doc_idx);
+		while (doc_no.size() < pad_width) {
+			doc_no = "0" + doc_no;
+		}
+		std::string out_path = output_dir + "/" + stem + "_doc" + doc_no + ".pdf";
+		QPDF single;
+		single.emptyPDF();
+		QPDFPageDocumentHelper single_pages(single);
+		for (int page_no = first; page_no <= last; page_no++) {
+			single_pages.addPage(pages[page_no - 1], false);
+		}
+		QPDFWriter writer(single, out_path.c_str());
+		writer.write();
+		emitted.push_back(out_path);
+	}
+}
+
 void Compress(const std::string &input, const std::string &output) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	QPDF doc;

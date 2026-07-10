@@ -62,6 +62,18 @@ void Decrypt(const std::string &input, const std::string &output, const std::str
 // because copyForeignObject caches per source object).
 void Pages(const std::string &input, const std::string &output, const std::string &ranges);
 
+// Extracts each page range in `ranges` (1-based, inclusive [first, last])
+// into its own output PDF at <output_dir>/<stem>_doc<K>.pdf (K 1-based,
+// zero-padded to ranges.size()'s digit width); appends each written path to
+// `emitted`, in range order. Used by pdf_split_blank: the caller (poppler
+// side, pdf_extension.cpp) detects blank-page separators and computes the
+// content-page ranges; this function only does the qpdf extraction, exactly
+// like Split above but for arbitrary multi-page ranges instead of one page
+// each. The caller validates input/output_dir and computes stem/ranges; an
+// out-of-bounds or empty range throws (via the error contract).
+void SplitRanges(const std::string &input, const std::string &output_dir, const std::string &stem,
+                 const std::vector<std::pair<int, int>> &ranges, std::vector<std::string> &emitted);
+
 // One entry per AcroForm field. `type` is qpdf's raw field type name
 // ('/Tx', '/Btn', ...) — the caller maps it to display text.
 struct FormField {

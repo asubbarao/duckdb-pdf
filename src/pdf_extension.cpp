@@ -5084,6 +5084,198 @@ static void PdfSplitScan(ClientContext &context, TableFunctionInput &data_p, Dat
 }
 
 //===--------------------------------------------------------------------===//
+// pdf_split_blank(input, output_dir[, blank_threshold]) -> TABLE(document
+// INTEGER, first_page INTEGER, last_page INTEGER, page_count INTEGER, file
+// VARCHAR).
+//
+// Mailroom batch splitting: an office scanner produces ONE PDF that is really
+// N documents separated by blank sheets. A page is a SEPARATOR when it has no
+// extractable text AND its raster is (near-)white — text-empty alone would
+// false-positive on a full-page-image scan (e.g. a scanned photo with no OCR
+// layer). Detection runs here, on the poppler side; the qpdf side
+// (pdf_qpdf::SplitRanges, qpdf_ops.cpp) only extracts the already-computed
+// content-page ranges into separate files, exactly like pdf_split /
+// pdf_qpdf::Split above but for multi-page ranges instead of one page each.
+//===--------------------------------------------------------------------===//
+
+// Renders the page at a low DPI (detection doesn't need print resolution) and
+// reports whether the fraction of near-white pixels meets `threshold`. Shares
+// the exact render hints as OcrPage / RenderPageToPngBytes; reads the raw
+// argb32 buffer directly instead of round-tripping through PNG or tesseract.
+static bool PageRendersNearWhite(poppler::page *page, double threshold) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	poppler::page_renderer renderer;
+	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
+	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
+
+	const int32_t kBlankCheckDpi = 72; // low-res is enough to tell blank from content
+	poppler::image img = renderer.render_page(page, kBlankCheckDpi, kBlankCheckDpi);
+	if (!img.is_valid() || img.width() <= 0 || img.height() <= 0) {
+		// Can't render — never claim blank on a page we couldn't inspect.
+		return false;
+	}
+
+	const int width = img.width();
+	const int height = img.height();
+	const int stride = img.bytes_per_row();
+	const auto *data = reinterpret_cast<const unsigned char *>(img.const_data());
+	const unsigned char kNearWhiteChannel = 250; // out of 255, per color channel
+	int64_t white_pixels = 0;
+	const int64_t total_pixels = static_cast<int64_t>(width) * static_cast<int64_t>(height);
+	for (int y = 0; y < height; y++) {
+		const unsigned char *row = data + static_cast<size_t>(y) * static_cast<size_t>(stride);
+		for (int x = 0; x < width; x++) {
+			// poppler renders argb32; alpha is always opaque for a page raster, so
+			// checking the first 3 bytes (order-agnostic for a whiteness test —
+			// white is 255 on every channel regardless of byte order) is enough.
+			const unsigned char *px = row + static_cast<size_t>(x) * 4;
+			if (px[0] >= kNearWhiteChannel && px[1] >= kNearWhiteChannel && px[2] >= kNearWhiteChannel) {
+				white_pixels++;
+			}
+		}
+	}
+	return total_pixels > 0 && (static_cast<double>(white_pixels) / static_cast<double>(total_pixels)) >= threshold;
+}
+
+struct PdfSplitBlankBindData : public TableFunctionData {
+	string input;
+	string output_dir;
+	double blank_threshold = 0.995;
+};
+
+struct PdfSplitBlankEmitted {
+	int document = 0;
+	int first_page = 0;
+	int last_page = 0;
+	int page_count = 0;
+	string file;
+};
+
+struct PdfSplitBlankState : public GlobalTableFunctionState {
+	bool executed = false;
+	idx_t emit_idx = 0;
+	std::vector<PdfSplitBlankEmitted> emitted;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfSplitBlankBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfSplitBlankBindData>();
+	result->input = StringValue::Get(input.inputs[0]);
+	result->output_dir = StringValue::Get(input.inputs[1]);
+	for (auto &kv : input.named_parameters) {
+		auto key = StringUtil::Lower(kv.first);
+		if (key == "blank_threshold") {
+			result->blank_threshold = DoubleValue::Get(kv.second);
+		}
+	}
+	if (!(result->blank_threshold > 0.0) || result->blank_threshold > 1.0) {
+		throw InvalidInputException("pdf_split_blank: blank_threshold must be in (0, 1] (got %f)",
+		                            result->blank_threshold);
+	}
+	return_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::VARCHAR};
+	names = {"document", "first_page", "last_page", "page_count", "file"};
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfSplitBlankInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfSplitBlankState>();
+}
+
+// Detects separator pages, then delegates the actual file writing to qpdf.
+static void PdfSplitBlankExecute(ClientContext &context, const string &input, const string &output_dir,
+                                 double blank_threshold, std::vector<PdfSplitBlankEmitted> &emitted) {
+	PdfOpsCheckInputExists("pdf_split_blank", input);
+	{
+		auto fs = FileSystem::CreateLocal();
+		if (!fs->DirectoryExists(output_dir)) {
+			throw InvalidInputException("pdf_split_blank: output directory '%s' does not exist", output_dir);
+		}
+	}
+
+	string bytes;
+	ReadAllBytes(context, input, bytes);
+	auto doc = LoadDoc(bytes, "", input);
+	const int page_count = doc->pages();
+
+	std::vector<bool> is_separator(page_count, false);
+	{
+		PopplerDocGuard poppler_guard;
+		for (int i = 0; i < page_count; i++) {
+			unique_ptr<poppler::page> page(doc->create_page(i));
+			if (!page) {
+				continue; // unreadable page: never treat as a separator
+			}
+			string text = UStringToUtf8(page->text(poppler::rectf(), poppler::page::physical_layout));
+			bool text_blank = text.find_first_not_of(" \t\r\n\f\v") == string::npos;
+			is_separator[i] = text_blank && PageRendersNearWhite(page.get(), blank_threshold);
+		}
+	}
+
+	// Contiguous runs of non-separator pages, 1-based inclusive. Leading /
+	// trailing / consecutive separator pages simply never open (or immediately
+	// close without opening) a run, so no empty document is ever emitted; an
+	// all-blank file leaves `ranges` empty, so zero rows are emitted.
+	std::vector<std::pair<int, int>> ranges;
+	int range_start = -1;
+	for (int i = 0; i < page_count; i++) {
+		if (!is_separator[i]) {
+			if (range_start == -1) {
+				range_start = i;
+			}
+		} else if (range_start != -1) {
+			ranges.emplace_back(range_start + 1, i);
+			range_start = -1;
+		}
+	}
+	if (range_start != -1) {
+		ranges.emplace_back(range_start + 1, page_count);
+	}
+
+	std::vector<string> files;
+	try {
+		pdf_qpdf::SplitRanges(input, output_dir, PdfOpsStem(input), ranges, files);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_split_blank: %s", string(e.what()));
+	}
+
+	for (size_t k = 0; k < ranges.size(); k++) {
+		PdfSplitBlankEmitted row;
+		row.document = static_cast<int>(k) + 1;
+		row.first_page = ranges[k].first;
+		row.last_page = ranges[k].second;
+		row.page_count = ranges[k].second - ranges[k].first + 1;
+		row.file = files[k];
+		emitted.push_back(std::move(row));
+	}
+}
+
+static void PdfSplitBlankScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfSplitBlankBindData>();
+	auto &st = data_p.global_state->Cast<PdfSplitBlankState>();
+	if (!st.executed) {
+		// Side effects happen at scan time (not bind), so EXPLAIN writes nothing.
+		PdfSplitBlankExecute(context, bind.input, bind.output_dir, bind.blank_threshold, st.emitted);
+		st.executed = true;
+	}
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && st.emit_idx < st.emitted.size()) {
+		auto &row = st.emitted[st.emit_idx];
+		output.SetValue(0, count, Value::INTEGER(row.document));
+		output.SetValue(1, count, Value::INTEGER(row.first_page));
+		output.SetValue(2, count, Value::INTEGER(row.last_page));
+		output.SetValue(3, count, Value::INTEGER(row.page_count));
+		output.SetValue(4, count, Value(row.file));
+		st.emit_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
 // qpdf suite: pdf_compress / pdf_encrypt / pdf_decrypt / pdf_pages
 //
 // Same conventions as pdf_merge/pdf_rotate: local filesystem paths exactly as
@@ -5708,6 +5900,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction pdf_split("pdf_split", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfSplitScan, PdfSplitBind,
 	                        PdfSplitInit);
 	loader.RegisterFunction(pdf_split);
+
+	TableFunction pdf_split_blank("pdf_split_blank", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfSplitBlankScan,
+	                              PdfSplitBlankBind, PdfSplitBlankInit);
+	pdf_split_blank.named_parameters["blank_threshold"] = LogicalType::DOUBLE;
+	loader.RegisterFunction(pdf_split_blank);
 
 	// qpdf everyday suite
 	loader.RegisterFunction(ScalarFunction("pdf_compress", {LogicalType::VARCHAR, LogicalType::VARCHAR},
