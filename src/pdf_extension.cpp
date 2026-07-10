@@ -5664,6 +5664,286 @@ static void PdfSignScan(ClientContext &context, TableFunctionInput &data_p, Data
 }
 
 //===--------------------------------------------------------------------===//
+// pdf_redact(input, output, redactions[, dpi := 200, password := '...'])
+//   -> TABLE(page INTEGER, redacted BOOLEAN, boxes_applied INTEGER)
+//
+// TRUE (raster) redaction — the redacted text is removed, not merely hidden
+// behind a drawn rectangle. `redactions` is a LIST(STRUCT(page INTEGER,
+// x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE)) in PDF POINTS with the ORIGIN at the
+// page's BOTTOM-LEFT (standard PDF user space): (x, y) is the lower-left corner
+// of the box, w/h its width/height. `page` is 1-based.
+//
+// Every page carrying at least one box is re-rendered to an RGB raster (poppler,
+// the same renderer read_pdf/pdf_to_png use), the boxes are painted solid black
+// in the raster, and the page is rebuilt (qpdf side) as an image-only page whose
+// only content is that raster. The whole page becomes an image, so NO text from
+// a redacted page is extractable afterwards. Pages with no boxes are copied
+// through untouched and keep their live text.
+//
+// Side effects (rendering + file write) happen at SCAN time, not bind, so a bare
+// EXPLAIN writes nothing.
+//===--------------------------------------------------------------------===//
+struct RedactBox {
+	int page = 0; // 1-based
+	double x = 0, y = 0, w = 0, h = 0;
+};
+
+struct PdfRedactBindData : public TableFunctionData {
+	string input;
+	string output;
+	string password;
+	int32_t dpi = 200;
+	vector<RedactBox> boxes;
+};
+
+struct PdfRedactState : public GlobalTableFunctionState {
+	bool executed = false;
+	idx_t emit_idx = 0;
+	std::vector<std::vector<Value>> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+// Read a STRUCT field by (case-insensitive) name; throws if absent.
+static const Value &RedactStructField(const vector<string> &field_names, const vector<Value> &field_vals,
+                                      const char *name) {
+	for (idx_t i = 0; i < field_names.size(); i++) {
+		if (StringUtil::Lower(field_names[i]) == name) {
+			return field_vals[i];
+		}
+	}
+	throw InvalidInputException("pdf_redact: redaction struct is missing required field '%s' "
+	                            "(expected STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE))",
+	                            name);
+}
+
+static unique_ptr<FunctionData> PdfRedactBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfRedactBindData>();
+	result->input = StringValue::Get(input.inputs[0]);
+	result->output = StringValue::Get(input.inputs[1]);
+
+	// redactions: LIST(STRUCT(page, x, y, w, h)).
+	const Value &list_val = input.inputs[2];
+	if (!list_val.IsNull()) {
+		auto &child_type = ListType::GetChildType(list_val.type());
+		if (child_type.id() != LogicalTypeId::STRUCT) {
+			throw InvalidInputException("pdf_redact: `redactions` must be a LIST of "
+			                            "STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE)");
+		}
+		auto &struct_children = StructType::GetChildTypes(child_type);
+		vector<string> field_names;
+		for (auto &kv : struct_children) {
+			field_names.push_back(kv.first);
+		}
+		for (auto &el : ListValue::GetChildren(list_val)) {
+			if (el.IsNull()) {
+				throw InvalidInputException("pdf_redact: `redactions` list contains a NULL entry");
+			}
+			auto &field_vals = StructValue::GetChildren(el);
+			RedactBox box;
+			box.page = IntegerValue::Get(
+			    RedactStructField(field_names, field_vals, "page").DefaultCastAs(LogicalType::INTEGER));
+			box.x =
+			    DoubleValue::Get(RedactStructField(field_names, field_vals, "x").DefaultCastAs(LogicalType::DOUBLE));
+			box.y =
+			    DoubleValue::Get(RedactStructField(field_names, field_vals, "y").DefaultCastAs(LogicalType::DOUBLE));
+			box.w =
+			    DoubleValue::Get(RedactStructField(field_names, field_vals, "w").DefaultCastAs(LogicalType::DOUBLE));
+			box.h =
+			    DoubleValue::Get(RedactStructField(field_names, field_vals, "h").DefaultCastAs(LogicalType::DOUBLE));
+			if (box.page < 1) {
+				throw InvalidInputException("pdf_redact: redaction page must be >= 1 (got %d)", box.page);
+			}
+			result->boxes.push_back(box);
+		}
+	}
+
+	for (auto &kv : input.named_parameters) {
+		auto key = StringUtil::Lower(kv.first);
+		if (key == "dpi") {
+			result->dpi = IntegerValue::Get(kv.second.DefaultCastAs(LogicalType::INTEGER));
+		} else if (key == "password") {
+			result->password = StringValue::Get(kv.second);
+		}
+	}
+	if (result->dpi < 1 || result->dpi > 2400) {
+		throw InvalidInputException("pdf_redact: dpi must be between 1 and 2400 (got %d)", result->dpi);
+	}
+
+	return_types = {LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::INTEGER};
+	names = {"page", "redacted", "boxes_applied"};
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfRedactInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfRedactState>();
+}
+
+// Render one page to RGB and paint the given boxes black. `boxes` are in PDF
+// points, origin bottom-left. Fills the RebuiltPage (top-down RGB, media dims).
+static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page_idx0, int dpi,
+                                                const vector<const RedactBox *> &boxes) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	unique_ptr<poppler::page> page(doc.create_page(page_idx0));
+	if (!page) {
+		throw IOException("pdf_redact: could not read page %d", page_idx0 + 1);
+	}
+	poppler::page_renderer renderer;
+	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
+	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
+	poppler::image img = renderer.render_page(page.get(), dpi, dpi);
+	if (!img.is_valid()) {
+		throw IOException("pdf_redact: failed to render page %d", page_idx0 + 1);
+	}
+
+	const int W = img.width();
+	const int H = img.height();
+	const int bpr = img.bytes_per_row();
+	const char *data = img.const_data();
+	const poppler::image::format_enum fmt = img.format();
+
+	pdf_qpdf::RebuiltPage out;
+	out.redacted = true;
+	out.width = W;
+	out.height = H;
+	out.media_w = W * 72.0 / dpi;
+	out.media_h = H * 72.0 / dpi;
+	out.rgb.resize(static_cast<size_t>(W) * static_cast<size_t>(H) * 3);
+
+	for (int y = 0; y < H; y++) {
+		const unsigned char *row = reinterpret_cast<const unsigned char *>(data) + static_cast<size_t>(y) * bpr;
+		for (int x = 0; x < W; x++) {
+			unsigned char r = 0, g = 0, b = 0;
+			switch (fmt) {
+			case poppler::image::format_argb32: {
+				uint32_t px;
+				std::memcpy(&px, row + static_cast<size_t>(x) * 4, sizeof(px));
+				r = (px >> 16) & 0xFF;
+				g = (px >> 8) & 0xFF;
+				b = px & 0xFF;
+				break;
+			}
+			case poppler::image::format_rgb24:
+				r = row[x * 3 + 0];
+				g = row[x * 3 + 1];
+				b = row[x * 3 + 2];
+				break;
+			case poppler::image::format_bgr24:
+				b = row[x * 3 + 0];
+				g = row[x * 3 + 1];
+				r = row[x * 3 + 2];
+				break;
+			case poppler::image::format_gray8:
+				r = g = b = row[x];
+				break;
+			case poppler::image::format_mono:
+				r = g = b = (row[x / 8] & (0x80 >> (x % 8))) ? 0xFF : 0x00;
+				break;
+			default:
+				throw IOException("pdf_redact: unsupported render format for page %d", page_idx0 + 1);
+			}
+			size_t o = (static_cast<size_t>(y) * W + x) * 3;
+			out.rgb[o + 0] = static_cast<char>(r);
+			out.rgb[o + 1] = static_cast<char>(g);
+			out.rgb[o + 2] = static_cast<char>(b);
+		}
+	}
+
+	// Paint each box solid black. Points -> pixels; flip y (PDF origin bottom-left,
+	// raster row 0 at top). Clamp to the raster so off-page boxes never overrun.
+	const double scale = dpi / 72.0;
+	auto clampi = [](int v, int lo, int hi) {
+		return v < lo ? lo : (v > hi ? hi : v);
+	};
+	for (const RedactBox *box : boxes) {
+		int px0 = clampi(static_cast<int>(std::floor(box->x * scale)), 0, W);
+		int px1 = clampi(static_cast<int>(std::ceil((box->x + box->w) * scale)), 0, W);
+		int ry0 = clampi(static_cast<int>(std::floor(H - (box->y + box->h) * scale)), 0, H);
+		int ry1 = clampi(static_cast<int>(std::ceil(H - box->y * scale)), 0, H);
+		for (int y = ry0; y < ry1; y++) {
+			for (int x = px0; x < px1; x++) {
+				size_t o = (static_cast<size_t>(y) * W + x) * 3;
+				out.rgb[o + 0] = 0;
+				out.rgb[o + 1] = 0;
+				out.rgb[o + 2] = 0;
+			}
+		}
+	}
+	return out;
+}
+
+static void PdfRedactExecute(ClientContext &context, const PdfRedactBindData &bind,
+                             std::vector<std::vector<Value>> &rows) {
+	PdfOpsCheckInputExists("pdf_redact", bind.input);
+	PdfOpsCheckOutputDir("pdf_redact", PdfOpsParentDir(bind.output));
+	if (bind.input == bind.output) {
+		throw InvalidInputException("pdf_redact: output path must differ from input path '%s'", bind.input);
+	}
+
+	// Open the source with poppler to count pages and render redacted ones.
+	string bytes;
+	ReadAllBytes(context, bind.input, bytes);
+	auto doc = LoadDoc(bytes, bind.password, bind.input);
+	const int page_count = doc->pages();
+
+	// Validate box page numbers and bucket boxes per page.
+	for (auto &box : bind.boxes) {
+		if (box.page > page_count) {
+			throw InvalidInputException("pdf_redact: redaction page %d is out of range (document has %d page%s)",
+			                            box.page, page_count, page_count == 1 ? "" : "s");
+		}
+	}
+
+	std::vector<pdf_qpdf::RebuiltPage> rebuilt(static_cast<size_t>(page_count));
+	std::vector<int> box_counts(static_cast<size_t>(page_count), 0);
+	for (int p = 1; p <= page_count; p++) {
+		vector<const RedactBox *> page_boxes;
+		for (auto &box : bind.boxes) {
+			if (box.page == p) {
+				page_boxes.push_back(&box);
+			}
+		}
+		if (page_boxes.empty()) {
+			rebuilt[p - 1].redacted = false;
+			continue;
+		}
+		rebuilt[p - 1] = RenderRedactedPage(*doc, p - 1, bind.dpi, page_boxes);
+		box_counts[p - 1] = static_cast<int>(page_boxes.size());
+	}
+
+	try {
+		pdf_qpdf::RebuildPagesAsImages(bind.input, bind.output, rebuilt, bind.password);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_redact: %s", string(e.what()));
+	}
+
+	for (int p = 1; p <= page_count; p++) {
+		rows.push_back({Value::INTEGER(p), Value::BOOLEAN(rebuilt[p - 1].redacted), Value::INTEGER(box_counts[p - 1])});
+	}
+}
+
+static void PdfRedactScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfRedactBindData>();
+	auto &st = data_p.global_state->Cast<PdfRedactState>();
+	if (!st.executed) {
+		PdfRedactExecute(context, bind, st.rows);
+		st.executed = true;
+	}
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && st.emit_idx < st.rows.size()) {
+		auto &row = st.rows[st.emit_idx];
+		for (idx_t col = 0; col < row.size(); col++) {
+			output.SetValue(col, count, row[col]);
+		}
+		st.emit_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 static void LoadInternal(ExtensionLoader &loader) {
@@ -5854,6 +6134,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_sign.named_parameters["field_name"] = LogicalType::VARCHAR;
 	pdf_sign.named_parameters["password"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(pdf_sign);
+
+	// pdf_redact: true raster redaction (removes text under the boxes, not a
+	// black rectangle over live text). redactions in PDF points, origin
+	// bottom-left. Side effects (render + write) happen at scan time.
+	auto redact_struct = LogicalType::STRUCT({{"page", LogicalType::INTEGER},
+	                                          {"x", LogicalType::DOUBLE},
+	                                          {"y", LogicalType::DOUBLE},
+	                                          {"w", LogicalType::DOUBLE},
+	                                          {"h", LogicalType::DOUBLE}});
+	TableFunction pdf_redact("pdf_redact",
+	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(redact_struct)},
+	                         PdfRedactScan, PdfRedactBind, PdfRedactInit);
+	pdf_redact.named_parameters["dpi"] = LogicalType::INTEGER;
+	pdf_redact.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_redact);
 
 	// COPY TO pdf
 	CopyFunction pdf_copy("pdf");

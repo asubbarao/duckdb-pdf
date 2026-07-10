@@ -26,6 +26,11 @@
 #include <qpdf/QPDFWriter.hh>
 #include <qpdf/QUtil.hh>
 
+// Pipelines for deflating the redaction raster into a FlateDecode image XObject.
+#include <qpdf/Buffer.hh>
+#include <qpdf/Pl_Buffer.hh>
+#include <qpdf/Pl_Flate.hh>
+
 // OpenSSL — CMS/PKCS#7 verification for pdf_signatures (tier 2) and CMS_sign for
 // pdf_sign. Plain C API; touches neither duckdb nor poppler, so it is safe to
 // include in this TU.
@@ -38,6 +43,7 @@
 #include <ctime>
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -994,6 +1000,95 @@ void SignDetached(const std::string &input, const std::string &output, const std
 	if (!out) {
 		throw std::runtime_error("failed writing signed PDF to '" + output + "'");
 	}
+}
+
+// pdf_redact — true (raster) redaction: replace each page carrying a redaction
+// box with an image-only page so the underlying text is destroyed, not merely
+// covered. The poppler-side caller renders each redacted page to RGB and paints
+// the boxes black; this function composes the output document, deflating the
+// raster into a FlateDecode DeviceRGB image XObject and rewriting the page.
+//===--------------------------------------------------------------------===//
+
+// Deflate raw bytes with zlib via qpdf's own pipeline (no external zlib include).
+static std::string FlateDeflate(const std::string &raw) {
+	Pl_Buffer collector("pdf_redact-flate");
+	Pl_Flate deflate("pdf_redact-deflate", &collector, Pl_Flate::a_deflate);
+	deflate.write(reinterpret_cast<const unsigned char *>(raw.data()), raw.size());
+	deflate.finish();
+	return collector.getString();
+}
+
+// Locale-independent fixed-point formatter for PDF numeric operands (never emits
+// a locale decimal comma the way std::to_string / ostringstream might).
+static std::string PdfNum(double v) {
+	char buf[64];
+	std::snprintf(buf, sizeof(buf), "%.4f", v);
+	return std::string(buf);
+}
+
+void RebuildPagesAsImages(const std::string &input, const std::string &output, const std::vector<RebuiltPage> &pages,
+                          const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	doc.processFile(input.c_str(), password.empty() ? nullptr : password.c_str());
+	QPDFPageDocumentHelper doc_pages(doc);
+	auto page_helpers = doc_pages.getAllPages();
+	if (page_helpers.size() != pages.size()) {
+		throw std::runtime_error("pdf_redact: internal page-count mismatch (" + std::to_string(page_helpers.size()) +
+		                         " document pages vs " + std::to_string(pages.size()) + " rebuilt pages)");
+	}
+	for (size_t i = 0; i < page_helpers.size(); ++i) {
+		const RebuiltPage &rp = pages[i];
+		if (!rp.redacted) {
+			continue; // page without redactions is carried over verbatim
+		}
+		if (rp.width <= 0 || rp.height <= 0 ||
+		    rp.rgb.size() != static_cast<size_t>(rp.width) * static_cast<size_t>(rp.height) * 3) {
+			throw std::runtime_error("pdf_redact: malformed raster for page " + std::to_string(i + 1));
+		}
+
+		// Image XObject: DeviceRGB, 8 bpc, FlateDecode-compressed raster bytes.
+		std::string compressed = FlateDeflate(rp.rgb);
+		QPDFObjectHandle image = QPDFObjectHandle::newStream(&doc);
+		image.replaceStreamData(compressed, QPDFObjectHandle::newName("/FlateDecode"), QPDFObjectHandle::newNull());
+		QPDFObjectHandle idict = image.getDict();
+		idict.replaceKey("/Type", QPDFObjectHandle::newName("/XObject"));
+		idict.replaceKey("/Subtype", QPDFObjectHandle::newName("/Image"));
+		idict.replaceKey("/Width", QPDFObjectHandle::newInteger(rp.width));
+		idict.replaceKey("/Height", QPDFObjectHandle::newInteger(rp.height));
+		idict.replaceKey("/ColorSpace", QPDFObjectHandle::newName("/DeviceRGB"));
+		idict.replaceKey("/BitsPerComponent", QPDFObjectHandle::newInteger(8));
+		QPDFObjectHandle image_ind = doc.makeIndirectObject(image);
+
+		// Resources: expose the image as /Im0.
+		QPDFObjectHandle xobjects = QPDFObjectHandle::newDictionary();
+		xobjects.replaceKey("/Im0", image_ind);
+		QPDFObjectHandle resources = QPDFObjectHandle::newDictionary();
+		resources.replaceKey("/XObject", xobjects);
+
+		// Content: scale the unit image square to the whole page and paint it.
+		std::string content = "q " + PdfNum(rp.media_w) + " 0 0 " + PdfNum(rp.media_h) + " 0 0 cm /Im0 Do Q\n";
+		QPDFObjectHandle contents = QPDFObjectHandle::newStream(&doc, content);
+		QPDFObjectHandle contents_ind = doc.makeIndirectObject(contents);
+
+		// Rewrite the page in place: image-only content, fresh MediaBox at the
+		// raster's display size, no rotation (the raster is already upright), and
+		// no annotations (an annotation could re-introduce extractable text).
+		QPDFObjectHandle page = page_helpers[i].getObjectHandle();
+		QPDFObjectHandle media_box = QPDFObjectHandle::newArray();
+		media_box.appendItem(QPDFObjectHandle::newInteger(0));
+		media_box.appendItem(QPDFObjectHandle::newInteger(0));
+		media_box.appendItem(QPDFObjectHandle::newReal(PdfNum(rp.media_w)));
+		media_box.appendItem(QPDFObjectHandle::newReal(PdfNum(rp.media_h)));
+		page.replaceKey("/Contents", contents_ind);
+		page.replaceKey("/Resources", resources);
+		page.replaceKey("/MediaBox", media_box);
+		page.removeKey("/Rotate");
+		page.removeKey("/CropBox");
+		page.removeKey("/Annots");
+	}
+	QPDFWriter writer(doc, output.c_str());
+	writer.write();
 }
 
 } // namespace pdf_qpdf

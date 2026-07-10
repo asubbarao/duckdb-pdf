@@ -430,6 +430,32 @@ SELECT output FROM pdf_sign('contract.pdf', 'contract_signed.pdf', 'cert.pem', '
 
 The signature covers the whole file via a `/ByteRange` around a fixed-size `/Contents` hole (8 KB of DER — ample for RSA-2048); an oversized signature raises an Invalid Input error. Standard `pdf_encrypt`/`pdf_decrypt` conventions apply: local paths, output overwritten, `input == output` refused.
 
+### `pdf_redact` — true (raster) redaction
+
+`pdf_redact(input, output, redactions [, dpi := 200, password := '...'])` performs **true removal**, not a black box drawn over live text. Every page carrying at least one redaction box is re-rendered to an RGB raster, the boxes are painted **solid black in the pixels**, and the page is rebuilt as an **image-only page** whose entire content is that raster. Because the page no longer contains any text object, the redacted text is **permanently unextractable** — `read_pdf` returns nothing for it, and there is no hidden text layer to recover (unlike a vector rectangle drawn on top of still-selectable text). Pages with no boxes are copied through byte-for-byte and keep their live text. It returns one row per output page: `page INTEGER`, `redacted BOOLEAN`, `boxes_applied INTEGER`.
+
+`redactions` is a `LIST(STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE))`. **Coordinate convention:** all values are in **PDF points** (1 pt = 1/72 in) with the **origin at the page's bottom-left corner** (standard PDF user space). `(x, y)` is the **lower-left corner** of the box; `w`/`h` are its width and height. `page` is **1-based**. A box that runs off the page is clamped to the raster.
+
+`dpi` (default 200) sets the render resolution of the rebuilt pages: higher dpi preserves more visual fidelity of the surrounding (unredacted) content but produces a larger output file; lower dpi is smaller but coarser. It does not affect the redaction guarantee — the covered text is gone at any dpi. Because redacted pages become images, their text is no longer selectable or searchable; leave unredacted pages untouched to preserve their text layer.
+
+```sql
+-- Redact one box over sensitive text on page 2 (origin bottom-left, points).
+-- Page 2 becomes an image; pages 1 and 3 keep their selectable text.
+SELECT page, redacted, boxes_applied
+FROM pdf_redact('statement.pdf', 'statement_redacted.pdf',
+                [{'page': 2, 'x': 72.0, 'y': 590.0, 'w': 260.0, 'h': 40.0}]);
+-- ┌──────┬──────────┬───────────────┐
+-- │ page │ redacted │ boxes_applied │
+-- ├──────┼──────────┼───────────────┤
+-- │    1 │ false    │             0 │
+-- │    2 │ true     │             1 │
+-- │    3 │ false    │             0 │
+-- └──────┴──────────┴───────────────┘
+
+-- The redacted text is gone — this returns 0 rows:
+SELECT * FROM read_pdf('statement_redacted.pdf') WHERE text LIKE '%account number%';
+```
+
 ### `write_pdf` — native text-to-PDF (no LibreOffice)
 
 `write_pdf(content [, output_path])` is a purely native, in-process scalar that authors a PDF from a VARCHAR using libharu — no external tools, no shell-out, always available once the extension is loaded. The 1-arg form writes to a temp file (platform `TMPDIR`/`TMP`/`TEMP` or `/tmp` + UUID); both forms return the output path.
@@ -674,6 +700,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_revisions(file)` | Table | One row per incremental-update revision, oldest first. |
 | `pdf_signatures(files)` | Table | One row per digital signature: metadata + OpenSSL CMS verification. |
 | `pdf_split(file, dir)` | Table | One single-page PDF per page; one row per emitted file. |
+| `pdf_redact(in, out, boxes [, dpi, password])` | Table | True raster redaction: replace boxed pages with image-only pages (text removed, not covered); one row per output page. |
 | `pdf_to_text(src [, layout])` | Scalar | Whole document as plain text. Path or `BLOB`. |
 | `pdf_to_markdown(path)` | Scalar | Whole document as GitHub-flavoured Markdown. |
 | `pdf_to_html(src)` | Scalar | Whole document as positioned HTML. Path or `BLOB`. |
