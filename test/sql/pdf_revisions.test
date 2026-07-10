@@ -70,3 +70,26 @@ query I
 SELECT count(*) FROM pdf_revisions('test/data/incremental.pdf', password := '');
 ----
 2
+
+# ── header-less input must throw a CLEAN, non-fatal error (regression) ──
+# A file with no %PDF- header anywhere once tripped an unescaped '%PDF-' in the
+# error format string, which raised an INTERNAL exception and fatally
+# invalidated the whole DuckDB connection (a session-level DoS: every later
+# query returned "database has been invalidated"). It must instead throw an
+# ordinary IO Error, and — critically — the connection must stay usable.
+statement error
+SELECT * FROM pdf_revisions('test/data/text_as_pdf.pdf');
+----
+is not a PDF (missing %PDF- header)
+
+# the connection survived the error above — a plain query still works
+query I
+SELECT 42;
+----
+42
+
+# and pdf_revisions itself still works on a valid file in the same connection
+query I
+SELECT count(*) FROM pdf_revisions('test/data/hello.pdf');
+----
+1
