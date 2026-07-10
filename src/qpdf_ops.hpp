@@ -201,7 +201,6 @@ void Watermark(const std::string &input, const std::string &output, const std::s
 void Bates(const std::string &input, const std::string &output, const std::string &prefix, long long start_number,
            std::vector<std::string> *stamped_labels = nullptr);
 
-
 //===--------------------------------------------------------------------===//
 // pdf_sign — create a PKCS#7/CMS detached digital signature (the inverse of
 // ReadSignatures). qpdf builds an AcroForm /Sig field with a /ByteRange and a

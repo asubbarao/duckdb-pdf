@@ -1261,7 +1261,6 @@ void Bates(const std::string &input, const std::string &output, const std::strin
 	writer.write();
 }
 
-
 //===--------------------------------------------------------------------===//
 // pdf_sign — create an adbe.pkcs7.detached CMS signature. See qpdf_ops.hpp for
 // the contract. Strategy: qpdf writes the AcroForm /Sig field with a /ByteRange
