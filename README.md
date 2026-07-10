@@ -233,7 +233,7 @@ SELECT pdf_to_markdown('report.pdf') AS md;
 
 ## Inspect
 
-These table functions answer "what is in this file?" without extracting body text. All take a path or glob; `password := '...'` is accepted by `pdf_info`, `read_pdf_meta`, `pdf_outline`, `pdf_attachments`, `pdf_revisions`, and `pdf_signatures`.
+These table functions answer "what is in this file?" without extracting body text. All take a path or glob; `password := '...'` is accepted by `pdf_info`, `read_pdf_meta`, `pdf_outline`, `pdf_attachments`, `pdf_revisions`, `pdf_signatures`, and `pdf_images`.
 
 ### `pdf_info` — full per-file census
 
@@ -343,6 +343,40 @@ SELECT file, field_name
 FROM pdf_signatures('contracts/*.pdf')
 WHERE verified AND NOT covers_whole_file;
 ```
+
+### `pdf_images` — extract embedded raster images
+
+One row per embedded image XObject per page — the **actual stored raster** (the JPEG a scanner wrote, the bitmap an editor placed), not a render of the page. Files with no images yield zero rows, not an error. Columns: `file`, `page` (1-based), `image_index` (1-based within page), `name` (resource name, e.g. `Im0`), `width`, `height`, `bits_per_component`, `colorspace` (raw PDF name, e.g. `DeviceRGB`), `format`, `data` (`BLOB`).
+
+`format` tells you what `data` holds, and every value is directly usable:
+
+| `format` | Source filter | `data` contents |
+| --- | --- | --- |
+| `jpeg` | `/DCTDecode` | Raw JPEG (JFIF) bytes, passed through (any earlier `/FlateDecode` is undone, the JPEG layer preserved). |
+| `jp2` | `/JPXDecode` | Raw JPEG-2000 codestream. |
+| `ccitt` | `/CCITTFaxDecode` | Raw fax-encoded bytes (qpdf does not decode CCITT). |
+| `png` | `/FlateDecode`, `/RunLengthDecode`, `/LZWDecode`, none | Fully decoded samples re-wrapped as a PNG. Applies to `DeviceGray`/`CalGray` (1- or 8-bit) and `DeviceRGB`/`CalRGB` (8-bit). |
+| `raw` | any of the above decodable filters | Decoded sample bytes with no container, used when the colorspace/bit depth can't be losslessly wrapped as PNG (`DeviceCMYK`, `Indexed`, `ICCBased`, image masks, exotic depths). |
+
+```sql
+-- Inventory every embedded image across a folder
+SELECT file, page, image_index, width, height, colorspace, format,
+       octet_length(data) AS bytes
+FROM pdf_images('scans/*.pdf')
+ORDER BY file, page, image_index;
+
+-- Dump each image to its own file (extension follows the format)
+COPY (
+  SELECT data,
+         format('extracted/{}_p{}_i{}.{}', regexp_replace(file, '.*/', ''),
+                page, image_index,
+                CASE format WHEN 'jpeg' THEN 'jpg' WHEN 'jp2' THEN 'jp2'
+                            WHEN 'png' THEN 'png' ELSE 'bin' END) AS path
+  FROM pdf_images('scans/invoice.pdf')
+) TO 'extracted' (FORMAT parquet);  -- or iterate rows and write_blob(path, data)
+```
+
+The `png`/`jpeg` rows drop straight into DuckDB's image tooling or any downstream writer; `raw` rows need the `colorspace`/`bits_per_component`/`width`/`height` columns to interpret the sample bytes.
 
 ## Transform & write
 
@@ -641,6 +675,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_annotations(files)` | Table | One row per annotation; `WHERE subtype = 'Link'` extracts hyperlinks. |
 | `pdf_revisions(file)` | Table | One row per incremental-update revision, oldest first. |
 | `pdf_signatures(files)` | Table | One row per digital signature: metadata + OpenSSL CMS verification. |
+| `pdf_images(files)` | Table | One row per embedded image XObject; `data` is JPEG/JP2/PNG/raw bytes per `format`. |
 | `pdf_split(file, dir)` | Table | One single-page PDF per page; one row per emitted file. |
 | `pdf_to_text(src [, layout])` | Scalar | Whole document as plain text. Path or `BLOB`. |
 | `pdf_to_markdown(path)` | Scalar | Whole document as GitHub-flavoured Markdown. |

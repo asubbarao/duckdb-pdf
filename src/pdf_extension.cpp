@@ -5503,6 +5503,68 @@ static void PdfSignaturesScan(ClientContext &context, TableFunctionInput &data_p
 }
 
 //===--------------------------------------------------------------------===//
+// pdf_images(files) -> one row per embedded raster image XObject per page.
+//
+// The page walk, filter-chain inspection, encoded-bytes passthrough, and PNG
+// re-wrapping all live in qpdf_ops.cpp (the C++17 qpdf TU). This file resolves
+// the file glob, parses the `password` named param, and shapes the plain
+// EmbeddedImage structs into rows (emitting `data` as a BLOB).
+//===--------------------------------------------------------------------===//
+
+struct PdfImagesBindData : public TableFunctionData {
+	vector<string> files;
+	string password;
+};
+
+static unique_ptr<FunctionData> PdfImagesBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfImagesBindData>();
+	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	for (auto &kv : input.named_parameters) {
+		auto key = StringUtil::Lower(kv.first);
+		if (key == "password") {
+			result->password = StringValue::Get(kv.second);
+		}
+	}
+	// `file` is included for glob parity with the other qpdf-backed table funcs.
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::BLOB};
+	names = {"file",       "page",   "image_index", "name", "width", "height", "bits_per_component",
+	         "colorspace", "format", "data"};
+	return std::move(result);
+}
+
+static void PdfImagesExecute(const string &path, const string &password, std::vector<std::vector<Value>> &rows) {
+	PdfOpsCheckInputExists("pdf_images", path);
+	std::vector<pdf_qpdf::EmbeddedImage> imgs;
+	try {
+		imgs = pdf_qpdf::ReadImages(path, password);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_images: %s", string(e.what()));
+	}
+	for (auto &img : imgs) {
+		Value colorspace = img.colorspace.empty() ? Value(LogicalType::VARCHAR) : Value(img.colorspace);
+		Value data = Value::BLOB(const_data_ptr_cast(img.data.data()), img.data.size());
+		rows.push_back({Value(path), Value::INTEGER(img.page), Value::INTEGER(img.image_index), Value(img.name),
+		                Value::INTEGER(img.width), Value::INTEGER(img.height), Value::INTEGER(img.bits_per_component),
+		                colorspace, Value(img.format), data});
+	}
+}
+
+static void PdfImagesScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfImagesBindData>();
+	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
+	if (!st.executed) {
+		for (auto &path : bind.files) {
+			PdfImagesExecute(path, bind.password, st.rows);
+		}
+		st.executed = true;
+	}
+	PdfQpdfRowsEmit(st, output);
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 static void LoadInternal(ExtensionLoader &loader) {
@@ -5680,6 +5742,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             PdfQpdfRowsInit);
 	pdf_signatures.named_parameters["password"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(pdf_signatures);
+
+	// pdf_images: extract embedded raster image XObjects (stored JPEG/bitmap).
+	TableFunction pdf_images("pdf_images", {LogicalType::VARCHAR}, PdfImagesScan, PdfImagesBind, PdfQpdfRowsInit);
+	pdf_images.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_images);
 
 	// COPY TO pdf
 	CopyFunction pdf_copy("pdf");

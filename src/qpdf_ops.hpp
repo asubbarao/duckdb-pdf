@@ -137,4 +137,38 @@ struct SignatureInfo {
 // contract (thrown std::exception).
 std::vector<SignatureInfo> ReadSignatures(const std::string &path, const std::string &password);
 
+// One entry per embedded image XObject per page (the actual stored raster, not a
+// page render). `image_index` is 1-based within its page; `name` is the resource
+// name ('Im0'). `colorspace` is the raw PDF colorspace name ('DeviceRGB',
+// 'ICCBased', 'Indexed', ...). `format` and `data` are paired:
+//   'jpeg' — /DCTDecode terminal filter; `data` is the raw JPEG (JFIF) bytes,
+//            passthrough (any earlier generalized filter such as /FlateDecode is
+//            undone first, the DCT layer is preserved).
+//   'jp2'  — /JPXDecode terminal filter; `data` is the raw JPEG-2000 codestream.
+//   'ccitt'— /CCITTFaxDecode terminal filter (qpdf cannot decode it); `data` is
+//            the raw fax-encoded bytes.
+//   'png'  — everything else (Flate/RunLength/LZW/none) fully decoded to raw
+//            samples and re-wrapped as a PNG so `data` is directly usable. Only
+//            DeviceGray/CalGray 1- or 8-bit and DeviceRGB/CalRGB 8-bit are
+//            wrapped as PNG.
+//   'raw'  — decoded samples that we do not know how to wrap losslessly as PNG
+//            (DeviceCMYK, Indexed, ICCBased, DeviceN, image masks, exotic
+//            bit depths, ...); `data` is the decoded sample bytes as-is.
+struct EmbeddedImage {
+	int page = 0;        // 1-based
+	int image_index = 0; // 1-based within page
+	std::string name;    // resource name ('Im0')
+	int width = 0;
+	int height = 0;
+	int bits_per_component = 0;
+	std::string colorspace; // raw PDF colorspace name
+	std::string format;     // 'jpeg' | 'jp2' | 'ccitt' | 'png' | 'raw'
+	std::string data;       // encoded/wrapped bytes per `format`
+};
+// `password` may be empty (unencrypted / owner-open). The caller validates the
+// path exists; a wrong password or unreadable file surfaces via the error
+// contract (thrown std::exception). A single image whose stream data cannot be
+// extracted is skipped rather than aborting the whole document.
+std::vector<EmbeddedImage> ReadImages(const std::string &path, const std::string &password);
+
 } // namespace pdf_qpdf

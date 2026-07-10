@@ -19,6 +19,8 @@
 #include <qpdf/QPDFAcroFormDocumentHelper.hh>
 #include <qpdf/QPDFAnnotationObjectHelper.hh>
 #include <qpdf/QPDFFormFieldObjectHelper.hh>
+#include <qpdf/Buffer.hh>
+#include <qpdf/Pl_Buffer.hh>
 #include <qpdf/QPDFObjGen.hh>
 #include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFPageDocumentHelper.hh>
@@ -33,7 +35,14 @@
 #include <openssl/err.h>
 #include <openssl/x509.h>
 
+// zlib — DEFLATE + CRC32 for the minimal PNG encoder used by ReadImages to wrap
+// fully-decoded raster samples. libqpdf already links zlib, and <zlib.h> is on
+// the vcpkg/homebrew include path; this is a plain C API touching neither duckdb
+// nor poppler, so it is safe in this TU.
+#include <zlib.h>
+
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -703,6 +712,269 @@ std::vector<SignatureInfo> ReadSignatures(const std::string &path, const std::st
 		sigs.push_back(std::move(out));
 	}
 	return sigs;
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_images — extract embedded raster image XObjects (the stored JPEG/bitmap,
+// not a page render). Walk each page's image resources via
+// QPDFPageObjectHelper::getImages(); per image, inspect the filter chain and
+// either pass the encoded bytes through (DCT->jpeg, JPX->jp2, CCITT->ccitt) or
+// fully decode and re-wrap the raw samples as PNG (Flate/RunLength/LZW/none),
+// falling back to 'raw' for colorspaces/bit depths we cannot losslessly wrap.
+//===--------------------------------------------------------------------===//
+namespace {
+
+// A stream filter name with the leading slash stripped ('FlateDecode'). PDF
+// permits inline-image abbreviations; XObjects use full names, but we normalize
+// the handful of abbreviations defensively.
+std::string NormalizeFilterName(const std::string &raw) {
+	std::string n = (!raw.empty() && raw[0] == '/') ? raw.substr(1) : raw;
+	if (n == "DCT") {
+		return "DCTDecode";
+	}
+	if (n == "CCF") {
+		return "CCITTFaxDecode";
+	}
+	if (n == "Fl") {
+		return "FlateDecode";
+	}
+	if (n == "LZW") {
+		return "LZWDecode";
+	}
+	if (n == "RL") {
+		return "RunLengthDecode";
+	}
+	if (n == "AHx") {
+		return "ASCIIHexDecode";
+	}
+	if (n == "A85") {
+		return "ASCII85Decode";
+	}
+	return n;
+}
+
+std::vector<std::string> StreamFilterNames(QPDFObjectHandle dict) {
+	std::vector<std::string> names;
+	if (!dict.isDictionary()) {
+		return names;
+	}
+	auto filter = dict.getKey("/Filter");
+	auto add = [&](QPDFObjectHandle item) {
+		if (item.isName()) {
+			names.push_back(NormalizeFilterName(item.getName()));
+		}
+	};
+	if (filter.isName()) {
+		add(filter);
+	} else if (filter.isArray()) {
+		int n = filter.getArrayNItems();
+		for (int i = 0; i < n; i++) {
+			add(filter.getArrayItem(i));
+		}
+	}
+	return names;
+}
+
+// Raw PDF colorspace name: a name directly ('DeviceRGB') or the leading name of
+// a colorspace array ('ICCBased', 'Indexed', 'DeviceN', ...). Empty if absent.
+std::string ColorSpaceName(QPDFObjectHandle dict) {
+	if (!dict.isDictionary()) {
+		return std::string();
+	}
+	auto cs = dict.getKey("/ColorSpace");
+	if (cs.isName()) {
+		std::string s = cs.getName();
+		return (!s.empty() && s[0] == '/') ? s.substr(1) : s;
+	}
+	if (cs.isArray() && cs.getArrayNItems() >= 1) {
+		auto first = cs.getArrayItem(0);
+		if (first.isName()) {
+			std::string s = first.getName();
+			return (!s.empty() && s[0] == '/') ? s.substr(1) : s;
+		}
+	}
+	return std::string();
+}
+
+int DictIntOrDefault(QPDFObjectHandle dict, const char *key, int def) {
+	if (!dict.isDictionary()) {
+		return def;
+	}
+	auto v = dict.getKey(key);
+	if (v.isInteger()) {
+		return static_cast<int>(v.getIntValue());
+	}
+	return def;
+}
+
+std::string BufferToString(const std::shared_ptr<Buffer> &buf) {
+	if (!buf || buf->getSize() == 0) {
+		return std::string();
+	}
+	return std::string(reinterpret_cast<const char *>(buf->getBuffer()), buf->getSize());
+}
+
+// Pipe stream data at a given decode level with no re-encoding (encode_flags=0),
+// so generalized/non-lossy filters are undone while lossy terminal filters
+// (DCT/JPX) and undecodable ones (CCITT) are left intact.
+std::string PipeStreamAtLevel(QPDFObjectHandle stream, qpdf_stream_decode_level_e level) {
+	Pl_Buffer pl("pdf_images");
+	bool attempted = false;
+	stream.pipeStreamData(&pl, &attempted, 0 /* encode_flags: no recompress */, level, true /* suppress warnings */,
+	                      false);
+	pl.finish();
+	return BufferToString(pl.getBufferSharedPointer());
+}
+
+void PngPut32(std::string &s, uint32_t v) {
+	s.push_back(static_cast<char>((v >> 24) & 0xff));
+	s.push_back(static_cast<char>((v >> 16) & 0xff));
+	s.push_back(static_cast<char>((v >> 8) & 0xff));
+	s.push_back(static_cast<char>(v & 0xff));
+}
+
+void PngAppendChunk(std::string &out, const char *type, const std::string &data) {
+	PngPut32(out, static_cast<uint32_t>(data.size()));
+	size_t crc_start = out.size();
+	out.append(type, 4);
+	out.append(data);
+	uLong crc = crc32(0L, Z_NULL, 0);
+	crc = crc32(crc, reinterpret_cast<const Bytef *>(out.data() + crc_start), static_cast<uInt>(4 + data.size()));
+	PngPut32(out, static_cast<uint32_t>(crc));
+}
+
+// Minimal PNG encoder: IHDR + a single zlib-deflated IDAT (per-row filter byte 0)
+// + IEND. color_type 0 (grayscale) or 2 (truecolor RGB); bit_depth 1 or 8.
+// Returns empty on any inconsistency so the caller can fall back to 'raw'.
+std::string EncodePng(int width, int height, int channels, int bit_depth, int color_type, const std::string &samples) {
+	if (width <= 0 || height <= 0) {
+		return std::string();
+	}
+	size_t row_bytes = (static_cast<size_t>(width) * channels * bit_depth + 7) / 8;
+	if (samples.size() < row_bytes * static_cast<size_t>(height)) {
+		return std::string(); // decoded data too short for the declared geometry
+	}
+	std::string raw;
+	raw.reserve((row_bytes + 1) * static_cast<size_t>(height));
+	for (int y = 0; y < height; y++) {
+		raw.push_back(0); // PNG filter type: None
+		raw.append(samples.data() + static_cast<size_t>(y) * row_bytes, row_bytes);
+	}
+	uLongf bound = compressBound(static_cast<uLong>(raw.size()));
+	std::string idat;
+	idat.resize(bound);
+	int rc = compress2(reinterpret_cast<Bytef *>(&idat[0]), &bound, reinterpret_cast<const Bytef *>(raw.data()),
+	                   static_cast<uLong>(raw.size()), Z_DEFAULT_COMPRESSION);
+	if (rc != Z_OK) {
+		return std::string();
+	}
+	idat.resize(bound);
+
+	std::string out;
+	static const unsigned char kSig[8] = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+	out.append(reinterpret_cast<const char *>(kSig), 8);
+	std::string ihdr;
+	PngPut32(ihdr, static_cast<uint32_t>(width));
+	PngPut32(ihdr, static_cast<uint32_t>(height));
+	ihdr.push_back(static_cast<char>(bit_depth));
+	ihdr.push_back(static_cast<char>(color_type));
+	ihdr.push_back(0); // compression method: deflate
+	ihdr.push_back(0); // filter method: adaptive (only type 0 used)
+	ihdr.push_back(0); // interlace: none
+	PngAppendChunk(out, "IHDR", ihdr);
+	PngAppendChunk(out, "IDAT", idat);
+	PngAppendChunk(out, "IEND", std::string());
+	return out;
+}
+
+bool IsGrayColorSpace(const std::string &cs) {
+	return cs == "DeviceGray" || cs == "CalGray" || cs == "G";
+}
+
+bool IsRgbColorSpace(const std::string &cs) {
+	return cs == "DeviceRGB" || cs == "CalRGB" || cs == "RGB";
+}
+
+} // namespace
+
+std::vector<EmbeddedImage> ReadImages(const std::string &path, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	std::vector<EmbeddedImage> images;
+	QPDF doc;
+	if (password.empty()) {
+		doc.processFile(path.c_str());
+	} else {
+		doc.processFile(path.c_str(), password.c_str());
+	}
+	QPDFPageDocumentHelper doc_pages(doc);
+	auto pages = doc_pages.getAllPages();
+	for (size_t page_idx = 0; page_idx < pages.size(); page_idx++) {
+		int image_index = 0;
+		// std::map: iterated in resource-name order, so image_index is stable.
+		for (auto &entry : QPDFPageObjectHelper(pages[page_idx]).getImages()) {
+			const std::string &res_name = entry.first;
+			QPDFObjectHandle stream = entry.second;
+			if (!stream.isStream()) {
+				continue;
+			}
+			auto dict = stream.getDict();
+			EmbeddedImage img;
+			img.page = static_cast<int>(page_idx + 1);
+			img.image_index = ++image_index;
+			// getImages() keys carry the leading slash ('/Im0'); strip it.
+			img.name = (!res_name.empty() && res_name[0] == '/') ? res_name.substr(1) : res_name;
+			img.width = DictIntOrDefault(dict, "/Width", 0);
+			img.height = DictIntOrDefault(dict, "/Height", 0);
+			bool image_mask =
+			    dict.isDictionary() && dict.getKey("/ImageMask").isBool() && dict.getKey("/ImageMask").getBoolValue();
+			img.bits_per_component = DictIntOrDefault(dict, "/BitsPerComponent", image_mask ? 1 : 8);
+			img.colorspace = ColorSpaceName(dict);
+
+			auto filters = StreamFilterNames(dict);
+			std::string terminal = filters.empty() ? std::string() : filters.back();
+
+			try {
+				if (terminal == "DCTDecode" || terminal == "JPXDecode" || terminal == "CCITTFaxDecode") {
+					// Lossy / undecodable terminal filter: pass the encoded bytes
+					// through. A lone terminal filter is exact via getRawStreamData;
+					// a chain undoes the earlier generalized filters at the
+					// specialized level, which never touches DCT/JPX/CCITT.
+					if (filters.size() <= 1) {
+						img.data = BufferToString(stream.getRawStreamData());
+					} else {
+						img.data = PipeStreamAtLevel(stream, qpdf_dl_specialized);
+					}
+					img.format = (terminal == "DCTDecode") ? "jpeg" : (terminal == "JPXDecode") ? "jp2" : "ccitt";
+				} else {
+					// Generalized/non-lossy (Flate/RunLength/LZW/ASCII/none): fully
+					// decode to raw samples, then wrap as PNG when we can do so
+					// losslessly; otherwise surface the decoded samples as 'raw'.
+					std::string decoded = BufferToString(stream.getStreamData(qpdf_dl_all));
+					std::string png;
+					if (!image_mask && IsGrayColorSpace(img.colorspace) &&
+					    (img.bits_per_component == 1 || img.bits_per_component == 8)) {
+						png = EncodePng(img.width, img.height, 1, img.bits_per_component, 0 /* grayscale */, decoded);
+					} else if (!image_mask && IsRgbColorSpace(img.colorspace) && img.bits_per_component == 8) {
+						png = EncodePng(img.width, img.height, 3, 8, 2 /* truecolor */, decoded);
+					}
+					if (!png.empty()) {
+						img.format = "png";
+						img.data = std::move(png);
+					} else {
+						img.format = "raw";
+						img.data = std::move(decoded);
+					}
+				}
+			} catch (...) {
+				// Best-effort per image: a stream whose data cannot be extracted
+				// (unknown filter chain, corrupt stream) contributes no row rather
+				// than aborting the whole document.
+				continue;
+			}
+			images.push_back(std::move(img));
+		}
+	}
+	return images;
 }
 
 } // namespace pdf_qpdf

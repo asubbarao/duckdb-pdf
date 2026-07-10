@@ -177,10 +177,15 @@ if(NOT WIN32)
     include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
                         ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
 
+    # zlib: qpdf_ops.cpp's minimal PNG encoder (pdf_images) calls crc32/compress2
+    # directly. libqpdf links zlib for itself but does not re-export it, so we
+    # must link it ourselves. It is a system dylib on macOS/apt.
+    find_package(ZLIB REQUIRED)
+
     target_link_libraries(${EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL)
+      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB)
     target_link_libraries(${LOADABLE_EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL)
+      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB)
 
     # libharu for write_pdf (local brew path). Dynamic dylib; find explicitly (no pkg-config).
     # Transitive (libpng, zlib) are satisfied by the dylib itself at runtime.
