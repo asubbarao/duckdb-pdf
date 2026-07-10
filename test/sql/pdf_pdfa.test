@@ -1,0 +1,34 @@
+# name: test/sql/pdf_pdfa.test
+# description: pdf_info PDF/A identification columns (detection only)
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── the pdfa.pdf fixture carries an XMP packet declaring pdfaid:part=2,
+#    conformance=B on the catalog /Metadata stream. Detection only — the file
+#    is not a validated PDF/A document. ──
+
+query II
+SELECT pdfa_part, pdfa_conformance FROM pdf_info('test/data/pdfa.pdf');
+----
+2	B
+
+query I
+SELECT pdfa_part = 2 AND pdfa_conformance = 'B' FROM pdf_info('test/data/pdfa.pdf');
+----
+true
+
+# ── an ordinary PDF with no XMP pdfaid claim reports NULL / NULL ──
+
+query II
+SELECT pdfa_part, pdfa_conformance FROM pdf_info('test/data/two_pages.pdf');
+----
+NULL	NULL
+
+query I
+SELECT pdfa_part IS NULL AND pdfa_conformance IS NULL FROM pdf_info('test/data/two_pages.pdf');
+----
+true

@@ -1409,6 +1409,62 @@ static Value InspectDateOrNull(time_t t) {
 	return Value::TIMESTAMP(Timestamp::FromEpochSeconds((int64_t)t));
 }
 
+// Trim leading/trailing ASCII whitespace from an XMP-extracted value.
+static string TrimXmpValue(const string &s) {
+	size_t a = 0, b = s.size();
+	while (a < b && isspace((unsigned char)s[a])) {
+		a++;
+	}
+	while (b > a && isspace((unsigned char)s[b - 1])) {
+		b--;
+	}
+	return s.substr(a, b - a);
+}
+
+// Detection-only scan of an XMP metadata packet for a pdfaid:<key> value.
+// Handles both the attribute form (pdfaid:part="2") and the element form
+// (<pdfaid:part>2</pdfaid:part>) that both occur in the wild. Returns the
+// trimmed value, or an empty string when the key is absent. No validation and
+// no XML library — a corrupt packet simply yields no match.
+static string ExtractPdfaId(const string &xmp, const string &key) {
+	const string needle = "pdfaid:" + key;
+	size_t pos = 0;
+	while ((pos = xmp.find(needle, pos)) != string::npos) {
+		// Skip closing tags like </pdfaid:part>.
+		if (pos > 0 && xmp[pos - 1] == '/') {
+			pos += needle.size();
+			continue;
+		}
+		size_t p = pos + needle.size();
+		while (p < xmp.size() && isspace((unsigned char)xmp[p])) {
+			p++;
+		}
+		if (p < xmp.size() && xmp[p] == '=') {
+			// Attribute form: pdfaid:key="value" or pdfaid:key='value'.
+			p++;
+			while (p < xmp.size() && isspace((unsigned char)xmp[p])) {
+				p++;
+			}
+			if (p < xmp.size() && (xmp[p] == '"' || xmp[p] == '\'')) {
+				char quote = xmp[p++];
+				size_t end = xmp.find(quote, p);
+				if (end != string::npos) {
+					return TrimXmpValue(xmp.substr(p, end - p));
+				}
+			}
+		} else if (p < xmp.size() && xmp[p] == '>') {
+			// Element form: <pdfaid:key>value</pdfaid:key>.
+			p++;
+			size_t end = xmp.find('<', p);
+			if (end != string::npos) {
+				return TrimXmpValue(xmp.substr(p, end - p));
+			}
+		}
+		pos += needle.size();
+	}
+	return string();
+}
+
 //===--------------------------------------------------------------------===//
 // pdf_info  -> one row per file (identity + geometry + storage census)
 //===--------------------------------------------------------------------===//
@@ -1424,10 +1480,11 @@ static unique_ptr<FunctionData> PdfInfoBind(ClientContext &context, TableFunctio
 	return_types = {LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP,
 	                LogicalType::TIMESTAMP, LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::VARCHAR,   LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BIGINT};
+	                LogicalType::VARCHAR,   LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BIGINT,
+	                LogicalType::INTEGER,   LogicalType::VARCHAR};
 	names = {"file",        "title",         "author",   "subject",    "keywords",     "creator",
 	         "producer",    "creation_date", "mod_date", "page_count", "is_encrypted", "is_linearized",
-	         "pdf_version", "width",         "height",   "file_size"};
+	         "pdf_version", "width",         "height",   "file_size",  "pdfa_part",    "pdfa_conformance"};
 	return PdfInspectBindCommon(context, input);
 }
 
@@ -1459,6 +1516,32 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 			height_val = Value::DOUBLE(rect.height());
 		}
 
+		// PDF/A identification from the XMP metadata packet (detection only,
+		// no validation): pdfaid:part (INTEGER) and pdfaid:conformance (A/B/U).
+		Value pdfa_part_val(LogicalType::INTEGER);
+		Value pdfa_conformance_val(LogicalType::VARCHAR);
+		{
+			string xmp = UStringToUtf8(doc->metadata());
+			if (!xmp.empty()) {
+				string part_str = ExtractPdfaId(xmp, "part");
+				if (!part_str.empty()) {
+					try {
+						size_t consumed = 0;
+						int part = std::stoi(part_str, &consumed);
+						if (consumed == part_str.size()) {
+							pdfa_part_val = Value::INTEGER(part);
+						}
+					} catch (const std::exception &) {
+						// non-numeric part -> leave NULL
+					}
+				}
+				string conformance = ExtractPdfaId(xmp, "conformance");
+				if (!conformance.empty()) {
+					pdfa_conformance_val = Value(conformance);
+				}
+			}
+		}
+
 		output.SetValue(0, count, Value(path));
 		output.SetValue(1, count, InspectStringOrNull(UStringToUtf8(doc->info_key("Title"))));
 		output.SetValue(2, count, InspectStringOrNull(UStringToUtf8(doc->info_key("Author"))));
@@ -1475,6 +1558,8 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 		output.SetValue(13, count, width_val);
 		output.SetValue(14, count, height_val);
 		output.SetValue(15, count, Value::BIGINT((int64_t)bytes.size()));
+		output.SetValue(16, count, pdfa_part_val);
+		output.SetValue(17, count, pdfa_conformance_val);
 		st.idx++;
 		count++;
 	}

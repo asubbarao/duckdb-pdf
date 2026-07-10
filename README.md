@@ -239,7 +239,9 @@ These table functions answer "what is in this file?" without extracting body tex
 
 One row per file: identity metadata plus structural facts. Unset metadata keys and dates are `NULL`, never `''`. `width`/`height` are the first-page media box in points; `file_size` is bytes on disk.
 
-Columns: `file`, `title`, `author`, `subject`, `keywords`, `creator`, `producer`, `creation_date` (`TIMESTAMP`), `mod_date` (`TIMESTAMP`), `page_count`, `is_encrypted`, `is_linearized`, `pdf_version`, `width`, `height`, `file_size`.
+Columns: `file`, `title`, `author`, `subject`, `keywords`, `creator`, `producer`, `creation_date` (`TIMESTAMP`), `mod_date` (`TIMESTAMP`), `page_count`, `is_encrypted`, `is_linearized`, `pdf_version`, `width`, `height`, `file_size`, `pdfa_part` (`INTEGER`), `pdfa_conformance` (`VARCHAR`).
+
+`pdfa_part` and `pdfa_conformance` are read straight from the `pdfaid:part` / `pdfaid:conformance` claims in the document's XMP metadata packet — this is **detection only**, not validation. A file that merely declares `pdfaid:part=2, conformance=B` will report those values even if it does not actually conform to PDF/A. Both columns are `NULL` when the XMP packet is absent or carries no `pdfaid` claim.
 
 ```sql
 -- Census a folder of PDFs
