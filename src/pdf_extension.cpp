@@ -5587,6 +5587,82 @@ static void PdfSignaturesScan(ClientContext &context, TableFunctionInput &data_p
 	PdfQpdfRowsEmit(st, output);
 }
 
+// pdf_sign(input, output, cert_path, key_path) -> one row {output, field_name}.
+//
+// Creates an adbe.pkcs7.detached CMS signature over the whole file. The qpdf
+// field construction, deterministic write, ByteRange patch, and OpenSSL CMS_sign
+// all live in qpdf_ops.cpp (the C++17 qpdf/openssl TU). This file only validates
+// paths, resolves the named parameters, and shapes the single result row. The
+// signed output verifies through pdf_signatures with covers_whole_file = true and
+// verified = true.
+//===--------------------------------------------------------------------===//
+
+struct PdfSignBindData : public TableFunctionData {
+	string input;
+	string output;
+	string cert_path;
+	string key_path;
+	string key_password;
+	string reason;
+	string location;
+	string signer_name;
+	string field_name = "Signature1";
+	string password;
+};
+
+static unique_ptr<FunctionData> PdfSignBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfSignBindData>();
+	result->input = StringValue::Get(input.inputs[0]);
+	result->output = StringValue::Get(input.inputs[1]);
+	result->cert_path = StringValue::Get(input.inputs[2]);
+	result->key_path = StringValue::Get(input.inputs[3]);
+	for (auto &kv : input.named_parameters) {
+		auto key = StringUtil::Lower(kv.first);
+		if (kv.second.IsNull()) {
+			continue;
+		}
+		if (key == "key_password") {
+			result->key_password = StringValue::Get(kv.second);
+		} else if (key == "reason") {
+			result->reason = StringValue::Get(kv.second);
+		} else if (key == "location") {
+			result->location = StringValue::Get(kv.second);
+		} else if (key == "signer_name") {
+			result->signer_name = StringValue::Get(kv.second);
+		} else if (key == "field_name") {
+			result->field_name = StringValue::Get(kv.second);
+		} else if (key == "password") {
+			result->password = StringValue::Get(kv.second);
+		}
+	}
+	if (result->field_name.empty()) {
+		result->field_name = "Signature1";
+	}
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+	names = {"output", "field_name"};
+	return std::move(result);
+}
+
+static void PdfSignScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfSignBindData>();
+	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
+	if (!st.executed) {
+		PdfOpsCheckInOut("pdf_sign", bind.input, bind.output);
+		PdfOpsCheckInputExists("pdf_sign", bind.cert_path);
+		PdfOpsCheckInputExists("pdf_sign", bind.key_path);
+		try {
+			pdf_qpdf::SignDetached(bind.input, bind.output, bind.cert_path, bind.key_path, bind.key_password,
+			                       bind.reason, bind.location, bind.signer_name, bind.field_name, bind.password);
+		} catch (const std::exception &e) {
+			throw InvalidInputException("pdf_sign: %s", string(e.what()));
+		}
+		st.rows.push_back({Value(bind.output), Value(bind.field_name)});
+		st.executed = true;
+	}
+	PdfQpdfRowsEmit(st, output);
+}
+
 //===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
@@ -5765,6 +5841,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             PdfQpdfRowsInit);
 	pdf_signatures.named_parameters["password"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(pdf_signatures);
+
+	// pdf_sign: create an adbe.pkcs7.detached CMS signature (inverse of
+	// pdf_signatures). Single-row table function so it can carry named options.
+	TableFunction pdf_sign("pdf_sign",
+	                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                       PdfSignScan, PdfSignBind, PdfQpdfRowsInit);
+	pdf_sign.named_parameters["key_password"] = LogicalType::VARCHAR;
+	pdf_sign.named_parameters["reason"] = LogicalType::VARCHAR;
+	pdf_sign.named_parameters["location"] = LogicalType::VARCHAR;
+	pdf_sign.named_parameters["signer_name"] = LogicalType::VARCHAR;
+	pdf_sign.named_parameters["field_name"] = LogicalType::VARCHAR;
+	pdf_sign.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_sign);
 
 	// COPY TO pdf
 	CopyFunction pdf_copy("pdf");

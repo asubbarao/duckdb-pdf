@@ -26,14 +26,19 @@
 #include <qpdf/QPDFWriter.hh>
 #include <qpdf/QUtil.hh>
 
-// OpenSSL — CMS/PKCS#7 verification for pdf_signatures (tier 2). Plain C API;
-// touches neither duckdb nor poppler, so it is safe to include in this TU.
+// OpenSSL — CMS/PKCS#7 verification for pdf_signatures (tier 2) and CMS_sign for
+// pdf_sign. Plain C API; touches neither duckdb nor poppler, so it is safe to
+// include in this TU.
 #include <openssl/bio.h>
 #include <openssl/cms.h>
 #include <openssl/err.h>
+#include <openssl/pem.h>
 #include <openssl/x509.h>
 
+#include <ctime>
+
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -703,6 +708,292 @@ std::vector<SignatureInfo> ReadSignatures(const std::string &path, const std::st
 		sigs.push_back(std::move(out));
 	}
 	return sigs;
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_sign — create an adbe.pkcs7.detached CMS signature. See qpdf_ops.hpp for
+// the contract. Strategy: qpdf writes the AcroForm /Sig field with a /ByteRange
+// and a fixed-width /Contents hex placeholder (all-NUL bytes → qpdf serializes a
+// hex string `<0000...>`) to a memory buffer, deterministically (static /ID, no
+// object streams, streams preserved) so the placeholder appears verbatim. We
+// then locate the placeholder, patch /ByteRange in place, CMS_sign the two spans,
+// and hex-fill the DER into the /Contents hole.
+//===--------------------------------------------------------------------===//
+
+// Fixed /Contents hex budget: 8192 DER bytes → 16384 hex chars. A self-signed
+// RSA-2048 detached CMS blob is ~1.5-2 KB, so this leaves generous headroom.
+static const size_t kSignContentsBytes = 8192;
+
+// pem_password_cb: hands the (possibly empty) key password to OpenSSL's PEM
+// reader. An empty password on an encrypted key surfaces as a decrypt failure,
+// which the caller reports as a wrong-password error.
+static int SignPemPasswordCb(char *buf, int size, int /*rwflag*/, void *user) {
+	const std::string *pw = static_cast<const std::string *>(user);
+	if (!pw) {
+		return 0;
+	}
+	int len = static_cast<int>(pw->size());
+	if (len > size) {
+		len = size;
+	}
+	if (len > 0) {
+		std::memcpy(buf, pw->data(), static_cast<size_t>(len));
+	}
+	return len;
+}
+
+static std::string ReadWholeFile(const std::string &path) {
+	std::ifstream f(path, std::ios::binary);
+	if (!f) {
+		throw std::runtime_error("could not read '" + path + "'");
+	}
+	std::ostringstream ss;
+	ss << f.rdbuf();
+	return ss.str();
+}
+
+// CMS_sign the message with a PEM cert + PEM (optionally encrypted) key. Returns
+// the detached SignedData as DER bytes. Throws on any load / sign failure.
+static std::string CmsSignDetached(const std::string &message, const std::string &cert_pem, const std::string &key_pem,
+                                   const std::string &key_password) {
+	std::unique_ptr<BIO, decltype(&BIO_free)> cert_bio(
+	    BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size())), BIO_free);
+	if (!cert_bio) {
+		throw std::runtime_error("out of memory reading certificate");
+	}
+	std::unique_ptr<X509, decltype(&X509_free)> cert(PEM_read_bio_X509(cert_bio.get(), nullptr, nullptr, nullptr),
+	                                                 X509_free);
+	if (!cert) {
+		ERR_clear_error();
+		throw std::runtime_error("could not parse certificate PEM (expected an X.509 certificate)");
+	}
+
+	std::unique_ptr<BIO, decltype(&BIO_free)> key_bio(BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size())),
+	                                                  BIO_free);
+	if (!key_bio) {
+		throw std::runtime_error("out of memory reading private key");
+	}
+	std::string pw_copy = key_password;
+	std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key(
+	    PEM_read_bio_PrivateKey(key_bio.get(), nullptr, SignPemPasswordCb, &pw_copy), EVP_PKEY_free);
+	if (!key) {
+		ERR_clear_error();
+		throw std::runtime_error("could not read private key (wrong key_password, or unsupported PEM)");
+	}
+
+	std::unique_ptr<BIO, decltype(&BIO_free)> data_bio(
+	    BIO_new_mem_buf(message.data(), static_cast<int>(message.size())), BIO_free);
+	if (!data_bio) {
+		throw std::runtime_error("out of memory building signed message");
+	}
+
+	// CMS_DETACHED: eContent absent (the /Contents blob signs external bytes).
+	// CMS_BINARY: PDF bytes are raw, not S/MIME canonical text.
+	// CMS_NOSMIMECAP: omit S/MIME capabilities to keep the blob compact.
+	unsigned flags = CMS_DETACHED | CMS_BINARY | CMS_NOSMIMECAP;
+	std::unique_ptr<CMS_ContentInfo, decltype(&CMS_ContentInfo_free)> cms(
+	    CMS_sign(cert.get(), key.get(), nullptr, data_bio.get(), flags), CMS_ContentInfo_free);
+	if (!cms) {
+		ERR_clear_error();
+		throw std::runtime_error("CMS signing failed");
+	}
+
+	int der_len = i2d_CMS_ContentInfo(cms.get(), nullptr);
+	if (der_len <= 0) {
+		ERR_clear_error();
+		throw std::runtime_error("CMS DER encoding failed");
+	}
+	std::string der(static_cast<size_t>(der_len), '\0');
+	unsigned char *out_ptr = reinterpret_cast<unsigned char *>(&der[0]);
+	if (i2d_CMS_ContentInfo(cms.get(), &out_ptr) != der_len) {
+		ERR_clear_error();
+		throw std::runtime_error("CMS DER encoding failed");
+	}
+	return der;
+}
+
+void SignDetached(const std::string &input, const std::string &output, const std::string &cert_path,
+                  const std::string &key_path, const std::string &key_password, const std::string &reason,
+                  const std::string &location, const std::string &signer_name, const std::string &field_name,
+                  const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+
+	// Load the signing material up front so bad cert/key paths fail before we
+	// touch the PDF.
+	std::string cert_pem = ReadWholeFile(cert_path);
+	std::string key_pem = ReadWholeFile(key_path);
+
+	QPDF doc;
+	if (password.empty()) {
+		doc.processFile(input.c_str());
+	} else {
+		doc.processFile(input.c_str(), password.c_str());
+	}
+
+	// Build the signature value dictionary with wide placeholders.
+	auto sig_dict = QPDFObjectHandle::newDictionary();
+	sig_dict.replaceKey("/Type", QPDFObjectHandle::newName("/Sig"));
+	sig_dict.replaceKey("/Filter", QPDFObjectHandle::newName("/Adobe.PPKLite"));
+	sig_dict.replaceKey("/SubFilter", QPDFObjectHandle::newName("/adbe.pkcs7.detached"));
+	// /ByteRange placeholder: three 10-digit sentinels (supports files < 10 GB);
+	// patched in place after the deterministic write.
+	sig_dict.replaceKey("/ByteRange",
+	                    QPDFObjectHandle::newArray(std::vector<QPDFObjectHandle> {
+	                        QPDFObjectHandle::newInteger(0), QPDFObjectHandle::newInteger(9999999999LL),
+	                        QPDFObjectHandle::newInteger(9999999999LL), QPDFObjectHandle::newInteger(9999999999LL)}));
+	// All-NUL string → qpdf writes a hex string `<0000...>` of exactly
+	// 2*kSignContentsBytes digits, which becomes the signature hole.
+	sig_dict.replaceKey("/Contents", QPDFObjectHandle::newString(std::string(kSignContentsBytes, '\0')));
+	// Signing time /M (current UTC), plus optional metadata.
+	{
+		std::time_t now = std::time(nullptr);
+		std::tm tm_utc {};
+#if defined(_WIN32)
+		gmtime_s(&tm_utc, &now);
+#else
+		gmtime_r(&now, &tm_utc);
+#endif
+		char m_buf[32];
+		std::strftime(m_buf, sizeof(m_buf), "D:%Y%m%d%H%M%S+00'00'", &tm_utc);
+		sig_dict.replaceKey("/M", QPDFObjectHandle::newString(std::string(m_buf)));
+	}
+	if (!signer_name.empty()) {
+		sig_dict.replaceKey("/Name", QPDFObjectHandle::newString(signer_name));
+	}
+	if (!reason.empty()) {
+		sig_dict.replaceKey("/Reason", QPDFObjectHandle::newString(reason));
+	}
+	if (!location.empty()) {
+		sig_dict.replaceKey("/Location", QPDFObjectHandle::newString(location));
+	}
+	auto sig_obj = doc.makeIndirectObject(sig_dict);
+
+	// Merged signature field / widget annotation on page 1 (invisible: zero Rect).
+	auto pages = QPDFPageDocumentHelper(doc).getAllPages();
+	if (pages.empty()) {
+		throw std::runtime_error("cannot sign a document with no pages");
+	}
+	auto page0 = pages[0].getObjectHandle();
+	auto widget = QPDFObjectHandle::newDictionary();
+	widget.replaceKey("/Type", QPDFObjectHandle::newName("/Annot"));
+	widget.replaceKey("/Subtype", QPDFObjectHandle::newName("/Widget"));
+	widget.replaceKey("/FT", QPDFObjectHandle::newName("/Sig"));
+	widget.replaceKey("/T", QPDFObjectHandle::newString(field_name));
+	widget.replaceKey("/V", sig_obj);
+	widget.replaceKey("/P", page0);
+	widget.replaceKey("/F", QPDFObjectHandle::newInteger(132)); // Print | Locked
+	widget.replaceKey("/Rect", QPDFObjectHandle::newArray(std::vector<QPDFObjectHandle> {
+	                               QPDFObjectHandle::newInteger(0), QPDFObjectHandle::newInteger(0),
+	                               QPDFObjectHandle::newInteger(0), QPDFObjectHandle::newInteger(0)}));
+	auto widget_obj = doc.makeIndirectObject(widget);
+
+	// Attach the widget to page 1's /Annots.
+	auto annots = page0.getKey("/Annots");
+	if (!annots.isArray()) {
+		annots = QPDFObjectHandle::newArray();
+	}
+	annots.appendItem(widget_obj);
+	page0.replaceKey("/Annots", annots);
+
+	// Register the field in the document AcroForm (create it if absent).
+	auto root = doc.getRoot();
+	auto acroform = root.getKey("/AcroForm");
+	if (!acroform.isDictionary()) {
+		acroform = doc.makeIndirectObject(QPDFObjectHandle::newDictionary());
+		root.replaceKey("/AcroForm", acroform);
+	}
+	auto fields = acroform.getKey("/Fields");
+	if (!fields.isArray()) {
+		fields = QPDFObjectHandle::newArray();
+	}
+	fields.appendItem(widget_obj);
+	acroform.replaceKey("/Fields", fields);
+	// SigFlags: bit1 SignaturesExist, bit2 AppendOnly.
+	acroform.replaceKey("/SigFlags", QPDFObjectHandle::newInteger(3));
+
+	// Deterministic write to memory: static /ID, no object streams (so the /Sig
+	// dict is a plain visible object), streams preserved (predictable bytes), no
+	// encryption (encrypting the /Contents string would break the placeholder).
+	QPDFWriter writer(doc);
+	writer.setOutputMemory();
+	writer.setStaticID(true);
+	writer.setObjectStreamMode(qpdf_o_disable);
+	writer.setStreamDataMode(qpdf_s_preserve);
+	writer.setPreserveEncryption(false);
+	writer.write();
+	auto buffer = writer.getBufferSharedPointer();
+	std::string bytes(reinterpret_cast<const char *>(buffer->getBuffer()), buffer->getSize());
+
+	// Locate the /Contents hex hole via its long zero run (unique in the file).
+	const std::string zero_run = "<" + std::string(256, '0');
+	size_t c_lt = bytes.find(zero_run);
+	if (c_lt == std::string::npos) {
+		throw std::runtime_error("could not locate /Contents placeholder in written PDF");
+	}
+	size_t c_gt = bytes.find('>', c_lt);
+	if (c_gt == std::string::npos) {
+		throw std::runtime_error("malformed /Contents placeholder in written PDF");
+	}
+	// Hole capacity in hex digits (between '<' and '>').
+	size_t hole_hex = c_gt - c_lt - 1;
+
+	// Locate and patch /ByteRange in place. The array occupies [lb, rb].
+	size_t br_key = bytes.find("/ByteRange");
+	if (br_key == std::string::npos) {
+		throw std::runtime_error("could not locate /ByteRange in written PDF");
+	}
+	size_t lb = bytes.find('[', br_key);
+	size_t rb = (lb == std::string::npos) ? std::string::npos : bytes.find(']', lb);
+	if (lb == std::string::npos || rb == std::string::npos) {
+		throw std::runtime_error("malformed /ByteRange array in written PDF");
+	}
+
+	// ByteRange = [0, len_before_hole, offset_after_hole, len_after_hole]. The
+	// hole is the /Contents string including its `<` and `>` delimiters.
+	const int64_t total = static_cast<int64_t>(bytes.size());
+	const int64_t b0 = 0;
+	const int64_t b1 = static_cast<int64_t>(c_lt);     // bytes [0, c_lt)
+	const int64_t b2 = static_cast<int64_t>(c_gt) + 1; // first byte after '>'
+	const int64_t b3 = total - b2;                     // bytes [b2, total)
+	std::string br_body = "[0 " + std::to_string(b1) + " " + std::to_string(b2) + " " + std::to_string(b3);
+	const size_t span_width = rb - lb + 1; // includes '[' and ']'
+	if (br_body.size() + 1 > span_width) { // +1 for the closing ']'
+		throw std::runtime_error("ByteRange placeholder too small for computed offsets");
+	}
+	std::string br_final = br_body + std::string(span_width - br_body.size() - 1, ' ') + "]";
+	bytes.replace(lb, span_width, br_final);
+
+	// Build the signed message from the (now patched) spans and CMS-sign it.
+	std::string message;
+	message.reserve(static_cast<size_t>(b1 + b3));
+	message.append(bytes.data() + b0, static_cast<size_t>(b1));
+	message.append(bytes.data() + b2, static_cast<size_t>(b3));
+	std::string der = CmsSignDetached(message, cert_pem, key_pem, key_password);
+
+	// Hex-encode the DER (uppercase) into the /Contents hole; zero-pad the rest.
+	if (der.size() * 2 > hole_hex) {
+		throw std::runtime_error("signature (" + std::to_string(der.size()) +
+		                         " bytes) exceeds the /Contents placeholder capacity (" + std::to_string(hole_hex / 2) +
+		                         " bytes)");
+	}
+	static const char kHex[] = "0123456789ABCDEF";
+	std::string filled(hole_hex, '0');
+	for (size_t i = 0; i < der.size(); i++) {
+		unsigned char byte = static_cast<unsigned char>(der[i]);
+		filled[2 * i] = kHex[(byte >> 4) & 0xF];
+		filled[2 * i + 1] = kHex[byte & 0xF];
+	}
+	bytes.replace(c_lt + 1, hole_hex, filled);
+
+	// Write the final signed bytes to the output path.
+	std::ofstream out(output, std::ios::binary | std::ios::trunc);
+	if (!out) {
+		throw std::runtime_error("could not open output '" + output + "' for writing");
+	}
+	out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+	if (!out) {
+		throw std::runtime_error("failed writing signed PDF to '" + output + "'");
+	}
 }
 
 } // namespace pdf_qpdf

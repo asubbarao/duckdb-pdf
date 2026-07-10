@@ -400,6 +400,36 @@ Encrypted files stay readable in place, too — every reader takes `password := 
 SELECT page, text FROM read_pdf('report_locked.pdf', password := 'user-secret');
 ```
 
+### `pdf_sign` — apply a digital signature
+
+`pdf_sign(input, output, cert_path, key_path)` adds an `adbe.pkcs7.detached` PKCS#7/CMS signature and writes the signed document to `output`. It is the inverse of `pdf_signatures` (above): the two form a closed loop — anything `pdf_sign` writes verifies back through `pdf_signatures` with `covers_whole_file = true` and `verified = true`. It is a single-row table function returning `{output, field_name}`.
+
+`cert_path` and `key_path` are **PEM** files — an X.509 certificate and its RSA/EC private key (PKCS#8 or PKCS#1). A self-signed pair is fine; the signature attests integrity, not certificate-chain trust (mirroring what `pdf_signatures` checks). Generate one with:
+
+```sh
+openssl genrsa -out key.pem 2048
+openssl req -new -x509 -key key.pem -out cert.pem -days 3650 -subj '/CN=Your Name'
+```
+
+Named options: `key_password` (decrypts an encrypted private key), `reason`, `location`, `signer_name` (populate the `/Reason` `/Location` `/Name` dictionary keys), `field_name` (the signature field name, default `'Signature1'`), and `password` (open an encrypted input PDF).
+
+```sql
+-- sign, then verify the closed loop with pdf_signatures
+SELECT output FROM pdf_sign('contract.pdf', 'contract_signed.pdf', 'cert.pem', 'key.pem',
+                            reason := 'I approve this document', location := 'San Francisco',
+                            signer_name := 'Jane Doe');
+
+SELECT field_name, signer_name, reason, covers_whole_file, verified
+FROM pdf_signatures('contract_signed.pdf');
+--   Signature1 | Jane Doe | I approve this document | true | true
+
+-- encrypted private key: supply its passphrase
+SELECT output FROM pdf_sign('contract.pdf', 'contract_signed.pdf', 'cert.pem', 'enc_key.pem',
+                            key_password := 'secret');
+```
+
+The signature covers the whole file via a `/ByteRange` around a fixed-size `/Contents` hole (8 KB of DER — ample for RSA-2048); an oversized signature raises an Invalid Input error. Standard `pdf_encrypt`/`pdf_decrypt` conventions apply: local paths, output overwritten, `input == output` refused.
+
 ### `write_pdf` — native text-to-PDF (no LibreOffice)
 
 `write_pdf(content [, output_path])` is a purely native, in-process scalar that authors a PDF from a VARCHAR using libharu — no external tools, no shell-out, always available once the extension is loaded. The 1-arg form writes to a temp file (platform `TMPDIR`/`TMP`/`TEMP` or `/tmp` + UUID); both forms return the output path.
@@ -656,6 +686,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_compress(in, out)` | Scalar | Structural compression + linearization. |
 | `pdf_encrypt(in, out, userpw [, ownerpw])` | Scalar | AES-256 password protection. |
 | `pdf_decrypt(in, out, pw)` | Scalar | Remove password protection. |
+| `pdf_sign(in, out, cert, key)` | Table | Apply an `adbe.pkcs7.detached` CMS signature (PEM cert+key); verifies via `pdf_signatures`. |
 | `write_pdf(text [, out])` | Scalar | Native text-to-PDF via libharu. |
 | `to_pdf(in [, out])` | Scalar | Office/markup document to PDF via LibreOffice (runtime shell-out). |
 | `COPY ... (FORMAT pdf)` | Copy | Query result to a typeset PDF; `TITLE`/`AUTHOR`/`HEADER`/`FOOTER`/`FONT_SIZE`/`PAGE_SIZE`/`MARGIN`. |
