@@ -2312,7 +2312,7 @@ static void PdfRevisionsScan(ClientContext &context, TableFunctionInput &data_p,
 				// Tolerate leading junk (see garbage_header.pdf) by searching.
 				size_t magic = bytes.find("%PDF-");
 				if (magic == string::npos) {
-					throw IOException("pdf_revisions: '%s' is not a PDF (missing %PDF- header)", path);
+					throw IOException("pdf_revisions: '%s' is not a PDF (missing %%PDF- header)", path);
 				}
 			}
 			st.rows = EnumeratePdfRevisions(bytes);
