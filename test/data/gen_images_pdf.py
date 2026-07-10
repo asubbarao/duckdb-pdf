@@ -97,13 +97,7 @@ def build_pdf() -> bytes:
     )
     # 6: content stream drawing both images
     content = b"q 100 0 0 100 10 90 cm /Im0 Do Q\n" b"q 100 0 0 75 10 5 cm /Im1 Do Q\n"
-    add(
-        b"<< /Length "
-        + str(len(content)).encode()
-        + b" >>\nstream\n"
-        + content
-        + b"endstream"
-    )
+    add(b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"endstream")
 
     out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
     offsets = [0]
@@ -130,9 +124,7 @@ def build_pdf() -> bytes:
 def main() -> None:
     pdf = build_pdf()
     OUT.write_bytes(pdf)
-    print(
-        f"wrote {OUT} ({len(pdf)} bytes); Im0={JPEG_W}x{JPEG_H} JPEG, Im1={RGB_W}x{RGB_H} FlateRGB"
-    )
+    print(f"wrote {OUT} ({len(pdf)} bytes); Im0={JPEG_W}x{JPEG_H} JPEG, Im1={RGB_W}x{RGB_H} FlateRGB")
 
 
 if __name__ == "__main__":

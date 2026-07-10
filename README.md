@@ -701,7 +701,7 @@ SELECT page, text
 FROM read_pdf('scan.pdf', ocr := true, tessdata_dir := '/opt/models/tessdata');
 ```
 
-You can also set the `TESSDATA_PREFIX` environment variable (Tesseract's own mechanism). Resolution order is: **`tessdata_dir` parameter → `TESSDATA_PREFIX` → auto-detected standard paths.** If no model is found anywhere, OCR raises a clear, actionable error — it never silently returns empty text.
+You can also set the `TESSDATA_PREFIX` environment variable (Tesseract's own mechanism). Resolution order is: **`tessdata_dir` parameter → `TESSDATA_PREFIX` → auto-detected standard paths.** If no model is found anywhere, *explicit* OCR (`ocr := true`) raises a clear, actionable error — it never silently returns empty text. The *implicit* `auto_ocr` fallback (a blank or scanned page encountered during a plain read) is best-effort instead: with no model available it degrades to empty text for that page, so reading a PDF that happens to contain a blank page never fails on a machine without Tesseract models.
 
 Select the language with the `ocr_language` parameter (default `eng`), and tune the OCR path with `ocr_dpi` (default 300), `ocr_psm`, and `ocr_oem`:
 
