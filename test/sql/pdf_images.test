@@ -60,8 +60,9 @@ SELECT count(*) FROM pdf_images('test/data/i*.pdf');
 ----
 2
 
+# normalize path separators: the glob expands with backslashes on Windows
 query II
-SELECT DISTINCT file, count(*) OVER (PARTITION BY file)
+SELECT DISTINCT replace(file, '\', '/') AS file, count(*) OVER (PARTITION BY file)
 FROM pdf_images('test/data/i*.pdf');
 ----
 test/data/images.pdf	2
