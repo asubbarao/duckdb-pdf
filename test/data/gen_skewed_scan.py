@@ -70,9 +70,7 @@ def main():
 
     # Rotate the whole raster to introduce the skew. expand=True keeps every glyph
     # inside the frame; fillcolor="white" leaves a clean scanned-paper background.
-    skewed = canvas.rotate(
-        SKEW_DEGREES, resample=Image.BICUBIC, expand=True, fillcolor="white"
-    )
+    skewed = canvas.rotate(SKEW_DEGREES, resample=Image.BICUBIC, expand=True, fillcolor="white")
 
     # Save as an image-only PDF (no text layer). resolution sets the page DPI so
     # the physical page size is sane; the pixels are what matter for OCR.

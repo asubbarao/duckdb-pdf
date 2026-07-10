@@ -56,10 +56,7 @@ def assemble(objs: dict[int, bytes]) -> bytes:
     body += b"0000000000 65535 f \n"
     for i in range(1, max_id + 1):
         body += f"{offsets[i]:010d} 00000 n \n".encode("ascii")
-    body += (
-        f"trailer\n<< /Size {max_id + 1} /Root 1 0 R >>\n"
-        f"startxref\n{xref_pos}\n%%EOF\n"
-    ).encode("ascii")
+    body += (f"trailer\n<< /Size {max_id + 1} /Root 1 0 R >>\n" f"startxref\n{xref_pos}\n%%EOF\n").encode("ascii")
     return bytes(body)
 
 
@@ -89,11 +86,7 @@ def build() -> bytes:
         else:
             stream = f"BT /F1 24 Tf 72 700 Td ({text}) Tj ET\n".encode("ascii")
         objects[contents_id] = (
-            b"<< /Length "
-            + str(len(stream)).encode("ascii")
-            + b" >>\nstream\n"
-            + stream
-            + b"endstream"
+            b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"endstream"
         )
 
     return assemble(objects)
