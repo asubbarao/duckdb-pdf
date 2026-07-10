@@ -447,6 +447,23 @@ Encrypted files stay readable in place, too — every reader takes `password := 
 SELECT page, text FROM read_pdf('report_locked.pdf', password := 'user-secret');
 ```
 
+### `pdf_watermark` / `pdf_bates`
+
+Both stamp **real, selectable text** on top of every page (a Helvetica text run appended to each page's content stream), so the stamp survives into the extracted text layer and is searchable — not a flattened raster. Each page is sized and positioned from its own MediaBox, so mixed-size documents stamp correctly.
+
+```sql
+-- watermark: a large 45° diagonal gray "DRAFT" centered across every page.
+-- 3-arg form uses the default opacity (0.30); the 4-arg form takes an explicit
+-- fill alpha in (0, 1].
+SELECT pdf_watermark('report.pdf', 'report_draft.pdf', 'DRAFT');
+SELECT pdf_watermark('report.pdf', 'report_faint.pdf', 'CONFIDENTIAL', 0.15);
+
+-- bates: legal-style Bates numbering — prefix + a zero-padded (min 6 digits)
+-- sequential number at the bottom-right of each page, incrementing per page.
+-- Page 1 -> ACME000100, page 2 -> ACME000101, ...
+SELECT pdf_bates('deposition.pdf', 'deposition_stamped.pdf', 'ACME', 100);
+```
+
 ### `write_pdf` — native text-to-PDF (no LibreOffice)
 
 `write_pdf(content [, output_path])` is a purely native, in-process scalar that authors a PDF from a VARCHAR using libharu — no external tools, no shell-out, always available once the extension is loaded. The 1-arg form writes to a temp file (platform `TMPDIR`/`TMP`/`TEMP` or `/tmp` + UUID); both forms return the output path.
@@ -702,6 +719,8 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_merge(files[], out)` | Scalar | Concatenate PDFs in list order. |
 | `pdf_rotate(in, out, deg [, pages])` | Scalar | Rotate pages by multiples of 90°. |
 | `pdf_pages(in, out, range)` | Scalar | Extract a page subset (`'1-3,7'`, `'z'`, `'r2'`). |
+| `pdf_watermark(in, out, text [, opacity])` | Scalar | Stamp a diagonal gray text watermark on every page (real text; default opacity 0.30). |
+| `pdf_bates(in, out, prefix, start)` | Scalar | Bates numbering: `prefix` + zero-padded sequential number, bottom-right of each page. |
 | `pdf_compress(in, out)` | Scalar | Structural compression + linearization. |
 | `pdf_encrypt(in, out, userpw [, ownerpw])` | Scalar | AES-256 password protection. |
 | `pdf_decrypt(in, out, pw)` | Scalar | Remove password protection. |

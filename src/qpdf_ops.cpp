@@ -41,8 +41,10 @@
 // nor poppler, so it is safe in this TU.
 #include <zlib.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -932,6 +934,131 @@ bool IsRgbColorSpace(const std::string &cs) {
 
 } // namespace
 
+// pdf_watermark / pdf_bates — stamp real Helvetica text on top of every page.
+//
+// Both build a fresh content stream per page and append it to the page's
+// existing /Contents (so the stamp draws ON TOP), registering a standard
+// Helvetica base-14 font (and, for the watermark, an ExtGState alpha) in that
+// page's own /Resources. Because the stamp is real text drawn with BT/Tf/Tj/ET,
+// it survives into the extracted text layer. To keep the combined content
+// stream well-formed regardless of what the original left on the graphics
+// state, the original content is bracketed: a `q` is prepended and the appended
+// stream opens with `Q` (restoring to the default state saved by that `q`)
+// before drawing its own `q ... Q` block. Each page is sized/positioned from
+// its own MediaBox so mixed-size documents stamp correctly.
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+// Escape a byte string for use inside a PDF literal string `( ... )`: backslash,
+// parentheses get a `\` prefix; any non-printable / non-ASCII byte becomes a
+// `\ddd` octal escape so the content stream stays well-formed for any input.
+std::string EscapePdfLiteral(const std::string &s) {
+	std::string out;
+	out.reserve(s.size() + 8);
+	for (unsigned char ch : s) {
+		if (ch == '\\' || ch == '(' || ch == ')') {
+			out.push_back('\\');
+			out.push_back(static_cast<char>(ch));
+		} else if (ch < 32 || ch > 126) {
+			char buf[5];
+			std::snprintf(buf, sizeof(buf), "\\%03o", ch);
+			out += buf;
+		} else {
+			out.push_back(static_cast<char>(ch));
+		}
+	}
+	return out;
+}
+
+// Format a coordinate/scalar for a content stream with a fixed, compact
+// precision (content streams are ASCII; %g-style exponents are illegal).
+std::string Num(double v) {
+	char buf[64];
+	std::snprintf(buf, sizeof(buf), "%.4f", v);
+	return std::string(buf);
+}
+
+struct MediaBox {
+	double llx = 0, lly = 0, urx = 612, ury = 792;
+};
+
+// MediaBox is inheritable, so resolve it via getAttribute (read-only, no copy).
+MediaBox PageMediaBox(QPDFPageObjectHelper &page) {
+	MediaBox b;
+	QPDFObjectHandle mb = page.getAttribute("/MediaBox", false);
+	if (mb.isArray() && mb.getArrayNItems() >= 4) {
+		b.llx = mb.getArrayItem(0).getNumericValue();
+		b.lly = mb.getArrayItem(1).getNumericValue();
+		b.urx = mb.getArrayItem(2).getNumericValue();
+		b.ury = mb.getArrayItem(3).getNumericValue();
+	}
+	return b;
+}
+
+// Return the page's own /Resources dictionary, copying an inherited/shared one
+// down onto the page so it is safe to mutate; creates an empty one if absent.
+QPDFObjectHandle EnsurePageResources(QPDFPageObjectHelper &page) {
+	QPDFObjectHandle resources = page.getAttribute("/Resources", true);
+	if (!resources.isDictionary()) {
+		resources = QPDFObjectHandle::newDictionary();
+		page.getObjectHandle().replaceKey("/Resources", resources);
+	}
+	return resources;
+}
+
+// Add a standard Helvetica base-14 Type1 font to /Resources /Font under a key
+// that does not collide with an existing one; return the chosen key ('/F-wm').
+std::string AddHelvetica(QPDFObjectHandle resources) {
+	QPDFObjectHandle fonts = resources.getKey("/Font");
+	if (!fonts.isDictionary()) {
+		fonts = QPDFObjectHandle::newDictionary();
+		resources.replaceKey("/Font", fonts);
+	}
+	std::string key = "/F-wm";
+	int suffix = 0;
+	while (fonts.hasKey(key)) {
+		key = "/F-wm" + std::to_string(++suffix);
+	}
+	QPDFObjectHandle font = QPDFObjectHandle::newDictionary();
+	font.replaceKey("/Type", QPDFObjectHandle::newName("/Font"));
+	font.replaceKey("/Subtype", QPDFObjectHandle::newName("/Type1"));
+	font.replaceKey("/BaseFont", QPDFObjectHandle::newName("/Helvetica"));
+	fonts.replaceKey(key, font);
+	return key;
+}
+
+// Add a constant-alpha ExtGState to /Resources /ExtGState under a non-colliding
+// key; return the chosen key ('/GS-wm').
+std::string AddAlphaGState(QPDFObjectHandle resources, double opacity) {
+	QPDFObjectHandle egs = resources.getKey("/ExtGState");
+	if (!egs.isDictionary()) {
+		egs = QPDFObjectHandle::newDictionary();
+		resources.replaceKey("/ExtGState", egs);
+	}
+	std::string key = "/GS-wm";
+	int suffix = 0;
+	while (egs.hasKey(key)) {
+		key = "/GS-wm" + std::to_string(++suffix);
+	}
+	QPDFObjectHandle gs = QPDFObjectHandle::newDictionary();
+	gs.replaceKey("/Type", QPDFObjectHandle::newName("/ExtGState"));
+	gs.replaceKey("/ca", QPDFObjectHandle::newReal(opacity, 3));
+	gs.replaceKey("/CA", QPDFObjectHandle::newReal(opacity, 3));
+	egs.replaceKey(key, gs);
+	return key;
+}
+
+// Bracket the original content with a saved graphics state and append `drawing`
+// on top: prepend `q`, then append `Q` (restore to that saved default) followed
+// by the caller's already-`q`/`Q`-balanced drawing block.
+void AppendStampOnTop(QPDF &doc, QPDFPageObjectHelper &page, const std::string &drawing) {
+	page.addPageContents(QPDFObjectHandle::newStream(&doc, "q\n"), true /* prepend */);
+	page.addPageContents(QPDFObjectHandle::newStream(&doc, "Q\n" + drawing), false /* append */);
+}
+
+} // namespace
+
 std::vector<EmbeddedImage> ReadImages(const std::string &path, const std::string &password) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	std::vector<EmbeddedImage> images;
@@ -1010,6 +1137,124 @@ std::vector<EmbeddedImage> ReadImages(const std::string &path, const std::string
 		}
 	}
 	return images;
+}
+
+void Watermark(const std::string &input, const std::string &output, const std::string &text, double opacity) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	doc.processFile(input.c_str());
+	QPDFPageDocumentHelper doc_pages(doc);
+
+	const std::string escaped = EscapePdfLiteral(text);
+	const double len = static_cast<double>(std::max<size_t>(text.size(), size_t(1)));
+	const double cos45 = 0.70710678, sin45 = 0.70710678; // 45° diagonal
+
+	for (auto &page : doc_pages.getAllPages()) {
+		MediaBox b = PageMediaBox(page);
+		double w = b.urx - b.llx;
+		double h = b.ury - b.lly;
+		if (w <= 0) {
+			w = 612;
+		}
+		if (h <= 0) {
+			h = 792;
+		}
+		QPDFObjectHandle resources = EnsurePageResources(page);
+		std::string font_key = AddHelvetica(resources);
+		std::string gs_key = AddAlphaGState(resources, opacity);
+
+		double cx = b.llx + w / 2.0;
+		double cy = b.lly + h / 2.0;
+		// Size the text so it spans most of the page diagonal (Helvetica averages
+		// ~0.5em/char), clamped to a sane range.
+		double diag = std::sqrt(w * w + h * h);
+		double font_size = 1.6 * diag / len;
+		font_size = std::max(12.0, std::min(font_size, 140.0));
+		double text_w = 0.5 * font_size * len;
+		// Center the rotated baseline midpoint on the page center; drop the origin
+		// half a cap-height along the perpendicular for rough vertical centering.
+		double tx = cx - (text_w / 2.0) * cos45 + (font_size * 0.35) * sin45;
+		double ty = cy - (text_w / 2.0) * sin45 - (font_size * 0.35) * cos45;
+
+		std::ostringstream draw;
+		draw << "q\n"
+		     << gs_key << " gs\n"
+		     << "0.5 0.5 0.5 rg\n"
+		     << "0.5 0.5 0.5 RG\n"
+		     << "BT\n"
+		     << font_key << " " << Num(font_size) << " Tf\n"
+		     << Num(cos45) << " " << Num(sin45) << " " << Num(-sin45) << " " << Num(cos45) << " " << Num(tx) << " "
+		     << Num(ty) << " Tm\n"
+		     << "(" << escaped << ") Tj\n"
+		     << "ET\n"
+		     // Text extractors assemble words from glyph geometry and cannot regroup
+		     // glyphs laid along a 45° baseline — the visible diagonal run comes out
+		     // fragmented ('D R AF T'). Emit a small INVISIBLE (render mode 3)
+		     // horizontal copy of the same text so the watermark stays searchable /
+		     // extractable — the same technique OCR text layers use.
+		     << "BT\n"
+		     << font_key << " 8 Tf\n"
+		     << "3 Tr\n"
+		     << "1 0 0 1 " << Num(b.llx + 6) << " " << Num(b.lly + 6) << " Tm\n"
+		     << "(" << escaped << ") Tj\n"
+		     << "ET\n"
+		     << "Q\n";
+		AppendStampOnTop(doc, page, draw.str());
+	}
+
+	QPDFWriter writer(doc, output.c_str());
+	writer.write();
+}
+
+void Bates(const std::string &input, const std::string &output, const std::string &prefix, long long start_number,
+           std::vector<std::string> *stamped_labels) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	doc.processFile(input.c_str());
+	QPDFPageDocumentHelper doc_pages(doc);
+
+	const double font_size = 10.0;
+	const double margin = 36.0; // half-inch from the page edges
+
+	long long number = start_number;
+	for (auto &page : doc_pages.getAllPages()) {
+		MediaBox b = PageMediaBox(page);
+
+		unsigned long long magnitude = (number < 0) ? static_cast<unsigned long long>(-(number + 1)) + 1ULL
+		                                            : static_cast<unsigned long long>(number);
+		std::string digits = std::to_string(magnitude);
+		while (digits.size() < 6) {
+			digits = "0" + digits;
+		}
+		std::string label = prefix + (number < 0 ? "-" : "") + digits;
+		std::string escaped = EscapePdfLiteral(label);
+
+		QPDFObjectHandle resources = EnsurePageResources(page);
+		std::string font_key = AddHelvetica(resources);
+
+		double text_w = 0.5 * font_size * static_cast<double>(label.size());
+		double tx = b.urx - margin - text_w;
+		double ty = b.lly + margin;
+
+		std::ostringstream draw;
+		draw << "q\n"
+		     << "0 0 0 rg\n"
+		     << "BT\n"
+		     << font_key << " " << Num(font_size) << " Tf\n"
+		     << Num(tx) << " " << Num(ty) << " Td\n"
+		     << "(" << escaped << ") Tj\n"
+		     << "ET\n"
+		     << "Q\n";
+		AppendStampOnTop(doc, page, draw.str());
+
+		if (stamped_labels) {
+			stamped_labels->push_back(label);
+		}
+		number++;
+	}
+
+	QPDFWriter writer(doc, output.c_str());
+	writer.write();
 }
 
 } // namespace pdf_qpdf

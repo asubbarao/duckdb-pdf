@@ -5418,6 +5418,76 @@ static void PdfPagesFun(DataChunk &args, ExpressionState &state, Vector &result)
 	}
 }
 
+// pdf_watermark(input, output, text[, opacity]) -> VARCHAR (the output path).
+// Stamps `text` as a large diagonal gray watermark, on top of every page's
+// content, as real (selectable) Helvetica text. `opacity` is the fill alpha,
+// default 0.30, and must be in (0, 1].
+static string PdfWatermarkImpl(const string &input, const string &output, const string &text, double opacity) {
+	PdfOpsCheckInOut("pdf_watermark", input, output);
+	if (!(opacity > 0.0 && opacity <= 1.0)) {
+		throw InvalidInputException("pdf_watermark: opacity must be in (0, 1] (got %f)", opacity);
+	}
+	try {
+		pdf_qpdf::Watermark(input, output, text, opacity);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_watermark: %s", string(e.what()));
+	}
+	return output;
+}
+
+static void PdfWatermarkFunInternal(DataChunk &args, Vector &result, bool has_opacity_arg) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		Value in_val = args.GetValue(0, row);
+		Value out_val = args.GetValue(1, row);
+		Value text_val = args.GetValue(2, row);
+		Value opacity_val = has_opacity_arg ? args.GetValue(3, row) : Value::DOUBLE(0.30);
+		if (in_val.IsNull() || out_val.IsNull() || text_val.IsNull() || opacity_val.IsNull()) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		result.SetValue(row, Value(PdfWatermarkImpl(StringValue::Get(in_val), StringValue::Get(out_val),
+		                                            StringValue::Get(text_val), DoubleValue::Get(opacity_val))));
+	}
+}
+
+static void PdfWatermarkFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfWatermarkFunInternal(args, result, false);
+}
+
+static void PdfWatermarkOpacityFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfWatermarkFunInternal(args, result, true);
+}
+
+// pdf_bates(input, output, prefix, start_number) -> VARCHAR (the output path).
+// Bates numbering: stamps prefix + a zero-padded (min 6 digits) sequential
+// number at the bottom-right of each page as real Helvetica text.
+static string PdfBatesImpl(const string &input, const string &output, const string &prefix, int64_t start_number) {
+	PdfOpsCheckInOut("pdf_bates", input, output);
+	try {
+		pdf_qpdf::Bates(input, output, prefix, static_cast<long long>(start_number), nullptr);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_bates: %s", string(e.what()));
+	}
+	return output;
+}
+
+static void PdfBatesFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		Value in_val = args.GetValue(0, row);
+		Value out_val = args.GetValue(1, row);
+		Value prefix_val = args.GetValue(2, row);
+		Value start_val = args.GetValue(3, row);
+		if (in_val.IsNull() || out_val.IsNull() || prefix_val.IsNull() || start_val.IsNull()) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		result.SetValue(row, Value(PdfBatesImpl(StringValue::Get(in_val), StringValue::Get(out_val),
+		                                        StringValue::Get(prefix_val), BigIntValue::Get(start_val))));
+	}
+}
+
 //===--------------------------------------------------------------------===//
 // qpdf suite: pdf_form_fields / pdf_annotations (table functions)
 //
@@ -5925,6 +5995,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction("pdf_pages",
 	                                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                                       LogicalType::VARCHAR, PdfPagesFun));
+
+	// pdf_watermark: 3-arg (default opacity 0.30) + 4-arg (explicit opacity).
+	ScalarFunctionSet pdf_watermark_set("pdf_watermark");
+	pdf_watermark_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                             LogicalType::VARCHAR, PdfWatermarkFun));
+	pdf_watermark_set.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::DOUBLE},
+	                   LogicalType::VARCHAR, PdfWatermarkOpacityFun));
+	loader.RegisterFunction(pdf_watermark_set);
+
+	loader.RegisterFunction(ScalarFunction(
+	    "pdf_bates", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+	    LogicalType::VARCHAR, PdfBatesFun));
 
 	TableFunction pdf_form_fields("pdf_form_fields", {LogicalType::VARCHAR}, PdfFormFieldsScan, PdfFormFieldsBind,
 	                              PdfQpdfRowsInit);

@@ -183,4 +183,22 @@ struct EmbeddedImage {
 // extracted is skipped rather than aborting the whole document.
 std::vector<EmbeddedImage> ReadImages(const std::string &path, const std::string &password);
 
+// Stamps `text` as a large diagonal (45°) gray watermark centered on every
+// page, on TOP of existing content (a fresh Helvetica text run appended to each
+// page's content stream, drawn through an ExtGState alpha). Because extractors
+// cannot regroup glyphs laid along a 45° baseline, an invisible (render mode 3)
+// horizontal copy of the same text is also stamped so the watermark round-trips
+// through the extracted text layer. `opacity` is the fill/stroke alpha
+// (0 < opacity <= 1, validated by the caller). Each page is sized from its own
+// MediaBox so mixed-size documents stamp correctly.
+void Watermark(const std::string &input, const std::string &output, const std::string &text, double opacity);
+
+// Bates numbering: stamps `prefix` followed by a zero-padded (min 6 digits)
+// sequential number (start_number, start_number+1, ...) at the bottom-right of
+// each page as real Helvetica text. When `stamped_labels` is non-null, the full
+// label applied to each page is appended in page order. Each page is positioned
+// from its own MediaBox.
+void Bates(const std::string &input, const std::string &output, const std::string &prefix, long long start_number,
+           std::vector<std::string> *stamped_labels = nullptr);
+
 } // namespace pdf_qpdf
