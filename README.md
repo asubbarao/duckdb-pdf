@@ -24,6 +24,11 @@ FROM pdf_info('docs/*.pdf');
 CREATE TABLE chunks AS FROM pdf_chunks('docs/*.pdf');
 ```
 
+> **See [COOKBOOK.md](COOKBOOK.md) for task-oriented recipes** — RAG ingestion,
+> full-text search, scanned-invoice OCR, quarantining broken files, signature
+> forensics, bulk document surgery, thumbnails, and reporting. This README is the
+> function-by-function reference.
+
 ## Installation
 
 ```sql
