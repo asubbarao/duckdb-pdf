@@ -239,7 +239,9 @@ These table functions answer "what is in this file?" without extracting body tex
 
 One row per file: identity metadata plus structural facts. Unset metadata keys and dates are `NULL`, never `''`. `width`/`height` are the first-page media box in points; `file_size` is bytes on disk.
 
-Columns: `file`, `title`, `author`, `subject`, `keywords`, `creator`, `producer`, `creation_date` (`TIMESTAMP`), `mod_date` (`TIMESTAMP`), `page_count`, `is_encrypted`, `is_linearized`, `pdf_version`, `width`, `height`, `file_size`.
+Columns: `file`, `title`, `author`, `subject`, `keywords`, `creator`, `producer`, `creation_date` (`TIMESTAMP`), `mod_date` (`TIMESTAMP`), `page_count`, `is_encrypted`, `is_linearized`, `pdf_version`, `width`, `height`, `file_size`, `pdfa_part` (`INTEGER`), `pdfa_conformance` (`VARCHAR`).
+
+`pdfa_part` and `pdfa_conformance` are read straight from the `pdfaid:part` / `pdfaid:conformance` claims in the document's XMP metadata packet — this is **detection only**, not validation. A file that merely declares `pdfaid:part=2, conformance=B` will report those values even if it does not actually conform to PDF/A. Both columns are `NULL` when the XMP packet is absent or carries no `pdfaid` claim.
 
 ```sql
 -- Census a folder of PDFs
@@ -462,6 +464,62 @@ SELECT pdf_watermark('report.pdf', 'report_faint.pdf', 'CONFIDENTIAL', 0.15);
 -- sequential number at the bottom-right of each page, incrementing per page.
 -- Page 1 -> ACME000100, page 2 -> ACME000101, ...
 SELECT pdf_bates('deposition.pdf', 'deposition_stamped.pdf', 'ACME', 100);
+```
+
+### `pdf_sign` — apply a digital signature
+
+`pdf_sign(input, output, cert_path, key_path)` adds an `adbe.pkcs7.detached` PKCS#7/CMS signature and writes the signed document to `output`. It is the inverse of `pdf_signatures` (above): the two form a closed loop — anything `pdf_sign` writes verifies back through `pdf_signatures` with `covers_whole_file = true` and `verified = true`. It is a single-row table function returning `{output, field_name}`.
+
+`cert_path` and `key_path` are **PEM** files — an X.509 certificate and its RSA/EC private key (PKCS#8 or PKCS#1). A self-signed pair is fine; the signature attests integrity, not certificate-chain trust (mirroring what `pdf_signatures` checks). Generate one with:
+
+```sh
+openssl genrsa -out key.pem 2048
+openssl req -new -x509 -key key.pem -out cert.pem -days 3650 -subj '/CN=Your Name'
+```
+
+Named options: `key_password` (decrypts an encrypted private key), `reason`, `location`, `signer_name` (populate the `/Reason` `/Location` `/Name` dictionary keys), `field_name` (the signature field name, default `'Signature1'`), and `password` (open an encrypted input PDF).
+
+```sql
+-- sign, then verify the closed loop with pdf_signatures
+SELECT output FROM pdf_sign('contract.pdf', 'contract_signed.pdf', 'cert.pem', 'key.pem',
+                            reason := 'I approve this document', location := 'San Francisco',
+                            signer_name := 'Jane Doe');
+
+SELECT field_name, signer_name, reason, covers_whole_file, verified
+FROM pdf_signatures('contract_signed.pdf');
+--   Signature1 | Jane Doe | I approve this document | true | true
+
+-- encrypted private key: supply its passphrase
+SELECT output FROM pdf_sign('contract.pdf', 'contract_signed.pdf', 'cert.pem', 'enc_key.pem',
+                            key_password := 'secret');
+```
+
+The signature covers the whole file via a `/ByteRange` around a fixed-size `/Contents` hole (8 KB of DER — ample for RSA-2048); an oversized signature raises an Invalid Input error. Standard `pdf_encrypt`/`pdf_decrypt` conventions apply: local paths, output overwritten, `input == output` refused.
+
+### `pdf_redact` — true (raster) redaction
+
+`pdf_redact(input, output, redactions [, dpi := 200, password := '...'])` performs **true removal**, not a black box drawn over live text. Every page carrying at least one redaction box is re-rendered to an RGB raster, the boxes are painted **solid black in the pixels**, and the page is rebuilt as an **image-only page** whose entire content is that raster. Because the page no longer contains any text object, the redacted text is **permanently unextractable** — `read_pdf` returns nothing for it, and there is no hidden text layer to recover (unlike a vector rectangle drawn on top of still-selectable text). Pages with no boxes are copied through byte-for-byte and keep their live text. It returns one row per output page: `page INTEGER`, `redacted BOOLEAN`, `boxes_applied INTEGER`.
+
+`redactions` is a `LIST(STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE))`. **Coordinate convention:** all values are in **PDF points** (1 pt = 1/72 in) with the **origin at the page's bottom-left corner** (standard PDF user space). `(x, y)` is the **lower-left corner** of the box; `w`/`h` are its width and height. `page` is **1-based**. A box that runs off the page is clamped to the raster.
+
+`dpi` (default 200) sets the render resolution of the rebuilt pages: higher dpi preserves more visual fidelity of the surrounding (unredacted) content but produces a larger output file; lower dpi is smaller but coarser. It does not affect the redaction guarantee — the covered text is gone at any dpi. Because redacted pages become images, their text is no longer selectable or searchable; leave unredacted pages untouched to preserve their text layer.
+
+```sql
+-- Redact one box over sensitive text on page 2 (origin bottom-left, points).
+-- Page 2 becomes an image; pages 1 and 3 keep their selectable text.
+SELECT page, redacted, boxes_applied
+FROM pdf_redact('statement.pdf', 'statement_redacted.pdf',
+                [{'page': 2, 'x': 72.0, 'y': 590.0, 'w': 260.0, 'h': 40.0}]);
+-- ┌──────┬──────────┬───────────────┐
+-- │ page │ redacted │ boxes_applied │
+-- ├──────┼──────────┼───────────────┤
+-- │    1 │ false    │             0 │
+-- │    2 │ true     │             1 │
+-- │    3 │ false    │             0 │
+-- └──────┴──────────┴───────────────┘
+
+-- The redacted text is gone — this returns 0 rows:
+SELECT * FROM read_pdf('statement_redacted.pdf') WHERE text LIKE '%account number%';
 ```
 
 ### `write_pdf` — native text-to-PDF (no LibreOffice)
@@ -710,6 +768,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_images(files)` | Table | One row per embedded image XObject; `data` is JPEG/JP2/PNG/raw bytes per `format`. |
 | `pdf_split(file, dir)` | Table | One single-page PDF per page; one row per emitted file. |
 | `pdf_split_blank(file, dir[, blank_threshold])` | Table | Splits on blank-page separators (mailroom batches); one row per emitted document. |
+| `pdf_redact(in, out, boxes [, dpi, password])` | Table | True raster redaction: replace boxed pages with image-only pages (text removed, not covered); one row per output page. |
 | `pdf_to_text(src [, layout])` | Scalar | Whole document as plain text. Path or `BLOB`. |
 | `pdf_to_markdown(path)` | Scalar | Whole document as GitHub-flavoured Markdown. |
 | `pdf_to_html(src)` | Scalar | Whole document as positioned HTML. Path or `BLOB`. |
@@ -724,6 +783,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_compress(in, out)` | Scalar | Structural compression + linearization. |
 | `pdf_encrypt(in, out, userpw [, ownerpw])` | Scalar | AES-256 password protection. |
 | `pdf_decrypt(in, out, pw)` | Scalar | Remove password protection. |
+| `pdf_sign(in, out, cert, key)` | Table | Apply an `adbe.pkcs7.detached` CMS signature (PEM cert+key); verifies via `pdf_signatures`. |
 | `write_pdf(text [, out])` | Scalar | Native text-to-PDF via libharu. |
 | `to_pdf(in [, out])` | Scalar | Office/markup document to PDF via LibreOffice (runtime shell-out). |
 | `COPY ... (FORMAT pdf)` | Copy | Query result to a typeset PDF; `TITLE`/`AUTHOR`/`HEADER`/`FOOTER`/`FONT_SIZE`/`PAGE_SIZE`/`MARGIN`. |

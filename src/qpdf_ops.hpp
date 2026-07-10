@@ -201,4 +201,55 @@ void Watermark(const std::string &input, const std::string &output, const std::s
 void Bates(const std::string &input, const std::string &output, const std::string &prefix, long long start_number,
            std::vector<std::string> *stamped_labels = nullptr);
 
+
+//===--------------------------------------------------------------------===//
+// pdf_sign — create a PKCS#7/CMS detached digital signature (the inverse of
+// ReadSignatures). qpdf builds an AcroForm /Sig field with a /ByteRange and a
+// fixed-width /Contents hex placeholder and writes the document deterministically
+// to an in-memory buffer; the ByteRange is then patched in place, the two spans
+// are hashed and signed with OpenSSL CMS_sign (detached, DER, PEM cert+key), and
+// the DER is hex-encoded into the /Contents hole before the final bytes are
+// written to `output`. The result verifies through ReadSignatures with
+// covers_whole_file = true and verified = true.
+//
+// `cert_path` / `key_path` are PEM files (X.509 certificate, PKCS#8/PKCS#1
+// private key). `key_password` decrypts an encrypted key ('' = unencrypted).
+// `reason` / `location` / `signer_name` populate the /Reason /Location /Name
+// dictionary keys ('' = omit). `field_name` names the /Sig field (the caller
+// defaults it to 'Signature1'). `password` opens an encrypted input ('' = none).
+//
+// Throws std::runtime_error on: unreadable cert/key, wrong key_password, a CMS
+// signing failure, or a DER blob larger than the /Contents placeholder.
+void SignDetached(const std::string &input, const std::string &output, const std::string &cert_path,
+                  const std::string &key_path, const std::string &key_password, const std::string &reason,
+                  const std::string &location, const std::string &signer_name, const std::string &field_name,
+                  const std::string &password);
+
+// One output page for pdf_redact. When `redacted` is true, the page is REPLACED
+// by an image-only page whose sole content is a single DeviceRGB image XObject
+// (8 bits/component) drawn to fill a MediaBox of `media_w` x `media_h` points —
+// there is no text object left on the page, so text under the redaction boxes
+// becomes permanently unextractable. `rgb` holds width*height*3 bytes, row-major,
+// TOP-DOWN (row 0 is the visual top of the page), already flipped/painted by the
+// caller. When `redacted` is false the original page is copied through untouched
+// and the image fields are ignored.
+struct RebuiltPage {
+	bool redacted = false;
+	int width = 0;      // raster pixel width  (redacted pages only)
+	int height = 0;     // raster pixel height (redacted pages only)
+	double media_w = 0; // target MediaBox width in points  (redacted pages only)
+	double media_h = 0; // target MediaBox height in points (redacted pages only)
+	std::string rgb;    // width*height*3 packed RGB bytes  (redacted pages only)
+};
+
+// Compose `output` from `input`: every page flagged `redacted` in `pages` has its
+// content, resources, annotations and rotation replaced by a single full-page
+// FlateDecode DeviceRGB image (see RebuiltPage); every unflagged page is carried
+// over verbatim. `pages.size()` MUST equal the input's page count (the caller
+// enforces this). `password` may be empty (unencrypted / owner-open). The caller
+// validates paths and that input != output; a bad password or unreadable file
+// surfaces via the error contract (thrown std::exception). Runs under QpdfMutex.
+void RebuildPagesAsImages(const std::string &input, const std::string &output, const std::vector<RebuiltPage> &pages,
+                          const std::string &password);
+
 } // namespace pdf_qpdf
