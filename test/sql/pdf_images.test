@@ -1,0 +1,79 @@
+# name: test/sql/pdf_images.test
+# description: pdf_images — extract embedded raster image XObjects
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── images.pdf: one DCTDecode JPEG (Im0) + one FlateDecode RGB bitmap (Im1) ──
+
+query I
+SELECT count(*) FROM pdf_images('test/data/images.pdf');
+----
+2
+
+# per-image metadata, ordered by resource name (Im0 then Im1)
+query IIIIIIII
+SELECT page, image_index, name, width, height, bits_per_component, colorspace, format
+FROM pdf_images('test/data/images.pdf')
+ORDER BY image_index;
+----
+1	1	Im0	16	16	8	DeviceRGB	jpeg
+1	2	Im1	4	3	8	DeviceRGB	png
+
+# every image carries non-empty data
+query I
+SELECT bool_and(octet_length(data) > 0) FROM pdf_images('test/data/images.pdf');
+----
+true
+
+# the DCTDecode row's data is the raw JPEG — starts with the SOI marker 0xFFD8
+query I
+SELECT data[1:2] = '\xFF\xD8'::BLOB
+FROM pdf_images('test/data/images.pdf')
+WHERE format = 'jpeg';
+----
+true
+
+# the FlateDecode RGB row is re-wrapped as PNG — starts with the PNG signature
+query I
+SELECT data[1:4] = '\x89PNG'::BLOB
+FROM pdf_images('test/data/images.pdf')
+WHERE format = 'png';
+----
+true
+
+# ── a PDF with no images yields zero rows (not an error) ──
+
+query I
+SELECT count(*) FROM pdf_images('test/data/hello.pdf');
+----
+0
+
+# ── glob mixes an image-bearing file (images.pdf) with an image-free one
+#    (incremental.pdf) — both valid; only images.pdf contributes rows ──
+
+query I
+SELECT count(*) FROM pdf_images('test/data/i*.pdf');
+----
+2
+
+query II
+SELECT DISTINCT file, count(*) OVER (PARTITION BY file)
+FROM pdf_images('test/data/i*.pdf');
+----
+test/data/images.pdf	2
+
+# the glob still surfaces exactly the two images from images.pdf
+query I
+SELECT count(*) FROM pdf_images('test/data/i*.pdf') WHERE format IN ('jpeg', 'png');
+----
+2
+
+# ── failure contract: missing file throws ──
+
+statement error
+SELECT * FROM pdf_images('test/data/does_not_exist_img.pdf');
+----

@@ -1,0 +1,119 @@
+# name: test/sql/pdf_sign.test
+# description: pdf_sign — create an adbe.pkcs7.detached CMS signature, verified by pdf_signatures
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── happy path: sign hello.pdf, closed-loop verify with pdf_signatures ──
+#
+# pdf_sign returns one row {output, field_name}; pdf_signatures over that output
+# must report the field with covers_whole_file = true and verified = true.
+
+query II
+SELECT output LIKE '%signed_basic.pdf', field_name
+FROM pdf_sign('test/data/hello.pdf', '__TEST_DIR__/signed_basic.pdf',
+              'test/data/sign_cert.pem', 'test/data/sign_key.pem',
+              reason := 'I approve', location := 'Bay Area', signer_name := 'Vori Signer');
+----
+true	Signature1
+
+query I
+SELECT count(*) FROM pdf_signatures('__TEST_DIR__/signed_basic.pdf');
+----
+1
+
+query IIIII
+SELECT field_name, subfilter, covers_whole_file, verified, has_verified
+FROM (
+  SELECT field_name, subfilter, covers_whole_file, verified,
+         verified IS NOT NULL AS has_verified
+  FROM pdf_signatures('__TEST_DIR__/signed_basic.pdf')
+);
+----
+Signature1	adbe.pkcs7.detached	true	true	true
+
+# dictionary metadata flows through from the named params
+query IIII
+SELECT signer_name, reason, location, signing_time IS NOT NULL
+FROM pdf_signatures('__TEST_DIR__/signed_basic.pdf');
+----
+Vori Signer	I approve	Bay Area	true
+
+# ── custom field_name is honored ──
+
+statement ok
+SELECT * FROM pdf_sign('test/data/hello.pdf', '__TEST_DIR__/signed_named.pdf',
+                       'test/data/sign_cert.pem', 'test/data/sign_key.pem',
+                       field_name := 'ApprovalSig');
+
+query III
+SELECT field_name, covers_whole_file, verified
+FROM pdf_signatures('__TEST_DIR__/signed_named.pdf');
+----
+ApprovalSig	true	true
+
+# ── original input is left unchanged ──
+
+query I
+SELECT count(*) FROM pdf_signatures('test/data/hello.pdf');
+----
+0
+
+# ── passphrase-protected key: correct key_password signs & verifies ──
+
+statement ok
+SELECT * FROM pdf_sign('test/data/hello.pdf', '__TEST_DIR__/signed_enc.pdf',
+                       'test/data/sign_cert.pem', 'test/data/sign_key_encrypted.pem',
+                       key_password := 'vori-secret');
+
+query II
+SELECT covers_whole_file, verified
+FROM pdf_signatures('__TEST_DIR__/signed_enc.pdf');
+----
+true	true
+
+# ── signing a multi-page document also verifies whole-file ──
+
+statement ok
+SELECT * FROM pdf_sign('test/data/two_pages.pdf', '__TEST_DIR__/signed_two.pdf',
+                       'test/data/sign_cert.pem', 'test/data/sign_key.pem');
+
+query II
+SELECT covers_whole_file, verified
+FROM pdf_signatures('__TEST_DIR__/signed_two.pdf');
+----
+true	true
+
+# ── error contract ──
+
+# wrong passphrase on the encrypted key
+statement error
+SELECT * FROM pdf_sign('test/data/hello.pdf', '__TEST_DIR__/signed_bad.pdf',
+                       'test/data/sign_cert.pem', 'test/data/sign_key_encrypted.pem',
+                       key_password := 'wrong-password');
+----
+key_password
+
+# missing certificate path
+statement error
+SELECT * FROM pdf_sign('test/data/hello.pdf', '__TEST_DIR__/signed_bad.pdf',
+                       'test/data/does_not_exist_cert.pem', 'test/data/sign_key.pem');
+----
+does not exist
+
+# missing input document
+statement error
+SELECT * FROM pdf_sign('test/data/does_not_exist.pdf', '__TEST_DIR__/signed_bad.pdf',
+                       'test/data/sign_cert.pem', 'test/data/sign_key.pem');
+----
+does not exist
+
+# input must differ from output
+statement error
+SELECT * FROM pdf_sign('test/data/hello.pdf', 'test/data/hello.pdf',
+                       'test/data/sign_cert.pem', 'test/data/sign_key.pem');
+----
+must differ

@@ -62,6 +62,18 @@ void Decrypt(const std::string &input, const std::string &output, const std::str
 // because copyForeignObject caches per source object).
 void Pages(const std::string &input, const std::string &output, const std::string &ranges);
 
+// Extracts each page range in `ranges` (1-based, inclusive [first, last])
+// into its own output PDF at <output_dir>/<stem>_doc<K>.pdf (K 1-based,
+// zero-padded to ranges.size()'s digit width); appends each written path to
+// `emitted`, in range order. Used by pdf_split_blank: the caller (poppler
+// side, pdf_extension.cpp) detects blank-page separators and computes the
+// content-page ranges; this function only does the qpdf extraction, exactly
+// like Split above but for arbitrary multi-page ranges instead of one page
+// each. The caller validates input/output_dir and computes stem/ranges; an
+// out-of-bounds or empty range throws (via the error contract).
+void SplitRanges(const std::string &input, const std::string &output_dir, const std::string &stem,
+                 const std::vector<std::pair<int, int>> &ranges, std::vector<std::string> &emitted);
+
 // One entry per AcroForm field. `type` is qpdf's raw field type name
 // ('/Tx', '/Btn', ...) — the caller maps it to display text.
 struct FormField {
@@ -136,5 +148,107 @@ struct SignatureInfo {
 // path exists; a wrong password or unreadable file surfaces via the error
 // contract (thrown std::exception).
 std::vector<SignatureInfo> ReadSignatures(const std::string &path, const std::string &password);
+
+// One entry per embedded image XObject per page (the actual stored raster, not a
+// page render). `image_index` is 1-based within its page; `name` is the resource
+// name ('Im0'). `colorspace` is the raw PDF colorspace name ('DeviceRGB',
+// 'ICCBased', 'Indexed', ...). `format` and `data` are paired:
+//   'jpeg' — /DCTDecode terminal filter; `data` is the raw JPEG (JFIF) bytes,
+//            passthrough (any earlier generalized filter such as /FlateDecode is
+//            undone first, the DCT layer is preserved).
+//   'jp2'  — /JPXDecode terminal filter; `data` is the raw JPEG-2000 codestream.
+//   'ccitt'— /CCITTFaxDecode terminal filter (qpdf cannot decode it); `data` is
+//            the raw fax-encoded bytes.
+//   'png'  — everything else (Flate/RunLength/LZW/none) fully decoded to raw
+//            samples and re-wrapped as a PNG so `data` is directly usable. Only
+//            DeviceGray/CalGray 1- or 8-bit and DeviceRGB/CalRGB 8-bit are
+//            wrapped as PNG.
+//   'raw'  — decoded samples that we do not know how to wrap losslessly as PNG
+//            (DeviceCMYK, Indexed, ICCBased, DeviceN, image masks, exotic
+//            bit depths, ...); `data` is the decoded sample bytes as-is.
+struct EmbeddedImage {
+	int page = 0;        // 1-based
+	int image_index = 0; // 1-based within page
+	std::string name;    // resource name ('Im0')
+	int width = 0;
+	int height = 0;
+	int bits_per_component = 0;
+	std::string colorspace; // raw PDF colorspace name
+	std::string format;     // 'jpeg' | 'jp2' | 'ccitt' | 'png' | 'raw'
+	std::string data;       // encoded/wrapped bytes per `format`
+};
+// `password` may be empty (unencrypted / owner-open). The caller validates the
+// path exists; a wrong password or unreadable file surfaces via the error
+// contract (thrown std::exception). A single image whose stream data cannot be
+// extracted is skipped rather than aborting the whole document.
+std::vector<EmbeddedImage> ReadImages(const std::string &path, const std::string &password);
+
+// Stamps `text` as a large diagonal (45°) gray watermark centered on every
+// page, on TOP of existing content (a fresh Helvetica text run appended to each
+// page's content stream, drawn through an ExtGState alpha). Because extractors
+// cannot regroup glyphs laid along a 45° baseline, an invisible (render mode 3)
+// horizontal copy of the same text is also stamped so the watermark round-trips
+// through the extracted text layer. `opacity` is the fill/stroke alpha
+// (0 < opacity <= 1, validated by the caller). Each page is sized from its own
+// MediaBox so mixed-size documents stamp correctly.
+void Watermark(const std::string &input, const std::string &output, const std::string &text, double opacity);
+
+// Bates numbering: stamps `prefix` followed by a zero-padded (min 6 digits)
+// sequential number (start_number, start_number+1, ...) at the bottom-right of
+// each page as real Helvetica text. When `stamped_labels` is non-null, the full
+// label applied to each page is appended in page order. Each page is positioned
+// from its own MediaBox.
+void Bates(const std::string &input, const std::string &output, const std::string &prefix, long long start_number,
+           std::vector<std::string> *stamped_labels = nullptr);
+
+//===--------------------------------------------------------------------===//
+// pdf_sign — create a PKCS#7/CMS detached digital signature (the inverse of
+// ReadSignatures). qpdf builds an AcroForm /Sig field with a /ByteRange and a
+// fixed-width /Contents hex placeholder and writes the document deterministically
+// to an in-memory buffer; the ByteRange is then patched in place, the two spans
+// are hashed and signed with OpenSSL CMS_sign (detached, DER, PEM cert+key), and
+// the DER is hex-encoded into the /Contents hole before the final bytes are
+// written to `output`. The result verifies through ReadSignatures with
+// covers_whole_file = true and verified = true.
+//
+// `cert_path` / `key_path` are PEM files (X.509 certificate, PKCS#8/PKCS#1
+// private key). `key_password` decrypts an encrypted key ('' = unencrypted).
+// `reason` / `location` / `signer_name` populate the /Reason /Location /Name
+// dictionary keys ('' = omit). `field_name` names the /Sig field (the caller
+// defaults it to 'Signature1'). `password` opens an encrypted input ('' = none).
+//
+// Throws std::runtime_error on: unreadable cert/key, wrong key_password, a CMS
+// signing failure, or a DER blob larger than the /Contents placeholder.
+void SignDetached(const std::string &input, const std::string &output, const std::string &cert_path,
+                  const std::string &key_path, const std::string &key_password, const std::string &reason,
+                  const std::string &location, const std::string &signer_name, const std::string &field_name,
+                  const std::string &password);
+
+// One output page for pdf_redact. When `redacted` is true, the page is REPLACED
+// by an image-only page whose sole content is a single DeviceRGB image XObject
+// (8 bits/component) drawn to fill a MediaBox of `media_w` x `media_h` points —
+// there is no text object left on the page, so text under the redaction boxes
+// becomes permanently unextractable. `rgb` holds width*height*3 bytes, row-major,
+// TOP-DOWN (row 0 is the visual top of the page), already flipped/painted by the
+// caller. When `redacted` is false the original page is copied through untouched
+// and the image fields are ignored.
+struct RebuiltPage {
+	bool redacted = false;
+	int width = 0;      // raster pixel width  (redacted pages only)
+	int height = 0;     // raster pixel height (redacted pages only)
+	double media_w = 0; // target MediaBox width in points  (redacted pages only)
+	double media_h = 0; // target MediaBox height in points (redacted pages only)
+	std::string rgb;    // width*height*3 packed RGB bytes  (redacted pages only)
+};
+
+// Compose `output` from `input`: every page flagged `redacted` in `pages` has its
+// content, resources, annotations and rotation replaced by a single full-page
+// FlateDecode DeviceRGB image (see RebuiltPage); every unflagged page is carried
+// over verbatim. `pages.size()` MUST equal the input's page count (the caller
+// enforces this). `password` may be empty (unencrypted / owner-open). The caller
+// validates paths and that input != output; a bad password or unreadable file
+// surfaces via the error contract (thrown std::exception). Runs under QpdfMutex.
+void RebuildPagesAsImages(const std::string &input, const std::string &output, const std::vector<RebuiltPage> &pages,
+                          const std::string &password);
 
 } // namespace pdf_qpdf

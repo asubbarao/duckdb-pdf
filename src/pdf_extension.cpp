@@ -32,6 +32,13 @@
 #include <tesseract/baseapi.h>
 #include <tesseract/resultiterator.h>
 
+// leptonica — image preprocessing (grayscale / deskew / binarize / despeckle)
+// applied to the rendered page before handing it to tesseract. Tesseract already
+// links leptonica (its Pix type is how images enter the engine), so no new
+// dependency is added here. Headers resolve via the same include dirs as
+// tesseract (brew/vcpkg both expose leptonica/allheaders.h).
+#include <leptonica/allheaders.h>
+
 // libharu — native PDF writer (C API) for write_pdf. No external processes.
 #include <hpdf.h>
 
@@ -878,20 +885,140 @@ static string ResolveTessdataDir(const string &language, const string &explicit_
 	return string();
 }
 
-// Render a poppler page and OCR it with tesseract, honoring engine knobs.
-static string OcrPage(poppler::page *page, const string &language, int dpi, int psm, int oem,
-                      const string &tessdata_dir) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-	poppler::page_renderer renderer;
-	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
-	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
-
-	poppler::image img = renderer.render_page(page, dpi, dpi);
+//===--------------------------------------------------------------------===//
+// Leptonica image preprocessing (grayscale / deskew / binarize / despeckle)
+//===--------------------------------------------------------------------===//
+// Convert a poppler render (argb32 by default; rgb24 handled too) into a fresh
+// 32bpp leptonica Pix so the preprocessing pipeline can operate on it. Returns
+// nullptr on any failure — the caller then falls back to feeding tesseract the
+// raw poppler bytes, so a conversion failure never blocks OCR.
+static Pix *PopplerImageToPix(const poppler::image &img) {
 	if (!img.is_valid()) {
-		return string();
+		return nullptr;
+	}
+	const int w = img.width();
+	const int h = img.height();
+	if (w <= 0 || h <= 0) {
+		return nullptr;
+	}
+	const char *base = img.const_data();
+	if (!base) {
+		return nullptr;
+	}
+	Pix *pix = pixCreate(w, h, 32);
+	if (!pix) {
+		return nullptr;
+	}
+	l_uint32 *data = pixGetData(pix);
+	const int wpl = pixGetWpl(pix);
+	const int bpr = img.bytes_per_row();
+	const bool is_rgb24 = (img.format() == poppler::image::format_rgb24);
+	for (int y = 0; y < h; y++) {
+		const unsigned char *row = reinterpret_cast<const unsigned char *>(base) + static_cast<size_t>(y) * bpr;
+		l_uint32 *line = data + static_cast<size_t>(y) * wpl;
+		for (int x = 0; x < w; x++) {
+			unsigned char r, g, b;
+			if (is_rgb24) {
+				const unsigned char *px = row + static_cast<size_t>(x) * 3;
+				r = px[0];
+				g = px[1];
+				b = px[2];
+			} else {
+				// argb32 in little-endian memory order is B,G,R,A.
+				const unsigned char *px = row + static_cast<size_t>(x) * 4;
+				b = px[0];
+				g = px[1];
+				r = px[2];
+			}
+			composeRGBPixel(r, g, b, &line[x]);
+		}
+	}
+	return pix;
+}
+
+// Conservative OCR preprocessing pipeline. Every leptonica call is null-guarded;
+// on any failure we return the best Pix produced so far (or nullptr, so the
+// caller reverts to the unprocessed image). Never throws, never crashes on tiny
+// or degenerate images.
+//   1. grayscale (pixConvertRGBToGray)
+//   2. deskew    (pixFindSkewSweepAndSearch on a binarized copy; if |angle|>0.3°
+//                 rotate the grayscale with area-map interpolation, white infill)
+//   3. binarize  (pixOtsuAdaptiveThreshold)
+//   4. despeckle (light 2x2 close-open, only at >=300 dpi where text strokes are
+//                 several pixels wide and 1px specks are safe to remove)
+static Pix *PreprocessPixForOcr(Pix *pixs, int dpi) {
+	if (!pixs) {
+		return nullptr;
+	}
+	const int w = pixGetWidth(pixs);
+	const int h = pixGetHeight(pixs);
+	if (w < 16 || h < 16) {
+		// Too small to meaningfully preprocess (deskew/Otsu are unreliable); let
+		// the caller OCR the original.
+		return nullptr;
 	}
 
-	tesseract::TessBaseAPI api;
+	// 1. Grayscale.
+	Pix *pixg = nullptr;
+	const int depth = pixGetDepth(pixs);
+	if (depth >= 24) {
+		pixg = pixConvertRGBToGray(pixs, 0.0f, 0.0f, 0.0f); // 0s => default luma weights
+	} else if (depth == 8) {
+		pixg = pixClone(pixs);
+	} else {
+		pixg = pixConvertTo8(pixs, 0);
+	}
+	if (!pixg) {
+		return nullptr;
+	}
+
+	// 2. Deskew: detect the skew angle on a binarized copy (leptonica's skew
+	//    finder requires 1bpp), then rotate the *grayscale* so the subsequent
+	//    Otsu threshold sees straightened strokes.
+	Pix *pixskew = pixThresholdToBinary(pixg, 130);
+	if (pixskew) {
+		l_float32 angle = 0.0f;
+		l_float32 conf = 0.0f;
+		if (pixFindSkewSweepAndSearch(pixskew, &angle, &conf, 4, 2, 7.0f, 1.0f, 0.01f) == 0 && conf > 0.0f &&
+		    fabsf(angle) > 0.3f) {
+			const l_float32 kDeg2Rad = 3.14159265358979323846f / 180.0f;
+			Pix *pixr = pixRotate(pixg, angle * kDeg2Rad, L_ROTATE_AREA_MAP, L_BRING_IN_WHITE, 0, 0);
+			if (pixr) {
+				pixDestroy(&pixg);
+				pixg = pixr;
+			}
+		}
+		pixDestroy(&pixskew);
+	}
+
+	// 3. Binarize (global Otsu — single tile spanning the whole page).
+	Pix *pixb = nullptr;
+	if (pixOtsuAdaptiveThreshold(pixg, pixGetWidth(pixg), pixGetHeight(pixg), 0, 0, 0.1f, nullptr, &pixb) != 0 ||
+	    !pixb) {
+		// Otsu failed: the (deskewed) grayscale is still a valid tesseract input.
+		pixSetResolution(pixg, dpi, dpi);
+		return pixg;
+	}
+	pixDestroy(&pixg);
+
+	// 4. Light despeckle at high render resolutions only.
+	if (dpi >= 300) {
+		char seq[] = "c2.2 o2.2";
+		Pix *pixc = pixMorphCompSequence(pixb, seq, 0);
+		if (pixc) {
+			pixDestroy(&pixb);
+			pixb = pixc;
+		}
+	}
+	pixSetResolution(pixb, dpi, dpi);
+	return pixb;
+}
+
+// Shared Init boilerplate: resolve the model dir and construct/initialize the
+// tesseract API, throwing the actionable install message if the model is
+// missing. Extracted so the text and word OCR paths share one code path.
+static void InitTesseract(tesseract::TessBaseAPI &api, const string &language, int psm, int oem,
+                          const string &tessdata_dir) {
 	// Tesseract needs a <lang>.traineddata model at runtime. vcpkg/most package
 	// managers do NOT ship language models, so OCR requires the user to install
 	// one. We auto-detect the standard install dirs (so a plain `brew install
@@ -910,16 +1037,83 @@ static string OcrPage(poppler::page *page, const string &language, int dpi, int 
 		    language, language, language);
 	}
 	api.SetPageSegMode(static_cast<tesseract::PageSegMode>(psm));
+}
 
-	const int bytes_per_pixel = 4; // poppler renders argb32; tesseract grayscales internally
-	api.SetImage(reinterpret_cast<const unsigned char *>(img.const_data()), img.width(), img.height(), bytes_per_pixel,
-	             img.bytes_per_row());
+// Feed the rendered page to tesseract, running the leptonica pipeline first when
+// `preprocess` is set. Ownership of any allocated Pix stays local — tesseract
+// clones the image internally — so both are destroyed after the call returns.
+// Returns the two Pix (base, processed) via out-params so the caller can destroy
+// them AFTER recognition completes (SetImage keeps a clone, so destroying before
+// GetUTF8Text/Recognize would be premature on some builds).
+static void SetOcrImage(tesseract::TessBaseAPI &api, const poppler::image &img, int dpi, bool preprocess, Pix *&base,
+                        Pix *&processed) {
+	base = preprocess ? PopplerImageToPix(img) : nullptr;
+	processed = base ? PreprocessPixForOcr(base, dpi) : nullptr;
+	Pix *use = processed ? processed : base;
+	if (use) {
+		api.SetImage(use);
+	} else {
+		const int bytes_per_pixel = 4; // poppler renders argb32; tesseract grayscales internally
+		api.SetImage(reinterpret_cast<const unsigned char *>(img.const_data()), img.width(), img.height(),
+		             bytes_per_pixel, img.bytes_per_row());
+	}
+}
 
-	char *out = api.GetUTF8Text();
-	string text = out ? string(out) : string();
-	delete[] out;
+// One page-text OCR pass at a fixed dpi. Returns the recognized text plus
+// tesseract's mean word confidence so the retry wrapper can compare attempts.
+struct OcrTextAttempt {
+	string text;
+	int confidence = 0; // MeanTextConf(): 0..100
+};
+
+static OcrTextAttempt OcrPageTextAttempt(poppler::page *page, const string &language, int dpi, int psm, int oem,
+                                         const string &tessdata_dir, bool preprocess) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	poppler::page_renderer renderer;
+	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
+	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
+
+	OcrTextAttempt out;
+	poppler::image img = renderer.render_page(page, dpi, dpi);
+	if (!img.is_valid()) {
+		return out;
+	}
+
+	tesseract::TessBaseAPI api;
+	InitTesseract(api, language, psm, oem, tessdata_dir);
+
+	Pix *base = nullptr;
+	Pix *processed = nullptr;
+	SetOcrImage(api, img, dpi, preprocess, base, processed);
+
+	char *text = api.GetUTF8Text();
+	out.text = text ? string(text) : string();
+	delete[] text;
+	out.confidence = api.MeanTextConf();
 	api.End();
-	return text;
+	if (processed) {
+		pixDestroy(&processed);
+	}
+	if (base) {
+		pixDestroy(&base);
+	}
+	return out;
+}
+
+// Render a poppler page and OCR it with tesseract, honoring engine knobs plus
+// the preprocessing (`preprocess`) and confidence-retry (`retry`) toggles. When
+// retry is on and the first pass is low-confidence at a sub-400 dpi render, we
+// re-render at 2x dpi and keep whichever pass scored higher.
+static string OcrPage(poppler::page *page, const string &language, int dpi, int psm, int oem,
+                      const string &tessdata_dir, bool preprocess, bool retry) {
+	OcrTextAttempt first = OcrPageTextAttempt(page, language, dpi, psm, oem, tessdata_dir, preprocess);
+	if (retry && first.confidence < 55 && dpi < 400) {
+		OcrTextAttempt second = OcrPageTextAttempt(page, language, dpi * 2, psm, oem, tessdata_dir, preprocess);
+		if (second.confidence > first.confidence) {
+			return second.text;
+		}
+	}
+	return first.text;
 }
 
 // Word-level OCR using tesseract ResultIterator at RIL_WORD. Reuses the exact
@@ -930,44 +1124,48 @@ struct OcrWord {
 	float confidence;
 };
 
-static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &language, int dpi, int psm, int oem,
-                                         const string &tessdata_dir) {
+// One word-level OCR pass at a fixed dpi. Carries tesseract's mean confidence
+// alongside the words so the retry wrapper keeps the higher-scoring pass (and,
+// with it, that pass's per-word confidences).
+struct OcrWordsAttempt {
+	std::vector<OcrWord> words;
+	int confidence = 0; // MeanTextConf(): 0..100
+};
+
+static OcrWordsAttempt OcrPageWordsAttempt(poppler::page *page, const string &language, int dpi, int psm, int oem,
+                                           const string &tessdata_dir, bool preprocess) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	poppler::page_renderer renderer;
 	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
 
+	OcrWordsAttempt out;
 	poppler::image img = renderer.render_page(page, dpi, dpi);
 	if (!img.is_valid()) {
-		return {};
+		return out;
 	}
 
 	tesseract::TessBaseAPI api;
-	string datadir = ResolveTessdataDir(language, tessdata_dir);
-	const char *datapath = datadir.empty() ? nullptr : datadir.c_str();
-	if (api.Init(datapath, language.c_str(), static_cast<tesseract::OcrEngineMode>(oem)) != 0) {
-		throw IOException(
-		    "read_pdf OCR: could not load the Tesseract model for language '%s'. Install a language model — "
-		    "macOS: `brew install tesseract-lang`; Debian/Ubuntu: `apt-get install tesseract-ocr-%s`; Windows: "
-		    "the UB Mannheim installer; or download %s.traineddata from "
-		    "https://github.com/tesseract-ocr/tessdata_fast. Standard install locations are auto-detected; if "
-		    "yours is non-standard, pass `tessdata_dir := '/path/to/tessdata'` or set the TESSDATA_PREFIX env var.",
-		    language, language, language);
-	}
-	api.SetPageSegMode(static_cast<tesseract::PageSegMode>(psm));
+	InitTesseract(api, language, psm, oem, tessdata_dir);
 
-	const int bytes_per_pixel = 4; // poppler renders argb32; tesseract grayscales internally
-	api.SetImage(reinterpret_cast<const unsigned char *>(img.const_data()), img.width(), img.height(), bytes_per_pixel,
-	             img.bytes_per_row());
+	Pix *base = nullptr;
+	Pix *processed = nullptr;
+	SetOcrImage(api, img, dpi, preprocess, base, processed);
 
 	int rec = api.Recognize(0);
 	if (rec != 0) {
 		// recognition failed; fall back cleanly to no words (avoid partial/broken results)
 		api.End();
-		return {};
+		if (processed) {
+			pixDestroy(&processed);
+		}
+		if (base) {
+			pixDestroy(&base);
+		}
+		return out;
 	}
+	out.confidence = api.MeanTextConf();
 	tesseract::ResultIterator *ri = api.GetIterator();
-	std::vector<OcrWord> result;
 	if (ri) {
 		do {
 			if (ri->Empty(tesseract::RIL_WORD)) {
@@ -989,13 +1187,34 @@ static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &lang
 			w.y1 = (img.height() - top) * 72.0 / dpi;
 			w.confidence = conf;
 			if (!w.text.empty()) {
-				result.push_back(std::move(w));
+				out.words.push_back(std::move(w));
 			}
 		} while (ri->Next(tesseract::RIL_WORD));
 		// ri is owned by api; do not delete
 	}
 	api.End();
-	return result;
+	if (processed) {
+		pixDestroy(&processed);
+	}
+	if (base) {
+		pixDestroy(&base);
+	}
+	return out;
+}
+
+// Word-level OCR with the same preprocessing + confidence-retry semantics as
+// OcrPage. On retry the higher-confidence pass wins, so the returned words carry
+// the confidences of whichever attempt was kept.
+static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &language, int dpi, int psm, int oem,
+                                         const string &tessdata_dir, bool preprocess, bool retry) {
+	OcrWordsAttempt first = OcrPageWordsAttempt(page, language, dpi, psm, oem, tessdata_dir, preprocess);
+	if (retry && first.confidence < 55 && dpi < 400) {
+		OcrWordsAttempt second = OcrPageWordsAttempt(page, language, dpi * 2, psm, oem, tessdata_dir, preprocess);
+		if (second.confidence > first.confidence) {
+			return std::move(second.words);
+		}
+	}
+	return std::move(first.words);
 }
 
 //===--------------------------------------------------------------------===//
@@ -1006,9 +1225,11 @@ struct PdfOptions {
 	bool auto_ocr = true;
 	string ocr_language = "eng";
 	int32_t ocr_dpi = 300;
-	int32_t ocr_psm = 3; // PSM_AUTO
-	int32_t ocr_oem = 3; // OEM_DEFAULT
-	string tessdata_dir; // optional: directory containing <lang>.traineddata
+	int32_t ocr_psm = 3;        // PSM_AUTO
+	int32_t ocr_oem = 3;        // OEM_DEFAULT
+	bool ocr_preprocess = true; // leptonica grayscale/deskew/binarize/despeckle before OCR
+	bool ocr_retry = true;      // re-render low-confidence sub-400dpi pages at 2x and keep the better result
+	string tessdata_dir;        // optional: directory containing <lang>.traineddata
 	string layout = "reading";
 	bool parse_tables = false;
 	string password;
@@ -1037,6 +1258,10 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 			o.ocr_psm = IntegerValue::Get(kv.second);
 		} else if (key == "ocr_oem") {
 			o.ocr_oem = IntegerValue::Get(kv.second);
+		} else if (key == "ocr_preprocess") {
+			o.ocr_preprocess = BooleanValue::Get(kv.second);
+		} else if (key == "ocr_retry") {
+			o.ocr_retry = BooleanValue::Get(kv.second);
 		} else if (key == "tessdata_dir") {
 			o.tessdata_dir = StringValue::Get(kv.second);
 		} else if (key == "layout") {
@@ -1085,6 +1310,8 @@ static void AddCommonNamedParams(TableFunction &fn) {
 	fn.named_parameters["ocr_dpi"] = LogicalType::INTEGER;
 	fn.named_parameters["ocr_psm"] = LogicalType::INTEGER;
 	fn.named_parameters["ocr_oem"] = LogicalType::INTEGER;
+	fn.named_parameters["ocr_preprocess"] = LogicalType::BOOLEAN;
+	fn.named_parameters["ocr_retry"] = LogicalType::BOOLEAN;
 	fn.named_parameters["tessdata_dir"] = LogicalType::VARCHAR;
 	fn.named_parameters["layout"] = LogicalType::VARCHAR;
 	fn.named_parameters["parse_tables"] = LogicalType::BOOLEAN;
@@ -1279,8 +1506,9 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 				}
 				bool blank = text.find_first_not_of(" \t\r\n\f\v") == string::npos;
 				if (bind.opt.force_ocr || (bind.opt.auto_ocr && blank)) {
-					string ocr = OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
-					                     bind.opt.ocr_oem, bind.opt.tessdata_dir);
+					string ocr =
+					    OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm, bind.opt.ocr_oem,
+					            bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry);
 					if (!ocr.empty()) {
 						text = ocr;
 					}
@@ -1409,6 +1637,62 @@ static Value InspectDateOrNull(time_t t) {
 	return Value::TIMESTAMP(Timestamp::FromEpochSeconds((int64_t)t));
 }
 
+// Trim leading/trailing ASCII whitespace from an XMP-extracted value.
+static string TrimXmpValue(const string &s) {
+	size_t a = 0, b = s.size();
+	while (a < b && isspace((unsigned char)s[a])) {
+		a++;
+	}
+	while (b > a && isspace((unsigned char)s[b - 1])) {
+		b--;
+	}
+	return s.substr(a, b - a);
+}
+
+// Detection-only scan of an XMP metadata packet for a pdfaid:<key> value.
+// Handles both the attribute form (pdfaid:part="2") and the element form
+// (<pdfaid:part>2</pdfaid:part>) that both occur in the wild. Returns the
+// trimmed value, or an empty string when the key is absent. No validation and
+// no XML library — a corrupt packet simply yields no match.
+static string ExtractPdfaId(const string &xmp, const string &key) {
+	const string needle = "pdfaid:" + key;
+	size_t pos = 0;
+	while ((pos = xmp.find(needle, pos)) != string::npos) {
+		// Skip closing tags like </pdfaid:part>.
+		if (pos > 0 && xmp[pos - 1] == '/') {
+			pos += needle.size();
+			continue;
+		}
+		size_t p = pos + needle.size();
+		while (p < xmp.size() && isspace((unsigned char)xmp[p])) {
+			p++;
+		}
+		if (p < xmp.size() && xmp[p] == '=') {
+			// Attribute form: pdfaid:key="value" or pdfaid:key='value'.
+			p++;
+			while (p < xmp.size() && isspace((unsigned char)xmp[p])) {
+				p++;
+			}
+			if (p < xmp.size() && (xmp[p] == '"' || xmp[p] == '\'')) {
+				char quote = xmp[p++];
+				size_t end = xmp.find(quote, p);
+				if (end != string::npos) {
+					return TrimXmpValue(xmp.substr(p, end - p));
+				}
+			}
+		} else if (p < xmp.size() && xmp[p] == '>') {
+			// Element form: <pdfaid:key>value</pdfaid:key>.
+			p++;
+			size_t end = xmp.find('<', p);
+			if (end != string::npos) {
+				return TrimXmpValue(xmp.substr(p, end - p));
+			}
+		}
+		pos += needle.size();
+	}
+	return string();
+}
+
 //===--------------------------------------------------------------------===//
 // pdf_info  -> one row per file (identity + geometry + storage census)
 //===--------------------------------------------------------------------===//
@@ -1424,10 +1708,11 @@ static unique_ptr<FunctionData> PdfInfoBind(ClientContext &context, TableFunctio
 	return_types = {LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP,
 	                LogicalType::TIMESTAMP, LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::VARCHAR,   LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BIGINT};
+	                LogicalType::VARCHAR,   LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BIGINT,
+	                LogicalType::INTEGER,   LogicalType::VARCHAR};
 	names = {"file",        "title",         "author",   "subject",    "keywords",     "creator",
 	         "producer",    "creation_date", "mod_date", "page_count", "is_encrypted", "is_linearized",
-	         "pdf_version", "width",         "height",   "file_size"};
+	         "pdf_version", "width",         "height",   "file_size",  "pdfa_part",    "pdfa_conformance"};
 	return PdfInspectBindCommon(context, input);
 }
 
@@ -1459,6 +1744,32 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 			height_val = Value::DOUBLE(rect.height());
 		}
 
+		// PDF/A identification from the XMP metadata packet (detection only,
+		// no validation): pdfaid:part (INTEGER) and pdfaid:conformance (A/B/U).
+		Value pdfa_part_val(LogicalType::INTEGER);
+		Value pdfa_conformance_val(LogicalType::VARCHAR);
+		{
+			string xmp = UStringToUtf8(doc->metadata());
+			if (!xmp.empty()) {
+				string part_str = ExtractPdfaId(xmp, "part");
+				if (!part_str.empty()) {
+					try {
+						size_t consumed = 0;
+						int part = std::stoi(part_str, &consumed);
+						if (consumed == part_str.size()) {
+							pdfa_part_val = Value::INTEGER(part);
+						}
+					} catch (const std::exception &) {
+						// non-numeric part -> leave NULL
+					}
+				}
+				string conformance = ExtractPdfaId(xmp, "conformance");
+				if (!conformance.empty()) {
+					pdfa_conformance_val = Value(conformance);
+				}
+			}
+		}
+
 		output.SetValue(0, count, Value(path));
 		output.SetValue(1, count, InspectStringOrNull(UStringToUtf8(doc->info_key("Title"))));
 		output.SetValue(2, count, InspectStringOrNull(UStringToUtf8(doc->info_key("Author"))));
@@ -1475,6 +1786,8 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 		output.SetValue(13, count, width_val);
 		output.SetValue(14, count, height_val);
 		output.SetValue(15, count, Value::BIGINT((int64_t)bytes.size()));
+		output.SetValue(16, count, pdfa_part_val);
+		output.SetValue(17, count, pdfa_conformance_val);
 		st.idx++;
 		count++;
 	}
@@ -2070,16 +2383,16 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 	if (page) {
 		if (opt.force_ocr) {
 			// force_ocr runs OCR unconditionally, even if native text layer present
-			g.ocr_boxes =
-			    OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem, opt.tessdata_dir);
+			g.ocr_boxes = OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem,
+			                           opt.tessdata_dir, opt.ocr_preprocess, opt.ocr_retry);
 			g.page_is_ocr = !g.ocr_boxes.empty();
 		} else {
 			g.boxes = page->text_list(poppler::page::text_list_include_font);
 			if (!g.boxes.empty()) {
 				g.page_is_ocr = false;
 			} else if (opt.auto_ocr) {
-				g.ocr_boxes =
-				    OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem, opt.tessdata_dir);
+				g.ocr_boxes = OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem,
+				                           opt.tessdata_dir, opt.ocr_preprocess, opt.ocr_retry);
 				g.page_is_ocr = !g.ocr_boxes.empty();
 			} else {
 				g.page_is_ocr = false;
@@ -3114,8 +3427,9 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 			std::vector<PdfWord> words;
 			if (bind.opt.force_ocr) {
 				// force_ocr runs OCR unconditionally (bypasses native text layer)
-				auto ocr_words = OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
-				                              bind.opt.ocr_oem, bind.opt.tessdata_dir);
+				auto ocr_words =
+				    OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
+				                 bind.opt.ocr_oem, bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry);
 				for (auto &ow : ocr_words) {
 					PdfWord w;
 					w.xMin = ow.x0;
@@ -3138,7 +3452,8 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 				}
 				if (words.empty() && bind.opt.auto_ocr) {
 					auto ocr_words = OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
-					                              bind.opt.ocr_oem, bind.opt.tessdata_dir);
+					                              bind.opt.ocr_oem, bind.opt.tessdata_dir, bind.opt.ocr_preprocess,
+					                              bind.opt.ocr_retry);
 					for (auto &ow : ocr_words) {
 						PdfWord w;
 						w.xMin = ow.x0;
@@ -5084,6 +5399,198 @@ static void PdfSplitScan(ClientContext &context, TableFunctionInput &data_p, Dat
 }
 
 //===--------------------------------------------------------------------===//
+// pdf_split_blank(input, output_dir[, blank_threshold]) -> TABLE(document
+// INTEGER, first_page INTEGER, last_page INTEGER, page_count INTEGER, file
+// VARCHAR).
+//
+// Mailroom batch splitting: an office scanner produces ONE PDF that is really
+// N documents separated by blank sheets. A page is a SEPARATOR when it has no
+// extractable text AND its raster is (near-)white — text-empty alone would
+// false-positive on a full-page-image scan (e.g. a scanned photo with no OCR
+// layer). Detection runs here, on the poppler side; the qpdf side
+// (pdf_qpdf::SplitRanges, qpdf_ops.cpp) only extracts the already-computed
+// content-page ranges into separate files, exactly like pdf_split /
+// pdf_qpdf::Split above but for multi-page ranges instead of one page each.
+//===--------------------------------------------------------------------===//
+
+// Renders the page at a low DPI (detection doesn't need print resolution) and
+// reports whether the fraction of near-white pixels meets `threshold`. Shares
+// the exact render hints as OcrPage / RenderPageToPngBytes; reads the raw
+// argb32 buffer directly instead of round-tripping through PNG or tesseract.
+static bool PageRendersNearWhite(poppler::page *page, double threshold) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	poppler::page_renderer renderer;
+	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
+	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
+
+	const int32_t kBlankCheckDpi = 72; // low-res is enough to tell blank from content
+	poppler::image img = renderer.render_page(page, kBlankCheckDpi, kBlankCheckDpi);
+	if (!img.is_valid() || img.width() <= 0 || img.height() <= 0) {
+		// Can't render — never claim blank on a page we couldn't inspect.
+		return false;
+	}
+
+	const int width = img.width();
+	const int height = img.height();
+	const int stride = img.bytes_per_row();
+	const auto *data = reinterpret_cast<const unsigned char *>(img.const_data());
+	const unsigned char kNearWhiteChannel = 250; // out of 255, per color channel
+	int64_t white_pixels = 0;
+	const int64_t total_pixels = static_cast<int64_t>(width) * static_cast<int64_t>(height);
+	for (int y = 0; y < height; y++) {
+		const unsigned char *row = data + static_cast<size_t>(y) * static_cast<size_t>(stride);
+		for (int x = 0; x < width; x++) {
+			// poppler renders argb32; alpha is always opaque for a page raster, so
+			// checking the first 3 bytes (order-agnostic for a whiteness test —
+			// white is 255 on every channel regardless of byte order) is enough.
+			const unsigned char *px = row + static_cast<size_t>(x) * 4;
+			if (px[0] >= kNearWhiteChannel && px[1] >= kNearWhiteChannel && px[2] >= kNearWhiteChannel) {
+				white_pixels++;
+			}
+		}
+	}
+	return total_pixels > 0 && (static_cast<double>(white_pixels) / static_cast<double>(total_pixels)) >= threshold;
+}
+
+struct PdfSplitBlankBindData : public TableFunctionData {
+	string input;
+	string output_dir;
+	double blank_threshold = 0.995;
+};
+
+struct PdfSplitBlankEmitted {
+	int document = 0;
+	int first_page = 0;
+	int last_page = 0;
+	int page_count = 0;
+	string file;
+};
+
+struct PdfSplitBlankState : public GlobalTableFunctionState {
+	bool executed = false;
+	idx_t emit_idx = 0;
+	std::vector<PdfSplitBlankEmitted> emitted;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfSplitBlankBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfSplitBlankBindData>();
+	result->input = StringValue::Get(input.inputs[0]);
+	result->output_dir = StringValue::Get(input.inputs[1]);
+	for (auto &kv : input.named_parameters) {
+		auto key = StringUtil::Lower(kv.first);
+		if (key == "blank_threshold") {
+			result->blank_threshold = DoubleValue::Get(kv.second);
+		}
+	}
+	if (!(result->blank_threshold > 0.0) || result->blank_threshold > 1.0) {
+		throw InvalidInputException("pdf_split_blank: blank_threshold must be in (0, 1] (got %f)",
+		                            result->blank_threshold);
+	}
+	return_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::VARCHAR};
+	names = {"document", "first_page", "last_page", "page_count", "file"};
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfSplitBlankInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfSplitBlankState>();
+}
+
+// Detects separator pages, then delegates the actual file writing to qpdf.
+static void PdfSplitBlankExecute(ClientContext &context, const string &input, const string &output_dir,
+                                 double blank_threshold, std::vector<PdfSplitBlankEmitted> &emitted) {
+	PdfOpsCheckInputExists("pdf_split_blank", input);
+	{
+		auto fs = FileSystem::CreateLocal();
+		if (!fs->DirectoryExists(output_dir)) {
+			throw InvalidInputException("pdf_split_blank: output directory '%s' does not exist", output_dir);
+		}
+	}
+
+	string bytes;
+	ReadAllBytes(context, input, bytes);
+	auto doc = LoadDoc(bytes, "", input);
+	const int page_count = doc->pages();
+
+	std::vector<bool> is_separator(page_count, false);
+	{
+		PopplerDocGuard poppler_guard;
+		for (int i = 0; i < page_count; i++) {
+			unique_ptr<poppler::page> page(doc->create_page(i));
+			if (!page) {
+				continue; // unreadable page: never treat as a separator
+			}
+			string text = UStringToUtf8(page->text(poppler::rectf(), poppler::page::physical_layout));
+			bool text_blank = text.find_first_not_of(" \t\r\n\f\v") == string::npos;
+			is_separator[i] = text_blank && PageRendersNearWhite(page.get(), blank_threshold);
+		}
+	}
+
+	// Contiguous runs of non-separator pages, 1-based inclusive. Leading /
+	// trailing / consecutive separator pages simply never open (or immediately
+	// close without opening) a run, so no empty document is ever emitted; an
+	// all-blank file leaves `ranges` empty, so zero rows are emitted.
+	std::vector<std::pair<int, int>> ranges;
+	int range_start = -1;
+	for (int i = 0; i < page_count; i++) {
+		if (!is_separator[i]) {
+			if (range_start == -1) {
+				range_start = i;
+			}
+		} else if (range_start != -1) {
+			ranges.emplace_back(range_start + 1, i);
+			range_start = -1;
+		}
+	}
+	if (range_start != -1) {
+		ranges.emplace_back(range_start + 1, page_count);
+	}
+
+	std::vector<string> files;
+	try {
+		pdf_qpdf::SplitRanges(input, output_dir, PdfOpsStem(input), ranges, files);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_split_blank: %s", string(e.what()));
+	}
+
+	for (size_t k = 0; k < ranges.size(); k++) {
+		PdfSplitBlankEmitted row;
+		row.document = static_cast<int>(k) + 1;
+		row.first_page = ranges[k].first;
+		row.last_page = ranges[k].second;
+		row.page_count = ranges[k].second - ranges[k].first + 1;
+		row.file = files[k];
+		emitted.push_back(std::move(row));
+	}
+}
+
+static void PdfSplitBlankScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfSplitBlankBindData>();
+	auto &st = data_p.global_state->Cast<PdfSplitBlankState>();
+	if (!st.executed) {
+		// Side effects happen at scan time (not bind), so EXPLAIN writes nothing.
+		PdfSplitBlankExecute(context, bind.input, bind.output_dir, bind.blank_threshold, st.emitted);
+		st.executed = true;
+	}
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && st.emit_idx < st.emitted.size()) {
+		auto &row = st.emitted[st.emit_idx];
+		output.SetValue(0, count, Value::INTEGER(row.document));
+		output.SetValue(1, count, Value::INTEGER(row.first_page));
+		output.SetValue(2, count, Value::INTEGER(row.last_page));
+		output.SetValue(3, count, Value::INTEGER(row.page_count));
+		output.SetValue(4, count, Value(row.file));
+		st.emit_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
 // qpdf suite: pdf_compress / pdf_encrypt / pdf_decrypt / pdf_pages
 //
 // Same conventions as pdf_merge/pdf_rotate: local filesystem paths exactly as
@@ -5223,6 +5730,76 @@ static void PdfPagesFun(DataChunk &args, ExpressionState &state, Vector &result)
 		}
 		result.SetValue(row, Value(PdfPagesImpl(StringValue::Get(in_val), StringValue::Get(out_val),
 		                                        StringValue::Get(ranges_val))));
+	}
+}
+
+// pdf_watermark(input, output, text[, opacity]) -> VARCHAR (the output path).
+// Stamps `text` as a large diagonal gray watermark, on top of every page's
+// content, as real (selectable) Helvetica text. `opacity` is the fill alpha,
+// default 0.30, and must be in (0, 1].
+static string PdfWatermarkImpl(const string &input, const string &output, const string &text, double opacity) {
+	PdfOpsCheckInOut("pdf_watermark", input, output);
+	if (!(opacity > 0.0 && opacity <= 1.0)) {
+		throw InvalidInputException("pdf_watermark: opacity must be in (0, 1] (got %f)", opacity);
+	}
+	try {
+		pdf_qpdf::Watermark(input, output, text, opacity);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_watermark: %s", string(e.what()));
+	}
+	return output;
+}
+
+static void PdfWatermarkFunInternal(DataChunk &args, Vector &result, bool has_opacity_arg) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		Value in_val = args.GetValue(0, row);
+		Value out_val = args.GetValue(1, row);
+		Value text_val = args.GetValue(2, row);
+		Value opacity_val = has_opacity_arg ? args.GetValue(3, row) : Value::DOUBLE(0.30);
+		if (in_val.IsNull() || out_val.IsNull() || text_val.IsNull() || opacity_val.IsNull()) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		result.SetValue(row, Value(PdfWatermarkImpl(StringValue::Get(in_val), StringValue::Get(out_val),
+		                                            StringValue::Get(text_val), DoubleValue::Get(opacity_val))));
+	}
+}
+
+static void PdfWatermarkFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfWatermarkFunInternal(args, result, false);
+}
+
+static void PdfWatermarkOpacityFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfWatermarkFunInternal(args, result, true);
+}
+
+// pdf_bates(input, output, prefix, start_number) -> VARCHAR (the output path).
+// Bates numbering: stamps prefix + a zero-padded (min 6 digits) sequential
+// number at the bottom-right of each page as real Helvetica text.
+static string PdfBatesImpl(const string &input, const string &output, const string &prefix, int64_t start_number) {
+	PdfOpsCheckInOut("pdf_bates", input, output);
+	try {
+		pdf_qpdf::Bates(input, output, prefix, static_cast<long long>(start_number), nullptr);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_bates: %s", string(e.what()));
+	}
+	return output;
+}
+
+static void PdfBatesFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		Value in_val = args.GetValue(0, row);
+		Value out_val = args.GetValue(1, row);
+		Value prefix_val = args.GetValue(2, row);
+		Value start_val = args.GetValue(3, row);
+		if (in_val.IsNull() || out_val.IsNull() || prefix_val.IsNull() || start_val.IsNull()) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		result.SetValue(row, Value(PdfBatesImpl(StringValue::Get(in_val), StringValue::Get(out_val),
+		                                        StringValue::Get(prefix_val), BigIntValue::Get(start_val))));
 	}
 }
 
@@ -5502,6 +6079,424 @@ static void PdfSignaturesScan(ClientContext &context, TableFunctionInput &data_p
 	PdfQpdfRowsEmit(st, output);
 }
 
+// pdf_sign(input, output, cert_path, key_path) -> one row {output, field_name}.
+//
+// Creates an adbe.pkcs7.detached CMS signature over the whole file. The qpdf
+// field construction, deterministic write, ByteRange patch, and OpenSSL CMS_sign
+// all live in qpdf_ops.cpp (the C++17 qpdf/openssl TU). This file only validates
+// paths, resolves the named parameters, and shapes the single result row. The
+// signed output verifies through pdf_signatures with covers_whole_file = true and
+// verified = true.
+//===--------------------------------------------------------------------===//
+
+struct PdfSignBindData : public TableFunctionData {
+	string input;
+	string output;
+	string cert_path;
+	string key_path;
+	string key_password;
+	string reason;
+	string location;
+	string signer_name;
+	string field_name = "Signature1";
+	string password;
+};
+
+static unique_ptr<FunctionData> PdfSignBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfSignBindData>();
+	result->input = StringValue::Get(input.inputs[0]);
+	result->output = StringValue::Get(input.inputs[1]);
+	result->cert_path = StringValue::Get(input.inputs[2]);
+	result->key_path = StringValue::Get(input.inputs[3]);
+	for (auto &kv : input.named_parameters) {
+		auto key = StringUtil::Lower(kv.first);
+		if (kv.second.IsNull()) {
+			continue;
+		}
+		if (key == "key_password") {
+			result->key_password = StringValue::Get(kv.second);
+		} else if (key == "reason") {
+			result->reason = StringValue::Get(kv.second);
+		} else if (key == "location") {
+			result->location = StringValue::Get(kv.second);
+		} else if (key == "signer_name") {
+			result->signer_name = StringValue::Get(kv.second);
+		} else if (key == "field_name") {
+			result->field_name = StringValue::Get(kv.second);
+		} else if (key == "password") {
+			result->password = StringValue::Get(kv.second);
+		}
+	}
+	if (result->field_name.empty()) {
+		result->field_name = "Signature1";
+	}
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+	names = {"output", "field_name"};
+	return std::move(result);
+}
+
+static void PdfSignScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfSignBindData>();
+	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
+	if (!st.executed) {
+		PdfOpsCheckInOut("pdf_sign", bind.input, bind.output);
+		PdfOpsCheckInputExists("pdf_sign", bind.cert_path);
+		PdfOpsCheckInputExists("pdf_sign", bind.key_path);
+		try {
+			pdf_qpdf::SignDetached(bind.input, bind.output, bind.cert_path, bind.key_path, bind.key_password,
+			                       bind.reason, bind.location, bind.signer_name, bind.field_name, bind.password);
+		} catch (const std::exception &e) {
+			throw InvalidInputException("pdf_sign: %s", string(e.what()));
+		}
+		st.rows.push_back({Value(bind.output), Value(bind.field_name)});
+		st.executed = true;
+	}
+	PdfQpdfRowsEmit(st, output);
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_redact(input, output, redactions[, dpi := 200, password := '...'])
+//   -> TABLE(page INTEGER, redacted BOOLEAN, boxes_applied INTEGER)
+//
+// TRUE (raster) redaction — the redacted text is removed, not merely hidden
+// behind a drawn rectangle. `redactions` is a LIST(STRUCT(page INTEGER,
+// x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE)) in PDF POINTS with the ORIGIN at the
+// page's BOTTOM-LEFT (standard PDF user space): (x, y) is the lower-left corner
+// of the box, w/h its width/height. `page` is 1-based.
+//
+// Every page carrying at least one box is re-rendered to an RGB raster (poppler,
+// the same renderer read_pdf/pdf_to_png use), the boxes are painted solid black
+// in the raster, and the page is rebuilt (qpdf side) as an image-only page whose
+// only content is that raster. The whole page becomes an image, so NO text from
+// a redacted page is extractable afterwards. Pages with no boxes are copied
+// through untouched and keep their live text.
+//
+// Side effects (rendering + file write) happen at SCAN time, not bind, so a bare
+// EXPLAIN writes nothing.
+//===--------------------------------------------------------------------===//
+struct RedactBox {
+	int page = 0; // 1-based
+	double x = 0, y = 0, w = 0, h = 0;
+};
+
+struct PdfRedactBindData : public TableFunctionData {
+	string input;
+	string output;
+	string password;
+	int32_t dpi = 200;
+	vector<RedactBox> boxes;
+};
+
+struct PdfRedactState : public GlobalTableFunctionState {
+	bool executed = false;
+	idx_t emit_idx = 0;
+	std::vector<std::vector<Value>> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+// Read a STRUCT field by (case-insensitive) name; throws if absent.
+static const Value &RedactStructField(const vector<string> &field_names, const vector<Value> &field_vals,
+                                      const char *name) {
+	for (idx_t i = 0; i < field_names.size(); i++) {
+		if (StringUtil::Lower(field_names[i]) == name) {
+			return field_vals[i];
+		}
+	}
+	throw InvalidInputException("pdf_redact: redaction struct is missing required field '%s' "
+	                            "(expected STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE))",
+	                            name);
+}
+
+static unique_ptr<FunctionData> PdfRedactBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfRedactBindData>();
+	result->input = StringValue::Get(input.inputs[0]);
+	result->output = StringValue::Get(input.inputs[1]);
+
+	// redactions: LIST(STRUCT(page, x, y, w, h)).
+	const Value &list_val = input.inputs[2];
+	if (!list_val.IsNull()) {
+		auto &child_type = ListType::GetChildType(list_val.type());
+		if (child_type.id() != LogicalTypeId::STRUCT) {
+			throw InvalidInputException("pdf_redact: `redactions` must be a LIST of "
+			                            "STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE)");
+		}
+		auto &struct_children = StructType::GetChildTypes(child_type);
+		vector<string> field_names;
+		for (auto &kv : struct_children) {
+			field_names.push_back(kv.first);
+		}
+		for (auto &el : ListValue::GetChildren(list_val)) {
+			if (el.IsNull()) {
+				throw InvalidInputException("pdf_redact: `redactions` list contains a NULL entry");
+			}
+			auto &field_vals = StructValue::GetChildren(el);
+			RedactBox box;
+			box.page = IntegerValue::Get(
+			    RedactStructField(field_names, field_vals, "page").DefaultCastAs(LogicalType::INTEGER));
+			box.x =
+			    DoubleValue::Get(RedactStructField(field_names, field_vals, "x").DefaultCastAs(LogicalType::DOUBLE));
+			box.y =
+			    DoubleValue::Get(RedactStructField(field_names, field_vals, "y").DefaultCastAs(LogicalType::DOUBLE));
+			box.w =
+			    DoubleValue::Get(RedactStructField(field_names, field_vals, "w").DefaultCastAs(LogicalType::DOUBLE));
+			box.h =
+			    DoubleValue::Get(RedactStructField(field_names, field_vals, "h").DefaultCastAs(LogicalType::DOUBLE));
+			if (box.page < 1) {
+				throw InvalidInputException("pdf_redact: redaction page must be >= 1 (got %d)", box.page);
+			}
+			result->boxes.push_back(box);
+		}
+	}
+
+	for (auto &kv : input.named_parameters) {
+		auto key = StringUtil::Lower(kv.first);
+		if (key == "dpi") {
+			result->dpi = IntegerValue::Get(kv.second.DefaultCastAs(LogicalType::INTEGER));
+		} else if (key == "password") {
+			result->password = StringValue::Get(kv.second);
+		}
+	}
+	if (result->dpi < 1 || result->dpi > 2400) {
+		throw InvalidInputException("pdf_redact: dpi must be between 1 and 2400 (got %d)", result->dpi);
+	}
+
+	return_types = {LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::INTEGER};
+	names = {"page", "redacted", "boxes_applied"};
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfRedactInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfRedactState>();
+}
+
+// Render one page to RGB and paint the given boxes black. `boxes` are in PDF
+// points, origin bottom-left. Fills the RebuiltPage (top-down RGB, media dims).
+static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page_idx0, int dpi,
+                                                const vector<const RedactBox *> &boxes) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	unique_ptr<poppler::page> page(doc.create_page(page_idx0));
+	if (!page) {
+		throw IOException("pdf_redact: could not read page %d", page_idx0 + 1);
+	}
+	poppler::page_renderer renderer;
+	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
+	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
+	poppler::image img = renderer.render_page(page.get(), dpi, dpi);
+	if (!img.is_valid()) {
+		throw IOException("pdf_redact: failed to render page %d", page_idx0 + 1);
+	}
+
+	const int W = img.width();
+	const int H = img.height();
+	const int bpr = img.bytes_per_row();
+	const char *data = img.const_data();
+	const poppler::image::format_enum fmt = img.format();
+
+	pdf_qpdf::RebuiltPage out;
+	out.redacted = true;
+	out.width = W;
+	out.height = H;
+	out.media_w = W * 72.0 / dpi;
+	out.media_h = H * 72.0 / dpi;
+	out.rgb.resize(static_cast<size_t>(W) * static_cast<size_t>(H) * 3);
+
+	for (int y = 0; y < H; y++) {
+		const unsigned char *row = reinterpret_cast<const unsigned char *>(data) + static_cast<size_t>(y) * bpr;
+		for (int x = 0; x < W; x++) {
+			unsigned char r = 0, g = 0, b = 0;
+			switch (fmt) {
+			case poppler::image::format_argb32: {
+				uint32_t px;
+				std::memcpy(&px, row + static_cast<size_t>(x) * 4, sizeof(px));
+				r = (px >> 16) & 0xFF;
+				g = (px >> 8) & 0xFF;
+				b = px & 0xFF;
+				break;
+			}
+			case poppler::image::format_rgb24:
+				r = row[x * 3 + 0];
+				g = row[x * 3 + 1];
+				b = row[x * 3 + 2];
+				break;
+			case poppler::image::format_bgr24:
+				b = row[x * 3 + 0];
+				g = row[x * 3 + 1];
+				r = row[x * 3 + 2];
+				break;
+			case poppler::image::format_gray8:
+				r = g = b = row[x];
+				break;
+			case poppler::image::format_mono:
+				r = g = b = (row[x / 8] & (0x80 >> (x % 8))) ? 0xFF : 0x00;
+				break;
+			default:
+				throw IOException("pdf_redact: unsupported render format for page %d", page_idx0 + 1);
+			}
+			size_t o = (static_cast<size_t>(y) * W + x) * 3;
+			out.rgb[o + 0] = static_cast<char>(r);
+			out.rgb[o + 1] = static_cast<char>(g);
+			out.rgb[o + 2] = static_cast<char>(b);
+		}
+	}
+
+	// Paint each box solid black. Points -> pixels; flip y (PDF origin bottom-left,
+	// raster row 0 at top). Clamp to the raster so off-page boxes never overrun.
+	const double scale = dpi / 72.0;
+	auto clampi = [](int v, int lo, int hi) {
+		return v < lo ? lo : (v > hi ? hi : v);
+	};
+	for (const RedactBox *box : boxes) {
+		int px0 = clampi(static_cast<int>(std::floor(box->x * scale)), 0, W);
+		int px1 = clampi(static_cast<int>(std::ceil((box->x + box->w) * scale)), 0, W);
+		int ry0 = clampi(static_cast<int>(std::floor(H - (box->y + box->h) * scale)), 0, H);
+		int ry1 = clampi(static_cast<int>(std::ceil(H - box->y * scale)), 0, H);
+		for (int y = ry0; y < ry1; y++) {
+			for (int x = px0; x < px1; x++) {
+				size_t o = (static_cast<size_t>(y) * W + x) * 3;
+				out.rgb[o + 0] = 0;
+				out.rgb[o + 1] = 0;
+				out.rgb[o + 2] = 0;
+			}
+		}
+	}
+	return out;
+}
+
+static void PdfRedactExecute(ClientContext &context, const PdfRedactBindData &bind,
+                             std::vector<std::vector<Value>> &rows) {
+	PdfOpsCheckInputExists("pdf_redact", bind.input);
+	PdfOpsCheckOutputDir("pdf_redact", PdfOpsParentDir(bind.output));
+	if (bind.input == bind.output) {
+		throw InvalidInputException("pdf_redact: output path must differ from input path '%s'", bind.input);
+	}
+
+	// Open the source with poppler to count pages and render redacted ones.
+	string bytes;
+	ReadAllBytes(context, bind.input, bytes);
+	auto doc = LoadDoc(bytes, bind.password, bind.input);
+	const int page_count = doc->pages();
+
+	// Validate box page numbers and bucket boxes per page.
+	for (auto &box : bind.boxes) {
+		if (box.page > page_count) {
+			throw InvalidInputException("pdf_redact: redaction page %d is out of range (document has %d page%s)",
+			                            box.page, page_count, page_count == 1 ? "" : "s");
+		}
+	}
+
+	std::vector<pdf_qpdf::RebuiltPage> rebuilt(static_cast<size_t>(page_count));
+	std::vector<int> box_counts(static_cast<size_t>(page_count), 0);
+	for (int p = 1; p <= page_count; p++) {
+		vector<const RedactBox *> page_boxes;
+		for (auto &box : bind.boxes) {
+			if (box.page == p) {
+				page_boxes.push_back(&box);
+			}
+		}
+		if (page_boxes.empty()) {
+			rebuilt[p - 1].redacted = false;
+			continue;
+		}
+		rebuilt[p - 1] = RenderRedactedPage(*doc, p - 1, bind.dpi, page_boxes);
+		box_counts[p - 1] = static_cast<int>(page_boxes.size());
+	}
+
+	try {
+		pdf_qpdf::RebuildPagesAsImages(bind.input, bind.output, rebuilt, bind.password);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_redact: %s", string(e.what()));
+	}
+
+	for (int p = 1; p <= page_count; p++) {
+		rows.push_back({Value::INTEGER(p), Value::BOOLEAN(rebuilt[p - 1].redacted), Value::INTEGER(box_counts[p - 1])});
+	}
+}
+
+static void PdfRedactScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfRedactBindData>();
+	auto &st = data_p.global_state->Cast<PdfRedactState>();
+	if (!st.executed) {
+		PdfRedactExecute(context, bind, st.rows);
+		st.executed = true;
+	}
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && st.emit_idx < st.rows.size()) {
+		auto &row = st.rows[st.emit_idx];
+		for (idx_t col = 0; col < row.size(); col++) {
+			output.SetValue(col, count, row[col]);
+		}
+		st.emit_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_images(files) -> one row per embedded raster image XObject per page.
+//
+// The page walk, filter-chain inspection, encoded-bytes passthrough, and PNG
+// re-wrapping all live in qpdf_ops.cpp (the C++17 qpdf TU). This file resolves
+// the file glob, parses the `password` named param, and shapes the plain
+// EmbeddedImage structs into rows (emitting `data` as a BLOB).
+//===--------------------------------------------------------------------===//
+
+struct PdfImagesBindData : public TableFunctionData {
+	vector<string> files;
+	string password;
+};
+
+static unique_ptr<FunctionData> PdfImagesBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfImagesBindData>();
+	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	for (auto &kv : input.named_parameters) {
+		auto key = StringUtil::Lower(kv.first);
+		if (key == "password") {
+			result->password = StringValue::Get(kv.second);
+		}
+	}
+	// `file` is included for glob parity with the other qpdf-backed table funcs.
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::BLOB};
+	names = {"file",       "page",   "image_index", "name", "width", "height", "bits_per_component",
+	         "colorspace", "format", "data"};
+	return std::move(result);
+}
+
+static void PdfImagesExecute(const string &path, const string &password, std::vector<std::vector<Value>> &rows) {
+	PdfOpsCheckInputExists("pdf_images", path);
+	std::vector<pdf_qpdf::EmbeddedImage> imgs;
+	try {
+		imgs = pdf_qpdf::ReadImages(path, password);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_images: %s", string(e.what()));
+	}
+	for (auto &img : imgs) {
+		Value colorspace = img.colorspace.empty() ? Value(LogicalType::VARCHAR) : Value(img.colorspace);
+		Value data = Value::BLOB(const_data_ptr_cast(img.data.data()), img.data.size());
+		rows.push_back({Value(path), Value::INTEGER(img.page), Value::INTEGER(img.image_index), Value(img.name),
+		                Value::INTEGER(img.width), Value::INTEGER(img.height), Value::INTEGER(img.bits_per_component),
+		                colorspace, Value(img.format), data});
+	}
+}
+
+static void PdfImagesScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfImagesBindData>();
+	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
+	if (!st.executed) {
+		for (auto &path : bind.files) {
+			PdfImagesExecute(path, bind.password, st.rows);
+		}
+		st.executed = true;
+	}
+	PdfQpdfRowsEmit(st, output);
+}
+
 //===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
@@ -5647,6 +6642,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                        PdfSplitInit);
 	loader.RegisterFunction(pdf_split);
 
+	TableFunction pdf_split_blank("pdf_split_blank", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfSplitBlankScan,
+	                              PdfSplitBlankBind, PdfSplitBlankInit);
+	pdf_split_blank.named_parameters["blank_threshold"] = LogicalType::DOUBLE;
+	loader.RegisterFunction(pdf_split_blank);
+
 	// qpdf everyday suite
 	loader.RegisterFunction(ScalarFunction("pdf_compress", {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                                       LogicalType::VARCHAR, PdfCompressFun));
@@ -5667,6 +6667,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                                       LogicalType::VARCHAR, PdfPagesFun));
 
+	// pdf_watermark: 3-arg (default opacity 0.30) + 4-arg (explicit opacity).
+	ScalarFunctionSet pdf_watermark_set("pdf_watermark");
+	pdf_watermark_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                             LogicalType::VARCHAR, PdfWatermarkFun));
+	pdf_watermark_set.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::DOUBLE},
+	                   LogicalType::VARCHAR, PdfWatermarkOpacityFun));
+	loader.RegisterFunction(pdf_watermark_set);
+
+	loader.RegisterFunction(ScalarFunction(
+	    "pdf_bates", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+	    LogicalType::VARCHAR, PdfBatesFun));
+
 	TableFunction pdf_form_fields("pdf_form_fields", {LogicalType::VARCHAR}, PdfFormFieldsScan, PdfFormFieldsBind,
 	                              PdfQpdfRowsInit);
 	loader.RegisterFunction(pdf_form_fields);
@@ -5680,6 +6693,39 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             PdfQpdfRowsInit);
 	pdf_signatures.named_parameters["password"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(pdf_signatures);
+
+	// pdf_images: extract embedded raster image XObjects (stored JPEG/bitmap).
+	TableFunction pdf_images("pdf_images", {LogicalType::VARCHAR}, PdfImagesScan, PdfImagesBind, PdfQpdfRowsInit);
+	pdf_images.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_images);
+
+	// pdf_sign: create an adbe.pkcs7.detached CMS signature (inverse of
+	// pdf_signatures). Single-row table function so it can carry named options.
+	TableFunction pdf_sign("pdf_sign",
+	                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                       PdfSignScan, PdfSignBind, PdfQpdfRowsInit);
+	pdf_sign.named_parameters["key_password"] = LogicalType::VARCHAR;
+	pdf_sign.named_parameters["reason"] = LogicalType::VARCHAR;
+	pdf_sign.named_parameters["location"] = LogicalType::VARCHAR;
+	pdf_sign.named_parameters["signer_name"] = LogicalType::VARCHAR;
+	pdf_sign.named_parameters["field_name"] = LogicalType::VARCHAR;
+	pdf_sign.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_sign);
+
+	// pdf_redact: true raster redaction (removes text under the boxes, not a
+	// black rectangle over live text). redactions in PDF points, origin
+	// bottom-left. Side effects (render + write) happen at scan time.
+	auto redact_struct = LogicalType::STRUCT({{"page", LogicalType::INTEGER},
+	                                          {"x", LogicalType::DOUBLE},
+	                                          {"y", LogicalType::DOUBLE},
+	                                          {"w", LogicalType::DOUBLE},
+	                                          {"h", LogicalType::DOUBLE}});
+	TableFunction pdf_redact("pdf_redact",
+	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(redact_struct)},
+	                         PdfRedactScan, PdfRedactBind, PdfRedactInit);
+	pdf_redact.named_parameters["dpi"] = LogicalType::INTEGER;
+	pdf_redact.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_redact);
 
 	// COPY TO pdf
 	CopyFunction pdf_copy("pdf");
