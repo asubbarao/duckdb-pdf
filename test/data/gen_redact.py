@@ -64,15 +64,10 @@ def main() -> None:
     # We assemble the body objects with placeholder byte offsets recorded as we go.
     objects: dict[int, bytes] = {}
 
-    objects[1] = (
-        b"<<\n/Type /Pages\n/Count 3\n/Kids [3 0 R 5 0 R 7 0 R]\n"
-        b"/MediaBox [0 0 612 792]\n>>\n"
-    )
+    objects[1] = b"<<\n/Type /Pages\n/Count 3\n/Kids [3 0 R 5 0 R 7 0 R]\n" b"/MediaBox [0 0 612 792]\n>>\n"
     objects[2] = b"<<\n/Type /Catalog\n/Pages 1 0 R\n>>\n"
 
-    objects[3] = (
-        b"<<\n/Type /Page\n/Parent 1 0 R\n/Contents 4 0 R\n/Resources 10 0 R\n>>\n"
-    )
+    objects[3] = b"<<\n/Type /Page\n/Parent 1 0 R\n/Contents 4 0 R\n/Resources 10 0 R\n>>\n"
     objects[4] = (
         b"<< /Length "
         + str(len(page_contents[0])).encode("ascii")
@@ -80,9 +75,7 @@ def main() -> None:
         + page_contents[0]
         + b"endstream\n"
     )
-    objects[5] = (
-        b"<<\n/Type /Page\n/Parent 1 0 R\n/Contents 6 0 R\n/Resources 10 0 R\n>>\n"
-    )
+    objects[5] = b"<<\n/Type /Page\n/Parent 1 0 R\n/Contents 6 0 R\n/Resources 10 0 R\n>>\n"
     objects[6] = (
         b"<< /Length "
         + str(len(page_contents[1])).encode("ascii")
@@ -90,9 +83,7 @@ def main() -> None:
         + page_contents[1]
         + b"endstream\n"
     )
-    objects[7] = (
-        b"<<\n/Type /Page\n/Parent 1 0 R\n/Contents 8 0 R\n/Resources 10 0 R\n>>\n"
-    )
+    objects[7] = b"<<\n/Type /Page\n/Parent 1 0 R\n/Contents 8 0 R\n/Resources 10 0 R\n>>\n"
     objects[8] = (
         b"<< /Length "
         + str(len(page_contents[2])).encode("ascii")
@@ -100,10 +91,7 @@ def main() -> None:
         + page_contents[2]
         + b"endstream\n"
     )
-    objects[9] = (
-        b"<<\n/Type /Font\n/Subtype /Type1\n/BaseFont /Helvetica\n"
-        b"/Encoding /WinAnsiEncoding\n>>\n"
-    )
+    objects[9] = b"<<\n/Type /Font\n/Subtype /Type1\n/BaseFont /Helvetica\n" b"/Encoding /WinAnsiEncoding\n>>\n"
     objects[10] = b"<<\n/Font << /F1 9 0 R >>\n/ProcSet [/PDF /Text]\n>>\n"
     objects[11] = b"<<\n/CreationDate (D:20260101000000Z)\n>>\n"
 
@@ -136,9 +124,7 @@ def main() -> None:
 
     out = bytes(body) + bytes(xref) + trailer
     OUT.write_bytes(out)
-    print(
-        f"wrote {OUT} ({len(out)} bytes); xref at {xref_offset}; secret={SECRET!r} on page 2 at (72,600)"
-    )
+    print(f"wrote {OUT} ({len(out)} bytes); xref at {xref_offset}; secret={SECRET!r} on page 2 at (72,600)")
 
 
 if __name__ == "__main__":

@@ -28,9 +28,7 @@ SUBJECT = "/C=US/O=Vori PDF Test/CN=Vori PDF Signer"
 def run(cmd: list[str]) -> None:
     proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"command failed: {' '.join(cmd)}\n{proc.stderr.decode(errors='replace')}"
-        )
+        raise RuntimeError(f"command failed: {' '.join(cmd)}\n{proc.stderr.decode(errors='replace')}")
 
 
 def main() -> int:

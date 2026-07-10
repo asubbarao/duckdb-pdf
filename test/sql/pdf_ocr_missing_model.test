@@ -1,0 +1,39 @@
+# name: test/sql/pdf_ocr_missing_model.test
+# description: auto-OCR is best-effort — a missing tesseract model must not error
+# group: [sql]
+
+# The implicit auto_ocr fallback (blank/scanned page, no native text layer) must
+# degrade to "no OCR text" when no tesseract language model can be loaded — a
+# plain read of any PDF containing a blank page must work on machines without
+# tessdata. Explicit OCR (force_ocr / ocr := true) keeps the loud, actionable
+# install error. An explicit bogus tessdata_dir is trusted over auto-detection,
+# which makes these assertions deterministic on machines that DO have tessdata.
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# blank_split.pdf has 3 blank pages -> auto_ocr fires on each; with an unusable
+# model dir it must silently yield empty text, not an IO Error
+query I
+SELECT count(*) FROM read_pdf('test/data/blank_split.pdf', tessdata_dir := '/nonexistent/tessdata');
+----
+7
+
+# word-level auto-OCR path (read_pdf_words) degrades the same way
+query I
+SELECT count(*) FROM read_pdf_words('test/data/blank_split.pdf', tessdata_dir := '/nonexistent/tessdata')
+WHERE page = 3;
+----
+0
+
+# table extraction's auto-OCR path degrades the same way (blank pages -> no words -> no tables)
+statement ok
+SELECT * FROM read_pdf_tables('test/data/blank_split.pdf', tessdata_dir := '/nonexistent/tessdata');
+
+# explicit OCR keeps the loud, actionable error
+statement error
+SELECT * FROM read_pdf('test/data/blank_split.pdf', ocr := true, tessdata_dir := '/nonexistent/tessdata');
+----
+could not load the Tesseract model
