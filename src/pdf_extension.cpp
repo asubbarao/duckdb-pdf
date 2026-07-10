@@ -32,6 +32,13 @@
 #include <tesseract/baseapi.h>
 #include <tesseract/resultiterator.h>
 
+// leptonica — image preprocessing (grayscale / deskew / binarize / despeckle)
+// applied to the rendered page before handing it to tesseract. Tesseract already
+// links leptonica (its Pix type is how images enter the engine), so no new
+// dependency is added here. Headers resolve via the same include dirs as
+// tesseract (brew/vcpkg both expose leptonica/allheaders.h).
+#include <leptonica/allheaders.h>
+
 // libharu — native PDF writer (C API) for write_pdf. No external processes.
 #include <hpdf.h>
 
@@ -878,20 +885,140 @@ static string ResolveTessdataDir(const string &language, const string &explicit_
 	return string();
 }
 
-// Render a poppler page and OCR it with tesseract, honoring engine knobs.
-static string OcrPage(poppler::page *page, const string &language, int dpi, int psm, int oem,
-                      const string &tessdata_dir) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-	poppler::page_renderer renderer;
-	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
-	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
-
-	poppler::image img = renderer.render_page(page, dpi, dpi);
+//===--------------------------------------------------------------------===//
+// Leptonica image preprocessing (grayscale / deskew / binarize / despeckle)
+//===--------------------------------------------------------------------===//
+// Convert a poppler render (argb32 by default; rgb24 handled too) into a fresh
+// 32bpp leptonica Pix so the preprocessing pipeline can operate on it. Returns
+// nullptr on any failure — the caller then falls back to feeding tesseract the
+// raw poppler bytes, so a conversion failure never blocks OCR.
+static Pix *PopplerImageToPix(const poppler::image &img) {
 	if (!img.is_valid()) {
-		return string();
+		return nullptr;
+	}
+	const int w = img.width();
+	const int h = img.height();
+	if (w <= 0 || h <= 0) {
+		return nullptr;
+	}
+	const char *base = img.const_data();
+	if (!base) {
+		return nullptr;
+	}
+	Pix *pix = pixCreate(w, h, 32);
+	if (!pix) {
+		return nullptr;
+	}
+	l_uint32 *data = pixGetData(pix);
+	const int wpl = pixGetWpl(pix);
+	const int bpr = img.bytes_per_row();
+	const bool is_rgb24 = (img.format() == poppler::image::format_rgb24);
+	for (int y = 0; y < h; y++) {
+		const unsigned char *row = reinterpret_cast<const unsigned char *>(base) + static_cast<size_t>(y) * bpr;
+		l_uint32 *line = data + static_cast<size_t>(y) * wpl;
+		for (int x = 0; x < w; x++) {
+			unsigned char r, g, b;
+			if (is_rgb24) {
+				const unsigned char *px = row + static_cast<size_t>(x) * 3;
+				r = px[0];
+				g = px[1];
+				b = px[2];
+			} else {
+				// argb32 in little-endian memory order is B,G,R,A.
+				const unsigned char *px = row + static_cast<size_t>(x) * 4;
+				b = px[0];
+				g = px[1];
+				r = px[2];
+			}
+			composeRGBPixel(r, g, b, &line[x]);
+		}
+	}
+	return pix;
+}
+
+// Conservative OCR preprocessing pipeline. Every leptonica call is null-guarded;
+// on any failure we return the best Pix produced so far (or nullptr, so the
+// caller reverts to the unprocessed image). Never throws, never crashes on tiny
+// or degenerate images.
+//   1. grayscale (pixConvertRGBToGray)
+//   2. deskew    (pixFindSkewSweepAndSearch on a binarized copy; if |angle|>0.3°
+//                 rotate the grayscale with area-map interpolation, white infill)
+//   3. binarize  (pixOtsuAdaptiveThreshold)
+//   4. despeckle (light 2x2 close-open, only at >=300 dpi where text strokes are
+//                 several pixels wide and 1px specks are safe to remove)
+static Pix *PreprocessPixForOcr(Pix *pixs, int dpi) {
+	if (!pixs) {
+		return nullptr;
+	}
+	const int w = pixGetWidth(pixs);
+	const int h = pixGetHeight(pixs);
+	if (w < 16 || h < 16) {
+		// Too small to meaningfully preprocess (deskew/Otsu are unreliable); let
+		// the caller OCR the original.
+		return nullptr;
 	}
 
-	tesseract::TessBaseAPI api;
+	// 1. Grayscale.
+	Pix *pixg = nullptr;
+	const int depth = pixGetDepth(pixs);
+	if (depth >= 24) {
+		pixg = pixConvertRGBToGray(pixs, 0.0f, 0.0f, 0.0f); // 0s => default luma weights
+	} else if (depth == 8) {
+		pixg = pixClone(pixs);
+	} else {
+		pixg = pixConvertTo8(pixs, 0);
+	}
+	if (!pixg) {
+		return nullptr;
+	}
+
+	// 2. Deskew: detect the skew angle on a binarized copy (leptonica's skew
+	//    finder requires 1bpp), then rotate the *grayscale* so the subsequent
+	//    Otsu threshold sees straightened strokes.
+	Pix *pixskew = pixThresholdToBinary(pixg, 130);
+	if (pixskew) {
+		l_float32 angle = 0.0f;
+		l_float32 conf = 0.0f;
+		if (pixFindSkewSweepAndSearch(pixskew, &angle, &conf, 4, 2, 7.0f, 1.0f, 0.01f) == 0 && conf > 0.0f &&
+		    fabsf(angle) > 0.3f) {
+			const l_float32 kDeg2Rad = 3.14159265358979323846f / 180.0f;
+			Pix *pixr = pixRotate(pixg, angle * kDeg2Rad, L_ROTATE_AREA_MAP, L_BRING_IN_WHITE, 0, 0);
+			if (pixr) {
+				pixDestroy(&pixg);
+				pixg = pixr;
+			}
+		}
+		pixDestroy(&pixskew);
+	}
+
+	// 3. Binarize (global Otsu — single tile spanning the whole page).
+	Pix *pixb = nullptr;
+	if (pixOtsuAdaptiveThreshold(pixg, pixGetWidth(pixg), pixGetHeight(pixg), 0, 0, 0.1f, nullptr, &pixb) != 0 ||
+	    !pixb) {
+		// Otsu failed: the (deskewed) grayscale is still a valid tesseract input.
+		pixSetResolution(pixg, dpi, dpi);
+		return pixg;
+	}
+	pixDestroy(&pixg);
+
+	// 4. Light despeckle at high render resolutions only.
+	if (dpi >= 300) {
+		char seq[] = "c2.2 o2.2";
+		Pix *pixc = pixMorphCompSequence(pixb, seq, 0);
+		if (pixc) {
+			pixDestroy(&pixb);
+			pixb = pixc;
+		}
+	}
+	pixSetResolution(pixb, dpi, dpi);
+	return pixb;
+}
+
+// Shared Init boilerplate: resolve the model dir and construct/initialize the
+// tesseract API, throwing the actionable install message if the model is
+// missing. Extracted so the text and word OCR paths share one code path.
+static void InitTesseract(tesseract::TessBaseAPI &api, const string &language, int psm, int oem,
+                          const string &tessdata_dir) {
 	// Tesseract needs a <lang>.traineddata model at runtime. vcpkg/most package
 	// managers do NOT ship language models, so OCR requires the user to install
 	// one. We auto-detect the standard install dirs (so a plain `brew install
@@ -910,16 +1037,83 @@ static string OcrPage(poppler::page *page, const string &language, int dpi, int 
 		    language, language, language);
 	}
 	api.SetPageSegMode(static_cast<tesseract::PageSegMode>(psm));
+}
 
-	const int bytes_per_pixel = 4; // poppler renders argb32; tesseract grayscales internally
-	api.SetImage(reinterpret_cast<const unsigned char *>(img.const_data()), img.width(), img.height(), bytes_per_pixel,
-	             img.bytes_per_row());
+// Feed the rendered page to tesseract, running the leptonica pipeline first when
+// `preprocess` is set. Ownership of any allocated Pix stays local — tesseract
+// clones the image internally — so both are destroyed after the call returns.
+// Returns the two Pix (base, processed) via out-params so the caller can destroy
+// them AFTER recognition completes (SetImage keeps a clone, so destroying before
+// GetUTF8Text/Recognize would be premature on some builds).
+static void SetOcrImage(tesseract::TessBaseAPI &api, const poppler::image &img, int dpi, bool preprocess, Pix *&base,
+                        Pix *&processed) {
+	base = preprocess ? PopplerImageToPix(img) : nullptr;
+	processed = base ? PreprocessPixForOcr(base, dpi) : nullptr;
+	Pix *use = processed ? processed : base;
+	if (use) {
+		api.SetImage(use);
+	} else {
+		const int bytes_per_pixel = 4; // poppler renders argb32; tesseract grayscales internally
+		api.SetImage(reinterpret_cast<const unsigned char *>(img.const_data()), img.width(), img.height(),
+		             bytes_per_pixel, img.bytes_per_row());
+	}
+}
 
-	char *out = api.GetUTF8Text();
-	string text = out ? string(out) : string();
-	delete[] out;
+// One page-text OCR pass at a fixed dpi. Returns the recognized text plus
+// tesseract's mean word confidence so the retry wrapper can compare attempts.
+struct OcrTextAttempt {
+	string text;
+	int confidence = 0; // MeanTextConf(): 0..100
+};
+
+static OcrTextAttempt OcrPageTextAttempt(poppler::page *page, const string &language, int dpi, int psm, int oem,
+                                         const string &tessdata_dir, bool preprocess) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	poppler::page_renderer renderer;
+	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
+	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
+
+	OcrTextAttempt out;
+	poppler::image img = renderer.render_page(page, dpi, dpi);
+	if (!img.is_valid()) {
+		return out;
+	}
+
+	tesseract::TessBaseAPI api;
+	InitTesseract(api, language, psm, oem, tessdata_dir);
+
+	Pix *base = nullptr;
+	Pix *processed = nullptr;
+	SetOcrImage(api, img, dpi, preprocess, base, processed);
+
+	char *text = api.GetUTF8Text();
+	out.text = text ? string(text) : string();
+	delete[] text;
+	out.confidence = api.MeanTextConf();
 	api.End();
-	return text;
+	if (processed) {
+		pixDestroy(&processed);
+	}
+	if (base) {
+		pixDestroy(&base);
+	}
+	return out;
+}
+
+// Render a poppler page and OCR it with tesseract, honoring engine knobs plus
+// the preprocessing (`preprocess`) and confidence-retry (`retry`) toggles. When
+// retry is on and the first pass is low-confidence at a sub-400 dpi render, we
+// re-render at 2x dpi and keep whichever pass scored higher.
+static string OcrPage(poppler::page *page, const string &language, int dpi, int psm, int oem,
+                      const string &tessdata_dir, bool preprocess, bool retry) {
+	OcrTextAttempt first = OcrPageTextAttempt(page, language, dpi, psm, oem, tessdata_dir, preprocess);
+	if (retry && first.confidence < 55 && dpi < 400) {
+		OcrTextAttempt second = OcrPageTextAttempt(page, language, dpi * 2, psm, oem, tessdata_dir, preprocess);
+		if (second.confidence > first.confidence) {
+			return second.text;
+		}
+	}
+	return first.text;
 }
 
 // Word-level OCR using tesseract ResultIterator at RIL_WORD. Reuses the exact
@@ -930,44 +1124,48 @@ struct OcrWord {
 	float confidence;
 };
 
-static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &language, int dpi, int psm, int oem,
-                                         const string &tessdata_dir) {
+// One word-level OCR pass at a fixed dpi. Carries tesseract's mean confidence
+// alongside the words so the retry wrapper keeps the higher-scoring pass (and,
+// with it, that pass's per-word confidences).
+struct OcrWordsAttempt {
+	std::vector<OcrWord> words;
+	int confidence = 0; // MeanTextConf(): 0..100
+};
+
+static OcrWordsAttempt OcrPageWordsAttempt(poppler::page *page, const string &language, int dpi, int psm, int oem,
+                                           const string &tessdata_dir, bool preprocess) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	poppler::page_renderer renderer;
 	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
 
+	OcrWordsAttempt out;
 	poppler::image img = renderer.render_page(page, dpi, dpi);
 	if (!img.is_valid()) {
-		return {};
+		return out;
 	}
 
 	tesseract::TessBaseAPI api;
-	string datadir = ResolveTessdataDir(language, tessdata_dir);
-	const char *datapath = datadir.empty() ? nullptr : datadir.c_str();
-	if (api.Init(datapath, language.c_str(), static_cast<tesseract::OcrEngineMode>(oem)) != 0) {
-		throw IOException(
-		    "read_pdf OCR: could not load the Tesseract model for language '%s'. Install a language model — "
-		    "macOS: `brew install tesseract-lang`; Debian/Ubuntu: `apt-get install tesseract-ocr-%s`; Windows: "
-		    "the UB Mannheim installer; or download %s.traineddata from "
-		    "https://github.com/tesseract-ocr/tessdata_fast. Standard install locations are auto-detected; if "
-		    "yours is non-standard, pass `tessdata_dir := '/path/to/tessdata'` or set the TESSDATA_PREFIX env var.",
-		    language, language, language);
-	}
-	api.SetPageSegMode(static_cast<tesseract::PageSegMode>(psm));
+	InitTesseract(api, language, psm, oem, tessdata_dir);
 
-	const int bytes_per_pixel = 4; // poppler renders argb32; tesseract grayscales internally
-	api.SetImage(reinterpret_cast<const unsigned char *>(img.const_data()), img.width(), img.height(), bytes_per_pixel,
-	             img.bytes_per_row());
+	Pix *base = nullptr;
+	Pix *processed = nullptr;
+	SetOcrImage(api, img, dpi, preprocess, base, processed);
 
 	int rec = api.Recognize(0);
 	if (rec != 0) {
 		// recognition failed; fall back cleanly to no words (avoid partial/broken results)
 		api.End();
-		return {};
+		if (processed) {
+			pixDestroy(&processed);
+		}
+		if (base) {
+			pixDestroy(&base);
+		}
+		return out;
 	}
+	out.confidence = api.MeanTextConf();
 	tesseract::ResultIterator *ri = api.GetIterator();
-	std::vector<OcrWord> result;
 	if (ri) {
 		do {
 			if (ri->Empty(tesseract::RIL_WORD)) {
@@ -989,13 +1187,34 @@ static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &lang
 			w.y1 = (img.height() - top) * 72.0 / dpi;
 			w.confidence = conf;
 			if (!w.text.empty()) {
-				result.push_back(std::move(w));
+				out.words.push_back(std::move(w));
 			}
 		} while (ri->Next(tesseract::RIL_WORD));
 		// ri is owned by api; do not delete
 	}
 	api.End();
-	return result;
+	if (processed) {
+		pixDestroy(&processed);
+	}
+	if (base) {
+		pixDestroy(&base);
+	}
+	return out;
+}
+
+// Word-level OCR with the same preprocessing + confidence-retry semantics as
+// OcrPage. On retry the higher-confidence pass wins, so the returned words carry
+// the confidences of whichever attempt was kept.
+static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &language, int dpi, int psm, int oem,
+                                         const string &tessdata_dir, bool preprocess, bool retry) {
+	OcrWordsAttempt first = OcrPageWordsAttempt(page, language, dpi, psm, oem, tessdata_dir, preprocess);
+	if (retry && first.confidence < 55 && dpi < 400) {
+		OcrWordsAttempt second = OcrPageWordsAttempt(page, language, dpi * 2, psm, oem, tessdata_dir, preprocess);
+		if (second.confidence > first.confidence) {
+			return std::move(second.words);
+		}
+	}
+	return std::move(first.words);
 }
 
 //===--------------------------------------------------------------------===//
@@ -1006,9 +1225,11 @@ struct PdfOptions {
 	bool auto_ocr = true;
 	string ocr_language = "eng";
 	int32_t ocr_dpi = 300;
-	int32_t ocr_psm = 3; // PSM_AUTO
-	int32_t ocr_oem = 3; // OEM_DEFAULT
-	string tessdata_dir; // optional: directory containing <lang>.traineddata
+	int32_t ocr_psm = 3;        // PSM_AUTO
+	int32_t ocr_oem = 3;        // OEM_DEFAULT
+	bool ocr_preprocess = true; // leptonica grayscale/deskew/binarize/despeckle before OCR
+	bool ocr_retry = true;      // re-render low-confidence sub-400dpi pages at 2x and keep the better result
+	string tessdata_dir;        // optional: directory containing <lang>.traineddata
 	string layout = "reading";
 	bool parse_tables = false;
 	string password;
@@ -1037,6 +1258,10 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 			o.ocr_psm = IntegerValue::Get(kv.second);
 		} else if (key == "ocr_oem") {
 			o.ocr_oem = IntegerValue::Get(kv.second);
+		} else if (key == "ocr_preprocess") {
+			o.ocr_preprocess = BooleanValue::Get(kv.second);
+		} else if (key == "ocr_retry") {
+			o.ocr_retry = BooleanValue::Get(kv.second);
 		} else if (key == "tessdata_dir") {
 			o.tessdata_dir = StringValue::Get(kv.second);
 		} else if (key == "layout") {
@@ -1085,6 +1310,8 @@ static void AddCommonNamedParams(TableFunction &fn) {
 	fn.named_parameters["ocr_dpi"] = LogicalType::INTEGER;
 	fn.named_parameters["ocr_psm"] = LogicalType::INTEGER;
 	fn.named_parameters["ocr_oem"] = LogicalType::INTEGER;
+	fn.named_parameters["ocr_preprocess"] = LogicalType::BOOLEAN;
+	fn.named_parameters["ocr_retry"] = LogicalType::BOOLEAN;
 	fn.named_parameters["tessdata_dir"] = LogicalType::VARCHAR;
 	fn.named_parameters["layout"] = LogicalType::VARCHAR;
 	fn.named_parameters["parse_tables"] = LogicalType::BOOLEAN;
@@ -1279,8 +1506,9 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 				}
 				bool blank = text.find_first_not_of(" \t\r\n\f\v") == string::npos;
 				if (bind.opt.force_ocr || (bind.opt.auto_ocr && blank)) {
-					string ocr = OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
-					                     bind.opt.ocr_oem, bind.opt.tessdata_dir);
+					string ocr =
+					    OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm, bind.opt.ocr_oem,
+					            bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry);
 					if (!ocr.empty()) {
 						text = ocr;
 					}
@@ -2155,16 +2383,16 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 	if (page) {
 		if (opt.force_ocr) {
 			// force_ocr runs OCR unconditionally, even if native text layer present
-			g.ocr_boxes =
-			    OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem, opt.tessdata_dir);
+			g.ocr_boxes = OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem,
+			                           opt.tessdata_dir, opt.ocr_preprocess, opt.ocr_retry);
 			g.page_is_ocr = !g.ocr_boxes.empty();
 		} else {
 			g.boxes = page->text_list(poppler::page::text_list_include_font);
 			if (!g.boxes.empty()) {
 				g.page_is_ocr = false;
 			} else if (opt.auto_ocr) {
-				g.ocr_boxes =
-				    OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem, opt.tessdata_dir);
+				g.ocr_boxes = OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem,
+				                           opt.tessdata_dir, opt.ocr_preprocess, opt.ocr_retry);
 				g.page_is_ocr = !g.ocr_boxes.empty();
 			} else {
 				g.page_is_ocr = false;
@@ -3199,8 +3427,9 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 			std::vector<PdfWord> words;
 			if (bind.opt.force_ocr) {
 				// force_ocr runs OCR unconditionally (bypasses native text layer)
-				auto ocr_words = OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
-				                              bind.opt.ocr_oem, bind.opt.tessdata_dir);
+				auto ocr_words =
+				    OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
+				                 bind.opt.ocr_oem, bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry);
 				for (auto &ow : ocr_words) {
 					PdfWord w;
 					w.xMin = ow.x0;
@@ -3223,7 +3452,8 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 				}
 				if (words.empty() && bind.opt.auto_ocr) {
 					auto ocr_words = OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
-					                              bind.opt.ocr_oem, bind.opt.tessdata_dir);
+					                              bind.opt.ocr_oem, bind.opt.tessdata_dir, bind.opt.ocr_preprocess,
+					                              bind.opt.ocr_retry);
 					for (auto &ow : ocr_words) {
 						PdfWord w;
 						w.xMin = ow.x0;

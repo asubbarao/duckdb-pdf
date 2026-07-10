@@ -55,6 +55,8 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 | `ocr_language` | VARCHAR | `'eng'` | Tesseract language model. |
 | `ocr_dpi` | INTEGER | 300 | Render DPI for the OCR raster (1–2400). |
 | `ocr_psm` / `ocr_oem` | INTEGER | Tesseract defaults | Page segmentation mode / OCR engine mode. |
+| `ocr_preprocess` | BOOLEAN | true | Run the Leptonica preprocessing pipeline (grayscale → deskew → binarize → despeckle) on the rendered page before OCR. |
+| `ocr_retry` | BOOLEAN | true | Re-render low-confidence pages (mean confidence < 55) at 2× DPI when the render was below 400 DPI, keeping whichever pass scores higher. |
 | `tessdata_dir` | VARCHAR | auto-detected | Explicit Tesseract model directory (see [OCR support](#ocr-support)). |
 | `ignore_errors` | BOOLEAN | false | `read_pdf` / `read_pdf_meta` only: skip unopenable files in a multi-file scan instead of aborting it. |
 
@@ -701,6 +703,25 @@ Select the language with the `ocr_language` parameter (default `eng`), and tune 
 ```sql
 SELECT page, text
 FROM read_pdf('scan.pdf', ocr := true, ocr_language := 'eng', ocr_dpi := 300);
+```
+
+### Preprocessing and confidence retry
+
+Real-world scans are rarely clean — pages come in skewed, grayscale-noisy, or lightly speckled. Before handing a rendered page to Tesseract, the extension runs a conservative [Leptonica](http://www.leptonica.org/) preprocessing pipeline (on by default via `ocr_preprocess := true`):
+
+1. **Grayscale** — convert the rendered page to 8-bit gray (`pixConvertRGBToGray`) if it isn't already.
+2. **Deskew** — measure the page's skew angle (`pixFindSkewSweepAndSearch`); if it exceeds 0.3°, rotate the page back with area-map interpolation and a white background so text baselines are level.
+3. **Binarize** — apply an Otsu adaptive threshold (`pixOtsuAdaptiveThreshold`) to separate ink from paper.
+4. **Despeckle** — at ≥ 300 DPI renders only (where strokes are several pixels wide and 1-pixel specks are safe to drop), a light 2×2 close-open morphological pass removes isolated noise.
+
+Every step is null-guarded: if any Leptonica call fails — or the image is too small to preprocess safely — the pipeline falls back to the unprocessed image rather than erroring, so preprocessing never turns a readable page into a failure. Set `ocr_preprocess := false` to feed Tesseract the raw render.
+
+The extension also retries low-confidence pages at higher resolution (on by default via `ocr_retry := true`): if a page's mean OCR confidence comes back below 55 **and** it was rendered below 400 DPI, the page is re-rendered at 2× DPI, re-preprocessed, and re-OCR'd; whichever pass scored higher wins. This is silent, self-tuning quality — retried pages report the text (and, for `read_pdf_words`, the per-word confidences) of the kept pass. Set `ocr_retry := false` to disable the second pass.
+
+```sql
+-- deskew + binarize a batch of crooked scans, with the low-confidence retry on
+SELECT filename, page, text
+FROM read_pdf('scans/*.pdf', ocr := true, ocr_preprocess := true, ocr_retry := true);
 ```
 
 ## Scope

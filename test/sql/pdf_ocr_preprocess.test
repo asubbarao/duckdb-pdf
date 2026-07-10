@@ -1,0 +1,77 @@
+# name: test/sql/pdf_ocr_preprocess.test
+# description: OCR preprocessing (leptonica deskew/binarize/despeckle) + confidence retry
+# group: [sql]
+
+require pdf
+
+# OCR needs a Tesseract language model at runtime (located via TESSDATA_PREFIX).
+# Package managers do not ship one, so this whole suite is skipped unless the
+# environment provides a model directory. Run locally/CI with e.g.
+#   TESSDATA_PREFIX="/opt/homebrew/share/tessdata" make test
+require-env TESSDATA_PREFIX
+
+statement ok
+PRAGMA enable_verification
+
+# ── skewed_scan.pdf: image-only page, text raster rotated ~2.5 degrees ──────
+# Regenerate with: python3 test/data/gen_skewed_scan.py
+
+# Default OCR (ocr_preprocess defaults to true) recovers the known words even
+# though the page is skewed. OCR output is not byte-stable across tesseract
+# versions, so assert case-insensitively on robust dictionary words.
+query I
+SELECT contains(lower(text), 'quick') AND contains(lower(text), 'brown')
+FROM read_pdf('test/data/skewed_scan.pdf', ocr:=true);
+----
+true
+
+# Explicit ocr_preprocess:=true finds the skewed fixture's known string.
+query I
+SELECT contains(lower(text), 'quick brown fox')
+FROM read_pdf('test/data/skewed_scan.pdf', ocr:=true, ocr_preprocess:=true);
+----
+true
+
+# ── ocr_preprocess:=false still runs cleanly ───────────────────────────────
+# We only assert it does NOT throw/crash — tesseract sometimes straightens mild
+# skew on its own, so we do not assert that disabling preprocessing loses the
+# text.
+query I
+SELECT length(text) >= 0
+FROM read_pdf('test/data/skewed_scan.pdf', ocr:=true, ocr_preprocess:=false);
+----
+true
+
+# ── confidence retry (ocr_retry) is accepted and composes with preprocessing ─
+query I
+SELECT count(*) > 0
+FROM read_pdf_words('test/data/skewed_scan.pdf', ocr:=true, ocr_preprocess:=true, ocr_retry:=true);
+----
+true
+
+# Retried pages must still report per-word confidence (0..100) for the kept pass.
+query I
+SELECT count(*) = 0
+FROM read_pdf_words('test/data/skewed_scan.pdf', ocr:=true, ocr_preprocess:=true)
+WHERE confidence < 0 OR confidence > 100;
+----
+true
+
+# ── shared params are advertised on every OCR-capable function ──────────────
+statement ok
+SELECT * FROM read_pdf_lines('test/data/skewed_scan.pdf', ocr:=true, ocr_preprocess:=false, ocr_retry:=false);
+
+statement ok
+SELECT * FROM read_pdf_tables('test/data/scanned.pdf', ocr:=true, ocr_preprocess:=true, ocr_retry:=false);
+
+# ── preprocessing must not corrupt an already-clean OCR page ─────────────────
+# scanned.pdf is the axis-aligned, image-only fixture the existing OCR suite
+# reads at baseline; the pipeline must still recover its known words with
+# ocr_preprocess:=true (non-degradation). We assert on scanned.pdf rather than a
+# tiny synthetic text PDF because small/synthetic rasters are unreliable across
+# tesseract model versions.
+query I
+SELECT contains(lower(text), 'apples')
+FROM read_pdf('test/data/scanned.pdf', ocr:=true, ocr_preprocess:=true, ocr_retry:=true);
+----
+true
