@@ -22,7 +22,9 @@
 
 // poppler-cpp — text extraction + page rendering + metadata
 #include <poppler-document.h>
+#include <poppler-destination.h>
 #include <poppler-embedded-file.h>
+#include <poppler-font.h>
 #include <poppler-page.h>
 #include <poppler-page-renderer.h>
 #include <poppler-image.h>
@@ -835,7 +837,9 @@ static pdf_ocr::ImageFormat PopplerFormatToOcr(poppler::image::format_enum fmt) 
 }
 
 static pdf_ocr::Options MakeOcrOptions(const string &language, int dpi, int psm, int oem,
-                                       const string &tessdata_dir, bool preprocess, bool best_effort) {
+                                       const string &tessdata_dir, bool preprocess, bool best_effort,
+                                       const string &ocr_backend = "tesseract", const string &ocr_plugin = "",
+                                       const string &ocr_endpoint = "") {
 	pdf_ocr::Options o;
 	o.language = language;
 	o.dpi = dpi;
@@ -844,8 +848,13 @@ static pdf_ocr::Options MakeOcrOptions(const string &language, int dpi, int psm,
 	o.tessdata_dir = tessdata_dir;
 	o.preprocess = preprocess;
 	o.best_effort = best_effort;
+	o.backend = pdf_ocr::BackendFromString(ocr_backend);
+	o.external_plugin = ocr_plugin;
+	o.external_endpoint = ocr_endpoint;
 	return o;
 }
+
+
 
 // Render a poppler page under the global lock. Returns an invalid image on
 // failure. Caller owns the returned poppler::image (value type).
@@ -893,8 +902,11 @@ struct OcrWord {
 // retry is on and the first pass is low-confidence at a sub-400 dpi render, we
 // re-render at 2x dpi and keep whichever pass scored higher.
 static string OcrPage(poppler::page *page, const string &language, int dpi, int psm, int oem,
-                      const string &tessdata_dir, bool preprocess, bool retry, bool best_effort) {
-	auto opt = MakeOcrOptions(language, dpi, psm, oem, tessdata_dir, preprocess, best_effort);
+                      const string &tessdata_dir, bool preprocess, bool retry, bool best_effort,
+                      const string &ocr_backend = "tesseract", const string &ocr_plugin = "",
+                      const string &ocr_endpoint = "") {
+	auto opt = MakeOcrOptions(language, dpi, psm, oem, tessdata_dir, preprocess, best_effort, ocr_backend,
+	                         ocr_plugin, ocr_endpoint);
 	poppler::image img = RenderPageForOcr(page, dpi);
 	pdf_ocr::TextResult first = OcrBitmapText(img, opt);
 	if (retry && first.confidence < 55 && dpi < 400) {
@@ -913,8 +925,11 @@ static string OcrPage(poppler::page *page, const string &language, int dpi, int 
 // OcrPage. On retry the higher-confidence pass wins, so the returned words carry
 // the confidences of whichever attempt was kept.
 static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &language, int dpi, int psm, int oem,
-                                         const string &tessdata_dir, bool preprocess, bool retry, bool best_effort) {
-	auto opt = MakeOcrOptions(language, dpi, psm, oem, tessdata_dir, preprocess, best_effort);
+                                         const string &tessdata_dir, bool preprocess, bool retry, bool best_effort,
+                                         const string &ocr_backend = "tesseract", const string &ocr_plugin = "",
+                                         const string &ocr_endpoint = "") {
+	auto opt = MakeOcrOptions(language, dpi, psm, oem, tessdata_dir, preprocess, best_effort, ocr_backend,
+	                         ocr_plugin, ocr_endpoint);
 	poppler::image img = RenderPageForOcr(page, dpi);
 	pdf_ocr::WordsResult first = OcrBitmapWords(img, opt);
 	if (retry && first.confidence < 55 && dpi < 400) {
@@ -965,6 +980,11 @@ struct PdfOptions {
 	// Default false preserves the strict "one bad file throws" contract. Skipped
 	// files are recoverable in SQL: glob(pattern) EXCEPT SELECT DISTINCT filename.
 	bool ignore_errors = false;
+	// OCR backend: "tesseract" (linked default) or "external" (plugin C ABI or
+	// SQL pdf_page_images → llm pipeline). See ocr_ops.hpp.
+	string ocr_backend = "tesseract";
+	string ocr_plugin;   // path to shared lib for external backend
+	string ocr_endpoint; // reserved; documented handoff only (no shell/HTTP here)
 };
 
 static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
@@ -1000,6 +1020,12 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 			o.last_page = IntegerValue::Get(kv.second);
 		} else if (key == "ignore_errors") {
 			o.ignore_errors = BooleanValue::Get(kv.second);
+		} else if (key == "ocr_backend") {
+			o.ocr_backend = StringValue::Get(kv.second);
+		} else if (key == "ocr_plugin") {
+			o.ocr_plugin = StringValue::Get(kv.second);
+		} else if (key == "ocr_endpoint") {
+			o.ocr_endpoint = StringValue::Get(kv.second);
 		}
 	}
 
@@ -1025,6 +1051,12 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 	if (o.last_page > 0 && o.last_page < o.first_page) {
 		throw InvalidInputException("read_pdf: last_page (%d) must be >= first_page (%d)", o.last_page, o.first_page);
 	}
+	// ocr_backend name is validated via BackendFromString so typos fail fast.
+	try {
+		(void)pdf_ocr::BackendFromString(o.ocr_backend);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("%s", string(e.what()));
+	}
 }
 
 static void AddCommonNamedParams(TableFunction &fn) {
@@ -1042,6 +1074,9 @@ static void AddCommonNamedParams(TableFunction &fn) {
 	fn.named_parameters["password"] = LogicalType::VARCHAR;
 	fn.named_parameters["first_page"] = LogicalType::INTEGER;
 	fn.named_parameters["last_page"] = LogicalType::INTEGER;
+	fn.named_parameters["ocr_backend"] = LogicalType::VARCHAR;
+	fn.named_parameters["ocr_plugin"] = LogicalType::VARCHAR;
+	fn.named_parameters["ocr_endpoint"] = LogicalType::VARCHAR;
 }
 
 static vector<string> ResolveFiles(ClientContext &context, const string &pattern) {
@@ -1246,7 +1281,7 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 					const bool best_effort = !bind.opt.force_ocr || has_text_layer;
 					string ocr =
 					    OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm, bind.opt.ocr_oem,
-					            bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry, best_effort);
+					            bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry, best_effort, bind.opt.ocr_backend, bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
 					if (!ocr.empty()) {
 						text = ocr;
 						used_ocr = true;
@@ -2132,7 +2167,7 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 			const bool has_native = !g.boxes.empty();
 			g.ocr_boxes = OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem,
 			                           opt.tessdata_dir, opt.ocr_preprocess, opt.ocr_retry,
-			                           /*best_effort=*/has_native);
+			                           /*best_effort=*/has_native, opt.ocr_backend, opt.ocr_plugin, opt.ocr_endpoint);
 			if (!g.ocr_boxes.empty()) {
 				g.boxes.clear();
 				g.page_is_ocr = true;
@@ -2145,7 +2180,7 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 				g.page_is_ocr = false;
 			} else if (opt.auto_ocr) {
 				g.ocr_boxes = OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem,
-				                           opt.tessdata_dir, opt.ocr_preprocess, opt.ocr_retry, /*best_effort=*/true);
+				                           opt.tessdata_dir, opt.ocr_preprocess, opt.ocr_retry, /*best_effort=*/true, opt.ocr_backend, opt.ocr_plugin, opt.ocr_endpoint);
 				g.page_is_ocr = !g.ocr_boxes.empty();
 			} else {
 				g.page_is_ocr = false;
@@ -3183,7 +3218,7 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 				auto ocr_words =
 				    OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
 				                 bind.opt.ocr_oem, bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry,
-				                 /*best_effort=*/true);
+				                 /*best_effort=*/true, bind.opt.ocr_backend, bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
 				for (auto &ow : ocr_words) {
 					PdfWord w;
 					w.xMin = ow.x0;
@@ -3219,7 +3254,7 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 				if (words.empty() && bind.opt.auto_ocr) {
 					auto ocr_words = OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
 					                              bind.opt.ocr_oem, bind.opt.tessdata_dir, bind.opt.ocr_preprocess,
-					                              bind.opt.ocr_retry, /*best_effort=*/true);
+					                              bind.opt.ocr_retry, /*best_effort=*/true, bind.opt.ocr_backend, bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
 					for (auto &ow : ocr_words) {
 						PdfWord w;
 						w.xMin = ow.x0;
@@ -6266,6 +6301,782 @@ static void PdfImagesScan(ClientContext &context, TableFunctionInput &data_p, Da
 //===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
+
+//===--------------------------------------------------------------------===//
+// Comprehensive poppler-cpp surface (high-value gaps)
+//   pdf_pages_info  — per-page geometry / orientation / label
+//   pdf_permissions — document permission bits + form/js/ids/mode
+//   pdf_fonts       — embedded/external font inventory
+//   pdf_destinations— named destination map
+//   pdf_page_images — render every page to PNG (SQL handoff for SOTA OCR)
+// Comprehensive qpdf surface (high-value gaps)
+//   pdf_qpdf_info   — linearization / xref / encryption details
+//   pdf_json        — structural JSON dump
+//   pdf_repair      — content-normalization repair write
+//===--------------------------------------------------------------------===//
+
+static const char *OrientationName(poppler::page::orientation_enum o) {
+	switch (o) {
+	case poppler::page::landscape:
+		return "landscape";
+	case poppler::page::seascape:
+		return "seascape";
+	case poppler::page::upside_down:
+		return "upside_down";
+	case poppler::page::portrait:
+	default:
+		return "portrait";
+	}
+}
+
+static int OrientationDegrees(poppler::page::orientation_enum o) {
+	switch (o) {
+	case poppler::page::landscape:
+		return 90;
+	case poppler::page::upside_down:
+		return 180;
+	case poppler::page::seascape:
+		return 270;
+	case poppler::page::portrait:
+	default:
+		return 0;
+	}
+}
+
+static const char *PageModeName(poppler::document::page_mode_enum m) {
+	switch (m) {
+	case poppler::document::use_outlines:
+		return "use_outlines";
+	case poppler::document::use_thumbs:
+		return "use_thumbs";
+	case poppler::document::fullscreen:
+		return "fullscreen";
+	case poppler::document::use_oc:
+		return "use_oc";
+	case poppler::document::use_attach:
+		return "use_attach";
+	case poppler::document::use_none:
+	default:
+		return "use_none";
+	}
+}
+
+static const char *PageLayoutName(poppler::document::page_layout_enum l) {
+	switch (l) {
+	case poppler::document::single_page:
+		return "single_page";
+	case poppler::document::one_column:
+		return "one_column";
+	case poppler::document::two_column_left:
+		return "two_column_left";
+	case poppler::document::two_column_right:
+		return "two_column_right";
+	case poppler::document::two_page_left:
+		return "two_page_left";
+	case poppler::document::two_page_right:
+		return "two_page_right";
+	case poppler::document::no_layout:
+	default:
+		return "no_layout";
+	}
+}
+
+// poppler::document has both `enum class form_type` and a method form_type(),
+// so the type name is hidden in this scope under C++11. Use the underlying int.
+static const char *FormTypeName(int t) {
+	// Values match poppler::document::form_type { none=0, acro=1, xfa=2 }.
+	switch (t) {
+	case 1:
+		return "acro";
+	case 2:
+		return "xfa";
+	case 0:
+	default:
+		return "none";
+	}
+}
+
+static const char *FontTypeName(poppler::font_info::type_enum t) {
+	switch (t) {
+	case poppler::font_info::type1:
+		return "type1";
+	case poppler::font_info::type1c:
+		return "type1c";
+	case poppler::font_info::type1c_ot:
+		return "type1c_ot";
+	case poppler::font_info::type3:
+		return "type3";
+	case poppler::font_info::truetype:
+		return "truetype";
+	case poppler::font_info::truetype_ot:
+		return "truetype_ot";
+	case poppler::font_info::cid_type0:
+		return "cid_type0";
+	case poppler::font_info::cid_type0c:
+		return "cid_type0c";
+	case poppler::font_info::cid_type0c_ot:
+		return "cid_type0c_ot";
+	case poppler::font_info::cid_truetype:
+		return "cid_truetype";
+	case poppler::font_info::cid_truetype_ot:
+		return "cid_truetype_ot";
+	case poppler::font_info::unknown:
+	default:
+		return "unknown";
+	}
+}
+
+static const char *DestinationTypeName(poppler::destination::type_enum t) {
+	switch (t) {
+	case poppler::destination::xyz:
+		return "xyz";
+	case poppler::destination::fit:
+		return "fit";
+	case poppler::destination::fit_h:
+		return "fit_h";
+	case poppler::destination::fit_v:
+		return "fit_v";
+	case poppler::destination::fit_r:
+		return "fit_r";
+	case poppler::destination::fit_b:
+		return "fit_b";
+	case poppler::destination::fit_b_h:
+		return "fit_b_h";
+	case poppler::destination::fit_b_v:
+		return "fit_b_v";
+	case poppler::destination::unknown:
+	default:
+		return "unknown";
+	}
+}
+
+//---- pdf_pages_info -------------------------------------------------------
+struct PdfPagesInfoRow {
+	int page = 0;
+	double width = 0, height = 0;
+	double media_w = 0, media_h = 0;
+	double crop_w = 0, crop_h = 0;
+	int rotation = 0;
+	string orientation;
+	string label;
+	double duration = -1;
+};
+
+struct PdfPagesInfoState : public GlobalTableFunctionState {
+	idx_t file_idx = 0;
+	idx_t row_idx = 0;
+	string current_file;
+	int page_count = 0;
+	std::vector<PdfPagesInfoRow> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfPagesInfoBind(ClientContext &context, TableFunctionBindInput &input,
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,   LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,   LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::DOUBLE};
+	names = {"file",     "page",    "page_count", "width",       "height", "media_width", "media_height",
+	         "crop_width", "crop_height", "rotation", "orientation", "label", "duration"};
+	return PdfInspectBindCommon(context, input);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfPagesInfoInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfPagesInfoState>();
+}
+
+static void PdfPagesInfoScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	auto &bind = data_p.bind_data->Cast<PdfInspectBindData>();
+	auto &st = data_p.global_state->Cast<PdfPagesInfoState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE) {
+		if (st.row_idx >= st.rows.size()) {
+			if (st.file_idx >= bind.files.size()) {
+				break;
+			}
+			st.rows.clear();
+			st.row_idx = 0;
+			st.current_file = bind.files[st.file_idx++];
+			string bytes;
+			ReadAllBytes(context, st.current_file, bytes);
+			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+			st.page_count = doc->pages();
+			for (int i = 0; i < st.page_count; i++) {
+				unique_ptr<poppler::page> page(doc->create_page(i));
+				if (!page) {
+					continue;
+				}
+				PdfPagesInfoRow row;
+				row.page = i + 1;
+				auto crop = page->page_rect(poppler::crop_box);
+				auto media = page->page_rect(poppler::media_box);
+				row.width = crop.width();
+				row.height = crop.height();
+				row.crop_w = crop.width();
+				row.crop_h = crop.height();
+				row.media_w = media.width();
+				row.media_h = media.height();
+				auto ori = page->orientation();
+				row.orientation = OrientationName(ori);
+				row.rotation = OrientationDegrees(ori);
+				row.label = UStringToUtf8(page->label());
+				row.duration = page->duration();
+				st.rows.push_back(std::move(row));
+			}
+			continue;
+		}
+		auto &row = st.rows[st.row_idx];
+		output.SetValue(0, count, Value(st.current_file));
+		output.SetValue(1, count, Value::INTEGER(row.page));
+		output.SetValue(2, count, Value::INTEGER(st.page_count));
+		output.SetValue(3, count, Value::DOUBLE(row.width));
+		output.SetValue(4, count, Value::DOUBLE(row.height));
+		output.SetValue(5, count, Value::DOUBLE(row.media_w));
+		output.SetValue(6, count, Value::DOUBLE(row.media_h));
+		output.SetValue(7, count, Value::DOUBLE(row.crop_w));
+		output.SetValue(8, count, Value::DOUBLE(row.crop_h));
+		output.SetValue(9, count, Value::INTEGER(row.rotation));
+		output.SetValue(10, count, Value(row.orientation));
+		output.SetValue(11, count, InspectStringOrNull(row.label));
+		output.SetValue(12, count, row.duration < 0 ? Value(LogicalType::DOUBLE) : Value::DOUBLE(row.duration));
+		st.row_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//---- pdf_permissions ------------------------------------------------------
+struct PdfPermissionsState : public GlobalTableFunctionState {
+	idx_t idx = 0;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfPermissionsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {
+	    LogicalType::VARCHAR,  LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	    LogicalType::BOOLEAN,  LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	    LogicalType::BOOLEAN,  LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
+	    LogicalType::VARCHAR,  LogicalType::VARCHAR, LogicalType::VARCHAR};
+	names = {"file",
+	         "is_encrypted",
+	         "is_locked",
+	         "perm_print",
+	         "perm_print_high_resolution",
+	         "perm_change",
+	         "perm_copy",
+	         "perm_add_notes",
+	         "perm_fill_forms",
+	         "perm_accessibility",
+	         "perm_assemble",
+	         "has_javascript",
+	         "form_type",
+	         "is_linearized",
+	         "page_mode",
+	         "page_layout",
+	         "permanent_id",
+	         "update_id"};
+	return PdfInspectBindCommon(context, input);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfPermissionsInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfPermissionsState>();
+}
+
+static void PdfPermissionsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	auto &bind = data_p.bind_data->Cast<PdfInspectBindData>();
+	auto &st = data_p.global_state->Cast<PdfPermissionsState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && st.idx < bind.files.size()) {
+		auto &path = bind.files[st.idx];
+		string bytes;
+		ReadAllBytes(context, path, bytes);
+		auto doc = LoadDoc(bytes, bind.opt.password, path);
+		std::string permanent_id, update_id;
+		doc->get_pdf_id(&permanent_id, &update_id);
+		output.SetValue(0, count, Value(path));
+		output.SetValue(1, count, Value::BOOLEAN(doc->is_encrypted()));
+		output.SetValue(2, count, Value::BOOLEAN(doc->is_locked()));
+		output.SetValue(3, count, Value::BOOLEAN(doc->has_permission(poppler::perm_print)));
+		output.SetValue(4, count, Value::BOOLEAN(doc->has_permission(poppler::perm_print_high_resolution)));
+		output.SetValue(5, count, Value::BOOLEAN(doc->has_permission(poppler::perm_change)));
+		output.SetValue(6, count, Value::BOOLEAN(doc->has_permission(poppler::perm_copy)));
+		output.SetValue(7, count, Value::BOOLEAN(doc->has_permission(poppler::perm_add_notes)));
+		output.SetValue(8, count, Value::BOOLEAN(doc->has_permission(poppler::perm_fill_forms)));
+		output.SetValue(9, count, Value::BOOLEAN(doc->has_permission(poppler::perm_accessibility)));
+		output.SetValue(10, count, Value::BOOLEAN(doc->has_permission(poppler::perm_assemble)));
+		output.SetValue(11, count, Value::BOOLEAN(doc->has_javascript()));
+		output.SetValue(12, count, Value(string(FormTypeName(static_cast<int>(doc->form_type())))));
+		output.SetValue(13, count, Value::BOOLEAN(doc->is_linearized()));
+		output.SetValue(14, count, Value(string(PageModeName(doc->page_mode()))));
+		output.SetValue(15, count, Value(string(PageLayoutName(doc->page_layout()))));
+		output.SetValue(16, count, InspectStringOrNull(permanent_id));
+		output.SetValue(17, count, InspectStringOrNull(update_id));
+		st.idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//---- pdf_fonts ------------------------------------------------------------
+struct PdfFontRow {
+	int page = 0; // 1-based; 0 when unknown / document-level
+	string name;
+	string type;
+	bool embedded = false;
+	bool subset = false;
+	string file;
+};
+
+struct PdfFontsState : public GlobalTableFunctionState {
+	idx_t file_idx = 0;
+	idx_t row_idx = 0;
+	string current_file;
+	std::vector<PdfFontRow> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfFontsBind(ClientContext &context, TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::VARCHAR};
+	names = {"file", "page", "name", "type", "embedded", "subset", "font_file"};
+	return PdfInspectBindCommon(context, input);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfFontsInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfFontsState>();
+}
+
+static void PdfFontsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	auto &bind = data_p.bind_data->Cast<PdfInspectBindData>();
+	auto &st = data_p.global_state->Cast<PdfFontsState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE) {
+		if (st.row_idx >= st.rows.size()) {
+			if (st.file_idx >= bind.files.size()) {
+				break;
+			}
+			st.rows.clear();
+			st.row_idx = 0;
+			st.current_file = bind.files[st.file_idx++];
+			string bytes;
+			ReadAllBytes(context, st.current_file, bytes);
+			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+			// Prefer the page-walking iterator so each font is tagged with the
+			// page it first appears on; fall back to document::fonts() if the
+			// iterator is unavailable.
+			unique_ptr<poppler::font_iterator> it(doc->create_font_iterator(0));
+			if (it) {
+				while (it->has_next()) {
+					int page0 = it->current_page();
+					auto fonts = it->next();
+					for (auto &fi : fonts) {
+						PdfFontRow row;
+						row.page = page0 + 1;
+						row.name = fi.name();
+						row.type = FontTypeName(fi.type());
+						row.embedded = fi.is_embedded();
+						row.subset = fi.is_subset();
+						row.file = fi.file();
+						st.rows.push_back(std::move(row));
+					}
+				}
+			} else {
+				for (auto &fi : doc->fonts()) {
+					PdfFontRow row;
+					row.page = 0;
+					row.name = fi.name();
+					row.type = FontTypeName(fi.type());
+					row.embedded = fi.is_embedded();
+					row.subset = fi.is_subset();
+					row.file = fi.file();
+					st.rows.push_back(std::move(row));
+				}
+			}
+			continue;
+		}
+		auto &row = st.rows[st.row_idx];
+		output.SetValue(0, count, Value(st.current_file));
+		output.SetValue(1, count, row.page > 0 ? Value::INTEGER(row.page) : Value(LogicalType::INTEGER));
+		output.SetValue(2, count, InspectStringOrNull(row.name));
+		output.SetValue(3, count, Value(row.type));
+		output.SetValue(4, count, Value::BOOLEAN(row.embedded));
+		output.SetValue(5, count, Value::BOOLEAN(row.subset));
+		output.SetValue(6, count, InspectStringOrNull(row.file));
+		st.row_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//---- pdf_destinations -----------------------------------------------------
+struct PdfDestRow {
+	string name;
+	string type;
+	int page = 0;
+	double left = 0, bottom = 0, right = 0, top = 0, zoom = 0;
+	bool change_left = false, change_top = false, change_zoom = false;
+};
+
+struct PdfDestinationsState : public GlobalTableFunctionState {
+	idx_t file_idx = 0;
+	idx_t row_idx = 0;
+	string current_file;
+	std::vector<PdfDestRow> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfDestinationsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,  LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN};
+	names = {"file", "name", "type", "page", "left", "bottom", "right", "top", "zoom",
+	         "change_left", "change_top", "change_zoom"};
+	return PdfInspectBindCommon(context, input);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfDestinationsInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfDestinationsState>();
+}
+
+static void PdfDestinationsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	auto &bind = data_p.bind_data->Cast<PdfInspectBindData>();
+	auto &st = data_p.global_state->Cast<PdfDestinationsState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE) {
+		if (st.row_idx >= st.rows.size()) {
+			if (st.file_idx >= bind.files.size()) {
+				break;
+			}
+			st.rows.clear();
+			st.row_idx = 0;
+			st.current_file = bind.files[st.file_idx++];
+			string bytes;
+			ReadAllBytes(context, st.current_file, bytes);
+			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+			// create_destination_map returns by value; destinations are movable.
+			auto dest_map = doc->create_destination_map();
+			for (auto &kv : dest_map) {
+				PdfDestRow row;
+				row.name = kv.first;
+				auto &d = kv.second;
+				row.type = DestinationTypeName(d.type());
+				row.page = d.page_number();
+				row.left = d.left();
+				row.bottom = d.bottom();
+				row.right = d.right();
+				row.top = d.top();
+				row.zoom = d.zoom();
+				row.change_left = d.is_change_left();
+				row.change_top = d.is_change_top();
+				row.change_zoom = d.is_change_zoom();
+				st.rows.push_back(std::move(row));
+			}
+			continue;
+		}
+		auto &row = st.rows[st.row_idx];
+		output.SetValue(0, count, Value(st.current_file));
+		output.SetValue(1, count, Value(row.name));
+		output.SetValue(2, count, Value(row.type));
+		output.SetValue(3, count, Value::INTEGER(row.page));
+		output.SetValue(4, count, Value::DOUBLE(row.left));
+		output.SetValue(5, count, Value::DOUBLE(row.bottom));
+		output.SetValue(6, count, Value::DOUBLE(row.right));
+		output.SetValue(7, count, Value::DOUBLE(row.top));
+		output.SetValue(8, count, Value::DOUBLE(row.zoom));
+		output.SetValue(9, count, Value::BOOLEAN(row.change_left));
+		output.SetValue(10, count, Value::BOOLEAN(row.change_top));
+		output.SetValue(11, count, Value::BOOLEAN(row.change_zoom));
+		st.row_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//---- pdf_page_images — render each page to PNG for SOTA / llm pipelines ----
+struct PdfPageImagesBindData : public TableFunctionData {
+	vector<string> files;
+	PdfOptions opt;
+	int32_t dpi = 150;
+};
+
+struct PdfPageImagesRow {
+	int page = 0;
+	int width = 0;
+	int height = 0;
+	string png;
+};
+
+struct PdfPageImagesState : public GlobalTableFunctionState {
+	idx_t file_idx = 0;
+	idx_t row_idx = 0;
+	string current_file;
+	int page_count = 0;
+	std::vector<PdfPageImagesRow> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfPageImagesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfPageImagesBindData>();
+	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	ParseNamed(input.named_parameters, result->opt);
+	for (auto &kv : input.named_parameters) {
+		if (StringUtil::Lower(kv.first) == "dpi") {
+			result->dpi = IntegerValue::Get(kv.second);
+		}
+	}
+	if (result->dpi < 1 || result->dpi > 2400) {
+		throw InvalidInputException("pdf_page_images: dpi must be between 1 and 2400 (got %d)", result->dpi);
+	}
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BLOB};
+	names = {"file", "page", "page_count", "dpi", "width", "height", "png"};
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfPageImagesInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfPageImagesState>();
+}
+
+static void PdfPageImagesScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfPageImagesBindData>();
+	auto &st = data_p.global_state->Cast<PdfPageImagesState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE) {
+		if (st.row_idx >= st.rows.size()) {
+			if (st.file_idx >= bind.files.size()) {
+				break;
+			}
+			st.rows.clear();
+			st.row_idx = 0;
+			st.current_file = bind.files[st.file_idx++];
+			string bytes;
+			ReadAllBytes(context, st.current_file, bytes);
+			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+			st.page_count = doc->pages();
+			int first = bind.opt.first_page > 0 ? bind.opt.first_page : 1;
+			int last = bind.opt.last_page < 0 ? st.page_count : MinValue<int>(bind.opt.last_page, st.page_count);
+			for (int p = first; p <= last; p++) {
+				PdfPageImagesRow row;
+				row.page = p;
+				row.png = RenderPageToPngBytes(*doc, p, bind.dpi, "pdf_page_images");
+				// Recover pixel dimensions from the PNG IHDR (bytes 16..23).
+				if (row.png.size() >= 24) {
+					auto u32be = [](const char *b) -> int {
+						return (static_cast<unsigned char>(b[0]) << 24) |
+						       (static_cast<unsigned char>(b[1]) << 16) |
+						       (static_cast<unsigned char>(b[2]) << 8) |
+						       (static_cast<unsigned char>(b[3]));
+					};
+					row.width = u32be(row.png.data() + 16);
+					row.height = u32be(row.png.data() + 20);
+				}
+				st.rows.push_back(std::move(row));
+			}
+			continue;
+		}
+		auto &row = st.rows[st.row_idx];
+		output.SetValue(0, count, Value(st.current_file));
+		output.SetValue(1, count, Value::INTEGER(row.page));
+		output.SetValue(2, count, Value::INTEGER(st.page_count));
+		output.SetValue(3, count, Value::INTEGER(bind.dpi));
+		output.SetValue(4, count, Value::INTEGER(row.width));
+		output.SetValue(5, count, Value::INTEGER(row.height));
+		output.SetValue(6, count, Value::BLOB(const_data_ptr_cast(row.png.data()), row.png.size()));
+		st.row_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//---- pdf_qpdf_info --------------------------------------------------------
+struct PdfQpdfInfoBindData : public TableFunctionData {
+	vector<string> files;
+	string password;
+};
+
+struct PdfQpdfInfoState : public GlobalTableFunctionState {
+	idx_t idx = 0;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfQpdfInfoBind(ClientContext &context, TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfQpdfInfoBindData>();
+	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	for (auto &kv : input.named_parameters) {
+		if (StringUtil::Lower(kv.first) == "password") {
+			result->password = StringValue::Get(kv.second);
+		}
+	}
+	return_types = {
+	    LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::INTEGER, LogicalType::BIGINT,
+	    LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN,
+	    LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	    LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	    LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	    LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BIGINT};
+	names = {"file",
+	         "is_linearized",
+	         "linearized_ok",
+	         "page_count",
+	         "object_count",
+	         "xref_total",
+	         "xref_free",
+	         "xref_uncompressed",
+	         "xref_compressed",
+	         "is_encrypted",
+	         "enc_R",
+	         "enc_P",
+	         "enc_V",
+	         "stream_method",
+	         "string_method",
+	         "file_method",
+	         "owner_password_matched",
+	         "user_password_matched",
+	         "allow_accessibility",
+	         "allow_extract",
+	         "allow_print_low",
+	         "allow_print_high",
+	         "allow_modify_assembly",
+	         "allow_modify_form",
+	         "allow_modify_annotation",
+	         "allow_modify_other",
+	         "allow_modify_all",
+	         "warning_count"};
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfQpdfInfoInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfQpdfInfoState>();
+}
+
+static void PdfQpdfInfoScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfQpdfInfoBindData>();
+	auto &st = data_p.global_state->Cast<PdfQpdfInfoState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && st.idx < bind.files.size()) {
+		auto &path = bind.files[st.idx];
+		// Existence check via DuckDB FS so virtual paths still work; qpdf opens
+		// the host path itself (same pattern as other qpdf table functions).
+		auto &fs = FileSystem::GetFileSystem(context);
+		if (!fs.FileExists(path)) {
+			throw IOException("pdf_qpdf_info: file '%s' does not exist", path);
+		}
+		pdf_qpdf::DocumentStats s;
+		try {
+			s = pdf_qpdf::InspectDocument(path, bind.password);
+		} catch (const std::exception &e) {
+			throw IOException("pdf_qpdf_info: %s", string(e.what()));
+		}
+		int c = 0;
+		output.SetValue(c++, count, Value(path));
+		output.SetValue(c++, count, Value::BOOLEAN(s.is_linearized));
+		output.SetValue(c++, count, Value::BOOLEAN(s.linearized_ok));
+		output.SetValue(c++, count, Value::INTEGER(s.page_count));
+		output.SetValue(c++, count, Value::BIGINT(s.object_count));
+		output.SetValue(c++, count, Value::BIGINT(s.xref_total));
+		output.SetValue(c++, count, Value::BIGINT(s.xref_free));
+		output.SetValue(c++, count, Value::BIGINT(s.xref_uncompressed));
+		output.SetValue(c++, count, Value::BIGINT(s.xref_compressed));
+		output.SetValue(c++, count, Value::BOOLEAN(s.is_encrypted));
+		output.SetValue(c++, count, Value::INTEGER(s.enc_R));
+		output.SetValue(c++, count, Value::INTEGER(s.enc_P));
+		output.SetValue(c++, count, Value::INTEGER(s.enc_V));
+		output.SetValue(c++, count, Value(s.stream_method));
+		output.SetValue(c++, count, Value(s.string_method));
+		output.SetValue(c++, count, Value(s.file_method));
+		output.SetValue(c++, count, Value::BOOLEAN(s.owner_password_matched));
+		output.SetValue(c++, count, Value::BOOLEAN(s.user_password_matched));
+		output.SetValue(c++, count, Value::BOOLEAN(s.allow_accessibility));
+		output.SetValue(c++, count, Value::BOOLEAN(s.allow_extract));
+		output.SetValue(c++, count, Value::BOOLEAN(s.allow_print_low));
+		output.SetValue(c++, count, Value::BOOLEAN(s.allow_print_high));
+		output.SetValue(c++, count, Value::BOOLEAN(s.allow_modify_assembly));
+		output.SetValue(c++, count, Value::BOOLEAN(s.allow_modify_form));
+		output.SetValue(c++, count, Value::BOOLEAN(s.allow_modify_annotation));
+		output.SetValue(c++, count, Value::BOOLEAN(s.allow_modify_other));
+		output.SetValue(c++, count, Value::BOOLEAN(s.allow_modify_all));
+		output.SetValue(c++, count, Value::BIGINT(s.warning_count));
+		st.idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//---- pdf_json (scalar) ----------------------------------------------------
+static void PdfJsonFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	(void)context;
+	BinaryExecutor::Execute<string_t, string_t, string_t>(
+	    args.data[0], args.data[1], result, args.size(), [&](string_t path, string_t password) {
+		    try {
+			    auto json = pdf_qpdf::WriteJson(path.GetString(), password.GetString(), 2);
+			    return StringVector::AddString(result, json);
+		    } catch (const std::exception &e) {
+			    throw IOException("pdf_json: %s", string(e.what()));
+		    }
+	    });
+}
+
+static void PdfJsonPathOnlyFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
+		try {
+			auto json = pdf_qpdf::WriteJson(path.GetString(), "", 2);
+			return StringVector::AddString(result, json);
+		} catch (const std::exception &e) {
+			throw IOException("pdf_json: %s", string(e.what()));
+		}
+	});
+}
+
+//---- pdf_repair (scalar) --------------------------------------------------
+static void PdfRepairFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	TernaryExecutor::Execute<string_t, string_t, string_t, string_t>(
+	    args.data[0], args.data[1], args.data[2], result, args.size(),
+	    [&](string_t input, string_t output, string_t password) {
+		    try {
+			    pdf_qpdf::Repair(input.GetString(), output.GetString(), password.GetString());
+			    return StringVector::AddString(result, output);
+		    } catch (const std::exception &e) {
+			    throw IOException("pdf_repair: %s", string(e.what()));
+		    }
+	    });
+}
+
+static void PdfRepairNoPwFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	BinaryExecutor::Execute<string_t, string_t, string_t>(
+	    args.data[0], args.data[1], result, args.size(), [&](string_t input, string_t output) {
+		    try {
+			    pdf_qpdf::Repair(input.GetString(), output.GetString(), "");
+			    return StringVector::AddString(result, output);
+		    } catch (const std::exception &e) {
+			    throw IOException("pdf_repair: %s", string(e.what()));
+		    }
+	    });
+}
+
+
 static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction read_pdf("read_pdf", {LogicalType::VARCHAR}, ReadPdfScan, ReadPdfBind, ReadPdfInitGlobal,
 	                       ReadPdfInitLocal);
@@ -6492,6 +7303,52 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_redact.named_parameters["dpi"] = LogicalType::INTEGER;
 	pdf_redact.named_parameters["password"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(pdf_redact);
+
+	// Comprehensive poppler / qpdf surface
+	TableFunction pdf_pages_info("pdf_pages_info", {LogicalType::VARCHAR}, PdfPagesInfoScan, PdfPagesInfoBind,
+	                             PdfPagesInfoInit);
+	pdf_pages_info.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_pages_info);
+
+	TableFunction pdf_permissions("pdf_permissions", {LogicalType::VARCHAR}, PdfPermissionsScan, PdfPermissionsBind,
+	                              PdfPermissionsInit);
+	pdf_permissions.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_permissions);
+
+	TableFunction pdf_fonts("pdf_fonts", {LogicalType::VARCHAR}, PdfFontsScan, PdfFontsBind, PdfFontsInit);
+	pdf_fonts.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_fonts);
+
+	TableFunction pdf_destinations("pdf_destinations", {LogicalType::VARCHAR}, PdfDestinationsScan, PdfDestinationsBind,
+	                               PdfDestinationsInit);
+	pdf_destinations.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_destinations);
+
+	TableFunction pdf_page_images("pdf_page_images", {LogicalType::VARCHAR}, PdfPageImagesScan, PdfPageImagesBind,
+	                              PdfPageImagesInit);
+	pdf_page_images.named_parameters["password"] = LogicalType::VARCHAR;
+	pdf_page_images.named_parameters["dpi"] = LogicalType::INTEGER;
+	pdf_page_images.named_parameters["first_page"] = LogicalType::INTEGER;
+	pdf_page_images.named_parameters["last_page"] = LogicalType::INTEGER;
+	loader.RegisterFunction(pdf_page_images);
+
+	TableFunction pdf_qpdf_info("pdf_qpdf_info", {LogicalType::VARCHAR}, PdfQpdfInfoScan, PdfQpdfInfoBind,
+	                            PdfQpdfInfoInit);
+	pdf_qpdf_info.named_parameters["password"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(pdf_qpdf_info);
+
+	ScalarFunctionSet pdf_json_set("pdf_json");
+	pdf_json_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfJsonPathOnlyFun));
+	pdf_json_set.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfJsonFun));
+	loader.RegisterFunction(pdf_json_set);
+
+	ScalarFunctionSet pdf_repair_set("pdf_repair");
+	pdf_repair_set.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfRepairNoPwFun));
+	pdf_repair_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                          LogicalType::VARCHAR, PdfRepairFun));
+	loader.RegisterFunction(pdf_repair_set);
 
 	// COPY TO pdf
 	CopyFunction pdf_copy("pdf");

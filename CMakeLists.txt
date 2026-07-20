@@ -189,10 +189,14 @@ if(NOT WIN32)
     # must link it ourselves. It is a system dylib on macOS/apt.
     find_package(ZLIB REQUIRED)
 
+    # ${CMAKE_DL_LIBS} is libdl on Linux (needed for the external OCR plugin
+    # dlopen path in ocr_ops.cpp) and empty on macOS where dlopen is in libSystem.
     target_link_libraries(${EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB)
+      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB
+      ${CMAKE_DL_LIBS})
     target_link_libraries(${LOADABLE_EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB)
+      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB
+      ${CMAKE_DL_LIBS})
 
     # libharu for write_pdf (local brew path). Dynamic dylib; find explicitly (no pkg-config).
     # Transitive (libpng, zlib) are satisfied by the dylib itself at runtime.

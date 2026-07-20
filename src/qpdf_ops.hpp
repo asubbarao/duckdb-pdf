@@ -251,4 +251,65 @@ struct RebuiltPage {
 void RebuildPagesAsImages(const std::string &input, const std::string &output, const std::vector<RebuiltPage> &pages,
                           const std::string &password);
 
+//===--------------------------------------------------------------------===//
+// Structure / encryption / repair / JSON — high-value qpdf inspection surface
+// that poppler-cpp does not expose (xref table, encryption method bits, object
+// counts, linearization check, JSON structure dump, content-normalization
+// repair). Plain-std types only; caller maps to DuckDB columns.
+//===--------------------------------------------------------------------===//
+
+// One-row document census from the qpdf object model (not poppler).
+struct DocumentStats {
+	bool is_linearized = false;
+	// true when isLinearized() && checkLinearization() reported no issues.
+	// For non-linearized files this stays false (there is nothing to check).
+	bool linearized_ok = false;
+	int page_count = 0;
+	// Approximate indirect-object count (qpdf::getObjectCount).
+	int64_t object_count = 0;
+	// Xref table census from getXRefTable().
+	int64_t xref_total = 0;
+	int64_t xref_free = 0;         // type 0
+	int64_t xref_uncompressed = 0; // type 1
+	int64_t xref_compressed = 0;   // type 2 (object streams)
+	// Encryption dictionary summary. When !is_encrypted the method strings are
+	// "none" and R/P/V are 0.
+	bool is_encrypted = false;
+	int enc_R = 0; // revision
+	int enc_P = 0; // permissions bitfield as stored
+	int enc_V = 0; // algorithm version
+	std::string stream_method; // "none" | "unknown" | "rc4" | "aes" | "aesv3"
+	std::string string_method;
+	std::string file_method;
+	bool owner_password_matched = false;
+	bool user_password_matched = false;
+	// Permission helpers (meaningful when encrypted; true when unencrypted).
+	bool allow_accessibility = true;
+	bool allow_extract = true;
+	bool allow_print_low = true;
+	bool allow_print_high = true;
+	bool allow_modify_assembly = true;
+	bool allow_modify_form = true;
+	bool allow_modify_annotation = true;
+	bool allow_modify_other = true;
+	bool allow_modify_all = true;
+	// Warning count drained from qpdf after open (dangling refs etc.).
+	int64_t warning_count = 0;
+};
+
+// Opens `path` with optional password and returns the structure census above.
+// Wrong password / unreadable file throws via the error contract.
+DocumentStats InspectDocument(const std::string &path, const std::string &password);
+
+// Dumps the document as qpdf JSON (version 2 by default). Stream *payloads* are
+// omitted (qpdf_sj_none) so the result is a structural map suitable for SQL
+// inspection, not a multi-megabyte re-encoding of every image. `password` may
+// be empty. Throws on open/write failure.
+std::string WriteJson(const std::string &path, const std::string &password, int json_version = 2);
+
+// Best-effort structural repair: fix dangling references, content-stream
+// normalization, stream recompression. Writes a new file at `output`. Does not
+// attempt OCR or raster rebuilds. Password may be empty.
+void Repair(const std::string &input, const std::string &output, const std::string &password);
+
 } // namespace pdf_qpdf

@@ -12,14 +12,179 @@
 
 #include <leptonica/allheaders.h>
 
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
+#include <string>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 namespace pdf_ocr {
 namespace {
+
+// C ABI function pointers for an external OCR plugin (see ocr_ops.hpp).
+using PluginRecognizeFn = int (*)(const unsigned char *, int, int, int, int, const char *, char **, int *);
+using PluginFreeFn = void (*)(void *);
+
+struct PluginHandle {
+	void *lib = nullptr;
+	PluginRecognizeFn recognize = nullptr;
+	PluginFreeFn free_fn = nullptr;
+	std::string path;
+};
+
+std::mutex &PluginMutex() {
+	static std::mutex m;
+	return m;
+}
+
+// Cached last-loaded plugin so repeated pages do not re-dlopen. Path-keyed:
+// changing external_plugin reloads.
+PluginHandle &CachedPlugin() {
+	static PluginHandle h;
+	return h;
+}
+
+void ClosePlugin(PluginHandle &h) {
+	if (!h.lib) {
+		return;
+	}
+#ifdef _WIN32
+	FreeLibrary(static_cast<HMODULE>(h.lib));
+#else
+	dlclose(h.lib);
+#endif
+	h.lib = nullptr;
+	h.recognize = nullptr;
+	h.free_fn = nullptr;
+	h.path.clear();
+}
+
+PluginHandle LoadPlugin(const std::string &path) {
+	std::lock_guard<std::mutex> guard(PluginMutex());
+	auto &cached = CachedPlugin();
+	if (cached.lib && cached.path == path && cached.recognize) {
+		return cached; // shallow copy of function pointers is fine
+	}
+	ClosePlugin(cached);
+	if (path.empty()) {
+		return cached;
+	}
+#ifdef _WIN32
+	HMODULE lib = LoadLibraryA(path.c_str());
+	if (!lib) {
+		throw std::runtime_error("read_pdf OCR external: could not LoadLibrary '" + path + "'");
+	}
+	auto recognize = reinterpret_cast<PluginRecognizeFn>(GetProcAddress(lib, "pdf_ocr_plugin_recognize"));
+	auto free_fn = reinterpret_cast<PluginFreeFn>(GetProcAddress(lib, "pdf_ocr_plugin_free"));
+#else
+	void *lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+	if (!lib) {
+		const char *err = dlerror();
+		throw std::runtime_error(std::string("read_pdf OCR external: could not dlopen '") + path +
+		                         "': " + (err ? err : "unknown error"));
+	}
+	// Clear any prior error, then resolve symbols.
+	dlerror();
+	auto recognize = reinterpret_cast<PluginRecognizeFn>(dlsym(lib, "pdf_ocr_plugin_recognize"));
+	const char *sym_err = dlerror();
+	if (sym_err || !recognize) {
+		dlclose(lib);
+		throw std::runtime_error(std::string("read_pdf OCR external: missing symbol "
+		                                     "pdf_ocr_plugin_recognize in '") +
+		                         path + "': " + (sym_err ? sym_err : "null"));
+	}
+	auto free_fn = reinterpret_cast<PluginFreeFn>(dlsym(lib, "pdf_ocr_plugin_free"));
+	// free_fn is optional — if missing we leak plugin-allocated strings (bad)
+	// but still function; require it for a clean contract.
+	sym_err = dlerror();
+	if (sym_err || !free_fn) {
+		dlclose(lib);
+		throw std::runtime_error(std::string("read_pdf OCR external: missing symbol "
+		                                     "pdf_ocr_plugin_free in '") +
+		                         path + "': " + (sym_err ? sym_err : "null"));
+	}
+#endif
+	if (!recognize || !free_fn) {
+#ifdef _WIN32
+		FreeLibrary(lib);
+#else
+		dlclose(lib);
+#endif
+		throw std::runtime_error("read_pdf OCR external: plugin '" + path +
+		                         "' is missing pdf_ocr_plugin_recognize / pdf_ocr_plugin_free");
+	}
+	cached.lib = lib;
+	cached.recognize = recognize;
+	cached.free_fn = free_fn;
+	cached.path = path;
+	return cached;
+}
+
+TextResult RecognizeExternal(const unsigned char *data, int width, int height, int bytes_per_row, ImageFormat format,
+                             const Options &opt) {
+	TextResult out;
+	out.backend_used = Backend::External;
+	if (!data || width <= 0 || height <= 0) {
+		return out;
+	}
+	if (opt.external_plugin.empty()) {
+		// No plugin, no shell: the SQL pipeline is the supported path.
+		// Message is actionable — points at pdf_page_images / pdf_to_png + llm.
+		if (opt.best_effort) {
+			return out;
+		}
+		std::string msg =
+		    "read_pdf OCR external: no plugin loaded. Either (a) pass "
+		    "ocr_plugin := '/path/to/libyour_ocr.so' implementing the "
+		    "pdf_ocr_plugin_recognize C ABI (see ocr_ops.hpp), or (b) render "
+		    "pages with pdf_page_images / pdf_to_png and send the PNG BLOB to a "
+		    "vision-LLM via the DuckDB llm/ai extension (SOTA path without "
+		    "recompiling read_pdf).";
+		if (!opt.external_endpoint.empty()) {
+			msg += " Note: ocr_endpoint was set but in-process HTTP is not wired "
+			       "(no shell-out); use the SQL image pipeline instead.";
+		}
+		throw std::runtime_error(msg);
+	}
+	PluginHandle plugin = LoadPlugin(opt.external_plugin);
+	char *text_ptr = nullptr;
+	int conf = -1;
+	int rc = plugin.recognize(data, width, height, bytes_per_row, static_cast<int>(format), opt.language.c_str(),
+	                          &text_ptr, &conf);
+	if (rc != 0) {
+		if (text_ptr && plugin.free_fn) {
+			plugin.free_fn(text_ptr);
+		}
+		if (opt.best_effort) {
+			return out;
+		}
+		throw std::runtime_error("read_pdf OCR external: plugin '" + opt.external_plugin +
+		                         "' returned error code " + std::to_string(rc));
+	}
+	if (text_ptr) {
+		out.text = std::string(text_ptr);
+		plugin.free_fn(text_ptr);
+	}
+	if (conf >= 0) {
+		out.confidence = conf;
+	}
+	return out;
+}
+
+TextResult RecognizeTesseractText(const unsigned char *data, int width, int height, int bytes_per_row,
+                                  ImageFormat format, const Options &opt);
 
 bool ModelExistsIn(const std::string &dir, const std::string &language) {
 	if (dir.empty()) {
@@ -211,11 +376,10 @@ void DestroyPixPair(Pix *processed, Pix *base) {
 	}
 }
 
-} // namespace
-
-TextResult RecognizeText(const unsigned char *data, int width, int height, int bytes_per_row, ImageFormat format,
-                         const Options &opt) {
+TextResult RecognizeTesseractText(const unsigned char *data, int width, int height, int bytes_per_row,
+                                  ImageFormat format, const Options &opt) {
 	TextResult out;
+	out.backend_used = Backend::Tesseract;
 	if (!data || width <= 0 || height <= 0) {
 		return out;
 	}
@@ -238,9 +402,10 @@ TextResult RecognizeText(const unsigned char *data, int width, int height, int b
 	return out;
 }
 
-WordsResult RecognizeWords(const unsigned char *data, int width, int height, int bytes_per_row, ImageFormat format,
-                           const Options &opt) {
+WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int height, int bytes_per_row,
+                                    ImageFormat format, const Options &opt) {
 	WordsResult out;
+	out.backend_used = Backend::Tesseract;
 	if (!data || width <= 0 || height <= 0) {
 		return out;
 	}
@@ -292,6 +457,69 @@ WordsResult RecognizeWords(const unsigned char *data, int width, int height, int
 	api.End();
 	DestroyPixPair(processed, base);
 	return out;
+}
+
+} // namespace
+
+Backend BackendFromString(const std::string &name) {
+	// case-insensitive compare without pulling in more deps
+	std::string lower;
+	lower.reserve(name.size());
+	for (unsigned char c : name) {
+		lower.push_back(static_cast<char>(std::tolower(c)));
+	}
+	if (lower.empty() || lower == "tesseract" || lower == "default") {
+		return Backend::Tesseract;
+	}
+	if (lower == "external" || lower == "plugin" || lower == "sota") {
+		return Backend::External;
+	}
+	throw std::runtime_error(
+	    "read_pdf: ocr_backend must be 'tesseract' or 'external' (got '" + name + "')");
+}
+
+const char *BackendName(Backend b) {
+	switch (b) {
+	case Backend::External:
+		return "external";
+	case Backend::Tesseract:
+	default:
+		return "tesseract";
+	}
+}
+
+TextResult RecognizeText(const unsigned char *data, int width, int height, int bytes_per_row, ImageFormat format,
+                         const Options &opt) {
+	if (opt.backend == Backend::External) {
+		return RecognizeExternal(data, width, height, bytes_per_row, format, opt);
+	}
+	return RecognizeTesseractText(data, width, height, bytes_per_row, format, opt);
+}
+
+WordsResult RecognizeWords(const unsigned char *data, int width, int height, int bytes_per_row, ImageFormat format,
+                           const Options &opt) {
+	if (opt.backend == Backend::External) {
+		// External plugins currently expose page-level text only. Word boxes
+		// would require a richer ABI; return empty words with the page text
+		// folded into a single synthetic word when text is available so table
+		// paths degrade gracefully rather than hanging.
+		WordsResult wr;
+		wr.backend_used = Backend::External;
+		TextResult tr = RecognizeExternal(data, width, height, bytes_per_row, format, opt);
+		wr.confidence = tr.confidence;
+		if (!tr.text.empty()) {
+			Word w;
+			w.text = tr.text;
+			w.x0 = 0;
+			w.y0 = 0;
+			w.x1 = width * 72.0 / (opt.dpi > 0 ? opt.dpi : 300);
+			w.y1 = height * 72.0 / (opt.dpi > 0 ? opt.dpi : 300);
+			w.confidence = static_cast<float>(tr.confidence);
+			wr.words.push_back(std::move(w));
+		}
+		return wr;
+	}
+	return RecognizeTesseractWords(data, width, height, bytes_per_row, format, opt);
 }
 
 } // namespace pdf_ocr

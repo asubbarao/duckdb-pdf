@@ -15,18 +15,21 @@
 //===--------------------------------------------------------------------===//
 #include "qpdf_ops.hpp"
 
+#include <qpdf/Buffer.hh>
+#include <qpdf/Constants.h>
+#include <qpdf/Pl_Buffer.hh>
 #include <qpdf/Pl_Flate.hh>
+#include <qpdf/Pl_String.hh>
 #include <qpdf/QPDF.hh>
 #include <qpdf/QPDFAcroFormDocumentHelper.hh>
 #include <qpdf/QPDFAnnotationObjectHelper.hh>
 #include <qpdf/QPDFFormFieldObjectHelper.hh>
-#include <qpdf/Buffer.hh>
-#include <qpdf/Pl_Buffer.hh>
 #include <qpdf/QPDFObjGen.hh>
 #include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFPageDocumentHelper.hh>
 #include <qpdf/QPDFPageObjectHelper.hh>
 #include <qpdf/QPDFWriter.hh>
+#include <qpdf/QPDFXRefEntry.hh>
 #include <qpdf/QUtil.hh>
 
 // OpenSSL — CMS/PKCS#7 verification for pdf_signatures (tier 2). Plain C API;
@@ -1633,6 +1636,134 @@ void RebuildPagesAsImages(const std::string &input, const std::string &output, c
 		page.removeKey("/Annots");
 	}
 	QPDFWriter writer(doc, output.c_str());
+	writer.write();
+}
+
+//===--------------------------------------------------------------------===//
+// Structure / encryption / JSON / repair
+//===--------------------------------------------------------------------===//
+
+static const char *EncryptionMethodName(QPDF::encryption_method_e m) {
+	switch (m) {
+	case QPDF::e_none:
+		return "none";
+	case QPDF::e_rc4:
+		return "rc4";
+	case QPDF::e_aes:
+		return "aes";
+	case QPDF::e_aesv3:
+		return "aesv3";
+	case QPDF::e_unknown:
+	default:
+		return "unknown";
+	}
+}
+
+static void OpenQpdf(QPDF &doc, const std::string &path, const std::string &password) {
+	doc.processFile(path.c_str(), password.empty() ? nullptr : password.c_str());
+}
+
+DocumentStats InspectDocument(const std::string &path, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	OpenQpdf(doc, path, password);
+
+	DocumentStats s;
+	s.is_linearized = doc.isLinearized();
+	if (s.is_linearized) {
+		// checkLinearization writes diagnostics to the logger; we only need the
+		// boolean outcome for SQL. Suppress noisy stdout by draining warnings
+		// rather than relying on the default logger's console path.
+		doc.setSuppressWarnings(true);
+		s.linearized_ok = doc.checkLinearization();
+	}
+	s.page_count = static_cast<int>(QPDFPageDocumentHelper(doc).getAllPages().size());
+	s.object_count = static_cast<int64_t>(doc.getObjectCount());
+
+	auto xref = doc.getXRefTable();
+	s.xref_total = static_cast<int64_t>(xref.size());
+	for (auto const &kv : xref) {
+		switch (kv.second.getType()) {
+		case 0:
+			s.xref_free++;
+			break;
+		case 1:
+			s.xref_uncompressed++;
+			break;
+		case 2:
+			s.xref_compressed++;
+			break;
+		default:
+			break;
+		}
+	}
+
+	int R = 0, P = 0, V = 0;
+	QPDF::encryption_method_e stream_m = QPDF::e_none, string_m = QPDF::e_none, file_m = QPDF::e_none;
+	s.is_encrypted = doc.isEncrypted(R, P, V, stream_m, string_m, file_m);
+	if (s.is_encrypted) {
+		s.enc_R = R;
+		s.enc_P = P;
+		s.enc_V = V;
+		s.stream_method = EncryptionMethodName(stream_m);
+		s.string_method = EncryptionMethodName(string_m);
+		s.file_method = EncryptionMethodName(file_m);
+		s.owner_password_matched = doc.ownerPasswordMatched();
+		s.user_password_matched = doc.userPasswordMatched();
+		s.allow_accessibility = doc.allowAccessibility();
+		s.allow_extract = doc.allowExtractAll();
+		s.allow_print_low = doc.allowPrintLowRes();
+		s.allow_print_high = doc.allowPrintHighRes();
+		s.allow_modify_assembly = doc.allowModifyAssembly();
+		s.allow_modify_form = doc.allowModifyForm();
+		s.allow_modify_annotation = doc.allowModifyAnnotation();
+		s.allow_modify_other = doc.allowModifyOther();
+		s.allow_modify_all = doc.allowModifyAll();
+	} else {
+		s.stream_method = "none";
+		s.string_method = "none";
+		s.file_method = "none";
+	}
+
+	// Drain any open-time warnings so they don't leak to stderr and so the
+	// caller can surface a count.
+	auto warnings = doc.getWarnings();
+	s.warning_count = static_cast<int64_t>(warnings.size());
+	return s;
+}
+
+std::string WriteJson(const std::string &path, const std::string &password, int json_version) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	if (json_version < 1) {
+		throw std::runtime_error("pdf_json: json_version must be >= 1");
+	}
+	QPDF doc;
+	doc.setSuppressWarnings(true);
+	OpenQpdf(doc, path, password);
+	std::string out;
+	Pl_String pipe("pdf_json", nullptr, out);
+	// Structure-only: do not inline stream bytes (images/fonts) into the JSON.
+	std::set<std::string> wanted; // empty => all objects
+	doc.writeJSON(json_version, &pipe, qpdf_dl_none, qpdf_sj_none, /*file_prefix=*/"", wanted);
+	pipe.finish();
+	return out;
+}
+
+void Repair(const std::string &input, const std::string &output, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	doc.setSuppressWarnings(true);
+	OpenQpdf(doc, input, password);
+	// Resolve dangling indirect refs (PDF-spec: treat as null) and rewrite with
+	// content-stream normalization + stream recompression. This is the portable
+	// "qpdf --check --normalize-content=y --compress-streams=y" repair path,
+	// not a full binary-level reconstruct.
+	doc.fixDanglingReferences(/*force=*/true);
+	QPDFWriter writer(doc, output.c_str());
+	writer.setContentNormalization(true);
+	writer.setCompressStreams(true);
+	writer.setRecompressFlate(true);
+	writer.setPreserveEncryption(false);
 	writer.write();
 }
 

@@ -1,0 +1,210 @@
+# name: test/sql/pdf_full_api.test
+# description: Comprehensive poppler + qpdf surface + OCR backend selector
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── fixtures ──────────────────────────────────────────────────────────────
+
+statement ok
+COPY (SELECT 'FullApiAlpha body text for geometry and fonts.' AS c)
+TO '__TEST_DIR__/full_a.pdf' (FORMAT pdf, TITLE 'Full API Alpha', AUTHOR 'Read PDF', USE_TMP_FILE false);
+
+statement ok
+COPY (SELECT 'page one of multi' AS c)
+TO '__TEST_DIR__/full_p1.pdf' (FORMAT pdf, USE_TMP_FILE false);
+
+statement ok
+COPY (SELECT 'page two of multi' AS c)
+TO '__TEST_DIR__/full_p2.pdf' (FORMAT pdf, USE_TMP_FILE false);
+
+query I
+SELECT ends_with(
+  pdf_merge(['__TEST_DIR__/full_p1.pdf', '__TEST_DIR__/full_p2.pdf'], '__TEST_DIR__/full_multi.pdf'),
+  'full_multi.pdf');
+----
+true
+
+# ── read_pdf_meta: metadata extraction on a real PDF ──────────────────────
+
+query III
+SELECT
+  title = 'Full API Alpha',
+  author = 'Read PDF',
+  pages = 1
+FROM read_pdf_meta('__TEST_DIR__/full_a.pdf');
+----
+true	true	true
+
+query I
+SELECT pages FROM read_pdf_meta('__TEST_DIR__/full_multi.pdf');
+----
+2
+
+# ── pdf_pages_info: per-page geometry / orientation / label ───────────────
+
+query I
+SELECT count(*) FROM pdf_pages_info('__TEST_DIR__/full_multi.pdf');
+----
+2
+
+query I
+SELECT bool_and(width > 0 AND height > 0 AND media_width > 0 AND crop_width > 0
+                AND orientation IS NOT NULL AND rotation IN (0, 90, 180, 270))
+FROM pdf_pages_info('__TEST_DIR__/full_multi.pdf');
+----
+true
+
+query I
+SELECT page_count FROM pdf_pages_info('__TEST_DIR__/full_multi.pdf') LIMIT 1;
+----
+2
+
+# ── pdf_permissions: permission bits + form/js/ids ────────────────────────
+
+query I
+SELECT is_encrypted = false AND is_locked = false AND perm_print = true
+       AND form_type = 'none' AND has_javascript = false
+FROM pdf_permissions('__TEST_DIR__/full_a.pdf');
+----
+true
+
+# ── pdf_fonts: embedded font inventory (writer embeds Helvetica-ish fonts) ─
+
+query I
+SELECT count(*) >= 1 FROM pdf_fonts('__TEST_DIR__/full_a.pdf');
+----
+true
+
+query I
+SELECT bool_and(type IS NOT NULL AND name IS NOT NULL)
+FROM pdf_fonts('__TEST_DIR__/full_a.pdf');
+----
+true
+
+# ── pdf_destinations: zero rows is fine (no named dests in writer output) ─
+
+query I
+SELECT count(*) FROM pdf_destinations('__TEST_DIR__/full_a.pdf');
+----
+0
+
+statement ok
+SELECT file, name, type, page FROM pdf_destinations('test/data/two_pages.pdf');
+
+# ── pdf_outline smoke (existing inspect path still works) ─────────────────
+
+statement ok
+SELECT file, ord, depth, title FROM pdf_outline('__TEST_DIR__/full_a.pdf');
+
+# ── pdf_page_images: render path for external / vision-LLM OCR ────────────
+
+query I
+SELECT count(*) FROM pdf_page_images('__TEST_DIR__/full_multi.pdf', dpi := 72);
+----
+2
+
+query I
+SELECT bool_and(octet_length(png) > 100 AND width > 0 AND height > 0 AND dpi = 72)
+FROM pdf_page_images('__TEST_DIR__/full_a.pdf', dpi := 72);
+----
+true
+
+# PNG magic bytes: 89 50 4E 47 ...
+query I
+SELECT starts_with(hex(png), '89504E47')
+FROM pdf_page_images('__TEST_DIR__/full_a.pdf', dpi := 72);
+----
+true
+
+# ── pdf_qpdf_info: structure + encryption census ──────────────────────────
+
+query I
+SELECT page_count = 2 AND object_count > 0 AND xref_total > 0
+       AND is_encrypted = false AND stream_method = 'none'
+       AND is_linearized = false
+FROM pdf_qpdf_info('__TEST_DIR__/full_multi.pdf');
+----
+true
+
+# encrypt then inspect encryption details
+query I
+SELECT ends_with(pdf_encrypt('__TEST_DIR__/full_multi.pdf', '__TEST_DIR__/full_enc.pdf', 'secret'),
+                 'full_enc.pdf');
+----
+true
+
+query I
+SELECT is_encrypted = true AND enc_R >= 4 AND stream_method IN ('aes', 'aesv3', 'rc4')
+       AND allow_extract = true
+FROM pdf_qpdf_info('__TEST_DIR__/full_enc.pdf', password := 'secret');
+----
+true
+
+# ── pdf_json: structural dump contains qpdf key ───────────────────────────
+
+query I
+SELECT contains(pdf_json('__TEST_DIR__/full_a.pdf'), 'qpdf');
+----
+true
+
+query I
+SELECT length(pdf_json('__TEST_DIR__/full_a.pdf')) > 50;
+----
+true
+
+# ── pdf_repair: rewrite round-trip preserves page count ───────────────────
+
+query I
+SELECT ends_with(pdf_repair('__TEST_DIR__/full_multi.pdf', '__TEST_DIR__/full_repaired.pdf'),
+                 'full_repaired.pdf');
+----
+true
+
+query I
+SELECT page_count FROM pdf_qpdf_info('__TEST_DIR__/full_repaired.pdf');
+----
+2
+
+query I
+SELECT max(page_count) FROM read_pdf('__TEST_DIR__/full_repaired.pdf', auto_ocr := false);
+----
+2
+
+# ── OCR backend selector: default tesseract still works; external needs plugin ─
+
+# invalid backend name fails at bind
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', ocr_backend := 'not_a_backend');
+----
+ocr_backend
+
+# default backend (tesseract) is implicit — text PDFs still extract natively
+query I
+SELECT contains(lower(text), 'hello duckdb')
+FROM read_pdf('test/data/hello.pdf', auto_ocr := false);
+----
+true
+
+# explicit tesseract backend on a text PDF
+query I
+SELECT contains(lower(text), 'hello duckdb')
+FROM read_pdf('test/data/hello.pdf', ocr_backend := 'tesseract', auto_ocr := false);
+----
+true
+
+# external without plugin + force OCR on image-only → actionable error (no shell)
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'external');
+----
+external
+
+# external + auto_ocr on image-only is best-effort empty (no plugin, no crash)
+query I
+SELECT length(trim(text)) < 5 AND used_ocr = false
+FROM read_pdf('test/data/scanned.pdf', auto_ocr := true, ocr_backend := 'external');
+----
+true
