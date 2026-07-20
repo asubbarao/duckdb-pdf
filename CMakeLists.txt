@@ -47,7 +47,10 @@ else()
 	endif()
 endif()
 
-set(EXTENSION_SOURCES src/pdf_extension.cpp src/qpdf_ops.cpp)
+# pdf_extension.cpp — DuckDB + poppler (no tesseract/leptonica/qpdf headers).
+# ocr_ops.cpp       — tesseract + leptonica only (no duckdb/poppler/qpdf).
+# qpdf_ops.cpp      — qpdf only, forced C++17 (see below).
+set(EXTENSION_SOURCES src/pdf_extension.cpp src/ocr_ops.cpp src/qpdf_ops.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -62,6 +65,10 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # its own duckdb-free translation unit (src/qpdf_ops.cpp) and ONLY that file
 # gets C++17. A per-source flag (not CXX_STANDARD, which is target-level) is
 # the mechanism; MSVC defaults to C++14 so it needs the flag spelled /std:c++17.
+#
+# ocr_ops.cpp is isolated for the same hygiene reason (heavy third-party
+# headers out of the duckdb TU) but does not need a forced standard — it
+# builds at the project default C++17 / whatever DuckDB drives.
 set_source_files_properties(src/qpdf_ops.cpp PROPERTIES
                             COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/std:c++17,-std=c++17>")
 

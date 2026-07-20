@@ -69,7 +69,19 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 
 ### `read_pdf` — one row per page
 
-Columns: `filename`, `page`, `page_count`, `text`, `width`, `height` (page size in PDF points).
+Columns: `filename`, `page`, `page_count`, `text`, `width`, `height` (page size in PDF points), `has_text_layer` (native embedded text is non-blank), `used_ocr` (Tesseract produced the returned text).
+
+`has_text_layer` describes the PDF itself (true even when `ocr:=true` forced a re-OCR of a text page). `used_ocr` is true when the page had no extractable text and auto-OCR ran, or when `ocr:=true` forced OCR and the engine returned text. Together they make image-only vs embedded-text detection first-class:
+
+```sql
+-- Find scanned / image-only pages across a folder
+SELECT filename, page FROM read_pdf('docs/*.pdf', auto_ocr:=false)
+WHERE NOT has_text_layer;
+
+-- Same pages, with OCR text filled in
+SELECT filename, page, text FROM read_pdf('docs/*.pdf')
+WHERE used_ocr;
+```
 
 The multi-file scan is **parallel**: each worker thread takes whole files, so a glob over a folder uses all your cores. (On Windows the scan runs serially — Poppler is not thread-safe across documents there.)
 
