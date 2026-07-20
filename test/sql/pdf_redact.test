@@ -1,0 +1,176 @@
+# name: test/sql/pdf_redact.test
+# description: pdf_redact — TRUE raster redaction removes text under the boxes
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── baseline: the fixture has the secret extractable on page 2 ──
+# redact_secret.pdf is a 3-page PDF with "SECRET-CODE-42" on page 2 at (72,600)
+# in PDF points (origin bottom-left).
+
+query I
+SELECT count(*) FROM read_pdf('test/data/redact_secret.pdf') WHERE text LIKE '%SECRET-CODE-42%';
+----
+1
+
+query I
+SELECT page_count FROM pdf_info('test/data/redact_secret.pdf');
+----
+3
+
+# ── redact the secret box on page 2 ──
+# Box covers x=60..320 (w=260), y=590..628 (h=38) — origin bottom-left — which
+# sits over the 24pt "SECRET-CODE-42" drawn at (72,600). One row per output page.
+
+query III
+SELECT page, redacted, boxes_applied
+FROM pdf_redact('test/data/redact_secret.pdf', '__TEST_DIR__/redacted.pdf',
+                [{'page': 2, 'x': 60.0, 'y': 590.0, 'w': 260.0, 'h': 38.0}]);
+----
+1	false	0
+2	true	1
+3	false	0
+
+# ── THE GUARANTEE: the secret is gone from the output ──
+# The secret is physically painted black in the raster, so it is unrecoverable
+# even by OCR: no "SECRET" survives with auto_ocr on OR off.
+
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted.pdf') WHERE text LIKE '%SECRET%';
+----
+0
+
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted.pdf', auto_ocr := false) WHERE text LIKE '%SECRET%';
+----
+0
+
+# Page 2's NATIVE text layer is now empty — the whole page is a raster image, so
+# there is no live text object left to extract (only a form-feed page separator
+# remains). auto_ocr disabled to read the text layer directly; with OCR on, only
+# the still-visible non-secret pixels would be re-recognized.
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted.pdf', auto_ocr := false)
+WHERE page = 2 AND regexp_matches(text, '[A-Za-z0-9]');
+----
+0
+
+# ── unredacted pages keep their live text ──
+
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted.pdf') WHERE text LIKE '%PAGE ONE PUBLIC HEADER%';
+----
+1
+
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted.pdf') WHERE text LIKE '%PAGE THREE FOOTER%';
+----
+1
+
+# ── page_count is unchanged ──
+
+query I
+SELECT page_count FROM pdf_info('__TEST_DIR__/redacted.pdf');
+----
+3
+
+# the redacted output is a valid PDF that reports 3 pages via read_pdf too
+query I
+SELECT count(DISTINCT page) FROM read_pdf('__TEST_DIR__/redacted.pdf');
+----
+3
+
+# ── multiple boxes across multiple pages ──
+# Redact page 1 AND page 2; page 3 passes through.
+
+query III
+SELECT page, redacted, boxes_applied
+FROM pdf_redact('test/data/redact_secret.pdf', '__TEST_DIR__/redacted2.pdf',
+                [{'page': 1, 'x': 60.0, 'y': 690.0, 'w': 400.0, 'h': 30.0},
+                 {'page': 2, 'x': 60.0, 'y': 590.0, 'w': 260.0, 'h': 38.0},
+                 {'page': 2, 'x': 60.0, 'y': 490.0, 'w': 400.0, 'h': 20.0}]);
+----
+1	true	1
+2	true	2
+3	false	0
+
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted2.pdf') WHERE text LIKE '%PAGE ONE%';
+----
+0
+
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted2.pdf') WHERE text LIKE '%PAGE THREE FOOTER%';
+----
+1
+
+# ── dpi named param is accepted (lower dpi = smaller output, same guarantee) ──
+
+query I
+SELECT redacted FROM pdf_redact('test/data/redact_secret.pdf', '__TEST_DIR__/redacted_lowdpi.pdf',
+                                [{'page': 2, 'x': 60.0, 'y': 590.0, 'w': 260.0, 'h': 38.0}],
+                                dpi := 72)
+WHERE page = 2;
+----
+true
+
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted_lowdpi.pdf') WHERE text LIKE '%SECRET%';
+----
+0
+
+# ── error cases ──
+
+# bad page number (document has only 3 pages)
+statement error
+SELECT * FROM pdf_redact('test/data/redact_secret.pdf', '__TEST_DIR__/bad.pdf',
+                         [{'page': 9, 'x': 10.0, 'y': 10.0, 'w': 10.0, 'h': 10.0}]);
+----
+out of range
+
+# page number below 1
+statement error
+SELECT * FROM pdf_redact('test/data/redact_secret.pdf', '__TEST_DIR__/bad.pdf',
+                         [{'page': 0, 'x': 10.0, 'y': 10.0, 'w': 10.0, 'h': 10.0}]);
+----
+page must be >= 1
+
+# missing input
+statement error
+SELECT * FROM pdf_redact('test/data/does_not_exist.pdf', '__TEST_DIR__/bad.pdf',
+                         [{'page': 1, 'x': 10.0, 'y': 10.0, 'w': 10.0, 'h': 10.0}]);
+----
+does not exist
+
+# empty redactions list: every page passes through untouched (no error)
+query III
+SELECT page, redacted, boxes_applied
+FROM pdf_redact('test/data/redact_secret.pdf', '__TEST_DIR__/passthrough.pdf',
+                []::STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE)[]);
+----
+1	false	0
+2	false	0
+3	false	0
+
+# passthrough keeps ALL text intact, including the secret
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/passthrough.pdf') WHERE text LIKE '%SECRET-CODE-42%';
+----
+1
+
+# invalid dpi
+statement error
+SELECT * FROM pdf_redact('test/data/redact_secret.pdf', '__TEST_DIR__/bad.pdf',
+                         [{'page': 1, 'x': 10.0, 'y': 10.0, 'w': 10.0, 'h': 10.0}], dpi := 0);
+----
+dpi must be between
+
+# output path must differ from input
+statement error
+SELECT * FROM pdf_redact('test/data/redact_secret.pdf', 'test/data/redact_secret.pdf',
+                         [{'page': 1, 'x': 10.0, 'y': 10.0, 'w': 10.0, 'h': 10.0}]);
+----
+must differ from input

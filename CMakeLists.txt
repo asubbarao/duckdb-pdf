@@ -47,7 +47,10 @@ else()
 	endif()
 endif()
 
-set(EXTENSION_SOURCES src/pdf_extension.cpp src/qpdf_ops.cpp)
+# pdf_extension.cpp — DuckDB + poppler (no tesseract/leptonica/qpdf headers).
+# ocr_ops.cpp       — tesseract + leptonica only (no duckdb/poppler/qpdf).
+# qpdf_ops.cpp      — qpdf only, forced C++17 (see below).
+set(EXTENSION_SOURCES src/pdf_extension.cpp src/ocr_ops.cpp src/qpdf_ops.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -62,6 +65,10 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # its own duckdb-free translation unit (src/qpdf_ops.cpp) and ONLY that file
 # gets C++17. A per-source flag (not CXX_STANDARD, which is target-level) is
 # the mechanism; MSVC defaults to C++14 so it needs the flag spelled /std:c++17.
+#
+# ocr_ops.cpp is isolated for the same hygiene reason (heavy third-party
+# headers out of the duckdb TU) but does not need a forced standard — it
+# builds at the project default C++17 / whatever DuckDB drives.
 set_source_files_properties(src/qpdf_ops.cpp PROPERTIES
                             COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/std:c++17,-std=c++17>")
 
@@ -96,8 +103,14 @@ if(NOT WIN32)
     # vcpkg archive. Built with default-features OFF, so qpdf uses its
     # built-in native crypto (no openssl/gnutls in the closure).
     pkg_check_modules(LIBQPDF REQUIRED libqpdf)
+    # OpenSSL for pdf_signatures CMS/PKCS#7 verification (tier 2). We need only
+    # the headers here — vcpkg installs libssl.a / libcrypto.a into the same lib
+    # dir, so they join the link via the GLOB over-link below like every other
+    # vcpkg archive. (This is OUR dependency, not qpdf's; qpdf still uses its
+    # built-in native crypto with default-features OFF.)
+    pkg_check_modules(OPENSSL REQUIRED openssl)
     include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
-                        ${LIBQPDF_INCLUDE_DIRS})
+                        ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
 
     if(DEFINED TESSERACT_LIBDIR AND EXISTS "${TESSERACT_LIBDIR}")
       set(VCPKG_STATIC_LIBDIR "${TESSERACT_LIBDIR}")
@@ -165,13 +178,25 @@ if(NOT WIN32)
     pkg_check_modules(LEPTONICA   REQUIRED IMPORTED_TARGET lept)
     # qpdf (pdf_merge/pdf_split/pdf_rotate): brew/apt qpdf ships libqpdf.pc.
     pkg_check_modules(LIBQPDF     REQUIRED IMPORTED_TARGET libqpdf)
+    # OpenSSL for pdf_signatures CMS/PKCS#7 verification (tier 2). Dynamic on the
+    # shared path, so link the IMPORTED_TARGET explicitly.
+    pkg_check_modules(OPENSSL     REQUIRED IMPORTED_TARGET openssl)
     include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
-                        ${LIBQPDF_INCLUDE_DIRS})
+                        ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
 
+    # zlib: qpdf_ops.cpp's minimal PNG encoder (pdf_images) calls crc32/compress2
+    # directly. libqpdf links zlib for itself but does not re-export it, so we
+    # must link it ourselves. It is a system dylib on macOS/apt.
+    find_package(ZLIB REQUIRED)
+
+    # ${CMAKE_DL_LIBS} is libdl on Linux (needed for the external OCR plugin
+    # dlopen path in ocr_ops.cpp) and empty on macOS where dlopen is in libSystem.
     target_link_libraries(${EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF)
+      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB
+      ${CMAKE_DL_LIBS})
     target_link_libraries(${LOADABLE_EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF)
+      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB
+      ${CMAKE_DL_LIBS})
 
     # libharu for write_pdf (local brew path). Dynamic dylib; find explicitly (no pkg-config).
     # Transitive (libpng, zlib) are satisfied by the dylib itself at runtime.

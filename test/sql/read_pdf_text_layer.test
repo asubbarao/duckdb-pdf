@@ -1,0 +1,78 @@
+# name: test/sql/read_pdf_text_layer.test
+# description: has_text_layer / used_ocr detection flags on read_pdf
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── text PDF (hello.pdf): native text layer present ───────────────────────
+
+query I
+SELECT has_text_layer FROM read_pdf('test/data/hello.pdf', auto_ocr:=false);
+----
+true
+
+query I
+SELECT used_ocr FROM read_pdf('test/data/hello.pdf', auto_ocr:=false);
+----
+false
+
+query I
+SELECT contains(lower(text), 'hello duckdb')
+FROM read_pdf('test/data/hello.pdf', auto_ocr:=false);
+----
+true
+
+# ── image-only PDF (scanned.pdf): no text layer ───────────────────────────
+
+query I
+SELECT has_text_layer FROM read_pdf('test/data/scanned.pdf', auto_ocr:=false);
+----
+false
+
+query I
+SELECT used_ocr FROM read_pdf('test/data/scanned.pdf', auto_ocr:=false);
+----
+false
+
+# Without OCR the text is empty/near-empty
+query I
+SELECT length(trim(text)) < 5
+FROM read_pdf('test/data/scanned.pdf', auto_ocr:=false);
+----
+true
+
+# ── OCR path (requires tessdata) ──────────────────────────────────────────
+# auto_ocr / ocr:=true on scanned.pdf should set used_ocr=true and recover text.
+# has_text_layer stays false — the flag describes the PDF, not the extraction.
+
+require-env TESSDATA_PREFIX
+
+query II
+SELECT has_text_layer, used_ocr
+FROM read_pdf('test/data/scanned.pdf', ocr:=true);
+----
+false	true
+
+query I
+SELECT contains(lower(text), 'apples')
+FROM read_pdf('test/data/scanned.pdf', ocr:=true);
+----
+true
+
+# auto_ocr on an image-only page also sets used_ocr
+query I
+SELECT used_ocr FROM read_pdf('test/data/scanned.pdf', auto_ocr:=true);
+----
+true
+
+# force_ocr on a text PDF: has_text_layer stays true; used_ocr is true only when
+# the raster OCR actually produced text (false when the page renders blank —
+# missing display fonts — and we fall back to the native layer).
+query I
+SELECT has_text_layer AND contains(lower(text), 'hello duckdb')
+FROM read_pdf('test/data/hello.pdf', ocr:=true);
+----
+true

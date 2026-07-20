@@ -1,0 +1,95 @@
+# name: test/sql/pdf_revisions.test
+# description: pdf_revisions — enumerate incremental-update revisions (oldest first)
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── single-revision fixture (hello.pdf has one startxref / %%EOF) ──
+
+query IIIII
+SELECT revision_index, startxref_offset, eof_offset, size_bytes, is_incremental
+FROM pdf_revisions('test/data/hello.pdf')
+ORDER BY revision_index;
+----
+0	669	979	979	false
+
+query I
+SELECT count(*) FROM pdf_revisions('test/data/hello.pdf');
+----
+1
+
+# ── multi-revision fixture (test/data/incremental.pdf; see gen_incremental_pdf.py) ──
+# Original hello.pdf body (rev 0) plus one classic-xref incremental update with
+# trailer /Prev 669 pointing at the original xref.
+
+query I
+SELECT count(*) FROM pdf_revisions('test/data/incremental.pdf');
+----
+2
+
+query IIIII
+SELECT revision_index, startxref_offset, eof_offset, size_bytes, is_incremental
+FROM pdf_revisions('test/data/incremental.pdf')
+ORDER BY revision_index;
+----
+0	669	979	979	false
+1	1069	1163	184	true
+
+# offsets are strictly increasing across revisions
+query I
+SELECT bool_and(startxref_offset < eof_offset)
+   AND bool_and(eof_offset > lag_eof)
+FROM (
+  SELECT startxref_offset, eof_offset,
+         lag(eof_offset, 1, 0) OVER (ORDER BY revision_index) AS lag_eof
+  FROM pdf_revisions('test/data/incremental.pdf')
+);
+----
+true
+
+# size_bytes covers the whole file when summed
+query I
+SELECT sum(size_bytes) = (SELECT eof_offset FROM pdf_revisions('test/data/incremental.pdf')
+                          ORDER BY revision_index DESC LIMIT 1)
+FROM pdf_revisions('test/data/incremental.pdf');
+----
+true
+
+# is_incremental is false only for revision 0
+query I
+SELECT bool_and(CASE WHEN revision_index = 0 THEN NOT is_incremental ELSE is_incremental END)
+FROM pdf_revisions('test/data/incremental.pdf');
+----
+true
+
+# password named parameter is accepted (unused for trailer walk)
+query I
+SELECT count(*) FROM pdf_revisions('test/data/incremental.pdf', password := '');
+----
+2
+
+# ── header-less input must throw a CLEAN, non-fatal error (regression) ──
+# A file with no %PDF- header anywhere once tripped an unescaped '%PDF-' in the
+# error format string, which raised an INTERNAL exception and fatally
+# invalidated the whole DuckDB connection (a session-level DoS: every later
+# query returned "database has been invalidated"). It must instead throw an
+# ordinary IO Error, and — critically — the connection must stay usable.
+statement error
+SELECT * FROM pdf_revisions('test/data/text_as_pdf.pdf');
+----
+is not a PDF (missing %PDF- header)
+
+# the connection survived the error above — a plain query still works
+query I
+SELECT 42;
+----
+42
+
+# and pdf_revisions itself still works on a valid file in the same connection
+query I
+SELECT count(*) FROM pdf_revisions('test/data/hello.pdf');
+----
+1

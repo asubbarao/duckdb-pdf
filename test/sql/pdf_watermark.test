@@ -1,0 +1,250 @@
+# name: test/sql/pdf_watermark.test
+# description: pdf_watermark + pdf_bates — stamp real text on top of every page
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── fixtures: single-page + multi-page + mixed-size documents, all authored by
+#    the extension's own COPY writer ──────────────────────────────────────────
+
+statement ok
+COPY (SELECT 'BodyAlphaMarker original page content' AS t) TO '__TEST_DIR__/wm_src.pdf' (FORMAT pdf);
+
+# letter- and legal-sized single pages, merged into one mixed-size document so
+# the per-MediaBox stamping path is exercised
+statement ok
+COPY (SELECT 'LetterBodyMarker content' AS t) TO '__TEST_DIR__/wm_letter.pdf' (FORMAT pdf, PAGE_SIZE 'letter');
+
+statement ok
+COPY (SELECT 'LegalBodyMarker content' AS t) TO '__TEST_DIR__/wm_legal.pdf' (FORMAT pdf, PAGE_SIZE 'legal');
+
+statement ok
+SELECT pdf_merge(['__TEST_DIR__/wm_letter.pdf', '__TEST_DIR__/wm_legal.pdf'], '__TEST_DIR__/wm_mixed.pdf');
+
+# the two merged pages really are different heights (letter 792pt vs legal 1008pt)
+query I
+SELECT count(DISTINCT round(height)) FROM read_pdf('__TEST_DIR__/wm_mixed.pdf');
+----
+2
+
+# ── NULL propagation ─────────────────────────────────────────────────────────
+
+query I
+SELECT pdf_watermark(NULL, '__TEST_DIR__/wmnull.pdf', 'DRAFT') IS NULL;
+----
+true
+
+query I
+SELECT pdf_watermark('__TEST_DIR__/wm_src.pdf', NULL, 'DRAFT') IS NULL;
+----
+true
+
+query I
+SELECT pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wmnull.pdf', NULL) IS NULL;
+----
+true
+
+query I
+SELECT pdf_bates(NULL, '__TEST_DIR__/wmnull.pdf', 'ACME', 1) IS NULL;
+----
+true
+
+query I
+SELECT pdf_bates('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wmnull.pdf', 'ACME', NULL) IS NULL;
+----
+true
+
+# ── pdf_watermark: output path is returned; file is readable back ────────────
+
+query I
+SELECT ends_with(
+  pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_draft.pdf', 'DRAFT'),
+  'wm_draft.pdf');
+----
+true
+
+query I
+SELECT max(page_count) FROM read_pdf('__TEST_DIR__/wm_draft.pdf');
+----
+1
+
+# the watermark is REAL text — it lands in the extracted text layer
+query I
+SELECT bool_and(contains(text, 'DRAFT')) FROM read_pdf('__TEST_DIR__/wm_draft.pdf');
+----
+true
+
+# the original body text is still present alongside the watermark
+query I
+SELECT bool_and(contains(text, 'BodyAlphaMarker')) FROM read_pdf('__TEST_DIR__/wm_draft.pdf');
+----
+true
+
+# ── pdf_watermark: multi-page — stamp appears on every page ──────────────────
+
+query I
+SELECT ends_with(
+  pdf_watermark('test/data/two_pages.pdf', '__TEST_DIR__/wm_two.pdf', 'CONFIDENTIAL'),
+  'wm_two.pdf');
+----
+true
+
+query I
+SELECT max(page_count) FROM read_pdf('__TEST_DIR__/wm_two.pdf');
+----
+2
+
+# watermark on both pages, original Alpha/Beta content preserved on each
+query I
+SELECT bool_and(contains(text, 'CONFIDENTIAL')) FROM read_pdf('__TEST_DIR__/wm_two.pdf');
+----
+true
+
+query II
+SELECT page, (CASE WHEN page = 1 THEN contains(text, 'Alpha') ELSE contains(text, 'Beta') END)
+FROM read_pdf('__TEST_DIR__/wm_two.pdf')
+ORDER BY page;
+----
+1	true
+2	true
+
+# ── pdf_watermark: mixed-size pages each get the stamp ───────────────────────
+
+query I
+SELECT ends_with(
+  pdf_watermark('__TEST_DIR__/wm_mixed.pdf', '__TEST_DIR__/wm_mixed_out.pdf', 'DRAFT'),
+  'wm_mixed_out.pdf');
+----
+true
+
+query I
+SELECT bool_and(contains(text, 'DRAFT')) FROM read_pdf('__TEST_DIR__/wm_mixed_out.pdf');
+----
+true
+
+query II
+SELECT page, (CASE WHEN page = 1 THEN contains(text, 'LetterBodyMarker') ELSE contains(text, 'LegalBodyMarker') END)
+FROM read_pdf('__TEST_DIR__/wm_mixed_out.pdf')
+ORDER BY page;
+----
+1	true
+2	true
+
+# ── pdf_watermark: explicit-opacity overload ─────────────────────────────────
+
+query I
+SELECT ends_with(
+  pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_opacity.pdf', 'DRAFT', 0.5),
+  'wm_opacity.pdf');
+----
+true
+
+query I
+SELECT bool_and(contains(text, 'DRAFT')) FROM read_pdf('__TEST_DIR__/wm_opacity.pdf');
+----
+true
+
+# text with PDF-literal special characters (parens, backslash) is escaped safely
+query I
+SELECT ends_with(
+  pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_special.pdf', 'DRAFT (v1)\ COPY'),
+  'wm_special.pdf');
+----
+true
+
+query I
+SELECT max(page_count) FROM read_pdf('__TEST_DIR__/wm_special.pdf');
+----
+1
+
+# ── pdf_bates: prefix + zero-padded sequential number, bottom-right ──────────
+
+query I
+SELECT ends_with(
+  pdf_bates('test/data/two_pages.pdf', '__TEST_DIR__/wm_bates.pdf', 'ACME', 100),
+  'wm_bates.pdf');
+----
+true
+
+query I
+SELECT max(page_count) FROM read_pdf('__TEST_DIR__/wm_bates.pdf');
+----
+2
+
+# page 1 gets the start number, padded to 6 digits; page 2 the next
+query II
+SELECT page, (CASE WHEN page = 1 THEN contains(text, 'ACME000100') ELSE contains(text, 'ACME000101') END)
+FROM read_pdf('__TEST_DIR__/wm_bates.pdf')
+ORDER BY page;
+----
+1	true
+2	true
+
+# the original page content survives the Bates stamp
+query II
+SELECT page, (CASE WHEN page = 1 THEN contains(text, 'Alpha') ELSE contains(text, 'Beta') END)
+FROM read_pdf('__TEST_DIR__/wm_bates.pdf')
+ORDER BY page;
+----
+1	true
+2	true
+
+# a large start number keeps all its digits (no truncation to 6)
+query I
+SELECT ends_with(
+  pdf_bates('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_bates_big.pdf', 'DOC-', 1234567),
+  'wm_bates_big.pdf');
+----
+true
+
+query I
+SELECT bool_and(contains(text, 'DOC-1234567')) FROM read_pdf('__TEST_DIR__/wm_bates_big.pdf');
+----
+true
+
+# ── error cases ──────────────────────────────────────────────────────────────
+
+# missing input file (watermark)
+statement error
+SELECT pdf_watermark('__TEST_DIR__/wm_no_such_input.pdf', '__TEST_DIR__/wmnever.pdf', 'DRAFT');
+----
+wm_no_such_input.pdf' does not exist
+
+# missing input file (bates)
+statement error
+SELECT pdf_bates('__TEST_DIR__/wm_no_such_input.pdf', '__TEST_DIR__/wmnever.pdf', 'ACME', 1);
+----
+wm_no_such_input.pdf' does not exist
+
+# opacity out of range: zero
+statement error
+SELECT pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wmbad.pdf', 'DRAFT', 0.0);
+----
+opacity must be in (0, 1]
+
+# opacity out of range: above 1
+statement error
+SELECT pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wmbad.pdf', 'DRAFT', 1.5);
+----
+opacity must be in (0, 1]
+
+# in-place operation refused (watermark)
+statement error
+SELECT pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_src.pdf', 'DRAFT');
+----
+must differ from input path
+
+# in-place operation refused (bates)
+statement error
+SELECT pdf_bates('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_src.pdf', 'ACME', 1);
+----
+must differ from input path
+
+# nonexistent output directory (watermark)
+statement error
+SELECT pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_no_such_dir/out.pdf', 'DRAFT');
+----
+wm_no_such_dir' does not exist

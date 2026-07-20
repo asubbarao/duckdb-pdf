@@ -15,19 +15,49 @@
 //===--------------------------------------------------------------------===//
 #include "qpdf_ops.hpp"
 
+#include <qpdf/Buffer.hh>
+#include <qpdf/Constants.h>
+#include <qpdf/Pl_Buffer.hh>
+#include <qpdf/Pl_Flate.hh>
+#include <qpdf/Pl_String.hh>
 #include <qpdf/QPDF.hh>
 #include <qpdf/QPDFAcroFormDocumentHelper.hh>
 #include <qpdf/QPDFAnnotationObjectHelper.hh>
 #include <qpdf/QPDFFormFieldObjectHelper.hh>
+#include <qpdf/QPDFObjGen.hh>
+#include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFPageDocumentHelper.hh>
 #include <qpdf/QPDFPageObjectHelper.hh>
 #include <qpdf/QPDFWriter.hh>
+#include <qpdf/QPDFXRefEntry.hh>
 #include <qpdf/QUtil.hh>
 
+// OpenSSL — CMS/PKCS#7 verification for pdf_signatures (tier 2). Plain C API;
+// touches neither duckdb nor poppler, so it is safe to include in this TU.
+#include <openssl/bio.h>
+#include <openssl/cms.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+
+// zlib — DEFLATE + CRC32 for the minimal PNG encoder used by ReadImages to wrap
+// fully-decoded raster samples. libqpdf already links zlib, and <zlib.h> is on
+// the vcpkg/homebrew include path; this is a plain C API touching neither duckdb
+// nor poppler, so it is safe in this TU.
+#include <zlib.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -107,6 +137,41 @@ void Split(const std::string &input, const std::string &output_dir, const std::s
 		QPDFWriter writer(single, out_path.c_str());
 		writer.write();
 		emitted.emplace_back(page_idx + 1, out_path);
+	}
+}
+
+void SplitRanges(const std::string &input, const std::string &output_dir, const std::string &stem,
+                 const std::vector<std::pair<int, int>> &ranges, std::vector<std::string> &emitted) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	doc.processFile(input.c_str());
+	QPDFPageDocumentHelper doc_pages(doc);
+	auto pages = doc_pages.getAllPages();
+	auto page_count = static_cast<int>(pages.size());
+	auto pad_width = std::to_string(ranges.size()).size();
+	int doc_idx = 0;
+	for (auto &range : ranges) {
+		doc_idx++;
+		int first = range.first;
+		int last = range.second;
+		if (first < 1 || last > page_count || first > last) {
+			throw std::runtime_error("SplitRanges: invalid page range [" + std::to_string(first) + "," +
+			                         std::to_string(last) + "] for a " + std::to_string(page_count) + "-page document");
+		}
+		std::string doc_no = std::to_string(doc_idx);
+		while (doc_no.size() < pad_width) {
+			doc_no = "0" + doc_no;
+		}
+		std::string out_path = output_dir + "/" + stem + "_doc" + doc_no + ".pdf";
+		QPDF single;
+		single.emptyPDF();
+		QPDFPageDocumentHelper single_pages(single);
+		for (int page_no = first; page_no <= last; page_no++) {
+			single_pages.addPage(pages[page_no - 1], false);
+		}
+		QPDFWriter writer(single, out_path.c_str());
+		writer.write();
+		emitted.push_back(out_path);
 	}
 }
 
@@ -251,6 +316,1455 @@ std::vector<Annotation> ReadAnnotations(const std::string &path) {
 		}
 	}
 	return annotations;
+}
+
+namespace {
+
+// Lightweight content-stream path interpreter: collects axis-aligned stroke
+// segments (and rectangle strokes/fills used as borders). Tracks CTM for `cm`.
+// poppler-cpp has no path API; qpdf's page content parser supplies the tokens.
+struct RulingPathCollector : public QPDFObjectHandle::ParserCallbacks {
+	struct Pt {
+		double x = 0, y = 0;
+	};
+	// CTM as [a b c d e f] mapping user space -> device (page) space.
+	double ctm[6] = {1, 0, 0, 1, 0, 0};
+	std::vector<double> stack; // operand stack (numeric only; others ignored)
+	Pt cur;
+	Pt path_start;
+	bool has_cur = false;
+	std::vector<std::pair<Pt, Pt>> segments; // stroke segments in page space
+
+	void ApplyCtm(double x, double y, double &ox, double &oy) const {
+		ox = ctm[0] * x + ctm[2] * y + ctm[4];
+		oy = ctm[1] * x + ctm[3] * y + ctm[5];
+	}
+
+	void MultiplyCtm(double a, double b, double c, double d, double e, double f) {
+		// new = T * current  (PDF: cm concatenates T onto CTM)
+		double na = a * ctm[0] + b * ctm[2];
+		double nb = a * ctm[1] + b * ctm[3];
+		double nc = c * ctm[0] + d * ctm[2];
+		double nd = c * ctm[1] + d * ctm[3];
+		double ne = e * ctm[0] + f * ctm[2] + ctm[4];
+		double nf = e * ctm[1] + f * ctm[3] + ctm[5];
+		ctm[0] = na;
+		ctm[1] = nb;
+		ctm[2] = nc;
+		ctm[3] = nd;
+		ctm[4] = ne;
+		ctm[5] = nf;
+	}
+
+	void AddSeg(Pt a, Pt b) {
+		// Keep near-axis-aligned segments only (table rules).
+		double dx = std::fabs(a.x - b.x);
+		double dy = std::fabs(a.y - b.y);
+		if (dx < 0.5 && dy < 0.5) {
+			return; // point
+		}
+		// allow ~3° skew: |dx| or |dy| dominates
+		if (dx < 1.0 || dy < 1.0 || dx > 20 * dy || dy > 20 * dx) {
+			segments.emplace_back(a, b);
+		}
+	}
+
+	void AddRect(double x, double y, double w, double h) {
+		Pt p0, p1, p2, p3;
+		ApplyCtm(x, y, p0.x, p0.y);
+		ApplyCtm(x + w, y, p1.x, p1.y);
+		ApplyCtm(x + w, y + h, p2.x, p2.y);
+		ApplyCtm(x, y + h, p3.x, p3.y);
+		AddSeg(p0, p1);
+		AddSeg(p1, p2);
+		AddSeg(p2, p3);
+		AddSeg(p3, p0);
+	}
+
+	void handleObject(QPDFObjectHandle obj, size_t, size_t) override {
+		if (obj.isInteger() || obj.isReal()) {
+			stack.push_back(obj.getNumericValue());
+			return;
+		}
+		if (!obj.isOperator()) {
+			// names, strings, arrays used by non-path ops — leave stack alone for
+			// mixed operands; path ops only consume numbers we push above.
+			return;
+		}
+		std::string op = obj.getOperatorValue();
+		auto need = [&](size_t n) -> bool {
+			return stack.size() >= n;
+		};
+		auto popn = [&](size_t n) {
+			std::vector<double> out(n);
+			for (size_t i = 0; i < n; ++i) {
+				out[n - 1 - i] = stack.back();
+				stack.pop_back();
+			}
+			return out;
+		};
+
+		if (op == "cm" && need(6)) {
+			auto v = popn(6);
+			MultiplyCtm(v[0], v[1], v[2], v[3], v[4], v[5]);
+		} else if (op == "m" && need(2)) {
+			auto v = popn(2);
+			ApplyCtm(v[0], v[1], cur.x, cur.y);
+			path_start = cur;
+			has_cur = true;
+		} else if (op == "l" && need(2)) {
+			auto v = popn(2);
+			Pt nxt;
+			ApplyCtm(v[0], v[1], nxt.x, nxt.y);
+			if (has_cur) {
+				AddSeg(cur, nxt);
+			}
+			cur = nxt;
+			has_cur = true;
+		} else if (op == "re" && need(4)) {
+			auto v = popn(4);
+			AddRect(v[0], v[1], v[2], v[3]);
+			// PDF: after re, current point is undefined for further path construction
+			has_cur = false;
+		} else if (op == "h") {
+			if (has_cur) {
+				AddSeg(cur, path_start);
+				cur = path_start;
+			}
+		} else if (op == "S" || op == "s" || op == "f" || op == "F" || op == "f*" || op == "B" || op == "B*" ||
+		           op == "b" || op == "b*") {
+			// stroke / fill ends the path; segments already recorded on construction
+			if (op == "s" || op == "b" || op == "b*") {
+				if (has_cur) {
+					AddSeg(cur, path_start);
+				}
+			}
+			has_cur = false;
+			// leave stack as-is (these take no operands)
+		} else if (op == "n" || op == "W" || op == "W*") {
+			has_cur = false;
+		} else if (op == "q" || op == "Q") {
+			// ignore graphics-state stack for rules (CTM save/restore not modelled fully);
+			// most table drawers set CTM once or use identity.
+			stack.clear();
+		} else {
+			// unknown operator: drop its would-be numeric leftovers by clearing
+			// when the operator is a common text/state op that consumes the stack.
+			// Heuristic: clear stack after any non-path operator to avoid pollution.
+			if (op == "Tj" || op == "TJ" || op == "'" || op == "\"" || op == "Td" || op == "TD" || op == "Tm" ||
+			    op == "T*" || op == "Tc" || op == "Tw" || op == "Tz" || op == "TL" || op == "Tf" || op == "Tr" ||
+			    op == "Ts" || op == "rg" || op == "RG" || op == "g" || op == "G" || op == "k" || op == "K" ||
+			    op == "w" || op == "J" || op == "j" || op == "M" || op == "d" || op == "gs" || op == "cs" ||
+			    op == "CS" || op == "scn" || op == "SCN" || op == "sc" || op == "SC" || op == "Do" || op == "BT" ||
+			    op == "ET" || op == "BMC" || op == "BDC" || op == "EMC" || op == "MP" || op == "DP") {
+				stack.clear();
+			}
+		}
+	}
+
+	void handleEOF() override {
+	}
+};
+
+} // namespace
+
+// Collect axis-aligned ruling segments from every page's content stream. Uses a
+// fresh interpreter per page and reads each page's MediaBox height so the caller
+// can flip horizontal rules into poppler's top-down text_list space. Parsing is
+// best-effort per page: a page whose content stream fails to parse contributes
+// no segments rather than aborting the document. processMemoryFile failures
+// (bad password / corrupt input) propagate per the error contract.
+std::vector<RuledSegment> ExtractRulingLines(const std::string &pdf_bytes, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	std::vector<RuledSegment> out;
+	QPDF qpdf;
+	qpdf.processMemoryFile("read_pdf_tables", pdf_bytes.data(), pdf_bytes.size(),
+	                       password.empty() ? nullptr : password.c_str());
+	auto pages = QPDFPageDocumentHelper(qpdf).getAllPages();
+	for (size_t pi = 0; pi < pages.size(); ++pi) {
+		auto &page = pages[pi];
+		// MediaBox [llx lly urx ury] — page height for the caller's y flip.
+		double page_h = 792.0;
+		try {
+			auto mb = page.getObjectHandle().getKey("/MediaBox");
+			if (mb.isArray() && mb.getArrayNItems() >= 4) {
+				double lly = mb.getArrayItem(1).getNumericValue();
+				double ury = mb.getArrayItem(3).getNumericValue();
+				if (ury > lly) {
+					page_h = ury - lly;
+				}
+			}
+		} catch (...) {
+		}
+
+		RulingPathCollector collector;
+		try {
+			page.parseContents(&collector);
+		} catch (...) {
+			continue; // best-effort: skip pages whose content stream won't parse
+		}
+		for (auto &seg : collector.segments) {
+			RuledSegment rs;
+			rs.page = static_cast<int>(pi + 1);
+			rs.x0 = seg.first.x;
+			rs.y0 = seg.first.y;
+			rs.x1 = seg.second.x;
+			rs.y1 = seg.second.y;
+			rs.page_height = page_h;
+			out.push_back(rs);
+		}
+	}
+	return out;
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_signatures — detect + cryptographically verify existing PDF signatures.
+//
+// One SignatureInfo per filled AcroForm /Sig field. Tier 1: parse the signature
+// dictionary (/SubFilter, /M, /Name, /Reason, /Location, /ByteRange) and compute
+// covers_whole_file (ByteRange starts at 0 and ends at EOF — the cheap "nothing
+// was appended after signing" tamper signal). Tier 2: rebuild the signed message
+// from the ByteRange spans and CMS_verify the /Contents PKCS#7/CMS blob with
+// OpenSSL. Signing (creation) is out of scope; detection + verification only.
+//===--------------------------------------------------------------------===//
+
+// Reads the whole file into memory for ByteRange coverage + CMS message rebuild.
+// qpdf's processFile reads the local filesystem, so pdf_signatures is already
+// local-path-only; a plain std::ifstream matches that constraint.
+static std::string ReadFileBytes(const std::string &path) {
+	std::ifstream f(path, std::ios::binary);
+	if (!f) {
+		throw std::runtime_error("could not read '" + path + "'");
+	}
+	std::ostringstream ss;
+	ss << f.rdbuf();
+	return ss.str();
+}
+
+// Read a PDF-string value from a dict key as UTF-8; empty string means absent
+// (the caller maps empty to SQL NULL).
+static std::string DictStringOrEmpty(QPDFObjectHandle dict, const char *key) {
+	if (!dict.isDictionary()) {
+		return std::string();
+	}
+	auto v = dict.getKey(key);
+	if (!v.isString()) {
+		return std::string();
+	}
+	return v.getUTF8Value();
+}
+
+// Extract CN= from an X509 subject name; empty if none.
+static std::string X509CommonName(X509 *cert) {
+	if (!cert) {
+		return std::string();
+	}
+	X509_NAME *name = X509_get_subject_name(cert);
+	if (!name) {
+		return std::string();
+	}
+	char buf[256];
+	int n = X509_NAME_get_text_by_NID(name, NID_commonName, buf, sizeof(buf));
+	if (n <= 0) {
+		return std::string();
+	}
+	return std::string(buf, static_cast<size_t>(n));
+}
+
+// Tier 2: verify a detached (or attached) CMS/PKCS#7 signature over the
+// ByteRange-covered bytes. Returns true only when CMS_verify succeeds.
+static bool CmsVerify(const std::string &message, const std::string &cms_der) {
+	if (cms_der.empty() || message.empty()) {
+		return false;
+	}
+	const unsigned char *p = reinterpret_cast<const unsigned char *>(cms_der.data());
+	CMS_ContentInfo *cms = d2i_CMS_ContentInfo(nullptr, &p, static_cast<long>(cms_der.size()));
+	if (!cms) {
+		ERR_clear_error();
+		return false;
+	}
+	BIO *data_bio = BIO_new_mem_buf(message.data(), static_cast<int>(message.size()));
+	if (!data_bio) {
+		CMS_ContentInfo_free(cms);
+		return false;
+	}
+	// CMS_NO_SIGNER_CERT_VERIFY: do not require a trusted CA chain — we only
+	// check that the digest over ByteRange matches the SignedData (integrity).
+	// CMS_BINARY: PDF bytes are raw, not canonicalized text.
+	// CMS_DETACHED: eContent is absent; message is the ByteRange concatenation.
+	unsigned flags = CMS_NO_SIGNER_CERT_VERIFY | CMS_BINARY | CMS_DETACHED;
+	int rc = CMS_verify(cms, nullptr, nullptr, data_bio, nullptr, flags);
+	if (rc != 1) {
+		// Some writers embed content (non-detached). Retry without DETACHED.
+		ERR_clear_error();
+		BIO_reset(data_bio);
+		flags = CMS_NO_SIGNER_CERT_VERIFY | CMS_BINARY;
+		rc = CMS_verify(cms, nullptr, nullptr, data_bio, nullptr, flags);
+	}
+	BIO_free(data_bio);
+	CMS_ContentInfo_free(cms);
+	ERR_clear_error();
+	return rc == 1;
+}
+
+// Best-effort CN from the CMS signer certificate (for signer_name fallback).
+static std::string CmsSignerCN(const std::string &cms_der) {
+	if (cms_der.empty()) {
+		return std::string();
+	}
+	const unsigned char *p = reinterpret_cast<const unsigned char *>(cms_der.data());
+	CMS_ContentInfo *cms = d2i_CMS_ContentInfo(nullptr, &p, static_cast<long>(cms_der.size()));
+	if (!cms) {
+		ERR_clear_error();
+		return std::string();
+	}
+	std::string cn;
+	STACK_OF(X509) *signers = CMS_get0_signers(cms);
+	if (signers && sk_X509_num(signers) > 0) {
+		cn = X509CommonName(sk_X509_value(signers, 0));
+	}
+	// CMS_get0_signers may be empty until verify; fall back to embedded certs.
+	if (cn.empty()) {
+		STACK_OF(X509) *certs = CMS_get1_certs(cms);
+		if (certs) {
+			if (sk_X509_num(certs) > 0) {
+				cn = X509CommonName(sk_X509_value(certs, 0));
+			}
+			sk_X509_pop_free(certs, X509_free);
+		}
+	}
+	CMS_ContentInfo_free(cms);
+	ERR_clear_error();
+	return cn;
+}
+
+std::vector<SignatureInfo> ReadSignatures(const std::string &path, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	std::vector<SignatureInfo> sigs;
+
+	// File length + raw bytes for ByteRange coverage and CMS message rebuild.
+	std::string file_bytes = ReadFileBytes(path);
+	const int64_t file_size = static_cast<int64_t>(file_bytes.size());
+
+	QPDF doc;
+	if (password.empty()) {
+		doc.processFile(path.c_str());
+	} else {
+		doc.processFile(path.c_str(), password.c_str());
+	}
+	QPDFAcroFormDocumentHelper acroform(doc);
+	if (!acroform.hasAcroForm()) {
+		return sigs;
+	}
+	for (auto &field : acroform.getFormFields()) {
+		if (field.getFieldType() != "/Sig") {
+			continue;
+		}
+		auto value = field.getValue();
+		// Empty / unsigned signature field: skip (no signature dictionary).
+		if (!value.isDictionary()) {
+			continue;
+		}
+		SignatureInfo out;
+		out.field_name = field.getFullyQualifiedName();
+
+		// /SubFilter is a name (/adbe.pkcs7.detached); strip the leading slash.
+		auto sf = value.getKey("/SubFilter");
+		if (sf.isName()) {
+			std::string n = sf.getName();
+			out.subfilter = (!n.empty() && n[0] == '/') ? n.substr(1) : n;
+		} else if (sf.isString()) {
+			out.subfilter = sf.getUTF8Value();
+		}
+
+		out.signing_time_raw = DictStringOrEmpty(value, "/M");
+		// Prefer dictionary /Name; fall back to CMS cert CN after parsing Contents.
+		out.signer_name = DictStringOrEmpty(value, "/Name");
+		out.reason = DictStringOrEmpty(value, "/Reason");
+		out.location = DictStringOrEmpty(value, "/Location");
+
+		// /ByteRange: array of integers [off0 len0 off1 len1 ...]
+		std::vector<int64_t> byte_range;
+		auto br = value.getKey("/ByteRange");
+		if (br.isArray()) {
+			int n = br.getArrayNItems();
+			for (int i = 0; i < n; i++) {
+				auto item = br.getArrayItem(i);
+				if (item.isInteger()) {
+					byte_range.push_back(item.getIntValue());
+				}
+			}
+		}
+
+		std::string message; // concatenation of ByteRange spans
+		if (byte_range.size() >= 2 && byte_range.size() % 2 == 0) {
+			out.covers_whole_file = (byte_range[0] == 0);
+			int64_t last_off = byte_range[byte_range.size() - 2];
+			int64_t last_len = byte_range[byte_range.size() - 1];
+			if (last_off < 0 || last_len < 0 || last_off > file_size || last_len > file_size - last_off) {
+				out.covers_whole_file = false;
+			} else if (last_off + last_len != file_size) {
+				out.covers_whole_file = false;
+			}
+			// Build the signed message; also validates each span.
+			bool spans_ok = true;
+			for (size_t i = 0; i + 1 < byte_range.size(); i += 2) {
+				int64_t off = byte_range[i];
+				int64_t len = byte_range[i + 1];
+				if (off < 0 || len < 0 || off > file_size || len > file_size - off) {
+					spans_ok = false;
+					break;
+				}
+				message.append(file_bytes.data() + off, static_cast<size_t>(len));
+			}
+			if (!spans_ok) {
+				out.covers_whole_file = false;
+				message.clear();
+			}
+		}
+
+		// /Contents: hex (or binary) string holding the CMS/PKCS#7 blob.
+		std::string cms_der;
+		auto contents = value.getKey("/Contents");
+		if (contents.isString()) {
+			// qpdf returns the decoded string bytes (hex already unhexed).
+			cms_der = contents.getStringValue();
+			// Strip trailing NUL padding writers leave in the fixed-width hex hole.
+			while (!cms_der.empty() && cms_der.back() == '\0') {
+				cms_der.pop_back();
+			}
+		}
+
+		// Tier 2 cryptographic verification.
+		if (!cms_der.empty() && !message.empty()) {
+			out.has_verified = true;
+			out.verified = CmsVerify(message, cms_der);
+		} else if (!cms_der.empty() && message.empty()) {
+			// Have a signature blob but an unusable ByteRange → not verified.
+			out.has_verified = true;
+			out.verified = false;
+		}
+		// else: no Contents → leave verified NULL (empty/incomplete sig dict).
+
+		if (out.signer_name.empty() && !cms_der.empty()) {
+			std::string cn = CmsSignerCN(cms_der);
+			if (!cn.empty()) {
+				out.signer_name = cn;
+			}
+		}
+
+		sigs.push_back(std::move(out));
+	}
+	return sigs;
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_images — extract embedded raster image XObjects (the stored JPEG/bitmap,
+// not a page render). Walk each page's image resources via
+// QPDFPageObjectHelper::getImages(); per image, inspect the filter chain and
+// either pass the encoded bytes through (DCT->jpeg, JPX->jp2, CCITT->ccitt) or
+// fully decode and re-wrap the raw samples as PNG (Flate/RunLength/LZW/none),
+// falling back to 'raw' for colorspaces/bit depths we cannot losslessly wrap.
+//===--------------------------------------------------------------------===//
+namespace {
+
+// A stream filter name with the leading slash stripped ('FlateDecode'). PDF
+// permits inline-image abbreviations; XObjects use full names, but we normalize
+// the handful of abbreviations defensively.
+std::string NormalizeFilterName(const std::string &raw) {
+	std::string n = (!raw.empty() && raw[0] == '/') ? raw.substr(1) : raw;
+	if (n == "DCT") {
+		return "DCTDecode";
+	}
+	if (n == "CCF") {
+		return "CCITTFaxDecode";
+	}
+	if (n == "Fl") {
+		return "FlateDecode";
+	}
+	if (n == "LZW") {
+		return "LZWDecode";
+	}
+	if (n == "RL") {
+		return "RunLengthDecode";
+	}
+	if (n == "AHx") {
+		return "ASCIIHexDecode";
+	}
+	if (n == "A85") {
+		return "ASCII85Decode";
+	}
+	return n;
+}
+
+std::vector<std::string> StreamFilterNames(QPDFObjectHandle dict) {
+	std::vector<std::string> names;
+	if (!dict.isDictionary()) {
+		return names;
+	}
+	auto filter = dict.getKey("/Filter");
+	auto add = [&](QPDFObjectHandle item) {
+		if (item.isName()) {
+			names.push_back(NormalizeFilterName(item.getName()));
+		}
+	};
+	if (filter.isName()) {
+		add(filter);
+	} else if (filter.isArray()) {
+		int n = filter.getArrayNItems();
+		for (int i = 0; i < n; i++) {
+			add(filter.getArrayItem(i));
+		}
+	}
+	return names;
+}
+
+// Raw PDF colorspace name: a name directly ('DeviceRGB') or the leading name of
+// a colorspace array ('ICCBased', 'Indexed', 'DeviceN', ...). Empty if absent.
+std::string ColorSpaceName(QPDFObjectHandle dict) {
+	if (!dict.isDictionary()) {
+		return std::string();
+	}
+	auto cs = dict.getKey("/ColorSpace");
+	if (cs.isName()) {
+		std::string s = cs.getName();
+		return (!s.empty() && s[0] == '/') ? s.substr(1) : s;
+	}
+	if (cs.isArray() && cs.getArrayNItems() >= 1) {
+		auto first = cs.getArrayItem(0);
+		if (first.isName()) {
+			std::string s = first.getName();
+			return (!s.empty() && s[0] == '/') ? s.substr(1) : s;
+		}
+	}
+	return std::string();
+}
+
+int DictIntOrDefault(QPDFObjectHandle dict, const char *key, int def) {
+	if (!dict.isDictionary()) {
+		return def;
+	}
+	auto v = dict.getKey(key);
+	if (v.isInteger()) {
+		return static_cast<int>(v.getIntValue());
+	}
+	return def;
+}
+
+std::string BufferToString(const std::shared_ptr<Buffer> &buf) {
+	if (!buf || buf->getSize() == 0) {
+		return std::string();
+	}
+	return std::string(reinterpret_cast<const char *>(buf->getBuffer()), buf->getSize());
+}
+
+// Pipe stream data at a given decode level with no re-encoding (encode_flags=0),
+// so generalized/non-lossy filters are undone while lossy terminal filters
+// (DCT/JPX) and undecodable ones (CCITT) are left intact.
+std::string PipeStreamAtLevel(QPDFObjectHandle stream, qpdf_stream_decode_level_e level) {
+	Pl_Buffer pl("pdf_images");
+	bool attempted = false;
+	stream.pipeStreamData(&pl, &attempted, 0 /* encode_flags: no recompress */, level, true /* suppress warnings */,
+	                      false);
+	pl.finish();
+	return BufferToString(pl.getBufferSharedPointer());
+}
+
+void PngPut32(std::string &s, uint32_t v) {
+	s.push_back(static_cast<char>((v >> 24) & 0xff));
+	s.push_back(static_cast<char>((v >> 16) & 0xff));
+	s.push_back(static_cast<char>((v >> 8) & 0xff));
+	s.push_back(static_cast<char>(v & 0xff));
+}
+
+void PngAppendChunk(std::string &out, const char *type, const std::string &data) {
+	PngPut32(out, static_cast<uint32_t>(data.size()));
+	size_t crc_start = out.size();
+	out.append(type, 4);
+	out.append(data);
+	uLong crc = crc32(0L, Z_NULL, 0);
+	crc = crc32(crc, reinterpret_cast<const Bytef *>(out.data() + crc_start), static_cast<uInt>(4 + data.size()));
+	PngPut32(out, static_cast<uint32_t>(crc));
+}
+
+// Minimal PNG encoder: IHDR + a single zlib-deflated IDAT (per-row filter byte 0)
+// + IEND. color_type 0 (grayscale) or 2 (truecolor RGB); bit_depth 1 or 8.
+// Returns empty on any inconsistency so the caller can fall back to 'raw'.
+std::string EncodePng(int width, int height, int channels, int bit_depth, int color_type, const std::string &samples) {
+	if (width <= 0 || height <= 0) {
+		return std::string();
+	}
+	size_t row_bytes = (static_cast<size_t>(width) * channels * bit_depth + 7) / 8;
+	if (samples.size() < row_bytes * static_cast<size_t>(height)) {
+		return std::string(); // decoded data too short for the declared geometry
+	}
+	std::string raw;
+	raw.reserve((row_bytes + 1) * static_cast<size_t>(height));
+	for (int y = 0; y < height; y++) {
+		raw.push_back(0); // PNG filter type: None
+		raw.append(samples.data() + static_cast<size_t>(y) * row_bytes, row_bytes);
+	}
+	uLongf bound = compressBound(static_cast<uLong>(raw.size()));
+	std::string idat;
+	idat.resize(bound);
+	int rc = compress2(reinterpret_cast<Bytef *>(&idat[0]), &bound, reinterpret_cast<const Bytef *>(raw.data()),
+	                   static_cast<uLong>(raw.size()), Z_DEFAULT_COMPRESSION);
+	if (rc != Z_OK) {
+		return std::string();
+	}
+	idat.resize(bound);
+
+	std::string out;
+	static const unsigned char kSig[8] = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+	out.append(reinterpret_cast<const char *>(kSig), 8);
+	std::string ihdr;
+	PngPut32(ihdr, static_cast<uint32_t>(width));
+	PngPut32(ihdr, static_cast<uint32_t>(height));
+	ihdr.push_back(static_cast<char>(bit_depth));
+	ihdr.push_back(static_cast<char>(color_type));
+	ihdr.push_back(0); // compression method: deflate
+	ihdr.push_back(0); // filter method: adaptive (only type 0 used)
+	ihdr.push_back(0); // interlace: none
+	PngAppendChunk(out, "IHDR", ihdr);
+	PngAppendChunk(out, "IDAT", idat);
+	PngAppendChunk(out, "IEND", std::string());
+	return out;
+}
+
+bool IsGrayColorSpace(const std::string &cs) {
+	return cs == "DeviceGray" || cs == "CalGray" || cs == "G";
+}
+
+bool IsRgbColorSpace(const std::string &cs) {
+	return cs == "DeviceRGB" || cs == "CalRGB" || cs == "RGB";
+}
+
+} // namespace
+
+// pdf_watermark / pdf_bates — stamp real Helvetica text on top of every page.
+//
+// Both build a fresh content stream per page and append it to the page's
+// existing /Contents (so the stamp draws ON TOP), registering a standard
+// Helvetica base-14 font (and, for the watermark, an ExtGState alpha) in that
+// page's own /Resources. Because the stamp is real text drawn with BT/Tf/Tj/ET,
+// it survives into the extracted text layer. To keep the combined content
+// stream well-formed regardless of what the original left on the graphics
+// state, the original content is bracketed: a `q` is prepended and the appended
+// stream opens with `Q` (restoring to the default state saved by that `q`)
+// before drawing its own `q ... Q` block. Each page is sized/positioned from
+// its own MediaBox so mixed-size documents stamp correctly.
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+// Escape a byte string for use inside a PDF literal string `( ... )`: backslash,
+// parentheses get a `\` prefix; any non-printable / non-ASCII byte becomes a
+// `\ddd` octal escape so the content stream stays well-formed for any input.
+std::string EscapePdfLiteral(const std::string &s) {
+	std::string out;
+	out.reserve(s.size() + 8);
+	for (unsigned char ch : s) {
+		if (ch == '\\' || ch == '(' || ch == ')') {
+			out.push_back('\\');
+			out.push_back(static_cast<char>(ch));
+		} else if (ch < 32 || ch > 126) {
+			char buf[5];
+			std::snprintf(buf, sizeof(buf), "\\%03o", ch);
+			out += buf;
+		} else {
+			out.push_back(static_cast<char>(ch));
+		}
+	}
+	return out;
+}
+
+// Format a coordinate/scalar for a content stream with a fixed, compact
+// precision (content streams are ASCII; %g-style exponents are illegal).
+std::string Num(double v) {
+	char buf[64];
+	std::snprintf(buf, sizeof(buf), "%.4f", v);
+	return std::string(buf);
+}
+
+struct MediaBox {
+	double llx = 0, lly = 0, urx = 612, ury = 792;
+};
+
+// MediaBox is inheritable, so resolve it via getAttribute (read-only, no copy).
+MediaBox PageMediaBox(QPDFPageObjectHelper &page) {
+	MediaBox b;
+	QPDFObjectHandle mb = page.getAttribute("/MediaBox", false);
+	if (mb.isArray() && mb.getArrayNItems() >= 4) {
+		b.llx = mb.getArrayItem(0).getNumericValue();
+		b.lly = mb.getArrayItem(1).getNumericValue();
+		b.urx = mb.getArrayItem(2).getNumericValue();
+		b.ury = mb.getArrayItem(3).getNumericValue();
+	}
+	return b;
+}
+
+// Return the page's own /Resources dictionary, copying an inherited/shared one
+// down onto the page so it is safe to mutate; creates an empty one if absent.
+QPDFObjectHandle EnsurePageResources(QPDFPageObjectHelper &page) {
+	QPDFObjectHandle resources = page.getAttribute("/Resources", true);
+	if (!resources.isDictionary()) {
+		resources = QPDFObjectHandle::newDictionary();
+		page.getObjectHandle().replaceKey("/Resources", resources);
+	}
+	return resources;
+}
+
+// Add a standard Helvetica base-14 Type1 font to /Resources /Font under a key
+// that does not collide with an existing one; return the chosen key ('/F-wm').
+std::string AddHelvetica(QPDFObjectHandle resources) {
+	QPDFObjectHandle fonts = resources.getKey("/Font");
+	if (!fonts.isDictionary()) {
+		fonts = QPDFObjectHandle::newDictionary();
+		resources.replaceKey("/Font", fonts);
+	}
+	std::string key = "/F-wm";
+	int suffix = 0;
+	while (fonts.hasKey(key)) {
+		key = "/F-wm" + std::to_string(++suffix);
+	}
+	QPDFObjectHandle font = QPDFObjectHandle::newDictionary();
+	font.replaceKey("/Type", QPDFObjectHandle::newName("/Font"));
+	font.replaceKey("/Subtype", QPDFObjectHandle::newName("/Type1"));
+	font.replaceKey("/BaseFont", QPDFObjectHandle::newName("/Helvetica"));
+	fonts.replaceKey(key, font);
+	return key;
+}
+
+// Add a constant-alpha ExtGState to /Resources /ExtGState under a non-colliding
+// key; return the chosen key ('/GS-wm').
+std::string AddAlphaGState(QPDFObjectHandle resources, double opacity) {
+	QPDFObjectHandle egs = resources.getKey("/ExtGState");
+	if (!egs.isDictionary()) {
+		egs = QPDFObjectHandle::newDictionary();
+		resources.replaceKey("/ExtGState", egs);
+	}
+	std::string key = "/GS-wm";
+	int suffix = 0;
+	while (egs.hasKey(key)) {
+		key = "/GS-wm" + std::to_string(++suffix);
+	}
+	QPDFObjectHandle gs = QPDFObjectHandle::newDictionary();
+	gs.replaceKey("/Type", QPDFObjectHandle::newName("/ExtGState"));
+	gs.replaceKey("/ca", QPDFObjectHandle::newReal(opacity, 3));
+	gs.replaceKey("/CA", QPDFObjectHandle::newReal(opacity, 3));
+	egs.replaceKey(key, gs);
+	return key;
+}
+
+// Bracket the original content with a saved graphics state and append `drawing`
+// on top: prepend `q`, then append `Q` (restore to that saved default) followed
+// by the caller's already-`q`/`Q`-balanced drawing block.
+void AppendStampOnTop(QPDF &doc, QPDFPageObjectHelper &page, const std::string &drawing) {
+	page.addPageContents(QPDFObjectHandle::newStream(&doc, "q\n"), true /* prepend */);
+	page.addPageContents(QPDFObjectHandle::newStream(&doc, "Q\n" + drawing), false /* append */);
+}
+
+} // namespace
+
+std::vector<EmbeddedImage> ReadImages(const std::string &path, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	std::vector<EmbeddedImage> images;
+	QPDF doc;
+	if (password.empty()) {
+		doc.processFile(path.c_str());
+	} else {
+		doc.processFile(path.c_str(), password.c_str());
+	}
+	QPDFPageDocumentHelper doc_pages(doc);
+	auto pages = doc_pages.getAllPages();
+	for (size_t page_idx = 0; page_idx < pages.size(); page_idx++) {
+		int image_index = 0;
+		// std::map: iterated in resource-name order, so image_index is stable.
+		for (auto &entry : QPDFPageObjectHelper(pages[page_idx]).getImages()) {
+			const std::string &res_name = entry.first;
+			QPDFObjectHandle stream = entry.second;
+			if (!stream.isStream()) {
+				continue;
+			}
+			auto dict = stream.getDict();
+			EmbeddedImage img;
+			img.page = static_cast<int>(page_idx + 1);
+			img.image_index = ++image_index;
+			// getImages() keys carry the leading slash ('/Im0'); strip it.
+			img.name = (!res_name.empty() && res_name[0] == '/') ? res_name.substr(1) : res_name;
+			img.width = DictIntOrDefault(dict, "/Width", 0);
+			img.height = DictIntOrDefault(dict, "/Height", 0);
+			bool image_mask =
+			    dict.isDictionary() && dict.getKey("/ImageMask").isBool() && dict.getKey("/ImageMask").getBoolValue();
+			img.bits_per_component = DictIntOrDefault(dict, "/BitsPerComponent", image_mask ? 1 : 8);
+			img.colorspace = ColorSpaceName(dict);
+
+			auto filters = StreamFilterNames(dict);
+			std::string terminal = filters.empty() ? std::string() : filters.back();
+
+			try {
+				if (terminal == "DCTDecode" || terminal == "JPXDecode" || terminal == "CCITTFaxDecode") {
+					// Lossy / undecodable terminal filter: pass the encoded bytes
+					// through. A lone terminal filter is exact via getRawStreamData;
+					// a chain undoes the earlier generalized filters at the
+					// specialized level, which never touches DCT/JPX/CCITT.
+					if (filters.size() <= 1) {
+						img.data = BufferToString(stream.getRawStreamData());
+					} else {
+						img.data = PipeStreamAtLevel(stream, qpdf_dl_specialized);
+					}
+					img.format = (terminal == "DCTDecode") ? "jpeg" : (terminal == "JPXDecode") ? "jp2" : "ccitt";
+				} else {
+					// Generalized/non-lossy (Flate/RunLength/LZW/ASCII/none): fully
+					// decode to raw samples, then wrap as PNG when we can do so
+					// losslessly; otherwise surface the decoded samples as 'raw'.
+					std::string decoded = BufferToString(stream.getStreamData(qpdf_dl_all));
+					std::string png;
+					if (!image_mask && IsGrayColorSpace(img.colorspace) &&
+					    (img.bits_per_component == 1 || img.bits_per_component == 8)) {
+						png = EncodePng(img.width, img.height, 1, img.bits_per_component, 0 /* grayscale */, decoded);
+					} else if (!image_mask && IsRgbColorSpace(img.colorspace) && img.bits_per_component == 8) {
+						png = EncodePng(img.width, img.height, 3, 8, 2 /* truecolor */, decoded);
+					}
+					if (!png.empty()) {
+						img.format = "png";
+						img.data = std::move(png);
+					} else {
+						img.format = "raw";
+						img.data = std::move(decoded);
+					}
+				}
+			} catch (...) {
+				// Best-effort per image: a stream whose data cannot be extracted
+				// (unknown filter chain, corrupt stream) contributes no row rather
+				// than aborting the whole document.
+				continue;
+			}
+			images.push_back(std::move(img));
+		}
+	}
+	return images;
+}
+
+void Watermark(const std::string &input, const std::string &output, const std::string &text, double opacity) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	doc.processFile(input.c_str());
+	QPDFPageDocumentHelper doc_pages(doc);
+
+	const std::string escaped = EscapePdfLiteral(text);
+	const double len = static_cast<double>(std::max<size_t>(text.size(), size_t(1)));
+	const double cos45 = 0.70710678, sin45 = 0.70710678; // 45° diagonal
+
+	for (auto &page : doc_pages.getAllPages()) {
+		MediaBox b = PageMediaBox(page);
+		double w = b.urx - b.llx;
+		double h = b.ury - b.lly;
+		if (w <= 0) {
+			w = 612;
+		}
+		if (h <= 0) {
+			h = 792;
+		}
+		QPDFObjectHandle resources = EnsurePageResources(page);
+		std::string font_key = AddHelvetica(resources);
+		std::string gs_key = AddAlphaGState(resources, opacity);
+
+		double cx = b.llx + w / 2.0;
+		double cy = b.lly + h / 2.0;
+		// Size the text so it spans most of the page diagonal (Helvetica averages
+		// ~0.5em/char), clamped to a sane range.
+		double diag = std::sqrt(w * w + h * h);
+		double font_size = 1.6 * diag / len;
+		font_size = std::max(12.0, std::min(font_size, 140.0));
+		double text_w = 0.5 * font_size * len;
+		// Center the rotated baseline midpoint on the page center; drop the origin
+		// half a cap-height along the perpendicular for rough vertical centering.
+		double tx = cx - (text_w / 2.0) * cos45 + (font_size * 0.35) * sin45;
+		double ty = cy - (text_w / 2.0) * sin45 - (font_size * 0.35) * cos45;
+
+		std::ostringstream draw;
+		draw << "q\n"
+		     << gs_key << " gs\n"
+		     << "0.5 0.5 0.5 rg\n"
+		     << "0.5 0.5 0.5 RG\n"
+		     << "BT\n"
+		     << font_key << " " << Num(font_size) << " Tf\n"
+		     << Num(cos45) << " " << Num(sin45) << " " << Num(-sin45) << " " << Num(cos45) << " " << Num(tx) << " "
+		     << Num(ty) << " Tm\n"
+		     << "(" << escaped << ") Tj\n"
+		     << "ET\n"
+		     // Text extractors assemble words from glyph geometry and cannot regroup
+		     // glyphs laid along a 45° baseline — the visible diagonal run comes out
+		     // fragmented ('D R AF T'). Emit a small INVISIBLE (render mode 3)
+		     // horizontal copy of the same text so the watermark stays searchable /
+		     // extractable — the same technique OCR text layers use.
+		     << "BT\n"
+		     << font_key << " 8 Tf\n"
+		     << "3 Tr\n"
+		     << "1 0 0 1 " << Num(b.llx + 6) << " " << Num(b.lly + 6) << " Tm\n"
+		     << "(" << escaped << ") Tj\n"
+		     << "ET\n"
+		     << "Q\n";
+		AppendStampOnTop(doc, page, draw.str());
+	}
+
+	QPDFWriter writer(doc, output.c_str());
+	writer.write();
+}
+
+void Bates(const std::string &input, const std::string &output, const std::string &prefix, long long start_number,
+           std::vector<std::string> *stamped_labels) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	doc.processFile(input.c_str());
+	QPDFPageDocumentHelper doc_pages(doc);
+
+	const double font_size = 10.0;
+	const double margin = 36.0; // half-inch from the page edges
+
+	long long number = start_number;
+	for (auto &page : doc_pages.getAllPages()) {
+		MediaBox b = PageMediaBox(page);
+
+		unsigned long long magnitude = (number < 0) ? static_cast<unsigned long long>(-(number + 1)) + 1ULL
+		                                            : static_cast<unsigned long long>(number);
+		std::string digits = std::to_string(magnitude);
+		while (digits.size() < 6) {
+			digits = "0" + digits;
+		}
+		std::string label = prefix + (number < 0 ? "-" : "") + digits;
+		std::string escaped = EscapePdfLiteral(label);
+
+		QPDFObjectHandle resources = EnsurePageResources(page);
+		std::string font_key = AddHelvetica(resources);
+
+		double text_w = 0.5 * font_size * static_cast<double>(label.size());
+		double tx = b.urx - margin - text_w;
+		double ty = b.lly + margin;
+
+		std::ostringstream draw;
+		draw << "q\n"
+		     << "0 0 0 rg\n"
+		     << "BT\n"
+		     << font_key << " " << Num(font_size) << " Tf\n"
+		     << Num(tx) << " " << Num(ty) << " Td\n"
+		     << "(" << escaped << ") Tj\n"
+		     << "ET\n"
+		     << "Q\n";
+		AppendStampOnTop(doc, page, draw.str());
+
+		if (stamped_labels) {
+			stamped_labels->push_back(label);
+		}
+		number++;
+	}
+
+	QPDFWriter writer(doc, output.c_str());
+	writer.write();
+}
+
+//===--------------------------------------------------------------------===//
+// pdf_sign — create an adbe.pkcs7.detached CMS signature. See qpdf_ops.hpp for
+// the contract. Strategy: qpdf writes the AcroForm /Sig field with a /ByteRange
+// and a fixed-width /Contents hex placeholder (all-NUL bytes → qpdf serializes a
+// hex string `<0000...>`) to a memory buffer, deterministically (static /ID, no
+// object streams, streams preserved) so the placeholder appears verbatim. We
+// then locate the placeholder, patch /ByteRange in place, CMS_sign the two spans,
+// and hex-fill the DER into the /Contents hole.
+//===--------------------------------------------------------------------===//
+
+// Fixed /Contents hex budget: 8192 DER bytes → 16384 hex chars. A self-signed
+// RSA-2048 detached CMS blob is ~1.5-2 KB, so this leaves generous headroom.
+static const size_t kSignContentsBytes = 8192;
+
+// pem_password_cb: hands the (possibly empty) key password to OpenSSL's PEM
+// reader. An empty password on an encrypted key surfaces as a decrypt failure,
+// which the caller reports as a wrong-password error.
+static int SignPemPasswordCb(char *buf, int size, int /*rwflag*/, void *user) {
+	const std::string *pw = static_cast<const std::string *>(user);
+	if (!pw) {
+		return 0;
+	}
+	int len = static_cast<int>(pw->size());
+	if (len > size) {
+		len = size;
+	}
+	if (len > 0) {
+		std::memcpy(buf, pw->data(), static_cast<size_t>(len));
+	}
+	return len;
+}
+
+static std::string ReadWholeFile(const std::string &path) {
+	std::ifstream f(path, std::ios::binary);
+	if (!f) {
+		throw std::runtime_error("could not read '" + path + "'");
+	}
+	std::ostringstream ss;
+	ss << f.rdbuf();
+	return ss.str();
+}
+
+// CMS_sign the message with a PEM cert + PEM (optionally encrypted) key. Returns
+// the detached SignedData as DER bytes. Throws on any load / sign failure.
+static std::string CmsSignDetached(const std::string &message, const std::string &cert_pem, const std::string &key_pem,
+                                   const std::string &key_password) {
+	std::unique_ptr<BIO, decltype(&BIO_free)> cert_bio(
+	    BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size())), BIO_free);
+	if (!cert_bio) {
+		throw std::runtime_error("out of memory reading certificate");
+	}
+	std::unique_ptr<X509, decltype(&X509_free)> cert(PEM_read_bio_X509(cert_bio.get(), nullptr, nullptr, nullptr),
+	                                                 X509_free);
+	if (!cert) {
+		ERR_clear_error();
+		throw std::runtime_error("could not parse certificate PEM (expected an X.509 certificate)");
+	}
+
+	std::unique_ptr<BIO, decltype(&BIO_free)> key_bio(BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size())),
+	                                                  BIO_free);
+	if (!key_bio) {
+		throw std::runtime_error("out of memory reading private key");
+	}
+	std::string pw_copy = key_password;
+	std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key(
+	    PEM_read_bio_PrivateKey(key_bio.get(), nullptr, SignPemPasswordCb, &pw_copy), EVP_PKEY_free);
+	if (!key) {
+		ERR_clear_error();
+		throw std::runtime_error("could not read private key (wrong key_password, or unsupported PEM)");
+	}
+
+	std::unique_ptr<BIO, decltype(&BIO_free)> data_bio(
+	    BIO_new_mem_buf(message.data(), static_cast<int>(message.size())), BIO_free);
+	if (!data_bio) {
+		throw std::runtime_error("out of memory building signed message");
+	}
+
+	// CMS_DETACHED: eContent absent (the /Contents blob signs external bytes).
+	// CMS_BINARY: PDF bytes are raw, not S/MIME canonical text.
+	// CMS_NOSMIMECAP: omit S/MIME capabilities to keep the blob compact.
+	unsigned flags = CMS_DETACHED | CMS_BINARY | CMS_NOSMIMECAP;
+	std::unique_ptr<CMS_ContentInfo, decltype(&CMS_ContentInfo_free)> cms(
+	    CMS_sign(cert.get(), key.get(), nullptr, data_bio.get(), flags), CMS_ContentInfo_free);
+	if (!cms) {
+		ERR_clear_error();
+		throw std::runtime_error("CMS signing failed");
+	}
+
+	int der_len = i2d_CMS_ContentInfo(cms.get(), nullptr);
+	if (der_len <= 0) {
+		ERR_clear_error();
+		throw std::runtime_error("CMS DER encoding failed");
+	}
+	std::string der(static_cast<size_t>(der_len), '\0');
+	unsigned char *out_ptr = reinterpret_cast<unsigned char *>(&der[0]);
+	if (i2d_CMS_ContentInfo(cms.get(), &out_ptr) != der_len) {
+		ERR_clear_error();
+		throw std::runtime_error("CMS DER encoding failed");
+	}
+	return der;
+}
+
+void SignDetached(const std::string &input, const std::string &output, const std::string &cert_path,
+                  const std::string &key_path, const std::string &key_password, const std::string &reason,
+                  const std::string &location, const std::string &signer_name, const std::string &field_name,
+                  const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+
+	// Load the signing material up front so bad cert/key paths fail before we
+	// touch the PDF.
+	std::string cert_pem = ReadWholeFile(cert_path);
+	std::string key_pem = ReadWholeFile(key_path);
+
+	QPDF doc;
+	if (password.empty()) {
+		doc.processFile(input.c_str());
+	} else {
+		doc.processFile(input.c_str(), password.c_str());
+	}
+
+	// Build the signature value dictionary with wide placeholders.
+	auto sig_dict = QPDFObjectHandle::newDictionary();
+	sig_dict.replaceKey("/Type", QPDFObjectHandle::newName("/Sig"));
+	sig_dict.replaceKey("/Filter", QPDFObjectHandle::newName("/Adobe.PPKLite"));
+	sig_dict.replaceKey("/SubFilter", QPDFObjectHandle::newName("/adbe.pkcs7.detached"));
+	// /ByteRange placeholder: three 10-digit sentinels (supports files < 10 GB);
+	// patched in place after the deterministic write.
+	sig_dict.replaceKey("/ByteRange",
+	                    QPDFObjectHandle::newArray(std::vector<QPDFObjectHandle> {
+	                        QPDFObjectHandle::newInteger(0), QPDFObjectHandle::newInteger(9999999999LL),
+	                        QPDFObjectHandle::newInteger(9999999999LL), QPDFObjectHandle::newInteger(9999999999LL)}));
+	// All-NUL string → qpdf writes a hex string `<0000...>` of exactly
+	// 2*kSignContentsBytes digits, which becomes the signature hole.
+	sig_dict.replaceKey("/Contents", QPDFObjectHandle::newString(std::string(kSignContentsBytes, '\0')));
+	// Signing time /M (current UTC), plus optional metadata.
+	{
+		std::time_t now = std::time(nullptr);
+		std::tm tm_utc {};
+#if defined(_WIN32)
+		gmtime_s(&tm_utc, &now);
+#else
+		gmtime_r(&now, &tm_utc);
+#endif
+		char m_buf[32];
+		std::strftime(m_buf, sizeof(m_buf), "D:%Y%m%d%H%M%S+00'00'", &tm_utc);
+		sig_dict.replaceKey("/M", QPDFObjectHandle::newString(std::string(m_buf)));
+	}
+	if (!signer_name.empty()) {
+		sig_dict.replaceKey("/Name", QPDFObjectHandle::newString(signer_name));
+	}
+	if (!reason.empty()) {
+		sig_dict.replaceKey("/Reason", QPDFObjectHandle::newString(reason));
+	}
+	if (!location.empty()) {
+		sig_dict.replaceKey("/Location", QPDFObjectHandle::newString(location));
+	}
+	auto sig_obj = doc.makeIndirectObject(sig_dict);
+
+	// Merged signature field / widget annotation on page 1 (invisible: zero Rect).
+	auto pages = QPDFPageDocumentHelper(doc).getAllPages();
+	if (pages.empty()) {
+		throw std::runtime_error("cannot sign a document with no pages");
+	}
+	auto page0 = pages[0].getObjectHandle();
+	auto widget = QPDFObjectHandle::newDictionary();
+	widget.replaceKey("/Type", QPDFObjectHandle::newName("/Annot"));
+	widget.replaceKey("/Subtype", QPDFObjectHandle::newName("/Widget"));
+	widget.replaceKey("/FT", QPDFObjectHandle::newName("/Sig"));
+	widget.replaceKey("/T", QPDFObjectHandle::newString(field_name));
+	widget.replaceKey("/V", sig_obj);
+	widget.replaceKey("/P", page0);
+	widget.replaceKey("/F", QPDFObjectHandle::newInteger(132)); // Print | Locked
+	widget.replaceKey("/Rect", QPDFObjectHandle::newArray(std::vector<QPDFObjectHandle> {
+	                               QPDFObjectHandle::newInteger(0), QPDFObjectHandle::newInteger(0),
+	                               QPDFObjectHandle::newInteger(0), QPDFObjectHandle::newInteger(0)}));
+	auto widget_obj = doc.makeIndirectObject(widget);
+
+	// Attach the widget to page 1's /Annots.
+	auto annots = page0.getKey("/Annots");
+	if (!annots.isArray()) {
+		annots = QPDFObjectHandle::newArray();
+	}
+	annots.appendItem(widget_obj);
+	page0.replaceKey("/Annots", annots);
+
+	// Register the field in the document AcroForm (create it if absent).
+	auto root = doc.getRoot();
+	auto acroform = root.getKey("/AcroForm");
+	if (!acroform.isDictionary()) {
+		acroform = doc.makeIndirectObject(QPDFObjectHandle::newDictionary());
+		root.replaceKey("/AcroForm", acroform);
+	}
+	auto fields = acroform.getKey("/Fields");
+	if (!fields.isArray()) {
+		fields = QPDFObjectHandle::newArray();
+	}
+	fields.appendItem(widget_obj);
+	acroform.replaceKey("/Fields", fields);
+	// SigFlags: bit1 SignaturesExist, bit2 AppendOnly.
+	acroform.replaceKey("/SigFlags", QPDFObjectHandle::newInteger(3));
+
+	// Deterministic write to memory: static /ID, no object streams (so the /Sig
+	// dict is a plain visible object), streams preserved (predictable bytes), no
+	// encryption (encrypting the /Contents string would break the placeholder).
+	QPDFWriter writer(doc);
+	writer.setOutputMemory();
+	writer.setStaticID(true);
+	writer.setObjectStreamMode(qpdf_o_disable);
+	writer.setStreamDataMode(qpdf_s_preserve);
+	writer.setPreserveEncryption(false);
+	writer.write();
+	auto buffer = writer.getBufferSharedPointer();
+	std::string bytes(reinterpret_cast<const char *>(buffer->getBuffer()), buffer->getSize());
+
+	// Locate the /Contents hex hole via its long zero run (unique in the file).
+	const std::string zero_run = "<" + std::string(256, '0');
+	size_t c_lt = bytes.find(zero_run);
+	if (c_lt == std::string::npos) {
+		throw std::runtime_error("could not locate /Contents placeholder in written PDF");
+	}
+	size_t c_gt = bytes.find('>', c_lt);
+	if (c_gt == std::string::npos) {
+		throw std::runtime_error("malformed /Contents placeholder in written PDF");
+	}
+	// Hole capacity in hex digits (between '<' and '>').
+	size_t hole_hex = c_gt - c_lt - 1;
+
+	// Locate and patch /ByteRange in place. The array occupies [lb, rb].
+	size_t br_key = bytes.find("/ByteRange");
+	if (br_key == std::string::npos) {
+		throw std::runtime_error("could not locate /ByteRange in written PDF");
+	}
+	size_t lb = bytes.find('[', br_key);
+	size_t rb = (lb == std::string::npos) ? std::string::npos : bytes.find(']', lb);
+	if (lb == std::string::npos || rb == std::string::npos) {
+		throw std::runtime_error("malformed /ByteRange array in written PDF");
+	}
+
+	// ByteRange = [0, len_before_hole, offset_after_hole, len_after_hole]. The
+	// hole is the /Contents string including its `<` and `>` delimiters.
+	const int64_t total = static_cast<int64_t>(bytes.size());
+	const int64_t b0 = 0;
+	const int64_t b1 = static_cast<int64_t>(c_lt);     // bytes [0, c_lt)
+	const int64_t b2 = static_cast<int64_t>(c_gt) + 1; // first byte after '>'
+	const int64_t b3 = total - b2;                     // bytes [b2, total)
+	std::string br_body = "[0 " + std::to_string(b1) + " " + std::to_string(b2) + " " + std::to_string(b3);
+	const size_t span_width = rb - lb + 1; // includes '[' and ']'
+	if (br_body.size() + 1 > span_width) { // +1 for the closing ']'
+		throw std::runtime_error("ByteRange placeholder too small for computed offsets");
+	}
+	std::string br_final = br_body + std::string(span_width - br_body.size() - 1, ' ') + "]";
+	bytes.replace(lb, span_width, br_final);
+
+	// Build the signed message from the (now patched) spans and CMS-sign it.
+	std::string message;
+	message.reserve(static_cast<size_t>(b1 + b3));
+	message.append(bytes.data() + b0, static_cast<size_t>(b1));
+	message.append(bytes.data() + b2, static_cast<size_t>(b3));
+	std::string der = CmsSignDetached(message, cert_pem, key_pem, key_password);
+
+	// Hex-encode the DER (uppercase) into the /Contents hole; zero-pad the rest.
+	if (der.size() * 2 > hole_hex) {
+		throw std::runtime_error("signature (" + std::to_string(der.size()) +
+		                         " bytes) exceeds the /Contents placeholder capacity (" + std::to_string(hole_hex / 2) +
+		                         " bytes)");
+	}
+	static const char kHex[] = "0123456789ABCDEF";
+	std::string filled(hole_hex, '0');
+	for (size_t i = 0; i < der.size(); i++) {
+		unsigned char byte = static_cast<unsigned char>(der[i]);
+		filled[2 * i] = kHex[(byte >> 4) & 0xF];
+		filled[2 * i + 1] = kHex[byte & 0xF];
+	}
+	bytes.replace(c_lt + 1, hole_hex, filled);
+
+	// Write the final signed bytes to the output path.
+	std::ofstream out(output, std::ios::binary | std::ios::trunc);
+	if (!out) {
+		throw std::runtime_error("could not open output '" + output + "' for writing");
+	}
+	out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+	if (!out) {
+		throw std::runtime_error("failed writing signed PDF to '" + output + "'");
+	}
+}
+
+// pdf_redact — true (raster) redaction: replace each page carrying a redaction
+// box with an image-only page so the underlying text is destroyed, not merely
+// covered. The poppler-side caller renders each redacted page to RGB and paints
+// the boxes black; this function composes the output document, deflating the
+// raster into a FlateDecode DeviceRGB image XObject and rewriting the page.
+//===--------------------------------------------------------------------===//
+
+// Deflate raw bytes with zlib via qpdf's own pipeline (no external zlib include).
+static std::string FlateDeflate(const std::string &raw) {
+	Pl_Buffer collector("pdf_redact-flate");
+	Pl_Flate deflate("pdf_redact-deflate", &collector, Pl_Flate::a_deflate);
+	deflate.write(reinterpret_cast<const unsigned char *>(raw.data()), raw.size());
+	deflate.finish();
+	return collector.getString();
+}
+
+// Locale-independent fixed-point formatter for PDF numeric operands (never emits
+// a locale decimal comma the way std::to_string / ostringstream might).
+static std::string PdfNum(double v) {
+	char buf[64];
+	std::snprintf(buf, sizeof(buf), "%.4f", v);
+	return std::string(buf);
+}
+
+void RebuildPagesAsImages(const std::string &input, const std::string &output, const std::vector<RebuiltPage> &pages,
+                          const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	doc.processFile(input.c_str(), password.empty() ? nullptr : password.c_str());
+	QPDFPageDocumentHelper doc_pages(doc);
+	auto page_helpers = doc_pages.getAllPages();
+	if (page_helpers.size() != pages.size()) {
+		throw std::runtime_error("pdf_redact: internal page-count mismatch (" + std::to_string(page_helpers.size()) +
+		                         " document pages vs " + std::to_string(pages.size()) + " rebuilt pages)");
+	}
+	for (size_t i = 0; i < page_helpers.size(); ++i) {
+		const RebuiltPage &rp = pages[i];
+		if (!rp.redacted) {
+			continue; // page without redactions is carried over verbatim
+		}
+		if (rp.width <= 0 || rp.height <= 0 ||
+		    rp.rgb.size() != static_cast<size_t>(rp.width) * static_cast<size_t>(rp.height) * 3) {
+			throw std::runtime_error("pdf_redact: malformed raster for page " + std::to_string(i + 1));
+		}
+
+		// Image XObject: DeviceRGB, 8 bpc, FlateDecode-compressed raster bytes.
+		std::string compressed = FlateDeflate(rp.rgb);
+		QPDFObjectHandle image = QPDFObjectHandle::newStream(&doc);
+		image.replaceStreamData(compressed, QPDFObjectHandle::newName("/FlateDecode"), QPDFObjectHandle::newNull());
+		QPDFObjectHandle idict = image.getDict();
+		idict.replaceKey("/Type", QPDFObjectHandle::newName("/XObject"));
+		idict.replaceKey("/Subtype", QPDFObjectHandle::newName("/Image"));
+		idict.replaceKey("/Width", QPDFObjectHandle::newInteger(rp.width));
+		idict.replaceKey("/Height", QPDFObjectHandle::newInteger(rp.height));
+		idict.replaceKey("/ColorSpace", QPDFObjectHandle::newName("/DeviceRGB"));
+		idict.replaceKey("/BitsPerComponent", QPDFObjectHandle::newInteger(8));
+		QPDFObjectHandle image_ind = doc.makeIndirectObject(image);
+
+		// Resources: expose the image as /Im0.
+		QPDFObjectHandle xobjects = QPDFObjectHandle::newDictionary();
+		xobjects.replaceKey("/Im0", image_ind);
+		QPDFObjectHandle resources = QPDFObjectHandle::newDictionary();
+		resources.replaceKey("/XObject", xobjects);
+
+		// Content: scale the unit image square to the whole page and paint it.
+		std::string content = "q " + PdfNum(rp.media_w) + " 0 0 " + PdfNum(rp.media_h) + " 0 0 cm /Im0 Do Q\n";
+		QPDFObjectHandle contents = QPDFObjectHandle::newStream(&doc, content);
+		QPDFObjectHandle contents_ind = doc.makeIndirectObject(contents);
+
+		// Rewrite the page in place: image-only content, fresh MediaBox at the
+		// raster's display size, no rotation (the raster is already upright), and
+		// no annotations (an annotation could re-introduce extractable text).
+		QPDFObjectHandle page = page_helpers[i].getObjectHandle();
+		QPDFObjectHandle media_box = QPDFObjectHandle::newArray();
+		media_box.appendItem(QPDFObjectHandle::newInteger(0));
+		media_box.appendItem(QPDFObjectHandle::newInteger(0));
+		media_box.appendItem(QPDFObjectHandle::newReal(PdfNum(rp.media_w)));
+		media_box.appendItem(QPDFObjectHandle::newReal(PdfNum(rp.media_h)));
+		page.replaceKey("/Contents", contents_ind);
+		page.replaceKey("/Resources", resources);
+		page.replaceKey("/MediaBox", media_box);
+		page.removeKey("/Rotate");
+		page.removeKey("/CropBox");
+		page.removeKey("/Annots");
+	}
+	QPDFWriter writer(doc, output.c_str());
+	writer.write();
+}
+
+//===--------------------------------------------------------------------===//
+// Structure / encryption / JSON / repair
+//===--------------------------------------------------------------------===//
+
+static const char *EncryptionMethodName(QPDF::encryption_method_e m) {
+	switch (m) {
+	case QPDF::e_none:
+		return "none";
+	case QPDF::e_rc4:
+		return "rc4";
+	case QPDF::e_aes:
+		return "aes";
+	case QPDF::e_aesv3:
+		return "aesv3";
+	case QPDF::e_unknown:
+	default:
+		return "unknown";
+	}
+}
+
+static void OpenQpdf(QPDF &doc, const std::string &path, const std::string &password) {
+	doc.processFile(path.c_str(), password.empty() ? nullptr : password.c_str());
+}
+
+DocumentStats InspectDocument(const std::string &path, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	OpenQpdf(doc, path, password);
+
+	DocumentStats s;
+	s.is_linearized = doc.isLinearized();
+	if (s.is_linearized) {
+		// checkLinearization writes diagnostics to the logger; we only need the
+		// boolean outcome for SQL. Suppress noisy stdout by draining warnings
+		// rather than relying on the default logger's console path.
+		doc.setSuppressWarnings(true);
+		s.linearized_ok = doc.checkLinearization();
+	}
+	s.page_count = static_cast<int>(QPDFPageDocumentHelper(doc).getAllPages().size());
+	s.object_count = static_cast<int64_t>(doc.getObjectCount());
+
+	auto xref = doc.getXRefTable();
+	s.xref_total = static_cast<int64_t>(xref.size());
+	for (auto const &kv : xref) {
+		switch (kv.second.getType()) {
+		case 0:
+			s.xref_free++;
+			break;
+		case 1:
+			s.xref_uncompressed++;
+			break;
+		case 2:
+			s.xref_compressed++;
+			break;
+		default:
+			break;
+		}
+	}
+
+	int R = 0, P = 0, V = 0;
+	QPDF::encryption_method_e stream_m = QPDF::e_none, string_m = QPDF::e_none, file_m = QPDF::e_none;
+	s.is_encrypted = doc.isEncrypted(R, P, V, stream_m, string_m, file_m);
+	if (s.is_encrypted) {
+		s.enc_R = R;
+		s.enc_P = P;
+		s.enc_V = V;
+		s.stream_method = EncryptionMethodName(stream_m);
+		s.string_method = EncryptionMethodName(string_m);
+		s.file_method = EncryptionMethodName(file_m);
+		s.owner_password_matched = doc.ownerPasswordMatched();
+		s.user_password_matched = doc.userPasswordMatched();
+		s.allow_accessibility = doc.allowAccessibility();
+		s.allow_extract = doc.allowExtractAll();
+		s.allow_print_low = doc.allowPrintLowRes();
+		s.allow_print_high = doc.allowPrintHighRes();
+		s.allow_modify_assembly = doc.allowModifyAssembly();
+		s.allow_modify_form = doc.allowModifyForm();
+		s.allow_modify_annotation = doc.allowModifyAnnotation();
+		s.allow_modify_other = doc.allowModifyOther();
+		s.allow_modify_all = doc.allowModifyAll();
+	} else {
+		s.stream_method = "none";
+		s.string_method = "none";
+		s.file_method = "none";
+	}
+
+	// Drain any open-time warnings so they don't leak to stderr and so the
+	// caller can surface a count.
+	auto warnings = doc.getWarnings();
+	s.warning_count = static_cast<int64_t>(warnings.size());
+	return s;
+}
+
+std::string WriteJson(const std::string &path, const std::string &password, int json_version) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	if (json_version < 1) {
+		throw std::runtime_error("pdf_json: json_version must be >= 1");
+	}
+	QPDF doc;
+	doc.setSuppressWarnings(true);
+	OpenQpdf(doc, path, password);
+	std::string out;
+	Pl_String pipe("pdf_json", nullptr, out);
+	// Structure-only: do not inline stream bytes (images/fonts) into the JSON.
+	std::set<std::string> wanted; // empty => all objects
+	doc.writeJSON(json_version, &pipe, qpdf_dl_none, qpdf_sj_none, /*file_prefix=*/"", wanted);
+	pipe.finish();
+	return out;
+}
+
+void Repair(const std::string &input, const std::string &output, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	doc.setSuppressWarnings(true);
+	OpenQpdf(doc, input, password);
+	// Resolve dangling indirect refs (PDF-spec: treat as null) and rewrite with
+	// content-stream normalization + stream recompression. This is the portable
+	// "qpdf --check --normalize-content=y --compress-streams=y" repair path,
+	// not a full binary-level reconstruct.
+	doc.fixDanglingReferences(/*force=*/true);
+	QPDFWriter writer(doc, output.c_str());
+	writer.setContentNormalization(true);
+	writer.setCompressStreams(true);
+	writer.setRecompressFlate(true);
+	writer.setPreserveEncryption(false);
+	writer.write();
 }
 
 } // namespace pdf_qpdf
