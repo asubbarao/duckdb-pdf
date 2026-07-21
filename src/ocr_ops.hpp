@@ -57,10 +57,7 @@ enum class ImageFormat : int {
 };
 
 // Which engine should Recognize* dispatch to.
-enum class Backend : int {
-	Tesseract = 0,
-	External = 1
-};
+enum class Backend : int { Tesseract = 0, External = 1 };
 
 // Parse a user-facing backend name. Unknown values throw std::runtime_error.
 Backend BackendFromString(const std::string &name);

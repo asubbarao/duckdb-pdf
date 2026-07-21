@@ -145,13 +145,12 @@ TextResult RecognizeExternal(const unsigned char *data, int width, int height, i
 		if (opt.best_effort) {
 			return out;
 		}
-		std::string msg =
-		    "read_pdf OCR external: no plugin loaded. Either (a) pass "
-		    "ocr_plugin := '/path/to/libyour_ocr.so' implementing the "
-		    "pdf_ocr_plugin_recognize C ABI (see ocr_ops.hpp), or (b) render "
-		    "pages with pdf_page_images / pdf_to_png and send the PNG BLOB to a "
-		    "vision-LLM via the DuckDB llm/ai extension (SOTA path without "
-		    "recompiling read_pdf).";
+		std::string msg = "read_pdf OCR external: no plugin loaded. Either (a) pass "
+		                  "ocr_plugin := '/path/to/libyour_ocr.so' implementing the "
+		                  "pdf_ocr_plugin_recognize C ABI (see ocr_ops.hpp), or (b) render "
+		                  "pages with pdf_page_images / pdf_to_png and send the PNG BLOB to a "
+		                  "vision-LLM via the DuckDB llm/ai extension (SOTA path without "
+		                  "recompiling read_pdf).";
 		if (!opt.external_endpoint.empty()) {
 			msg += " Note: ocr_endpoint was set but in-process HTTP is not wired "
 			       "(no shell-out); use the SQL image pipeline instead.";
@@ -170,8 +169,8 @@ TextResult RecognizeExternal(const unsigned char *data, int width, int height, i
 		if (opt.best_effort) {
 			return out;
 		}
-		throw std::runtime_error("read_pdf OCR external: plugin '" + opt.external_plugin +
-		                         "' returned error code " + std::to_string(rc));
+		throw std::runtime_error("read_pdf OCR external: plugin '" + opt.external_plugin + "' returned error code " +
+		                         std::to_string(rc));
 	}
 	if (text_ptr) {
 		out.text = std::string(text_ptr);
@@ -343,8 +342,7 @@ bool InitTesseract(tesseract::TessBaseAPI &api, const Options &opt) {
 		    "read_pdf OCR: could not load the Tesseract model for language '" + opt.language +
 		    "'. Install a language model — macOS: `brew install tesseract-lang`; Debian/Ubuntu: "
 		    "`apt-get install tesseract-ocr-" +
-		    opt.language +
-		    "`; Windows: the UB Mannheim installer; or download " + opt.language +
+		    opt.language + "`; Windows: the UB Mannheim installer; or download " + opt.language +
 		    ".traineddata from https://github.com/tesseract-ocr/tessdata_fast. Standard install locations "
 		    "are auto-detected; if yours is non-standard, pass `tessdata_dir := '/path/to/tessdata'` or set "
 		    "the TESSDATA_PREFIX env var.");
@@ -474,8 +472,7 @@ Backend BackendFromString(const std::string &name) {
 	if (lower == "external" || lower == "plugin" || lower == "sota") {
 		return Backend::External;
 	}
-	throw std::runtime_error(
-	    "read_pdf: ocr_backend must be 'tesseract' or 'external' (got '" + name + "')");
+	throw std::runtime_error("read_pdf: ocr_backend must be 'tesseract' or 'external' (got '" + name + "')");
 }
 
 const char *BackendName(Backend b) {

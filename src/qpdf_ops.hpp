@@ -275,9 +275,9 @@ struct DocumentStats {
 	// Encryption dictionary summary. When !is_encrypted the method strings are
 	// "none" and R/P/V are 0.
 	bool is_encrypted = false;
-	int enc_R = 0; // revision
-	int enc_P = 0; // permissions bitfield as stored
-	int enc_V = 0; // algorithm version
+	int enc_R = 0;             // revision
+	int enc_P = 0;             // permissions bitfield as stored
+	int enc_V = 0;             // algorithm version
 	std::string stream_method; // "none" | "unknown" | "rc4" | "aes" | "aesv3"
 	std::string string_method;
 	std::string file_method;

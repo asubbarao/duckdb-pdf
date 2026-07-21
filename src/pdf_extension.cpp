@@ -836,10 +836,9 @@ static pdf_ocr::ImageFormat PopplerFormatToOcr(poppler::image::format_enum fmt) 
 	return pdf_ocr::ImageFormat::ARGB32;
 }
 
-static pdf_ocr::Options MakeOcrOptions(const string &language, int dpi, int psm, int oem,
-                                       const string &tessdata_dir, bool preprocess, bool best_effort,
-                                       const string &ocr_backend = "tesseract", const string &ocr_plugin = "",
-                                       const string &ocr_endpoint = "") {
+static pdf_ocr::Options MakeOcrOptions(const string &language, int dpi, int psm, int oem, const string &tessdata_dir,
+                                       bool preprocess, bool best_effort, const string &ocr_backend = "tesseract",
+                                       const string &ocr_plugin = "", const string &ocr_endpoint = "") {
 	pdf_ocr::Options o;
 	o.language = language;
 	o.dpi = dpi;
@@ -853,8 +852,6 @@ static pdf_ocr::Options MakeOcrOptions(const string &language, int dpi, int psm,
 	o.external_endpoint = ocr_endpoint;
 	return o;
 }
-
-
 
 // Render a poppler page under the global lock. Returns an invalid image on
 // failure. Caller owns the returned poppler::image (value type).
@@ -905,8 +902,8 @@ static string OcrPage(poppler::page *page, const string &language, int dpi, int 
                       const string &tessdata_dir, bool preprocess, bool retry, bool best_effort,
                       const string &ocr_backend = "tesseract", const string &ocr_plugin = "",
                       const string &ocr_endpoint = "") {
-	auto opt = MakeOcrOptions(language, dpi, psm, oem, tessdata_dir, preprocess, best_effort, ocr_backend,
-	                         ocr_plugin, ocr_endpoint);
+	auto opt = MakeOcrOptions(language, dpi, psm, oem, tessdata_dir, preprocess, best_effort, ocr_backend, ocr_plugin,
+	                          ocr_endpoint);
 	poppler::image img = RenderPageForOcr(page, dpi);
 	pdf_ocr::TextResult first = OcrBitmapText(img, opt);
 	if (retry && first.confidence < 55 && dpi < 400) {
@@ -928,8 +925,8 @@ static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &lang
                                          const string &tessdata_dir, bool preprocess, bool retry, bool best_effort,
                                          const string &ocr_backend = "tesseract", const string &ocr_plugin = "",
                                          const string &ocr_endpoint = "") {
-	auto opt = MakeOcrOptions(language, dpi, psm, oem, tessdata_dir, preprocess, best_effort, ocr_backend,
-	                         ocr_plugin, ocr_endpoint);
+	auto opt = MakeOcrOptions(language, dpi, psm, oem, tessdata_dir, preprocess, best_effort, ocr_backend, ocr_plugin,
+	                          ocr_endpoint);
 	poppler::image img = RenderPageForOcr(page, dpi);
 	pdf_ocr::WordsResult first = OcrBitmapWords(img, opt);
 	if (retry && first.confidence < 55 && dpi < 400) {
@@ -1281,7 +1278,8 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 					const bool best_effort = !bind.opt.force_ocr || has_text_layer;
 					string ocr =
 					    OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm, bind.opt.ocr_oem,
-					            bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry, best_effort, bind.opt.ocr_backend, bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
+					            bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry, best_effort,
+					            bind.opt.ocr_backend, bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
 					if (!ocr.empty()) {
 						text = ocr;
 						used_ocr = true;
@@ -2180,7 +2178,8 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 				g.page_is_ocr = false;
 			} else if (opt.auto_ocr) {
 				g.ocr_boxes = OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem,
-				                           opt.tessdata_dir, opt.ocr_preprocess, opt.ocr_retry, /*best_effort=*/true, opt.ocr_backend, opt.ocr_plugin, opt.ocr_endpoint);
+				                           opt.tessdata_dir, opt.ocr_preprocess, opt.ocr_retry, /*best_effort=*/true,
+				                           opt.ocr_backend, opt.ocr_plugin, opt.ocr_endpoint);
 				g.page_is_ocr = !g.ocr_boxes.empty();
 			} else {
 				g.page_is_ocr = false;
@@ -3215,10 +3214,10 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 			std::vector<PdfWord> words;
 			if (bind.opt.force_ocr) {
 				// Prefer OCR; fall back to native when the raster is blank.
-				auto ocr_words =
-				    OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
-				                 bind.opt.ocr_oem, bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry,
-				                 /*best_effort=*/true, bind.opt.ocr_backend, bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
+				auto ocr_words = OcrPageWords(
+				    page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm, bind.opt.ocr_oem,
+				    bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry,
+				    /*best_effort=*/true, bind.opt.ocr_backend, bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
 				for (auto &ow : ocr_words) {
 					PdfWord w;
 					w.xMin = ow.x0;
@@ -3254,7 +3253,8 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 				if (words.empty() && bind.opt.auto_ocr) {
 					auto ocr_words = OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
 					                              bind.opt.ocr_oem, bind.opt.tessdata_dir, bind.opt.ocr_preprocess,
-					                              bind.opt.ocr_retry, /*best_effort=*/true, bind.opt.ocr_backend, bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
+					                              bind.opt.ocr_retry, /*best_effort=*/true, bind.opt.ocr_backend,
+					                              bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
 					for (auto &ow : ocr_words) {
 						PdfWord w;
 						w.xMin = ow.x0;
@@ -6476,11 +6476,11 @@ struct PdfPagesInfoState : public GlobalTableFunctionState {
 static unique_ptr<FunctionData> PdfPagesInfoBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<string> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::DOUBLE,
-	                LogicalType::DOUBLE,   LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
-	                LogicalType::DOUBLE,   LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,  LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::DOUBLE};
-	names = {"file",     "page",    "page_count", "width",       "height", "media_width", "media_height",
-	         "crop_width", "crop_height", "rotation", "orientation", "label", "duration"};
+	names = {"file",       "page",        "page_count", "width",       "height", "media_width", "media_height",
+	         "crop_width", "crop_height", "rotation",   "orientation", "label",  "duration"};
 	return PdfInspectBindCommon(context, input);
 }
 
@@ -6559,29 +6559,15 @@ struct PdfPermissionsState : public GlobalTableFunctionState {
 
 static unique_ptr<FunctionData> PdfPermissionsBind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
-	return_types = {
-	    LogicalType::VARCHAR,  LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	    LogicalType::BOOLEAN,  LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	    LogicalType::BOOLEAN,  LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
-	    LogicalType::VARCHAR,  LogicalType::VARCHAR, LogicalType::VARCHAR};
-	names = {"file",
-	         "is_encrypted",
-	         "is_locked",
-	         "perm_print",
-	         "perm_print_high_resolution",
-	         "perm_change",
-	         "perm_copy",
-	         "perm_add_notes",
-	         "perm_fill_forms",
-	         "perm_accessibility",
-	         "perm_assemble",
-	         "has_javascript",
-	         "form_type",
-	         "is_linearized",
-	         "page_mode",
-	         "page_layout",
-	         "permanent_id",
-	         "update_id"};
+	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR};
+	names = {"file",          "is_encrypted",   "is_locked",      "perm_print",      "perm_print_high_resolution",
+	         "perm_change",   "perm_copy",      "perm_add_notes", "perm_fill_forms", "perm_accessibility",
+	         "perm_assemble", "has_javascript", "form_type",      "is_linearized",   "page_mode",
+	         "page_layout",   "permanent_id",   "update_id"};
 	return PdfInspectBindCommon(context, input);
 }
 
@@ -6744,8 +6730,8 @@ static unique_ptr<FunctionData> PdfDestinationsBind(ClientContext &context, Tabl
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
 	                LogicalType::DOUBLE,  LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN};
-	names = {"file", "name", "type", "page", "left", "bottom", "right", "top", "zoom",
-	         "change_left", "change_top", "change_zoom"};
+	names = {"file",  "name", "type", "page",        "left",       "bottom",
+	         "right", "top",  "zoom", "change_left", "change_top", "change_zoom"};
 	return PdfInspectBindCommon(context, input);
 }
 
@@ -6881,10 +6867,8 @@ static void PdfPageImagesScan(ClientContext &context, TableFunctionInput &data_p
 				// Recover pixel dimensions from the PNG IHDR (bytes 16..23).
 				if (row.png.size() >= 24) {
 					auto u32be = [](const char *b) -> int {
-						return (static_cast<unsigned char>(b[0]) << 24) |
-						       (static_cast<unsigned char>(b[1]) << 16) |
-						       (static_cast<unsigned char>(b[2]) << 8) |
-						       (static_cast<unsigned char>(b[3]));
+						return (static_cast<unsigned char>(b[0]) << 24) | (static_cast<unsigned char>(b[1]) << 16) |
+						       (static_cast<unsigned char>(b[2]) << 8) | (static_cast<unsigned char>(b[3]));
 					};
 					row.width = u32be(row.png.data() + 16);
 					row.height = u32be(row.png.data() + 20);
@@ -6929,13 +6913,13 @@ static unique_ptr<FunctionData> PdfQpdfInfoBind(ClientContext &context, TableFun
 			result->password = StringValue::Get(kv.second);
 		}
 	}
-	return_types = {
-	    LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::INTEGER, LogicalType::BIGINT,
-	    LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN,
-	    LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	    LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	    LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	    LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BIGINT};
+	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::INTEGER,
+	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT,
+	                LogicalType::BIGINT,  LogicalType::BOOLEAN, LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BIGINT};
 	names = {"file",
 	         "is_linearized",
 	         "linearized_ok",
@@ -7075,7 +7059,6 @@ static void PdfRepairNoPwFun(DataChunk &args, ExpressionState &state, Vector &re
 		    }
 	    });
 }
-
 
 static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction read_pdf("read_pdf", {LogicalType::VARCHAR}, ReadPdfScan, ReadPdfBind, ReadPdfInitGlobal,
