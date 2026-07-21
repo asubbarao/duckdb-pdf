@@ -523,6 +523,16 @@ The signature covers the whole file via a `/ByteRange` around a fixed-size `/Con
 
 `dpi` (default 200) sets the render resolution of the rebuilt pages: higher dpi preserves more visual fidelity of the surrounding (unredacted) content but produces a larger output file; lower dpi is smaller but coarser. It does not affect the redaction guarantee — the covered text is gone at any dpi. Because redacted pages become images, their text is no longer selectable or searchable; leave unredacted pages untouched to preserve their text layer.
 
+**Column-ref / row-mode:** `pdf_redact` is a table in-out function, so `input`, `output`, and `redactions` may be **column references** (one set of values per outer row). A plain dependent join expands each document to its per-page result rows — no `format()` / `query()` string-building:
+
+```sql
+SELECT d.id, r.page, r.redacted, r.boxes_applied
+FROM documents d
+CROSS JOIN pdf_redact(d.source_path, d.out_path, d.boxes) r;
+```
+
+Named parameters `dpi` / `password` still work on the all-constants form. In row-mode they are not bound (DuckDB's in-out path does not surface named params with column-ref args); defaults are `dpi = 200` and `password = ''`.
+
 ```sql
 -- Redact one box over sensitive text on page 2 (origin bottom-left, points).
 -- Page 2 becomes an image; pages 1 and 3 keep their selectable text.

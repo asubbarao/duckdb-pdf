@@ -5973,8 +5973,19 @@ static void PdfSignScan(ClientContext &context, TableFunctionInput &data_p, Data
 // a redacted page is extractable afterwards. Pages with no boxes are copied
 // through untouched and keep their live text.
 //
-// Side effects (rendering + file write) happen at SCAN time, not bind, so a bare
-// EXPLAIN writes nothing.
+// Implementation: pure table in-out function (same mechanism as range/unnest).
+// Bind never StringValue::Get's the path/out/boxes args, so both constant-arg
+// form and column-ref dependent joins work:
+//
+//   FROM pdf_redact('in.pdf', 'out.pdf', [{'page':1,'x':0,'y':0,'w':10,'h':10}])
+//   FROM docs d CROSS JOIN pdf_redact(d.path, d.out, d.boxes) r
+//
+// Named params dpi/password still bind on the all-constants path. In row-mode
+// DuckDB folds column-ref args as a subquery and does not surface named params
+// to bind — dpi defaults to 200 and password to '' (see README).
+//
+// Side effects (rendering + file write) happen at execute time, not bind, so a
+// bare EXPLAIN writes nothing.
 //===--------------------------------------------------------------------===//
 struct RedactBox {
 	int page = 0; // 1-based
@@ -5982,19 +5993,22 @@ struct RedactBox {
 };
 
 struct PdfRedactBindData : public TableFunctionData {
-	string input;
-	string output;
 	string password;
 	int32_t dpi = 200;
-	vector<RedactBox> boxes;
 };
 
-struct PdfRedactState : public GlobalTableFunctionState {
-	bool executed = false;
+// Local state carries leftover page rows when one input file expands past
+// STANDARD_VECTOR_SIZE (or when we must re-enter for HAVE_MORE_OUTPUT).
+struct PdfRedactLocalState : public LocalTableFunctionState {
+	idx_t current_input_row = 0;
+	bool row_active = false;
 	idx_t emit_idx = 0;
-	std::vector<std::vector<Value>> rows;
+	std::vector<std::vector<Value>> page_rows;
+};
+
+struct PdfRedactGlobalState : public GlobalTableFunctionState {
 	idx_t MaxThreads() const override {
-		return 1;
+		return 1; // side-effecting file write; single-threaded
 	}
 };
 
@@ -6011,48 +6025,46 @@ static const Value &RedactStructField(const vector<string> &field_names, const v
 	                            name);
 }
 
-static unique_ptr<FunctionData> PdfRedactBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
-	auto result = make_uniq<PdfRedactBindData>();
-	result->input = StringValue::Get(input.inputs[0]);
-	result->output = StringValue::Get(input.inputs[1]);
-
-	// redactions: LIST(STRUCT(page, x, y, w, h)).
-	const Value &list_val = input.inputs[2];
-	if (!list_val.IsNull()) {
-		auto &child_type = ListType::GetChildType(list_val.type());
-		if (child_type.id() != LogicalTypeId::STRUCT) {
-			throw InvalidInputException("pdf_redact: `redactions` must be a LIST of "
-			                            "STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE)");
-		}
-		auto &struct_children = StructType::GetChildTypes(child_type);
-		vector<string> field_names;
-		for (auto &kv : struct_children) {
-			field_names.push_back(kv.first);
-		}
-		for (auto &el : ListValue::GetChildren(list_val)) {
-			if (el.IsNull()) {
-				throw InvalidInputException("pdf_redact: `redactions` list contains a NULL entry");
-			}
-			auto &field_vals = StructValue::GetChildren(el);
-			RedactBox box;
-			box.page = IntegerValue::Get(
-			    RedactStructField(field_names, field_vals, "page").DefaultCastAs(LogicalType::INTEGER));
-			box.x =
-			    DoubleValue::Get(RedactStructField(field_names, field_vals, "x").DefaultCastAs(LogicalType::DOUBLE));
-			box.y =
-			    DoubleValue::Get(RedactStructField(field_names, field_vals, "y").DefaultCastAs(LogicalType::DOUBLE));
-			box.w =
-			    DoubleValue::Get(RedactStructField(field_names, field_vals, "w").DefaultCastAs(LogicalType::DOUBLE));
-			box.h =
-			    DoubleValue::Get(RedactStructField(field_names, field_vals, "h").DefaultCastAs(LogicalType::DOUBLE));
-			if (box.page < 1) {
-				throw InvalidInputException("pdf_redact: redaction page must be >= 1 (got %d)", box.page);
-			}
-			result->boxes.push_back(box);
-		}
+static vector<RedactBox> ParseRedactBoxes(const Value &list_val) {
+	vector<RedactBox> boxes;
+	if (list_val.IsNull()) {
+		return boxes;
 	}
+	auto &child_type = ListType::GetChildType(list_val.type());
+	if (child_type.id() != LogicalTypeId::STRUCT) {
+		throw InvalidInputException("pdf_redact: `redactions` must be a LIST of "
+		                            "STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE)");
+	}
+	auto &struct_children = StructType::GetChildTypes(child_type);
+	vector<string> field_names;
+	for (auto &kv : struct_children) {
+		field_names.push_back(kv.first);
+	}
+	for (auto &el : ListValue::GetChildren(list_val)) {
+		if (el.IsNull()) {
+			throw InvalidInputException("pdf_redact: `redactions` list contains a NULL entry");
+		}
+		auto &field_vals = StructValue::GetChildren(el);
+		RedactBox box;
+		box.page =
+		    IntegerValue::Get(RedactStructField(field_names, field_vals, "page").DefaultCastAs(LogicalType::INTEGER));
+		box.x = DoubleValue::Get(RedactStructField(field_names, field_vals, "x").DefaultCastAs(LogicalType::DOUBLE));
+		box.y = DoubleValue::Get(RedactStructField(field_names, field_vals, "y").DefaultCastAs(LogicalType::DOUBLE));
+		box.w = DoubleValue::Get(RedactStructField(field_names, field_vals, "w").DefaultCastAs(LogicalType::DOUBLE));
+		box.h = DoubleValue::Get(RedactStructField(field_names, field_vals, "h").DefaultCastAs(LogicalType::DOUBLE));
+		if (box.page < 1) {
+			throw InvalidInputException("pdf_redact: redaction page must be >= 1 (got %d)", box.page);
+		}
+		boxes.push_back(box);
+	}
+	return boxes;
+}
 
+static unique_ptr<FunctionData> PdfRedactBind(ClientContext &, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	// Row-mode: path/out/boxes are NOT constant-foldable — never StringValue::Get
+	// them here. Named params (dpi/password) only arrive on the all-constants path.
+	auto result = make_uniq<PdfRedactBindData>();
 	for (auto &kv : input.named_parameters) {
 		auto key = StringUtil::Lower(kv.first);
 		if (key == "dpi") {
@@ -6070,8 +6082,13 @@ static unique_ptr<FunctionData> PdfRedactBind(ClientContext &context, TableFunct
 	return std::move(result);
 }
 
-static unique_ptr<GlobalTableFunctionState> PdfRedactInit(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<PdfRedactState>();
+static unique_ptr<GlobalTableFunctionState> PdfRedactInitGlobal(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfRedactGlobalState>();
+}
+
+static unique_ptr<LocalTableFunctionState> PdfRedactInitLocal(ExecutionContext &, TableFunctionInitInput &,
+                                                              GlobalTableFunctionState *) {
+	return make_uniq<PdfRedactLocalState>();
 }
 
 // Render one page to RGB and paint the given boxes black. `boxes` are in PDF
@@ -6167,22 +6184,25 @@ static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page
 	return out;
 }
 
-static void PdfRedactExecute(ClientContext &context, const PdfRedactBindData &bind,
-                             std::vector<std::vector<Value>> &rows) {
-	PdfOpsCheckInputExists("pdf_redact", bind.input);
-	PdfOpsCheckOutputDir("pdf_redact", PdfOpsParentDir(bind.output));
-	if (bind.input == bind.output) {
-		throw InvalidInputException("pdf_redact: output path must differ from input path '%s'", bind.input);
+// Redact a single (input, output, boxes) triple — shared by constant-arg and
+// row-mode paths. Appends one result row per output page to `rows`.
+static void PdfRedactExecuteFile(ClientContext &context, const string &input_path, const string &output_path,
+                                 const string &password, int32_t dpi, const vector<RedactBox> &boxes,
+                                 std::vector<std::vector<Value>> &rows) {
+	PdfOpsCheckInputExists("pdf_redact", input_path);
+	PdfOpsCheckOutputDir("pdf_redact", PdfOpsParentDir(output_path));
+	if (input_path == output_path) {
+		throw InvalidInputException("pdf_redact: output path must differ from input path '%s'", input_path);
 	}
 
 	// Open the source with poppler to count pages and render redacted ones.
 	string bytes;
-	ReadAllBytes(context, bind.input, bytes);
-	auto doc = LoadDoc(bytes, bind.password, bind.input);
+	ReadAllBytes(context, input_path, bytes);
+	auto doc = LoadDoc(bytes, password, input_path);
 	const int page_count = doc->pages();
 
 	// Validate box page numbers and bucket boxes per page.
-	for (auto &box : bind.boxes) {
+	for (auto &box : boxes) {
 		if (box.page > page_count) {
 			throw InvalidInputException("pdf_redact: redaction page %d is out of range (document has %d page%s)",
 			                            box.page, page_count, page_count == 1 ? "" : "s");
@@ -6193,7 +6213,7 @@ static void PdfRedactExecute(ClientContext &context, const PdfRedactBindData &bi
 	std::vector<int> box_counts(static_cast<size_t>(page_count), 0);
 	for (int p = 1; p <= page_count; p++) {
 		vector<const RedactBox *> page_boxes;
-		for (auto &box : bind.boxes) {
+		for (auto &box : boxes) {
 			if (box.page == p) {
 				page_boxes.push_back(&box);
 			}
@@ -6202,12 +6222,12 @@ static void PdfRedactExecute(ClientContext &context, const PdfRedactBindData &bi
 			rebuilt[p - 1].redacted = false;
 			continue;
 		}
-		rebuilt[p - 1] = RenderRedactedPage(*doc, p - 1, bind.dpi, page_boxes);
+		rebuilt[p - 1] = RenderRedactedPage(*doc, p - 1, dpi, page_boxes);
 		box_counts[p - 1] = static_cast<int>(page_boxes.size());
 	}
 
 	try {
-		pdf_qpdf::RebuildPagesAsImages(bind.input, bind.output, rebuilt, bind.password);
+		pdf_qpdf::RebuildPagesAsImages(input_path, output_path, rebuilt, password);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_redact: %s", string(e.what()));
 	}
@@ -6217,23 +6237,85 @@ static void PdfRedactExecute(ClientContext &context, const PdfRedactBindData &bi
 	}
 }
 
-static void PdfRedactScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+// Table in-out entry point. `input` holds the N bound argument rows for this
+// pipeline chunk (col0=path, col1=out, col2=boxes). Each input row expands to
+// one output row per PDF page.
+//
+// Pagination contract (mirrors range): whenever this call produces rows, return
+// HAVE_MORE_OUTPUT. Only return NEED_MORE_INPUT with an empty chunk after the
+// input is fully drained — so the constant-arg PhysicalTableScan path does not
+// re-execute the same parameters on the next GetData call.
+static OperatorResultType PdfRedactInOut(ExecutionContext &context, TableFunctionInput &data_p, DataChunk &input,
+                                         DataChunk &output) {
 	auto &bind = data_p.bind_data->Cast<PdfRedactBindData>();
-	auto &st = data_p.global_state->Cast<PdfRedactState>();
-	if (!st.executed) {
-		PdfRedactExecute(context, bind, st.rows);
-		st.executed = true;
+	auto &state = data_p.local_state->Cast<PdfRedactLocalState>();
+
+	if (input.ColumnCount() < 3) {
+		throw InvalidInputException("pdf_redact: expected 3 arguments (input, output, redactions), got %llu",
+		                            (unsigned long long)input.ColumnCount());
 	}
-	idx_t count = 0;
-	while (count < STANDARD_VECTOR_SIZE && st.emit_idx < st.rows.size()) {
-		auto &row = st.rows[st.emit_idx];
-		for (idx_t col = 0; col < row.size(); col++) {
-			output.SetValue(col, count, row[col]);
+
+	idx_t out_count = 0;
+	while (true) {
+		if (!state.row_active) {
+			if (state.current_input_row >= input.size()) {
+				// Fully consumed this input chunk. Reset so a fresh chunk (or the
+				// next outer row in a dependent join) starts clean.
+				state.current_input_row = 0;
+				output.SetCardinality(0);
+				return OperatorResultType::NEED_MORE_INPUT;
+			}
+
+			// Activate the next input row: read path/out/boxes and run redaction.
+			const Value path_v = input.data[0].GetValue(state.current_input_row);
+			const Value out_v = input.data[1].GetValue(state.current_input_row);
+			const Value boxes_v = input.data[2].GetValue(state.current_input_row);
+			if (path_v.IsNull() || out_v.IsNull()) {
+				throw InvalidInputException("pdf_redact: input and output paths must not be NULL");
+			}
+			const string input_path = StringValue::Get(path_v);
+			const string output_path = StringValue::Get(out_v);
+			vector<RedactBox> boxes = ParseRedactBoxes(boxes_v);
+
+			state.page_rows.clear();
+			PdfRedactExecuteFile(context.client, input_path, output_path, bind.password, bind.dpi, boxes,
+			                     state.page_rows);
+			state.row_active = true;
+			state.emit_idx = 0;
 		}
-		st.emit_idx++;
-		count++;
+
+		// Emit page rows for the active input row.
+		while (out_count < STANDARD_VECTOR_SIZE && state.emit_idx < state.page_rows.size()) {
+			auto &row = state.page_rows[state.emit_idx];
+			for (idx_t col = 0; col < row.size(); col++) {
+				output.SetValue(col, out_count, row[col]);
+			}
+			state.emit_idx++;
+			out_count++;
+		}
+
+		if (state.emit_idx >= state.page_rows.size()) {
+			// Finished this input row's pages.
+			state.row_active = false;
+			state.page_rows.clear();
+			state.emit_idx = 0;
+			state.current_input_row++;
+			if (out_count == 0) {
+				// Zero-page edge case: advance without returning empty mid-chunk.
+				continue;
+			}
+			if (out_count < STANDARD_VECTOR_SIZE && state.current_input_row < input.size()) {
+				// Room left in the output chunk and more input rows remain — pack.
+				continue;
+			}
+		}
+
+		// Produced rows this call (and either the vector is full or this was the
+		// last input row). Always HAVE_MORE_OUTPUT when out_count > 0 so the next
+		// re-entry can return NEED_MORE_INPUT with an empty chunk once drained.
+		output.SetCardinality(out_count);
+		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
-	output.SetCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -7274,15 +7356,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// pdf_redact: true raster redaction (removes text under the boxes, not a
 	// black rectangle over live text). redactions in PDF points, origin
-	// bottom-left. Side effects (render + write) happen at scan time.
+	// bottom-left. Pure in-out (like range): constant args AND column-ref
+	// dependent joins share one overload. Side effects at execute time.
 	auto redact_struct = LogicalType::STRUCT({{"page", LogicalType::INTEGER},
 	                                          {"x", LogicalType::DOUBLE},
 	                                          {"y", LogicalType::DOUBLE},
 	                                          {"w", LogicalType::DOUBLE},
 	                                          {"h", LogicalType::DOUBLE}});
 	TableFunction pdf_redact("pdf_redact",
-	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(redact_struct)},
-	                         PdfRedactScan, PdfRedactBind, PdfRedactInit);
+	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(redact_struct)}, nullptr,
+	                         PdfRedactBind, PdfRedactInitGlobal, PdfRedactInitLocal);
+	pdf_redact.in_out_function = PdfRedactInOut;
 	pdf_redact.named_parameters["dpi"] = LogicalType::INTEGER;
 	pdf_redact.named_parameters["password"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(pdf_redact);
