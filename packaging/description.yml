@@ -15,7 +15,7 @@
 extension:
   name: pdf
   description: Read, inspect, transform, and write PDFs in SQL — text at every grain (page/line/word/element/chunk), OCR for scanned files, metadata, tables, images, and document surgery (merge/split/sign/redact/watermark/encrypt/...).
-  version: 0.7.4
+  version: 0.7.5
   language: C++
   build: cmake
   license: GPL-2.0-or-later
