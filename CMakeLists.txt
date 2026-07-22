@@ -134,6 +134,28 @@ if(NOT WIN32)
     # (duckdb / unittest / plan_serializer), which link the extension by target
     # name and -- unlike a shared library -- do not tolerate unresolved symbols.
     pkg_check_modules(POPPLER_CPP REQUIRED poppler-cpp)
+    # Core libpoppler headers (Error.h, GlobalParams.h) — NOT re-exported by
+    # poppler-cpp. Required for setErrorCallback (fail-loudly) and
+    # GlobalParams::addFontFile (bundled base-14). System path already links
+    # PkgConfig::POPPLER; Windows derives parent of poppler/cpp. vcpkg was
+    # missing this and community linux_arm64 failed with "GlobalParams.h /
+    # Error.h: No such file or directory".
+    pkg_check_modules(POPPLER poppler)
+    set(_PDF_POPPLER_INCS ${POPPLER_CPP_INCLUDE_DIRS})
+    if(POPPLER_FOUND)
+      list(APPEND _PDF_POPPLER_INCS ${POPPLER_INCLUDE_DIRS})
+    endif()
+    foreach(_inc IN LISTS POPPLER_CPP_INCLUDE_DIRS)
+      get_filename_component(_leaf "${_inc}" NAME)
+      if(_leaf STREQUAL "cpp")
+        get_filename_component(_parent "${_inc}" DIRECTORY)
+        list(APPEND _PDF_POPPLER_INCS "${_parent}")
+      endif()
+      if(EXISTS "${_inc}/poppler/Error.h")
+        list(APPEND _PDF_POPPLER_INCS "${_inc}/poppler")
+      endif()
+    endforeach()
+    list(REMOVE_DUPLICATES _PDF_POPPLER_INCS)
     pkg_check_modules(TESSERACT   REQUIRED tesseract)
     pkg_check_modules(LEPTONICA   REQUIRED lept)
     # qpdf (pdf_merge/pdf_split/pdf_rotate): pkg-config only for headers —
@@ -147,8 +169,16 @@ if(NOT WIN32)
     # vcpkg archive. (This is OUR dependency, not qpdf's; qpdf still uses its
     # built-in native crypto with default-features OFF.)
     pkg_check_modules(OPENSSL REQUIRED openssl)
-    include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
+    include_directories(${_PDF_POPPLER_INCS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
                         ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+    # Targets are created before this block; pin includes on them so the
+    # generated base14_font_data.cpp (and every other TU) sees core poppler.
+    target_include_directories(${EXTENSION_NAME} PRIVATE
+      ${_PDF_POPPLER_INCS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
+      ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+    target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
+      ${_PDF_POPPLER_INCS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
+      ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
 
     if(DEFINED TESSERACT_LIBDIR AND EXISTS "${TESSERACT_LIBDIR}")
       set(VCPKG_STATIC_LIBDIR "${TESSERACT_LIBDIR}")
