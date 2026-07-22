@@ -30,6 +30,11 @@
 #include <poppler-image.h>
 #include <poppler-toc.h>
 
+// poppler C++ core — ErrorCallback / setErrorCallback (include path is
+// .../include/poppler from pkg-config). Used by pdf_redact to fail loudly when
+// display fonts are missing instead of silently emitting a blank page.
+#include "Error.h"
+
 // libharu — native PDF writer (C API) for write_pdf. No external processes.
 #include <hpdf.h>
 
@@ -6091,11 +6096,68 @@ static unique_ptr<GlobalTableFunctionState> PdfRedactInit(ClientContext &, Table
 	return make_uniq<PdfRedactState>();
 }
 
+// Fail loudly when poppler cannot resolve display fonts during redaction
+// rasterization. On font-starved runtimes (community/vcpkg poppler with no
+// fontconfig or base fonts), poppler emits stderr like:
+//   poppler/error: No display font for 'Helvetica-Oblique'
+//   poppler/error: Couldn't find a font for 'Helvetica'
+// and silently renders a blank page — while pdf_redact still returned
+// redacted=true / boxes_applied=N. That is silent document corruption.
+//
+// PopplerMutex already serializes every render path in this file, so a plain
+// flag (not TLS) is enough; the callback is installed once and the flag is
+// reset around each render_page call.
+//
+// Manual repro (no portable automated test: empty FONTCONFIG alone is not
+// enough on macOS without env -i, and setting it for the whole suite would
+// break every other PDF test):
+//   mkdir -p /tmp/empty-fc/fonts
+//   printf '%s\n' '<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "fonts.dtd">' \
+//     '<fontconfig><dir>/tmp/empty-fc/fonts</dir></fontconfig>' \
+//     > /tmp/empty-fc/fonts.conf
+//   env -i PATH="$PATH" HOME=/tmp/empty-fc FONTCONFIG_PATH=/tmp/empty-fc \
+//     FONTCONFIG_FILE=/tmp/empty-fc/fonts.conf \
+//     duckdb -c "LOAD 'build/release/extension/pdf/pdf.duckdb_extension';
+//       SELECT * FROM pdf_redact('test/data/redact_secret.pdf', '/tmp/out.pdf',
+//         [{page: 2, x: 60.0, y: 590.0, w: 260.0, h: 38.0}]);"
+// Expect IOException before /tmp/out.pdf is written. With normal env (fonts
+// present) the same query must succeed.
+static bool g_poppler_missing_display_font = false;
+
+static void PdfPopplerErrorCallback(ErrorCategory /*category*/, Goffset pos, const char *msg) {
+	if (!msg) {
+		return;
+	}
+	// setErrorCallback replaces poppler's default stderr printer — re-emit so
+	// other diagnostics (malformed PDF, bad password, …) stay visible.
+	if (pos >= 0) {
+		std::fprintf(stderr, "poppler/error (%lld): %s\n", static_cast<long long>(pos), msg);
+	} else {
+		std::fprintf(stderr, "poppler/error: %s\n", msg);
+	}
+	// Case-insensitive substring match — do not invent a full error taxonomy.
+	const string lower = StringUtil::Lower(string(msg));
+	if (StringUtil::Contains(lower, "no display font") || StringUtil::Contains(lower, "couldn't find a font")) {
+		g_poppler_missing_display_font = true;
+	}
+}
+
+static void EnsurePopplerErrorCallback() {
+	static bool installed = false;
+	if (!installed) {
+		setErrorCallback(PdfPopplerErrorCallback);
+		installed = true;
+	}
+}
+
 // Render one page to RGB and paint the given boxes black. `boxes` are in PDF
 // points, origin bottom-left. Fills the RebuiltPage (top-down RGB, media dims).
 static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page_idx0, int dpi,
                                                 const vector<const RedactBox *> &boxes) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	EnsurePopplerErrorCallback();
+	g_poppler_missing_display_font = false;
+
 	unique_ptr<poppler::page> page(doc.create_page(page_idx0));
 	if (!page) {
 		throw IOException("pdf_redact: could not read page %d", page_idx0 + 1);
@@ -6104,6 +6166,14 @@ static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page
 	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
 	poppler::image img = renderer.render_page(page.get(), dpi, dpi);
+	// Check font errors BEFORE any box paint or (later) output write. A blank
+	// raster with redacted=true is worse than a hard failure.
+	if (g_poppler_missing_display_font) {
+		throw IOException(
+		    "pdf_redact: poppler could not find display fonts for this PDF's fonts — the rendered page would be "
+		    "blank/corrupted. This usually means the runtime has no system fonts available. Install fontconfig + a "
+		    "base font package (e.g. on Debian/Ubuntu: fontconfig + fonts-liberation or fonts-urw-base35) and retry.");
+	}
 	if (!img.is_valid()) {
 		throw IOException("pdf_redact: failed to render page %d", page_idx0 + 1);
 	}

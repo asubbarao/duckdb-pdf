@@ -174,6 +174,10 @@ if(NOT WIN32)
     # closure is avoided here because keg-only system libs such as gettext's
     # -lintl are not on the default linker search path.)
     pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
+    # Core libpoppler (not re-exported by poppler-cpp): pdf_redact registers
+    # setErrorCallback from <Error.h> to fail loudly when display fonts are
+    # missing. Direct link is required so the symbol resolves at link time.
+    pkg_check_modules(POPPLER REQUIRED IMPORTED_TARGET poppler)
     pkg_check_modules(TESSERACT   REQUIRED IMPORTED_TARGET tesseract)
     pkg_check_modules(LEPTONICA   REQUIRED IMPORTED_TARGET lept)
     # qpdf (pdf_merge/pdf_split/pdf_rotate): brew/apt qpdf ships libqpdf.pc.
@@ -181,7 +185,7 @@ if(NOT WIN32)
     # OpenSSL for pdf_signatures CMS/PKCS#7 verification (tier 2). Dynamic on the
     # shared path, so link the IMPORTED_TARGET explicitly.
     pkg_check_modules(OPENSSL     REQUIRED IMPORTED_TARGET openssl)
-    include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
+    include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${POPPLER_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
                         ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
 
     # zlib: qpdf_ops.cpp's minimal PNG encoder (pdf_images) calls crc32/compress2
@@ -192,10 +196,10 @@ if(NOT WIN32)
     # ${CMAKE_DL_LIBS} is libdl on Linux (needed for the external OCR plugin
     # dlopen path in ocr_ops.cpp) and empty on macOS where dlopen is in libSystem.
     target_link_libraries(${EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB
+      PkgConfig::POPPLER_CPP PkgConfig::POPPLER PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB
       ${CMAKE_DL_LIBS})
     target_link_libraries(${LOADABLE_EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB
+      PkgConfig::POPPLER_CPP PkgConfig::POPPLER PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB
       ${CMAKE_DL_LIBS})
 
     # libharu for write_pdf (local brew path). Dynamic dylib; find explicitly (no pkg-config).
