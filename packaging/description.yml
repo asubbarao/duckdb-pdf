@@ -15,7 +15,7 @@
 extension:
   name: pdf
   description: Read, inspect, transform, and write PDFs in SQL — text at every grain (page/line/word/element/chunk), OCR for scanned files, metadata, tables, images, and document surgery (merge/split/sign/redact/watermark/encrypt/...).
-  version: 0.7.6
+  version: 0.7.7
   language: C++
   build: cmake
   license: GPL-2.0-or-later
@@ -54,6 +54,9 @@ docs:
     -- Render a page to PNG bytes (vision-model input, thumbnails)
     SELECT pdf_to_png('report.pdf', 1, 150) AS page_image;
 
+    -- Write page preview PNGs to disk (no pdftoppm): pages/<stem>/p1.png, …
+    SELECT * FROM pdf_write_page_images('reports/*.pdf', 'pages', dpi := 100);
+
     -- Query result to a typeset PDF, no external tools
     COPY (SELECT * FROM findings)
     TO 'findings.pdf' (FORMAT pdf, TITLE 'Findings', FOOTER 'page {page}');
@@ -81,7 +84,9 @@ docs:
     BLOBs), and PDF/A identification columns on `pdf_info`.
 
     **Convert** — `pdf_to_text` / `pdf_to_markdown` (layout-aware GitHub
-    markdown) / `pdf_to_html` / `pdf_to_xml` / `pdf_to_svg` / `pdf_to_png`.
+    markdown) / `pdf_to_html` / `pdf_to_xml` / `pdf_to_svg` / `pdf_to_png` /
+    `pdf_write_page_images` (write page preview PNGs to `out_dir/<stem>/p{N}.png`
+    without pdftoppm).
     The render scalars also accept PDF bytes as a BLOB, so they compose with
     `read_blob` and httpfs.
 

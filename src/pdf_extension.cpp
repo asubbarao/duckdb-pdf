@@ -30,7 +30,7 @@
 #include <poppler-image.h>
 #include <poppler-toc.h>
 
-// Bundled URW base-14 fonts + setErrorCallback (C++17 TUs — no private poppler
+// Bundled URW base-14 fonts + setErrorCallback (C++20 TUs — no private poppler
 // headers in this C++11 DuckDB TU). See base14_fonts.hpp.
 #include "base14_fonts.hpp"
 
@@ -6472,6 +6472,7 @@ static void PdfImagesScan(ClientContext &context, TableFunctionInput &data_p, Da
 //   pdf_fonts       — embedded/external font inventory
 //   pdf_destinations— named destination map
 //   pdf_page_images — render every page to PNG (SQL handoff for SOTA OCR)
+//   pdf_write_page_images — write page PNGs to out_dir/<stem>/p{N}.png
 // Comprehensive qpdf surface (high-value gaps)
 //   pdf_qpdf_info   — linearization / xref / encryption details
 //   pdf_json        — structural JSON dump
@@ -7054,6 +7055,189 @@ static void PdfPageImagesScan(ClientContext &context, TableFunctionInput &data_p
 	output.SetCardinality(count);
 }
 
+//---- pdf_write_page_images — render each page to on-disk PNG previews --------
+//
+// Product surface for apps that need preview trees on disk without shelling
+// out to pdftoppm. Same raster path as pdf_page_images / pdf_to_png
+// (RenderPageToPngBytes + bundled base-14 fonts), but WRITES files:
+//
+//   <out_dir>/<stem>/p1.png, p2.png, …   (1-based page, no zero-pad)
+//
+// Top-level out_dir and per-stem subdirs are created if missing. Overwrite
+// semantics match other writers (existing PNGs are replaced). Side effects at
+// scan time so EXPLAIN writes nothing. MaxThreads=1 (PopplerMutex already
+// serializes raster work).
+//
+// Signature:
+//   pdf_write_page_images(path_or_glob, out_dir
+//                         [, password, dpi, first_page, last_page])
+//   -> TABLE(file, page, out_path, width, height, bytes)
+struct PdfWritePageImagesBindData : public TableFunctionData {
+	vector<string> files;
+	string out_dir;
+	PdfOptions opt;
+	int32_t dpi = 150;
+};
+
+struct PdfWritePageImagesRow {
+	string file;
+	int page = 0;
+	string out_path;
+	int width = 0;
+	int height = 0;
+	int64_t bytes = 0;
+};
+
+struct PdfWritePageImagesState : public GlobalTableFunctionState {
+	bool executed = false;
+	idx_t emit_idx = 0;
+	std::vector<PdfWritePageImagesRow> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+// Join out_dir + relative path with a portable separator (no trailing slash
+// on out_dir assumed; tolerate one if the caller passes it).
+static string PdfWriteJoinPath(const string &dir, const string &leaf) {
+#ifdef _WIN32
+	const char sep = '\\';
+#else
+	const char sep = '/';
+#endif
+	if (dir.empty()) {
+		return leaf;
+	}
+	char last = dir.back();
+	if (last == '/' || last == '\\') {
+		return dir + leaf;
+	}
+	return dir + sep + leaf;
+}
+
+static void PdfWriteBytesToFile(const string &path, const string &bytes, const char *fn_name) {
+	std::ofstream of(path, std::ios::binary | std::ios::trunc);
+	if (!of) {
+		throw IOException("%s: could not open '%s' for writing", fn_name, path);
+	}
+	of.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+	if (!of) {
+		throw IOException("%s: short write to '%s'", fn_name, path);
+	}
+}
+
+static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfWritePageImagesBindData>();
+	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	result->out_dir = StringValue::Get(input.inputs[1]);
+	if (result->out_dir.empty()) {
+		throw InvalidInputException("pdf_write_page_images: out_dir must not be empty");
+	}
+	ParseNamed(input.named_parameters, result->opt);
+	for (auto &kv : input.named_parameters) {
+		if (StringUtil::Lower(kv.first) == "dpi") {
+			result->dpi = IntegerValue::Get(kv.second);
+		}
+	}
+	if (result->dpi < 1 || result->dpi > 2400) {
+		throw InvalidInputException("pdf_write_page_images: dpi must be between 1 and 2400 (got %d)", result->dpi);
+	}
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BIGINT};
+	names = {"file", "page", "out_path", "width", "height", "bytes"};
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfWritePageImagesInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfWritePageImagesState>();
+}
+
+static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePageImagesBindData &bind,
+                                      std::vector<PdfWritePageImagesRow> &rows) {
+	auto fs = FileSystem::CreateLocal();
+	// Ensure the top-level preview root exists (create, don't require the caller
+	// to mkdir first — this is an export tree, not a surgical in-place write).
+	if (!fs->DirectoryExists(bind.out_dir)) {
+		try {
+			fs->CreateDirectoriesRecursive(bind.out_dir);
+		} catch (const std::exception &e) {
+			throw IOException("pdf_write_page_images: could not create out_dir '%s': %s", bind.out_dir,
+			                  string(e.what()));
+		}
+	}
+
+	for (auto &path : bind.files) {
+		string bytes;
+		ReadAllBytes(context, path, bytes);
+		auto doc = LoadDoc(bytes, bind.opt.password, path);
+		int page_count = doc->pages();
+		int first = bind.opt.first_page > 0 ? bind.opt.first_page : 1;
+		int last = bind.opt.last_page < 0 ? page_count : MinValue<int>(bind.opt.last_page, page_count);
+		if (first > page_count) {
+			continue;
+		}
+
+		string stem = PdfOpsStem(path);
+		if (stem.empty()) {
+			throw InvalidInputException("pdf_write_page_images: could not derive a stem from '%s'", path);
+		}
+		string stem_dir = PdfWriteJoinPath(bind.out_dir, stem);
+		if (!fs->DirectoryExists(stem_dir)) {
+			try {
+				fs->CreateDirectory(stem_dir);
+			} catch (const std::exception &e) {
+				throw IOException("pdf_write_page_images: could not create directory '%s': %s", stem_dir,
+				                  string(e.what()));
+			}
+		}
+
+		for (int p = first; p <= last; p++) {
+			string png = RenderPageToPngBytes(*doc, p, bind.dpi, "pdf_write_page_images");
+			string out_path = PdfWriteJoinPath(stem_dir, "p" + std::to_string(p) + ".png");
+			PdfWriteBytesToFile(out_path, png, "pdf_write_page_images");
+
+			PdfWritePageImagesRow row;
+			row.file = path;
+			row.page = p;
+			row.out_path = out_path;
+			row.bytes = static_cast<int64_t>(png.size());
+			if (png.size() >= 24) {
+				auto u32be = [](const char *b) -> int {
+					return (static_cast<unsigned char>(b[0]) << 24) | (static_cast<unsigned char>(b[1]) << 16) |
+					       (static_cast<unsigned char>(b[2]) << 8) | (static_cast<unsigned char>(b[3]));
+				};
+				row.width = u32be(png.data() + 16);
+				row.height = u32be(png.data() + 20);
+			}
+			rows.push_back(std::move(row));
+		}
+	}
+}
+
+static void PdfWritePageImagesScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfWritePageImagesBindData>();
+	auto &st = data_p.global_state->Cast<PdfWritePageImagesState>();
+	if (!st.executed) {
+		// Side effects at scan time (not bind), so EXPLAIN writes nothing.
+		PdfWritePageImagesExecute(context, bind, st.rows);
+		st.executed = true;
+	}
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && st.emit_idx < st.rows.size()) {
+		auto &row = st.rows[st.emit_idx];
+		output.SetValue(0, count, Value(row.file));
+		output.SetValue(1, count, Value::INTEGER(row.page));
+		output.SetValue(2, count, Value(row.out_path));
+		output.SetValue(3, count, Value::INTEGER(row.width));
+		output.SetValue(4, count, Value::INTEGER(row.height));
+		output.SetValue(5, count, Value::BIGINT(row.bytes));
+		st.emit_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
 //---- pdf_qpdf_info --------------------------------------------------------
 struct PdfQpdfInfoBindData : public TableFunctionData {
 	vector<string> files;
@@ -7484,6 +7668,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_page_images.named_parameters["first_page"] = LogicalType::INTEGER;
 	pdf_page_images.named_parameters["last_page"] = LogicalType::INTEGER;
 	loader.RegisterFunction(pdf_page_images);
+
+	TableFunction pdf_write_page_images("pdf_write_page_images", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                    PdfWritePageImagesScan, PdfWritePageImagesBind, PdfWritePageImagesInit);
+	pdf_write_page_images.named_parameters["password"] = LogicalType::VARCHAR;
+	pdf_write_page_images.named_parameters["dpi"] = LogicalType::INTEGER;
+	pdf_write_page_images.named_parameters["first_page"] = LogicalType::INTEGER;
+	pdf_write_page_images.named_parameters["last_page"] = LogicalType::INTEGER;
+	loader.RegisterFunction(pdf_write_page_images);
 
 	TableFunction pdf_qpdf_info("pdf_qpdf_info", {LogicalType::VARCHAR}, PdfQpdfInfoScan, PdfQpdfInfoBind,
 	                            PdfQpdfInfoInit);

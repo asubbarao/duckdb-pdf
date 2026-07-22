@@ -94,16 +94,18 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 set_source_files_properties(${BASE14_FONT_GEN} PROPERTIES GENERATED TRUE)
 
-# C++17 isolation (NOT on pdf_extension.cpp — ODR with C++11 libduckdb_static):
-#   qpdf_ops.cpp — qpdf headers
+# C++ isolation (NOT on pdf_extension.cpp — ODR with C++11 libduckdb_static):
+#   qpdf_ops.cpp — qpdf headers need C++17 (string_view).
 #   poppler_private_ops.cpp + base14_font_data.cpp — GlobalParams.h / Error.h
-#     need C++17 (std::optional, span, string::starts_with). private-api
-#     feature installs those headers; C++11 still cannot parse them.
+#     from poppler private-api now need C++20 (std::span, string::starts_with /
+#     ends_with). C++17 is not enough on current vcpkg poppler. C++11 still
+#     cannot parse them; private-api feature installs the headers.
 # Per-source COMPILE_OPTIONS (not target CXX_STANDARD).
 set(_PDF_CXX17 "$<IF:$<CXX_COMPILER_ID:MSVC>,/std:c++17,-std=c++17>")
+set(_PDF_CXX20 "$<IF:$<CXX_COMPILER_ID:MSVC>,/std:c++20,-std=c++20>")
 set_source_files_properties(src/qpdf_ops.cpp PROPERTIES COMPILE_OPTIONS "${_PDF_CXX17}")
-set_source_files_properties(src/poppler_private_ops.cpp PROPERTIES COMPILE_OPTIONS "${_PDF_CXX17}")
-set_source_files_properties(${BASE14_FONT_GEN} PROPERTIES COMPILE_OPTIONS "${_PDF_CXX17}")
+set_source_files_properties(src/poppler_private_ops.cpp PROPERTIES COMPILE_OPTIONS "${_PDF_CXX20}")
+set_source_files_properties(${BASE14_FONT_GEN} PROPERTIES COMPILE_OPTIONS "${_PDF_CXX20}")
 
 if(NOT WIN32)
   # ---- POSIX path: pkg-config ----

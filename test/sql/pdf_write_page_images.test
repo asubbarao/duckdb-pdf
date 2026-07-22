@@ -1,0 +1,99 @@
+# name: test/sql/pdf_write_page_images.test
+# description: pdf_write_page_images writes page preview PNGs to out_dir/<stem>/p{N}.png
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── multi-page fixture → Closure path convention + non-empty rows ────────────
+# two_pages.pdf has 2 pages; low dpi for speed
+
+# Path checks use ends_with on the filename only (portable across / and \).
+query IIII
+SELECT page,
+       ends_with(out_path, 'p' || page || '.png') AND contains(out_path, 'two_pages'),
+       width > 0 AND height > 0,
+       bytes > 100
+FROM pdf_write_page_images('test/data/two_pages.pdf', '__TEST_DIR__/pages', dpi := 72)
+ORDER BY page;
+----
+1	true	true	true
+2	true	true	true
+
+# files on disk: PNG magic 89 50 4E 47
+query I
+SELECT starts_with(hex(content), '89504E47')
+FROM read_blob('__TEST_DIR__/pages/two_pages/p1.png');
+----
+true
+
+query I
+SELECT starts_with(hex(content), '89504E47') AND octet_length(content) > 100
+FROM read_blob('__TEST_DIR__/pages/two_pages/p2.png');
+----
+true
+
+# no zero-pad (p1.png / p2.png, not p01 / p-001)
+query I
+SELECT bool_and(ends_with(out_path, 'p' || page || '.png'))
+FROM pdf_write_page_images('test/data/two_pages.pdf', '__TEST_DIR__/pages_nopad', dpi := 50);
+----
+true
+
+# ── first_page / last_page range ─────────────────────────────────────────────
+
+query I
+SELECT list(page ORDER BY page)
+FROM pdf_write_page_images('test/data/two_pages.pdf', '__TEST_DIR__/pages_range',
+                           dpi := 50, first_page := 2, last_page := 2);
+----
+[2]
+
+query I
+SELECT starts_with(hex(content), '89504E47')
+FROM read_blob('__TEST_DIR__/pages_range/two_pages/p2.png');
+----
+true
+
+# ── single-page stem directory ───────────────────────────────────────────────
+
+query I
+SELECT ends_with(out_path, 'p1.png') AND contains(out_path, 'hello') AND bytes > 100
+FROM pdf_write_page_images('test/data/hello.pdf', '__TEST_DIR__/pages_hello', dpi := 72);
+----
+true
+
+# ── dpi validation ───────────────────────────────────────────────────────────
+
+statement error
+SELECT * FROM pdf_write_page_images('test/data/hello.pdf', '__TEST_DIR__/bad_dpi', dpi := 0);
+----
+dpi must be between
+
+statement error
+SELECT * FROM pdf_write_page_images('test/data/hello.pdf', '__TEST_DIR__/bad_dpi', dpi := 2401);
+----
+dpi must be between
+
+# ── empty out_dir rejected ───────────────────────────────────────────────────
+
+statement error
+SELECT * FROM pdf_write_page_images('test/data/hello.pdf', '');
+----
+out_dir must not be empty
+
+# ── overwrite is silent (second write succeeds, still valid PNG) ─────────────
+
+query I
+SELECT ends_with(out_path, 'p1.png') AND contains(out_path, 'hello') AND bytes > 100
+FROM pdf_write_page_images('test/data/hello.pdf', '__TEST_DIR__/pages_hello', dpi := 72);
+----
+true
+
+query I
+SELECT starts_with(hex(content), '89504E47') AND octet_length(content) > 100
+FROM read_blob('__TEST_DIR__/pages_hello/hello/p1.png');
+----
+true

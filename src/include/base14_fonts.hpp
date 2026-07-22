@@ -8,11 +8,12 @@
 // so page rasterization (pdf_redact, OCR, pdf_to_png, …) works without
 // fontconfig or system display fonts.
 //
-// Private poppler headers (GlobalParams.h, Error.h) require C++17 and must NOT
-// be included from pdf_extension.cpp (DuckDB Linux CI drives -std=c++11 for the
-// main TU — same ODR story as qpdf_ops.cpp). Implementations live in
-// base14_font_data.cpp (generated) and poppler_private_ops.cpp, both forced
-// to C++17 in CMakeLists.txt.
+// Private poppler headers (GlobalParams.h, Error.h) require C++20 on current
+// poppler (std::span, string::starts_with) and must NOT be included from
+// pdf_extension.cpp (DuckDB Linux CI drives -std=c++11 for the main TU — same
+// ODR story as qpdf_ops.cpp). Implementations live in base14_font_data.cpp
+// (generated) and poppler_private_ops.cpp, both forced to C++20 in CMakeLists.
+
 //===----------------------------------------------------------------------===//
 #pragma once
 

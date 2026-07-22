@@ -221,6 +221,7 @@ Scalar converters return the whole document (or one rendered page) as a single v
 | `pdf_to_xml` | `(path_or_blob)` | pdftoxml-style XML with per-word bounding boxes. |
 | `pdf_to_svg` | `(path_or_blob, page [, dpi])` | SVG embedding a base64 PNG raster of the page. Default DPI 150, range 1–2400. |
 | `pdf_to_png` | `(path_or_blob, page [, dpi])` | Raw PNG bytes as a `BLOB`. Same raster and DPI rules as `pdf_to_svg`. |
+| `pdf_write_page_images` | `(path_or_glob, out_dir [, dpi, first_page, last_page, password])` | **Table** — write each page as a PNG under `out_dir/<stem>/p{N}.png` (1-based, no zero-pad). Returns `(file, page, out_path, width, height, bytes)`. Same raster + bundled base-14 fonts as `pdf_page_images` / `pdf_to_png`. |
 
 **Paths go through DuckDB's FileSystem**, so `pdf_to_text('s3://...')` or `pdf_to_html('https://...')` work when `httpfs` (or another VFS) is loaded. **BLOB overloads** take the raw bytes directly — no filesystem involved:
 
@@ -242,6 +243,10 @@ SELECT pdf_to_text(content) FROM read_blob('report.pdf');
 -- Render page 1 as a PNG; DPI controls raster size
 SELECT octet_length(pdf_to_png('report.pdf', 1))      AS png_150dpi,
        octet_length(pdf_to_png('report.pdf', 1, 300)) AS png_300dpi;
+
+-- Write page previews to disk (replaces pdftoppm loops): pages/report/p1.png, …
+SELECT file, page, out_path, width, height, bytes
+FROM pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100);
 ```
 
 `pdf_to_markdown` converts using only Poppler's word-level geometry — no AI, no external tools, fully deterministic and local. It detects **headings** (font ≥ 1.15× body size, level by descending size rank), **tables** (aligned word columns emitted as GitHub pipe tables), **bold spans** (font name contains "Bold"), **lists** (`-`, `*`, `•`, `◦`, `N.` markers), and **paragraphs** (consecutive same-indent lines merged). Pages are joined with `\n\n`; `NULL` input → `NULL` output; missing or encrypted files raise an error.
@@ -249,6 +254,30 @@ SELECT octet_length(pdf_to_png('report.pdf', 1))      AS png_150dpi,
 ```sql
 SELECT pdf_to_markdown('report.pdf') AS md;
 ```
+
+### `pdf_page_images` — every page as a PNG BLOB (no `pdftoppm`)
+
+Table function for **in-process page previews**: one row per page with a rendered PNG, so vision / llm pipelines and thumbnails never need the Poppler CLI (`pdftoppm`) or a shell loop. Path or glob; named parameters `password`, `dpi` (default 150, range 1–2400), `first_page`, `last_page`.
+
+Columns: `file`, `page` (1-based), `page_count`, `dpi`, `width`, `height` (pixels from the PNG IHDR), `png` (`BLOB`).
+
+```sql
+-- BLOB per page — handoff to a vision model / llm extension
+SELECT file, page, png FROM pdf_page_images('docs/*.pdf', dpi := 100);
+
+-- Or the scalar for a single page
+SELECT pdf_to_png('a.pdf', 1, 100);
+```
+
+**Static file trees** (`pages/<stem>/pN.png` for Closure-style UIs): use `pdf_write_page_images` (pdf ≥ 0.7.7) — writes the whole tree in one call, creates `out_dir` + stem dirs, same raster/fonts as above. See [COOKBOOK §7](COOKBOOK.md#7-pdf--images-and-thumbnails-no-pdftoppm).
+
+```sql
+SELECT file, page, out_path, width, height, bytes
+FROM pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100);
+-- → pages/report/p1.png, pages/report/p2.png, …
+```
+
+**Fonts (pdf ≥ 0.7.3):** community binaries bundle URW **base-14** substitute fonts (Helvetica / Times / Courier / Symbol / ZapfDingbats) and register them with Poppler at load, so page rasters should not come back blank on hosts without fontconfig/system display fonts. Same path powers `pdf_redact`, OCR rendering, and `pdf_write_page_images`.
 
 ## Inspect
 
@@ -814,6 +843,8 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_revisions(file)` | Table | One row per incremental-update revision, oldest first. |
 | `pdf_signatures(files)` | Table | One row per digital signature: metadata + OpenSSL CMS verification. |
 | `pdf_images(files)` | Table | One row per embedded image XObject; `data` is JPEG/JP2/PNG/raw bytes per `format`. |
+| `pdf_page_images(files)` | Table | One row per page with a rendered PNG (`png` BLOB); `dpi` / page-range / `password`. No `pdftoppm`. |
+| `pdf_write_page_images(files, out_dir)` | Table | Write page PNGs to `out_dir/<stem>/p{N}.png` (1-based, no pad); `(file, page, out_path, width, height, bytes)`. |
 | `pdf_split(file, dir)` | Table | One single-page PDF per page; one row per emitted file. |
 | `pdf_split_blank(file, dir[, blank_threshold])` | Table | Splits on blank-page separators (mailroom batches); one row per emitted document. |
 | `pdf_redact(in, out, boxes [, dpi, password])` | Table | True raster redaction: replace boxed pages with image-only pages (text removed, not covered); one row per output page. |

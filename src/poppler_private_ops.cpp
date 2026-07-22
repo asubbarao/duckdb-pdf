@@ -1,7 +1,8 @@
-// poppler_private_ops.cpp — setErrorCallback + missing-font flag (C++17 TU).
+// poppler_private_ops.cpp — setErrorCallback + missing-font flag (C++20 TU).
 //
 // MUST NOT include duckdb.hpp (ODR with C++11 libduckdb_static). Only poppler
-// private headers + std. See base14_fonts.hpp for the public surface.
+// private headers + std. Poppler private-api headers need C++20 (std::span).
+// See base14_fonts.hpp for the public surface.
 
 #include "base14_fonts.hpp"
 

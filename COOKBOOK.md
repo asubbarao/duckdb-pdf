@@ -249,6 +249,47 @@ back out of a scan.
 SELECT pdf_to_png('report.pdf', 1)       AS page1_150dpi,
        pdf_to_png('report.pdf', 1, 300)  AS page1_300dpi;
 
+-- BLOB per page (path or glob) for vision / llm pipelines
+SELECT file, page, png FROM pdf_page_images('docs/*.pdf', dpi := 100);
+```
+
+Columns from `pdf_page_images`: `file`, `page` (1-based), `page_count`, `dpi`,
+`width`, `height` (pixel size from the PNG IHDR), `png` (`BLOB`). DPI range
+1–2400 (default 150). Feed `png` straight to a vision / llm extension, or keep
+it as a column for downstream SQL.
+
+### Closure-style static tree: `pages/<stem>/pN.png` (no `pdftoppm`)
+
+Static UIs and file servers want a **deterministic on-disk tree** of page PNGs.
+Use `pdf_write_page_images` — one call, multi-file, same raster + bundled
+base-14 fonts as `pdf_page_images` / `pdf_to_png`:
+
+```sql
+-- Writes pages/<stem>/p1.png, p2.png, … (1-based, no zero-pad)
+-- Creates out_dir and per-stem subdirs if missing.
+SELECT file, page, out_path, width, height, bytes
+FROM pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100);
+
+-- Page range + password (same named params as the readers)
+SELECT *
+FROM pdf_write_page_images('locked.pdf', 'pages', dpi := 100,
+                           password := 'secret', first_page := 1, last_page := 3);
+```
+
+Columns: `file`, `page` (1-based), `out_path`, `width`, `height`, `bytes`.
+Overwrite replaces existing PNGs. Side effects run at scan time (`EXPLAIN`
+writes nothing). Requires pdf ≥ 0.7.7.
+
+For a **single** page without a tree, the scalar + core `COPY` still works:
+
+```sql
+COPY (SELECT pdf_to_png('report.pdf', 1, 100))
+TO 'pages/report/p1.png' (FORMAT BLOB);  -- mkdir parent first
+```
+
+### Render vs extract
+
+```sql
 -- Pull the ACTUAL stored rasters (the JPEG the scanner wrote), not a render
 SELECT file, page, image_index, width, height, colorspace, format,
        octet_length(data) AS bytes
@@ -256,13 +297,23 @@ FROM pdf_images('scans/*.pdf')
 ORDER BY file, page, image_index;
 ```
 
-**Gotcha:** `pdf_to_png` **renders** the page (page number is 1-based, DPI range
-1–2400) — it is a rasterizer. `pdf_images` **extracts** the embedded image
-XObjects byte-for-byte and does not render anything; files with no images yield
-zero rows. Check the `format` column before using `data`: `jpeg`/`png` bytes
-drop straight into any image tool, but `ccitt` (fax) and `raw` (CMYK/indexed/
-exotic depth) rows need the `colorspace`/`bits_per_component`/`width`/`height`
-columns to interpret. `pdf_images` requires pdf ≥ 0.5.
+**Gotcha:** `pdf_page_images` / `pdf_write_page_images` / `pdf_to_png` **render**
+the page (1-based page numbers, DPI 1–2400) — they are rasterizers. `pdf_images`
+**extracts** the embedded image XObjects byte-for-byte and does not render
+anything; files with no images yield zero rows. Check the `format` column
+before using `data`: `jpeg`/`png` bytes drop straight into any image tool, but
+`ccitt` (fax) and `raw` (CMYK/indexed/exotic depth) rows need the
+`colorspace`/`bits_per_component`/`width`/`height` columns to interpret.
+`pdf_images` requires pdf ≥ 0.5; `pdf_write_page_images` requires pdf ≥ 0.7.7.
+
+### Fonts (pdf ≥ 0.7.3)
+
+From **0.7.3**, community binaries **bundle URW base-14 substitute fonts**
+(Helvetica / Times / Courier / Symbol / ZapfDingbats) and register them with
+Poppler at load. Page previews, OCR rasters, `pdf_redact`, and
+`pdf_write_page_images` should **not** come back blank on font-starved hosts
+(vcpkg/community Poppler without fontconfig or system display fonts). Exotic
+non-base-14 faces can still fail; standard office PDFs are the happy path.
 
 ---
 
