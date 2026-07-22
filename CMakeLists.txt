@@ -82,33 +82,28 @@ add_custom_command(
   COMMENT "Embedding URW base-14 substitute fonts into base14_font_data.cpp"
   VERBATIM
 )
-set(EXTENSION_SOURCES src/pdf_extension.cpp src/ocr_ops.cpp src/qpdf_ops.cpp ${BASE14_FONT_GEN})
+set(EXTENSION_SOURCES
+    src/pdf_extension.cpp
+    src/ocr_ops.cpp
+    src/qpdf_ops.cpp
+    src/poppler_private_ops.cpp
+    ${BASE14_FONT_GEN})
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-# base14_font_data.cpp includes poppler GlobalParams.h (same private core API
-# used for setErrorCallback). Ensure the generated TU sees poppler headers:
-# include dirs are added below per platform; also force the generated file to
-# rebuild with the extension targets.
 set_source_files_properties(${BASE14_FONT_GEN} PROPERTIES GENERATED TRUE)
 
-# qpdf headers require C++17 (std::string_view), but the main TU
-# (pdf_extension.cpp) MUST build at whatever standard DuckDB drives
-# (-std=c++11 on the Linux registry CI): duckdb headers define
-# `static constexpr` members that libduckdb_static.a carries as out-of-line
-# definitions at C++11, while a C++17 TU makes the same members implicitly
-# inline and emits its own — GNU ld then fails with "multiple definition of
-# duckdb::FileFlags::FILE_FLAGS_READ" (and friends). So the qpdf code lives in
-# its own duckdb-free translation unit (src/qpdf_ops.cpp) and ONLY that file
-# gets C++17. A per-source flag (not CXX_STANDARD, which is target-level) is
-# the mechanism; MSVC defaults to C++14 so it needs the flag spelled /std:c++17.
-#
-# ocr_ops.cpp is isolated for the same hygiene reason (heavy third-party
-# headers out of the duckdb TU) but does not need a forced standard — it
-# builds at the project default C++17 / whatever DuckDB drives.
-set_source_files_properties(src/qpdf_ops.cpp PROPERTIES
-                            COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/std:c++17,-std=c++17>")
+# C++17 isolation (NOT on pdf_extension.cpp — ODR with C++11 libduckdb_static):
+#   qpdf_ops.cpp — qpdf headers
+#   poppler_private_ops.cpp + base14_font_data.cpp — GlobalParams.h / Error.h
+#     need C++17 (std::optional, span, string::starts_with). private-api
+#     feature installs those headers; C++11 still cannot parse them.
+# Per-source COMPILE_OPTIONS (not target CXX_STANDARD).
+set(_PDF_CXX17 "$<IF:$<CXX_COMPILER_ID:MSVC>,/std:c++17,-std=c++17>")
+set_source_files_properties(src/qpdf_ops.cpp PROPERTIES COMPILE_OPTIONS "${_PDF_CXX17}")
+set_source_files_properties(src/poppler_private_ops.cpp PROPERTIES COMPILE_OPTIONS "${_PDF_CXX17}")
+set_source_files_properties(${BASE14_FONT_GEN} PROPERTIES COMPILE_OPTIONS "${_PDF_CXX17}")
 
 if(NOT WIN32)
   # ---- POSIX path: pkg-config ----
