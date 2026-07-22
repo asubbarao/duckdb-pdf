@@ -35,6 +35,10 @@
 // display fonts are missing instead of silently emitting a blank page.
 #include "Error.h"
 
+// Bundled URW base-14 fonts — registered with poppler so rasterization works
+// without system fontconfig (community/vcpkg builds). See base14_fonts.hpp.
+#include "base14_fonts.hpp"
+
 // libharu — native PDF writer (C API) for write_pdf. No external processes.
 #include <hpdf.h>
 
@@ -862,6 +866,7 @@ static pdf_ocr::Options MakeOcrOptions(const string &language, int dpi, int psm,
 // failure. Caller owns the returned poppler::image (value type).
 static poppler::image RenderPageForOcr(poppler::page *page, int dpi) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	EnsurePdfBase14Fonts();
 	poppler::page_renderer renderer;
 	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
@@ -1133,6 +1138,10 @@ static unique_ptr<poppler::document> LoadDoc(const string &bytes, const string &
 	if (doc->pages() <= 0) {
 		throw IOException("read_pdf: '%s' has no readable pages (empty or unreadable document)", path);
 	}
+	// First successful document open initializes poppler's globalParams. Register
+	// bundled base-14 substitute fonts so subsequent rasterization does not depend
+	// on system fontconfig (community/vcpkg binaries ship without it).
+	EnsurePdfBase14Fonts();
 	return doc;
 }
 
@@ -3628,6 +3637,7 @@ static string TempDir() {
 // image::save + binary read + magic validation as the original pdf_to_svg path.
 static string RenderPageToPngBytes(poppler::document &doc, int32_t page_no, int32_t dpi, const string &fn_name) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	EnsurePdfBase14Fonts();
 
 	unique_ptr<poppler::page> page(doc.create_page(page_no - 1));
 	if (!page) {
@@ -5225,6 +5235,7 @@ static void PdfSplitScan(ClientContext &context, TableFunctionInput &data_p, Dat
 // argb32 buffer directly instead of round-tripping through PNG or tesseract.
 static bool PageRendersNearWhite(poppler::page *page, double threshold) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	EnsurePdfBase14Fonts();
 	poppler::page_renderer renderer;
 	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
@@ -6098,30 +6109,27 @@ static unique_ptr<GlobalTableFunctionState> PdfRedactInit(ClientContext &, Table
 
 // Fail loudly when poppler cannot resolve display fonts during redaction
 // rasterization. On font-starved runtimes (community/vcpkg poppler with no
-// fontconfig or base fonts), poppler emits stderr like:
+// fontconfig or base fonts), poppler used to emit stderr like:
 //   poppler/error: No display font for 'Helvetica-Oblique'
 //   poppler/error: Couldn't find a font for 'Helvetica'
-// and silently renders a blank page — while pdf_redact still returned
+// and silently render a blank page — while pdf_redact still returned
 // redacted=true / boxes_applied=N. That is silent document corruption.
+//
+// Bundled URW base-14 fonts (EnsurePdfBase14Fonts / third_party/fonts) make
+// this path unreachable in the normal community-binary case: we register the
+// substitutes via GlobalParams::addFontFile before any render. The callback
+// remains as a last-resort guard for exotic non-base-14 fonts with no
+// substitute.
 //
 // PopplerMutex already serializes every render path in this file, so a plain
 // flag (not TLS) is enough; the callback is installed once and the flag is
 // reset around each render_page call.
 //
-// Manual repro (no portable automated test: empty FONTCONFIG alone is not
-// enough on macOS without env -i, and setting it for the whole suite would
-// break every other PDF test):
-//   mkdir -p /tmp/empty-fc/fonts
-//   printf '%s\n' '<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "fonts.dtd">' \
-//     '<fontconfig><dir>/tmp/empty-fc/fonts</dir></fontconfig>' \
-//     > /tmp/empty-fc/fonts.conf
-//   env -i PATH="$PATH" HOME=/tmp/empty-fc FONTCONFIG_PATH=/tmp/empty-fc \
-//     FONTCONFIG_FILE=/tmp/empty-fc/fonts.conf \
-//     duckdb -c "LOAD 'build/release/extension/pdf/pdf.duckdb_extension';
-//       SELECT * FROM pdf_redact('test/data/redact_secret.pdf', '/tmp/out.pdf',
-//         [{page: 2, x: 60.0, y: 590.0, w: 260.0, h: 38.0}]);"
-// Expect IOException before /tmp/out.pdf is written. With normal env (fonts
-// present) the same query must succeed.
+// Font-starved smoke test (scripts/test_font_starved_redact.sh): with
+// FONTCONFIG_PATH/HOME pointed at empty dirs, redaction must still succeed
+// and leave non-redacted page text extractable — proving bundled fonts alone
+// are enough. Expect success after the base-14 bundle; the fail-loudly
+// IOException is only for residual missing-font cases.
 static bool g_poppler_missing_display_font = false;
 
 static void PdfPopplerErrorCallback(ErrorCategory /*category*/, Goffset pos, const char *msg) {
@@ -6155,6 +6163,7 @@ static void EnsurePopplerErrorCallback() {
 static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page_idx0, int dpi,
                                                 const vector<const RedactBox *> &boxes) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	EnsurePdfBase14Fonts();
 	EnsurePopplerErrorCallback();
 	g_poppler_missing_display_font = false;
 
@@ -6167,12 +6176,15 @@ static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
 	poppler::image img = renderer.render_page(page.get(), dpi, dpi);
 	// Check font errors BEFORE any box paint or (later) output write. A blank
-	// raster with redacted=true is worse than a hard failure.
+	// raster with redacted=true is worse than a hard failure. With bundled
+	// base-14 fonts this should not fire for standard Helvetica/Times/Courier
+	// PDFs; it remains for non-base-14 faces poppler cannot substitute.
 	if (g_poppler_missing_display_font) {
 		throw IOException(
 		    "pdf_redact: poppler could not find display fonts for this PDF's fonts — the rendered page would be "
-		    "blank/corrupted. This usually means the runtime has no system fonts available. Install fontconfig + a "
-		    "base font package (e.g. on Debian/Ubuntu: fontconfig + fonts-liberation or fonts-urw-base35) and retry.");
+		    "blank/corrupted. Bundled base-14 substitutes (Helvetica/Times/Courier/Symbol/ZapfDingbats) are already "
+		    "registered; this PDF likely uses a non-standard font that is neither embedded nor substitutable. Install "
+		    "fontconfig + a broader font package (e.g. fonts-liberation) or embed fonts in the source PDF and retry.");
 	}
 	if (!img.is_valid()) {
 		throw IOException("pdf_redact: failed to render page %d", page_idx0 + 1);

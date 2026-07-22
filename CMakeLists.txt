@@ -50,10 +50,48 @@ endif()
 # pdf_extension.cpp — DuckDB + poppler (no tesseract/leptonica/qpdf headers).
 # ocr_ops.cpp       — tesseract + leptonica only (no duckdb/poppler/qpdf).
 # qpdf_ops.cpp      — qpdf only, forced C++17 (see below).
-set(EXTENSION_SOURCES src/pdf_extension.cpp src/ocr_ops.cpp src/qpdf_ops.cpp)
+# base14_font_data.cpp — generated: embedded URW base-14 OTFs for poppler.
+#
+# Community-extensions ship a single .duckdb_extension binary (no companion
+# data files). Fonts are compiled in and registered via GlobalParams::addFontFile
+# so pdf_redact rasterization works without system fontconfig.
+set(BASE14_FONT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts)
+set(BASE14_FONT_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_base14_fonts.py)
+set(BASE14_FONT_GEN ${CMAKE_CURRENT_BINARY_DIR}/base14_font_data.cpp)
+set(BASE14_FONT_FILES
+  ${BASE14_FONT_DIR}/NimbusSans-Regular.otf
+  ${BASE14_FONT_DIR}/NimbusSans-Bold.otf
+  ${BASE14_FONT_DIR}/NimbusSans-Italic.otf
+  ${BASE14_FONT_DIR}/NimbusSans-BoldItalic.otf
+  ${BASE14_FONT_DIR}/NimbusRoman-Regular.otf
+  ${BASE14_FONT_DIR}/NimbusRoman-Bold.otf
+  ${BASE14_FONT_DIR}/NimbusRoman-Italic.otf
+  ${BASE14_FONT_DIR}/NimbusRoman-BoldItalic.otf
+  ${BASE14_FONT_DIR}/NimbusMonoPS-Regular.otf
+  ${BASE14_FONT_DIR}/NimbusMonoPS-Bold.otf
+  ${BASE14_FONT_DIR}/NimbusMonoPS-Italic.otf
+  ${BASE14_FONT_DIR}/NimbusMonoPS-BoldItalic.otf
+  ${BASE14_FONT_DIR}/StandardSymbolsPS.otf
+  ${BASE14_FONT_DIR}/D050000L.otf
+)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_custom_command(
+  OUTPUT ${BASE14_FONT_GEN}
+  COMMAND ${Python3_EXECUTABLE} ${BASE14_FONT_SCRIPT} ${BASE14_FONT_DIR} ${BASE14_FONT_GEN}
+  DEPENDS ${BASE14_FONT_SCRIPT} ${BASE14_FONT_FILES}
+  COMMENT "Embedding URW base-14 substitute fonts into base14_font_data.cpp"
+  VERBATIM
+)
+set(EXTENSION_SOURCES src/pdf_extension.cpp src/ocr_ops.cpp src/qpdf_ops.cpp ${BASE14_FONT_GEN})
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+# base14_font_data.cpp includes poppler GlobalParams.h (same private core API
+# used for setErrorCallback). Ensure the generated TU sees poppler headers:
+# include dirs are added below per platform; also force the generated file to
+# rebuild with the extension targets.
+set_source_files_properties(${BASE14_FONT_GEN} PROPERTIES GENERATED TRUE)
 
 # qpdf headers require C++17 (std::string_view), but the main TU
 # (pdf_extension.cpp) MUST build at whatever standard DuckDB drives

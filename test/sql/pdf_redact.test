@@ -59,6 +59,12 @@ WHERE page = 2 AND regexp_matches(text, '[A-Za-z0-9]');
 0
 
 # ── unredacted pages keep their live text ──
+# This is also the in-suite regression for bundled base-14 fonts: the fixture
+# uses unembedded Helvetica. If poppler could not resolve a display font, the
+# redacted output pages would be blank rasters and these strings would vanish
+# from every page that was rebuilt (here only page 2 is rebuilt — pages 1/3
+# pass through with live text). A fuller font-starved env test lives in
+# scripts/test_font_starved_redact.sh (empty FONTCONFIG_PATH + HOME).
 
 query I
 SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted.pdf') WHERE text LIKE '%PAGE ONE PUBLIC HEADER%';
@@ -67,6 +73,15 @@ SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted.pdf') WHERE text LIKE '%PAG
 
 query I
 SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted.pdf') WHERE text LIKE '%PAGE THREE FOOTER%';
+----
+1
+
+# Page 2 is a rebuilt raster of Helvetica text + black redaction box. Re-OCR
+# must recover the non-secret visible string ("PAGE TWO") if the raster is not
+# blank — i.e. if bundled (or system) base-14 fonts resolved during render.
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted.pdf')
+WHERE page = 2 AND text LIKE '%PAGE TWO%';
 ----
 1
 
