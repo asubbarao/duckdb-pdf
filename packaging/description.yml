@@ -15,7 +15,7 @@
 extension:
   name: pdf
   description: Read, inspect, transform, and write PDFs in SQL — text at every grain (page/line/word/element/chunk), OCR for scanned files, metadata, tables, images, and document surgery (merge/split/sign/redact/watermark/encrypt/...).
-  version: 0.7.3
+  version: 0.7.4
   language: C++
   build: cmake
   license: GPL-2.0-or-later
@@ -31,7 +31,7 @@ extension:
 
 repo:
   github: asubbarao/duckdb-pdf
-  ref: b1dc8ec7ce4642786ed6d29239b42149c9775e04
+  ref: d30c5343c53d845ee400055efeb97e42a3c367b1
 
 docs:
   hello_world: |
