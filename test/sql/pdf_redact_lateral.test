@@ -1,0 +1,79 @@
+# name: test/sql/pdf_redact_lateral.test
+# description: pdf_redact_lateral — pure in-out column-ref / dependent-join form
+# group: [sql]
+
+require pdf
+
+# Two input documents, each with its own path/out/box-list, expanded in ONE
+# query via CROSS JOIN pdf_redact_lateral(col, col, col). DuckDB resolves the
+# column refs as a dependent join — no LATERAL keyword required.
+# (read_lines / read_lines_lateral two-name pattern: constants stay on
+# pdf_redact; column-ref rows use pdf_redact_lateral.)
+
+statement ok
+CREATE OR REPLACE TEMP TABLE redact_docs AS
+SELECT * FROM (VALUES
+  (1::INTEGER,
+   'test/data/redact_secret.pdf',
+   '__TEST_DIR__/row_a.pdf',
+   [{'page': 2, 'x': 60.0, 'y': 590.0, 'w': 260.0, 'h': 38.0}]
+     ::STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE)[]),
+  (2::INTEGER,
+   'test/data/two_pages.pdf',
+   '__TEST_DIR__/row_b.pdf',
+   []::STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE)[])
+) AS t(id, source_path, out_path, boxes);
+
+query IIII
+SELECT d.id, r.page, r.redacted, r.boxes_applied
+FROM redact_docs d
+CROSS JOIN pdf_redact_lateral(d.source_path, d.out_path, d.boxes) r
+ORDER BY d.id, r.page;
+----
+1	1	false	0
+1	2	true	1
+1	3	false	0
+2	1	false	0
+2	2	false	0
+
+# both output PDFs exist and report the expected page counts
+query II
+SELECT page_count, 1 AS exists_flag FROM pdf_info('__TEST_DIR__/row_a.pdf')
+UNION ALL
+SELECT page_count, 1 FROM pdf_info('__TEST_DIR__/row_b.pdf')
+ORDER BY page_count DESC;
+----
+3	1
+2	1
+
+# secret is gone from file A's output; file B is a pure passthrough
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/row_a.pdf') WHERE text LIKE '%SECRET%';
+----
+0
+
+# per-document outputs: distinct files both exist; boxes_applied counts match
+# the input box lists (doc 1: one box on page 2; doc 2: empty list → all 0)
+query III
+SELECT d.id, sum(r.boxes_applied)::INTEGER AS total_boxes, count(*)::INTEGER AS page_rows
+FROM redact_docs d
+CROSS JOIN pdf_redact_lateral(d.source_path,
+                             CASE d.id
+                               WHEN 1 THEN '__TEST_DIR__/row_a2.pdf'
+                               ELSE '__TEST_DIR__/row_b2.pdf'
+                             END,
+                             d.boxes) r
+GROUP BY d.id
+ORDER BY d.id;
+----
+1	1	3
+2	0	2
+
+query II
+SELECT page_count, 1 AS exists_flag FROM pdf_info('__TEST_DIR__/row_a2.pdf')
+UNION ALL
+SELECT page_count, 1 FROM pdf_info('__TEST_DIR__/row_b2.pdf')
+ORDER BY page_count DESC;
+----
+3	1
+2	1

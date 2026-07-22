@@ -5973,19 +5973,14 @@ static void PdfSignScan(ClientContext &context, TableFunctionInput &data_p, Data
 // a redacted page is extractable afterwards. Pages with no boxes are copied
 // through untouched and keep their live text.
 //
-// Implementation: pure table in-out function (same mechanism as range/unnest).
-// Bind never StringValue::Get's the path/out/boxes args, so both constant-arg
-// form and column-ref dependent joins work:
+// Two separately-named entry points (read_lines / read_lines_lateral pattern):
+//   - pdf_redact          classic table function; bind-time constant args;
+//                         named parameters dpi/password work.
+//   - pdf_redact_lateral  pure in-out table function; column-ref args only;
+//                         no named parameters (dpi=200, password='').
 //
-//   FROM pdf_redact('in.pdf', 'out.pdf', [{'page':1,'x':0,'y':0,'w':10,'h':10}])
-//   FROM docs d CROSS JOIN pdf_redact(d.path, d.out, d.boxes) r
-//
-// Named params dpi/password still bind on the all-constants path. In row-mode
-// DuckDB folds column-ref args as a subquery and does not surface named params
-// to bind — dpi defaults to 200 and password to '' (see README).
-//
-// Side effects (rendering + file write) happen at execute time, not bind, so a
-// bare EXPLAIN writes nothing.
+// Side effects (rendering + file write) happen at execute/scan time, not bind,
+// so a bare EXPLAIN writes nothing.
 //===--------------------------------------------------------------------===//
 struct RedactBox {
 	int page = 0; // 1-based
@@ -5993,23 +5988,31 @@ struct RedactBox {
 };
 
 struct PdfRedactBindData : public TableFunctionData {
+	string input;
+	string output;
 	string password;
 	int32_t dpi = 200;
+	vector<RedactBox> boxes;
 };
 
-// Local state carries leftover page rows when one input file expands past
-// STANDARD_VECTOR_SIZE (or when we must re-enter for HAVE_MORE_OUTPUT).
-struct PdfRedactLocalState : public LocalTableFunctionState {
-	idx_t current_input_row = 0;
+struct PdfRedactState : public GlobalTableFunctionState {
+	bool executed = false;
+	idx_t emit_idx = 0;
+	std::vector<std::vector<Value>> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+// Lateral (pure in-out) bind data is schema-only; dpi/password are fixed defaults.
+struct PdfRedactLateralBindData : public TableFunctionData {};
+
+// Per-thread local state for pdf_redact_lateral (NOT global state).
+struct PdfRedactLateralState : public LocalTableFunctionState {
+	idx_t current_row = 0;
 	bool row_active = false;
 	idx_t emit_idx = 0;
 	std::vector<std::vector<Value>> page_rows;
-};
-
-struct PdfRedactGlobalState : public GlobalTableFunctionState {
-	idx_t MaxThreads() const override {
-		return 1; // side-effecting file write; single-threaded
-	}
 };
 
 // Read a STRUCT field by (case-insensitive) name; throws if absent.
@@ -6060,11 +6063,13 @@ static vector<RedactBox> ParseRedactBoxes(const Value &list_val) {
 	return boxes;
 }
 
-static unique_ptr<FunctionData> PdfRedactBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> PdfRedactBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<string> &names) {
-	// Row-mode: path/out/boxes are NOT constant-foldable — never StringValue::Get
-	// them here. Named params (dpi/password) only arrive on the all-constants path.
 	auto result = make_uniq<PdfRedactBindData>();
+	result->input = StringValue::Get(input.inputs[0]);
+	result->output = StringValue::Get(input.inputs[1]);
+	result->boxes = ParseRedactBoxes(input.inputs[2]);
+
 	for (auto &kv : input.named_parameters) {
 		auto key = StringUtil::Lower(kv.first);
 		if (key == "dpi") {
@@ -6082,13 +6087,8 @@ static unique_ptr<FunctionData> PdfRedactBind(ClientContext &, TableFunctionBind
 	return std::move(result);
 }
 
-static unique_ptr<GlobalTableFunctionState> PdfRedactInitGlobal(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<PdfRedactGlobalState>();
-}
-
-static unique_ptr<LocalTableFunctionState> PdfRedactInitLocal(ExecutionContext &, TableFunctionInitInput &,
-                                                              GlobalTableFunctionState *) {
-	return make_uniq<PdfRedactLocalState>();
+static unique_ptr<GlobalTableFunctionState> PdfRedactInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfRedactState>();
 }
 
 // Render one page to RGB and paint the given boxes black. `boxes` are in PDF
@@ -6184,8 +6184,8 @@ static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page
 	return out;
 }
 
-// Redact a single (input, output, boxes) triple — shared by constant-arg and
-// row-mode paths. Appends one result row per output page to `rows`.
+// Shared redaction core used by both pdf_redact (constant-arg scan) and
+// pdf_redact_lateral (per-row in-out). Appends one result row per output page.
 static void PdfRedactExecuteFile(ClientContext &context, const string &input_path, const string &output_path,
                                  const string &password, int32_t dpi, const vector<RedactBox> &boxes,
                                  std::vector<std::vector<Value>> &rows) {
@@ -6195,13 +6195,11 @@ static void PdfRedactExecuteFile(ClientContext &context, const string &input_pat
 		throw InvalidInputException("pdf_redact: output path must differ from input path '%s'", input_path);
 	}
 
-	// Open the source with poppler to count pages and render redacted ones.
 	string bytes;
 	ReadAllBytes(context, input_path, bytes);
 	auto doc = LoadDoc(bytes, password, input_path);
 	const int page_count = doc->pages();
 
-	// Validate box page numbers and bucket boxes per page.
 	for (auto &box : boxes) {
 		if (box.page > page_count) {
 			throw InvalidInputException("pdf_redact: redaction page %d is out of range (document has %d page%s)",
@@ -6237,54 +6235,96 @@ static void PdfRedactExecuteFile(ClientContext &context, const string &input_pat
 	}
 }
 
-// Table in-out entry point. `input` holds the N bound argument rows for this
-// pipeline chunk (col0=path, col1=out, col2=boxes). Each input row expands to
-// one output row per PDF page.
-//
-// Pagination contract (mirrors range): whenever this call produces rows, return
-// HAVE_MORE_OUTPUT. Only return NEED_MORE_INPUT with an empty chunk after the
-// input is fully drained — so the constant-arg PhysicalTableScan path does not
-// re-execute the same parameters on the next GetData call.
-static OperatorResultType PdfRedactInOut(ExecutionContext &context, TableFunctionInput &data_p, DataChunk &input,
-                                         DataChunk &output) {
+static void PdfRedactScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind = data_p.bind_data->Cast<PdfRedactBindData>();
-	auto &state = data_p.local_state->Cast<PdfRedactLocalState>();
+	auto &st = data_p.global_state->Cast<PdfRedactState>();
+	if (!st.executed) {
+		PdfRedactExecuteFile(context, bind.input, bind.output, bind.password, bind.dpi, bind.boxes, st.rows);
+		st.executed = true;
+	}
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && st.emit_idx < st.rows.size()) {
+		auto &row = st.rows[st.emit_idx];
+		for (idx_t col = 0; col < row.size(); col++) {
+			output.SetValue(col, count, row[col]);
+		}
+		st.emit_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+// =============================================================================
+// Lateral join version: pdf_redact_lateral
+// Pure in-out table function (function=nullptr). Named parameters don't work
+// with in_out functions — dpi defaults to 200, password to ''.
+// =============================================================================
+
+static unique_ptr<FunctionData> PdfRedactLateralBind(ClientContext &, TableFunctionBindInput &,
+                                                     vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::INTEGER};
+	names = {"page", "redacted", "boxes_applied"};
+	return make_uniq<PdfRedactLateralBindData>();
+}
+
+static unique_ptr<LocalTableFunctionState> PdfRedactLateralLocalInit(ExecutionContext &, TableFunctionInitInput &,
+                                                                     GlobalTableFunctionState *) {
+	return make_uniq<PdfRedactLateralState>();
+}
+
+// OperatorResultType protocol (mirrors ReadTextLinesLateralInOut):
+//   - input.size()==0 → empty chunk + FINISHED
+//   - never return FINISHED while carrying output rows
+//   - HAVE_MORE_OUTPUT while the active row still has page rows, or the input
+//     chunk still has unprocessed rows
+//   - NEED_MORE_INPUT (after resetting current_row) when the chunk is fully
+//     consumed (may still carry output rows — FINISHED alone requires empty)
+static OperatorResultType PdfRedactLateralInOut(ExecutionContext &context, TableFunctionInput &data_p, DataChunk &input,
+                                                DataChunk &output) {
+	auto &state = data_p.local_state->Cast<PdfRedactLateralState>();
+
+	if (input.size() == 0) {
+		output.SetCardinality(0);
+		return OperatorResultType::FINISHED;
+	}
 
 	if (input.ColumnCount() < 3) {
-		throw InvalidInputException("pdf_redact: expected 3 arguments (input, output, redactions), got %llu",
+		throw InvalidInputException("pdf_redact_lateral: expected 3 arguments (input, output, redactions), got %llu",
 		                            (unsigned long long)input.ColumnCount());
 	}
 
 	idx_t out_count = 0;
-	while (true) {
+	while (out_count < STANDARD_VECTOR_SIZE) {
 		if (!state.row_active) {
-			if (state.current_input_row >= input.size()) {
-				// Fully consumed this input chunk. Reset so a fresh chunk (or the
-				// next outer row in a dependent join) starts clean.
-				state.current_input_row = 0;
-				output.SetCardinality(0);
-				return OperatorResultType::NEED_MORE_INPUT;
+			if (state.current_row >= input.size()) {
+				break;
 			}
 
-			// Activate the next input row: read path/out/boxes and run redaction.
-			const Value path_v = input.data[0].GetValue(state.current_input_row);
-			const Value out_v = input.data[1].GetValue(state.current_input_row);
-			const Value boxes_v = input.data[2].GetValue(state.current_input_row);
-			if (path_v.IsNull() || out_v.IsNull()) {
-				throw InvalidInputException("pdf_redact: input and output paths must not be NULL");
+			const Value path_v = input.GetValue(0, state.current_row);
+			const Value out_v = input.GetValue(1, state.current_row);
+			const Value boxes_v = input.GetValue(2, state.current_row);
+
+			// Skip NULL input path or NULL boxes (like read_lines_lateral skips NULL paths).
+			if (path_v.IsNull() || boxes_v.IsNull()) {
+				state.current_row++;
+				continue;
 			}
+			if (out_v.IsNull()) {
+				throw InvalidInputException("pdf_redact_lateral: output path must not be NULL");
+			}
+
 			const string input_path = StringValue::Get(path_v);
 			const string output_path = StringValue::Get(out_v);
 			vector<RedactBox> boxes = ParseRedactBoxes(boxes_v);
 
 			state.page_rows.clear();
-			PdfRedactExecuteFile(context.client, input_path, output_path, bind.password, bind.dpi, boxes,
+			// Lateral: fixed defaults (dpi=200, password='').
+			PdfRedactExecuteFile(context.client, input_path, output_path, /*password=*/"", /*dpi=*/200, boxes,
 			                     state.page_rows);
 			state.row_active = true;
 			state.emit_idx = 0;
 		}
 
-		// Emit page rows for the active input row.
 		while (out_count < STANDARD_VECTOR_SIZE && state.emit_idx < state.page_rows.size()) {
 			auto &row = state.page_rows[state.emit_idx];
 			for (idx_t col = 0; col < row.size(); col++) {
@@ -6295,27 +6335,38 @@ static OperatorResultType PdfRedactInOut(ExecutionContext &context, TableFunctio
 		}
 
 		if (state.emit_idx >= state.page_rows.size()) {
-			// Finished this input row's pages.
 			state.row_active = false;
 			state.page_rows.clear();
 			state.emit_idx = 0;
-			state.current_input_row++;
+			state.current_row++;
 			if (out_count == 0) {
 				// Zero-page edge case: advance without returning empty mid-chunk.
 				continue;
 			}
-			if (out_count < STANDARD_VECTOR_SIZE && state.current_input_row < input.size()) {
-				// Room left in the output chunk and more input rows remain — pack.
-				continue;
-			}
 		}
 
-		// Produced rows this call (and either the vector is full or this was the
-		// last input row). Always HAVE_MORE_OUTPUT when out_count > 0 so the next
-		// re-entry can return NEED_MORE_INPUT with an empty chunk once drained.
-		output.SetCardinality(out_count);
+		// Exit if we filled the vector or have no more work that packs into
+		// remaining slots without a re-enter.
+		if (out_count >= STANDARD_VECTOR_SIZE || state.row_active || state.current_row >= input.size()) {
+			break;
+		}
+	}
+
+	output.SetCardinality(out_count);
+
+	// More page rows from the active input row?
+	if (state.row_active) {
 		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
+	// More input rows in this chunk?
+	if (state.current_row < input.size()) {
+		return OperatorResultType::HAVE_MORE_OUTPUT;
+	}
+
+	// Chunk fully consumed. Reset for the next input chunk. Do NOT return
+	// FINISHED here — that requires an empty output chunk.
+	state.current_row = 0;
+	return OperatorResultType::NEED_MORE_INPUT;
 }
 
 //===--------------------------------------------------------------------===//
@@ -7354,22 +7405,27 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_sign.named_parameters["password"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(pdf_sign);
 
-	// pdf_redact: true raster redaction (removes text under the boxes, not a
-	// black rectangle over live text). redactions in PDF points, origin
-	// bottom-left. Pure in-out (like range): constant args AND column-ref
-	// dependent joins share one overload. Side effects at execute time.
+	// pdf_redact: classic table function (bind-time constant args + named dpi/password).
+	// pdf_redact_lateral: pure in-out for column-ref / dependent-join rows
+	// (read_lines / read_lines_lateral two-name pattern). Side effects at
+	// scan / in-out execute time.
 	auto redact_struct = LogicalType::STRUCT({{"page", LogicalType::INTEGER},
 	                                          {"x", LogicalType::DOUBLE},
 	                                          {"y", LogicalType::DOUBLE},
 	                                          {"w", LogicalType::DOUBLE},
 	                                          {"h", LogicalType::DOUBLE}});
 	TableFunction pdf_redact("pdf_redact",
-	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(redact_struct)}, nullptr,
-	                         PdfRedactBind, PdfRedactInitGlobal, PdfRedactInitLocal);
-	pdf_redact.in_out_function = PdfRedactInOut;
+	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(redact_struct)},
+	                         PdfRedactScan, PdfRedactBind, PdfRedactInit);
 	pdf_redact.named_parameters["dpi"] = LogicalType::INTEGER;
 	pdf_redact.named_parameters["password"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(pdf_redact);
+
+	TableFunction pdf_redact_lateral("pdf_redact_lateral",
+	                                 {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(redact_struct)},
+	                                 nullptr, PdfRedactLateralBind, nullptr, PdfRedactLateralLocalInit);
+	pdf_redact_lateral.in_out_function = PdfRedactLateralInOut;
+	loader.RegisterFunction(pdf_redact_lateral);
 
 	// Comprehensive poppler / qpdf surface
 	TableFunction pdf_pages_info("pdf_pages_info", {LogicalType::VARCHAR}, PdfPagesInfoScan, PdfPagesInfoBind,

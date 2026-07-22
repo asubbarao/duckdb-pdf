@@ -523,15 +523,15 @@ The signature covers the whole file via a `/ByteRange` around a fixed-size `/Con
 
 `dpi` (default 200) sets the render resolution of the rebuilt pages: higher dpi preserves more visual fidelity of the surrounding (unredacted) content but produces a larger output file; lower dpi is smaller but coarser. It does not affect the redaction guarantee — the covered text is gone at any dpi. Because redacted pages become images, their text is no longer selectable or searchable; leave unredacted pages untouched to preserve their text layer.
 
-**Column-ref / row-mode:** `pdf_redact` is a table in-out function, so `input`, `output`, and `redactions` may be **column references** (one set of values per outer row). A plain dependent join expands each document to its per-page result rows — no `format()` / `query()` string-building:
+**Column-ref / row-mode:** use the separate pure in-out function `pdf_redact_lateral` (same two-name pattern as `read_lines` / `read_lines_lateral`). `input`, `output`, and `redactions` are **column references** (one set of values per outer row). A plain dependent join expands each document to its per-page result rows — no `format()` / `query()` string-building:
 
 ```sql
 SELECT d.id, r.page, r.redacted, r.boxes_applied
 FROM documents d
-CROSS JOIN pdf_redact(d.source_path, d.out_path, d.boxes) r;
+CROSS JOIN pdf_redact_lateral(d.source_path, d.out_path, d.boxes) r;
 ```
 
-Named parameters `dpi` / `password` still work on the all-constants form. In row-mode they are not bound (DuckDB's in-out path does not surface named params with column-ref args); defaults are `dpi = 200` and `password = ''`.
+`pdf_redact` remains the classic constant-arg form with named parameters `dpi` / `password`. Named parameters do not work on in-out functions; `pdf_redact_lateral` is positional-only and uses defaults `dpi = 200` and `password = ''`.
 
 ```sql
 -- Redact one box over sensitive text on page 2 (origin bottom-left, points).
@@ -817,6 +817,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_split(file, dir)` | Table | One single-page PDF per page; one row per emitted file. |
 | `pdf_split_blank(file, dir[, blank_threshold])` | Table | Splits on blank-page separators (mailroom batches); one row per emitted document. |
 | `pdf_redact(in, out, boxes [, dpi, password])` | Table | True raster redaction: replace boxed pages with image-only pages (text removed, not covered); one row per output page. |
+| `pdf_redact_lateral(in, out, boxes)` | Table (in-out) | Column-ref / dependent-join form of `pdf_redact` (positional only; dpi=200, password=''). |
 | `pdf_to_text(src [, layout])` | Scalar | Whole document as plain text. Path or `BLOB`. |
 | `pdf_to_markdown(path)` | Scalar | Whole document as GitHub-flavoured Markdown. |
 | `pdf_to_html(src)` | Scalar | Whole document as positioned HTML. Path or `BLOB`. |
