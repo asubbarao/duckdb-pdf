@@ -1,27 +1,28 @@
 {
-	"dependencies": [
-		{
-			"name": "poppler",
-			"default-features": false,
-			"features": [
-				"zlib"
-			]
-		},
-		"tesseract",
-		"leptonica",
-		"libharu",
-		{
-			"name": "qpdf",
-			"default-features": false
-		},
-		"openssl"
-	],
-	"vcpkg-configuration": {
-		"overlay-ports": [
-			"./extension-ci-tools/vcpkg_ports"
-		],
-		"overlay-triplets": [
-			"./extension-ci-tools/toolchains"
-		]
-	}
+  "dependencies": [
+    {
+      "name": "poppler",
+      "default-features": false,
+      "features": [
+        "zlib",
+        "private-api"
+      ]
+    },
+    "tesseract",
+    "leptonica",
+    "libharu",
+    {
+      "name": "qpdf",
+      "default-features": false
+    },
+    "openssl"
+  ],
+  "vcpkg-configuration": {
+    "overlay-ports": [
+      "./extension-ci-tools/vcpkg_ports"
+    ],
+    "overlay-triplets": [
+      "./extension-ci-tools/toolchains"
+    ]
+  }
 }
