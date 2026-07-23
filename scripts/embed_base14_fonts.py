@@ -206,8 +206,9 @@ const char sep = '\\';
 #else
 const char sep = '/';
 #endif
-// Bump dir suffix when font payload changes so stale OTF trees are not reused.
-const std::string dir = Base14TempRoot() + sep + "duckdb_pdf_base14_fonts_v2_pfb";
+// Bump dir suffix when font payload changes so stale bad trees are not reused.
+// v3 = real binary PFB (0x80 0x01 segments), not PFA text misnamed as .pfb.
+const std::string dir = Base14TempRoot() + sep + "duckdb_pdf_base14_fonts_v4_t1binary";
 if (!EnsureDir(dir)) {
 // Non-fatal: leave done=false so a later call can retry; poppler may
 // still find system fonts, and the fail-loudly path remains as a last resort.
@@ -228,7 +229,34 @@ globalParams->addFontFile(std::string(blob.base14_name), path);
 }
 // Critical for vcpkg poppler with fontconfig OFF: walk displayFontTab and
 // resolve Helvetica/etc. via the legacy n0*.pfb filenames we just wrote.
+// Files must be real binary PFB (FreeType rejects mislabeled PFA on some builds).
 globalParams->setupBaseFonts(dir.c_str());
+
+// When poppler is built WITH fontconfig (community may enable it), point it at
+// our temp tree so system fontconfig emptiness does not blank-render pages.
+{
+const std::string conf = dir + sep + "fonts.conf";
+std::ofstream cf(conf, std::ios::trunc);
+if (cf) {
+cf << "<?xml version=\"1.0\"?>\n"
+      "<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n"
+      "<fontconfig>\n"
+      "  <dir>" << dir << "</dir>\n"
+      "  <cachedir>" << dir << "/cache</cachedir>\n"
+      "  <config></config>\n"
+      "</fontconfig>\n";
+cf.close();
+#ifndef _WIN32
+// Do not clobber an operator-set FONTCONFIG_*; only fill when unset.
+if (!std::getenv("FONTCONFIG_FILE")) {
+setenv("FONTCONFIG_FILE", conf.c_str(), 0);
+}
+if (!std::getenv("FONTCONFIG_PATH")) {
+setenv("FONTCONFIG_PATH", dir.c_str(), 0);
+}
+#endif
+}
+}
 
 if (all_ok) {
 done = true;

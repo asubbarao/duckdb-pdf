@@ -6111,8 +6111,10 @@ static unique_ptr<GlobalTableFunctionState> PdfRedactInit(ClientContext &, Table
 static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page_idx0, int dpi,
                                                 const vector<const RedactBox *> &boxes) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-	EnsurePdfBase14Fonts();
 	EnsurePopplerErrorCallback();
+	// Register base-14 *before* first render; re-run once if poppler still
+	// reports missing fonts (first document open can race globalParams).
+	EnsurePdfBase14Fonts();
 	ResetPopplerMissingDisplayFont();
 
 	unique_ptr<poppler::page> page(doc.create_page(page_idx0));
@@ -6123,10 +6125,15 @@ static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page
 	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
 	poppler::image img = renderer.render_page(page.get(), dpi, dpi);
-	// Check font errors BEFORE any box paint or (later) output write. A blank
-	// raster with redacted=true is worse than a hard failure. With bundled
-	// base-14 fonts this should not fire for standard Helvetica/Times/Courier
-	// PDFs; it remains for non-base-14 faces poppler cannot substitute.
+	if (PopplerMissingDisplayFont()) {
+		// Retry once after another base-14 pass (temp dir / setupBaseFonts).
+		EnsurePdfBase14Fonts();
+		ResetPopplerMissingDisplayFont();
+		img = renderer.render_page(page.get(), dpi, dpi);
+	}
+	// Fail loudly only if still missing after retry — silent blank redacts are
+	// worse. With bundled binary PFB base-14 this should not fire for
+	// Helvetica/Times/Courier PDFs.
 	if (PopplerMissingDisplayFont()) {
 		throw IOException(
 		    "pdf_redact: poppler could not find display fonts for this PDF's fonts — the rendered page would be "

@@ -199,20 +199,52 @@ bool ModelExistsIn(const std::string &dir, const std::string &language) {
 	return f.good();
 }
 
+// True if <dir>/<lang>.traineddata OR <dir>/tessdata/<lang>.traineddata exists.
+// Returns the directory to pass to TessBaseAPI::Init (parent of .traineddata).
+std::string DirWithModel(const std::string &dir, const std::string &language) {
+	if (dir.empty()) {
+		return std::string();
+	}
+	if (ModelExistsIn(dir, language)) {
+		return dir;
+	}
+	// TESSDATA_PREFIX is often the *parent* of tessdata/ (tesseract CLI convention).
+	std::string nested = dir;
+	char sep = nested.back();
+	if (sep != '/' && sep != '\\') {
+		nested += '/';
+	}
+	nested += "tessdata";
+	if (ModelExistsIn(nested, language)) {
+		return nested;
+	}
+	return std::string();
+}
+
 // Resolve the tessdata directory that contains <language>.traineddata.
 // Order: explicit tessdata_dir → TESSDATA_PREFIX → standard package-manager
 // install locations. Returns empty if nothing was found.
 std::string ResolveTessdataDir(const std::string &language, const std::string &explicit_dir) {
 	if (!explicit_dir.empty()) {
+		auto hit = DirWithModel(explicit_dir, language);
+		if (!hit.empty()) {
+			return hit;
+		}
+		// Caller forced a path — pass through so Init can emit a clear error.
 		return explicit_dir;
 	}
 	const char *env = std::getenv("TESSDATA_PREFIX");
-	if (env && *env && ModelExistsIn(env, language)) {
-		return std::string(env);
+	if (env && *env) {
+		auto hit = DirWithModel(env, language);
+		if (!hit.empty()) {
+			return hit;
+		}
 	}
 	static const char *kCandidates[] = {
 	    "/opt/homebrew/share/tessdata",
+	    "/opt/homebrew/share", // parent form of TESSDATA_PREFIX
 	    "/usr/local/share/tessdata",
+	    "/usr/local/share",
 	    "/usr/share/tessdata",
 	    "/usr/share/tesseract-ocr/5/tessdata",
 	    "/usr/share/tesseract-ocr/4.00/tessdata",
@@ -222,8 +254,9 @@ std::string ResolveTessdataDir(const std::string &language, const std::string &e
 	    "C:\\Program Files (x86)\\Tesseract-OCR\\tessdata",
 	};
 	for (auto candidate : kCandidates) {
-		if (ModelExistsIn(candidate, language)) {
-			return std::string(candidate);
+		auto hit = DirWithModel(candidate, language);
+		if (!hit.empty()) {
+			return hit;
 		}
 	}
 	return std::string();

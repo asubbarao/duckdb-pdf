@@ -4,16 +4,16 @@ These are free URW++ Type1 base-14 substitutes for PDF's standard 14 fonts
 (Helvetica, Times, Courier, Symbol, ZapfDingbats families). They are embedded
 into the extension binary and extracted at runtime so `pdf_redact` / page
 rasterization works on community-extension builds against vcpkg poppler
-**without** fontconfig or system display fonts.
+**without** system display fonts.
 
-## Why Type1 + legacy filenames
+## Why binary PFB + legacy filenames
 
-vcpkg poppler is built with `default-features: false` (no fontconfig). On that
-path, `GlobalParams::setupBaseFonts(dir)` looks for Ghostscript-era URW
-filenames (`n019003l.pfb`, …), not friendly OTF names. OpenType +
-`addFontFile` alone was insufficient on community Linux CI (blank redacts /
-fail-loudly). Files here are Artifex `.t1` Type1 programs renamed to those
-poppler PFB names.
+vcpkg poppler often has no useful system fonts. `GlobalParams::setupBaseFonts(dir)`
+looks for Ghostscript-era URW filenames (`n019003l.pfb`, …). Files here are
+Artifex URW Type1 programs converted to **real binary PFB** (0x80 0x01
+segments) — plain PFA text mislabeled as `.pfb` failed FreeType on community
+Linux CI. At load we also write a minimal `fonts.conf` when fontconfig is
+linked.
 
 ## Source
 

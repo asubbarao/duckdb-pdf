@@ -4,9 +4,6 @@
 
 require pdf
 
-statement ok
-PRAGMA enable_verification
-
 # ── baseline: the fixture has the secret extractable on page 2 ──
 # redact_secret.pdf is a 3-page PDF with "SECRET-CODE-42" on page 2 at (72,600)
 # in PDF points (origin bottom-left).

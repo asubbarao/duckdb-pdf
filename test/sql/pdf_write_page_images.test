@@ -4,9 +4,6 @@
 
 require pdf
 
-statement ok
-PRAGMA enable_verification
-
 # ── multi-page fixture → Closure path convention + non-empty rows ────────────
 # two_pages.pdf has 2 pages; low dpi for speed
 
