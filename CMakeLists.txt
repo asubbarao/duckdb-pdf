@@ -51,10 +51,13 @@ endif()
 # ocr_ops.cpp       — tesseract + leptonica only (no duckdb/poppler/qpdf).
 # qpdf_ops.cpp      — qpdf only, forced C++17 (see below).
 # base14_font_data.cpp — generated: embedded URW base-14 OTFs for poppler.
+# tessdata_embed.cpp  — generated: eng.traineddata (tessdata_fast) for zero-host OCR.
 #
 # Community-extensions ship a single .duckdb_extension binary (no companion
 # data files). Fonts are compiled in and registered via GlobalParams::addFontFile
-# so pdf_redact rasterization works without system fontconfig.
+# so pdf_redact rasterization works without system fontconfig. English OCR models
+# are compiled in and extracted on first use so scanned PDFs work without
+# brew/apt tessdata.
 set(BASE14_FONT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts)
 set(BASE14_FONT_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_base14_fonts.py)
 set(BASE14_FONT_GEN ${CMAKE_CURRENT_BINARY_DIR}/base14_font_data.cpp)
@@ -75,6 +78,10 @@ set(BASE14_FONT_FILES
   ${BASE14_FONT_DIR}/s050000l.pfb
   ${BASE14_FONT_DIR}/d050000l.pfb
 )
+set(TESSDATA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tessdata)
+set(TESSDATA_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_tessdata.py)
+set(TESSDATA_GEN ${CMAKE_CURRENT_BINARY_DIR}/tessdata_embed.cpp)
+set(TESSDATA_FILES ${TESSDATA_DIR}/eng.traineddata)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_custom_command(
   OUTPUT ${BASE14_FONT_GEN}
@@ -83,17 +90,26 @@ add_custom_command(
   COMMENT "Embedding URW base-14 substitute fonts into base14_font_data.cpp"
   VERBATIM
 )
+add_custom_command(
+  OUTPUT ${TESSDATA_GEN}
+  COMMAND ${Python3_EXECUTABLE} ${TESSDATA_SCRIPT} ${TESSDATA_DIR} ${TESSDATA_GEN}
+  DEPENDS ${TESSDATA_SCRIPT} ${TESSDATA_FILES}
+  COMMENT "Embedding tessdata_fast eng into tessdata_embed.cpp"
+  VERBATIM
+)
 set(EXTENSION_SOURCES
     src/pdf_extension.cpp
     src/ocr_ops.cpp
     src/qpdf_ops.cpp
     src/poppler_private_ops.cpp
-    ${BASE14_FONT_GEN})
+    ${BASE14_FONT_GEN}
+    ${TESSDATA_GEN})
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 set_source_files_properties(${BASE14_FONT_GEN} PROPERTIES GENERATED TRUE)
+set_source_files_properties(${TESSDATA_GEN} PROPERTIES GENERATED TRUE)
 
 # C++ isolation (NOT on pdf_extension.cpp — ODR with C++11 libduckdb_static):
 #   qpdf_ops.cpp — qpdf headers need C++17 (string_view).

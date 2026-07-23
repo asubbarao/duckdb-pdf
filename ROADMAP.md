@@ -32,12 +32,14 @@ function reference.
   pdf)`, and `to_pdf` (office documents via LibreOffice).
 - **OCR** — Tesseract-backed, auto-triggered on pages with no text layer; Leptonica
   preprocess + confidence retry via `ocr_dpi` / `ocr_psm` / `ocr_oem` /
-  `ocr_preprocess` / `ocr_retry` / `tessdata_dir`.
+  `ocr_preprocess` / `ocr_retry` / `tessdata_dir`. **English (eng) model is
+  bundled** (tessdata_fast) so community binaries OCR scans with zero host
+  tessdata install.
 
 ## In progress
 
-- **Community publish** — ship 0.7.7+ (base-14, fail-loudly, lateral redact,
-  `pdf_write_page_images`, C++20 private-API TUs) through
+- **Community publish** — ship 0.8.0 (base-14, fail-loudly, lateral redact,
+  `pdf_write_page_images`, C++20 private-API TUs, **bundled eng tessdata**) through
   `duckdb/community-extensions` so `INSTALL pdf FROM community` matches main.
 
 ## Planned

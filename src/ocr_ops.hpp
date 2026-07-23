@@ -112,4 +112,10 @@ TextResult RecognizeText(const unsigned char *data, int width, int height, int b
 WordsResult RecognizeWords(const unsigned char *data, int width, int height, int bytes_per_row, ImageFormat format,
                            const Options &opt);
 
+// Bundled tessdata (eng from tessdata_fast): extract to a process temp dir.
+// Implemented in generated tessdata_embed.cpp. Empty string if language is not
+// bundled or extract failed. HasBundledTessdata is a pure catalog check.
+std::string EnsureBundledTessdataDir(const std::string &language);
+bool HasBundledTessdata(const std::string &language);
+
 } // namespace pdf_ocr

@@ -15,7 +15,7 @@
 extension:
   name: pdf
   description: Read, inspect, transform, and write PDFs in SQL — text at every grain (page/line/word/element/chunk), OCR for scanned files, metadata, tables, images, and document surgery (merge/split/sign/redact/watermark/encrypt/...).
-  version: 0.7.9
+  version: 0.8.0
   language: C++
   build: cmake
   license: GPL-2.0-or-later
@@ -100,13 +100,13 @@ docs:
     results natively (libharu — no external tools); `to_pdf` converts office
     documents (docx, odt, pptx, ...) via a LibreOffice runtime shell-out.
 
-    **OCR** — pages with no text layer are OCR'd automatically. Install a
-    Tesseract language model the normal way (`brew install tesseract
-    tesseract-lang`, `apt-get install tesseract-ocr-eng`, or the Windows
-    installer) and it is auto-detected — no configuration. Override with
-    `tessdata_dir := ...` or `TESSDATA_PREFIX`; pick languages with
-    `ocr_language := 'deu'`. A Leptonica preprocessing pipeline (deskew,
-    binarize, despeckle) and a confidence-based DPI retry run by default.
+    **OCR** — pages with no text layer are OCR'd automatically. **English
+    (eng) is bundled** (tessdata_fast, extracted on first use) so scanned PDFs
+    work with zero host tessdata install. Other languages: install models the
+    normal way (`brew install tesseract-lang`, `apt-get install tesseract-ocr-deu`,
+    …) or pass `tessdata_dir` / `TESSDATA_PREFIX`. Pick languages with
+    `ocr_language := 'deu'`. Leptonica preprocess + confidence DPI retry by
+    default.
 
     **Scope** — deterministic extraction, not ML document understanding:
     merged cells and borderless/sparse tables are out of scope (use docling /

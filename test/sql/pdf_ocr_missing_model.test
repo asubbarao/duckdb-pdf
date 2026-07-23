@@ -14,25 +14,42 @@ require pdf
 statement ok
 PRAGMA enable_verification
 
-# blank_split.pdf has 3 blank pages -> auto_ocr fires on each; with an unusable
-# model dir it must silently yield empty text, not an IO Error
-query I
-SELECT count(*) FROM read_pdf('test/data/blank_split.pdf', tessdata_dir := '/nonexistent/tessdata');
+# blank_split.pdf is 7 pages (some blank). Explicit broken tessdata_dir is
+# sticky: auto_ocr must NOT fall through to bundled eng. used_ocr stays false;
+# content pages keep native text; blank pages stay empty.
+query III
+SELECT page, used_ocr, length(trim(text, E' \t\r\n\f')) > 0 AS has_text
+FROM read_pdf('test/data/blank_split.pdf', tessdata_dir := '/nonexistent/tessdata')
+ORDER BY page;
 ----
-7
+1	false	true
+2	false	true
+3	false	false
+4	false	true
+5	false	false
+6	false	false
+7	false	true
 
-# word-level auto-OCR path (read_pdf_words) degrades the same way
+# word-level auto-OCR path degrades the same way on blank pages
 query I
 SELECT count(*) FROM read_pdf_words('test/data/blank_split.pdf', tessdata_dir := '/nonexistent/tessdata')
 WHERE page = 3;
 ----
 0
 
-# table extraction's auto-OCR path degrades the same way (blank pages -> no words -> no tables)
+# image-only scan + auto_ocr + missing model: empty, not error, not used_ocr
+query II
+SELECT used_ocr, length(trim(text)) < 5
+FROM read_pdf('test/data/scanned.pdf', auto_ocr := true, tessdata_dir := '/nonexistent/tessdata');
+----
+false	true
+
+# table extraction's auto-OCR path degrades the same way
 statement ok
 SELECT * FROM read_pdf_tables('test/data/blank_split.pdf', tessdata_dir := '/nonexistent/tessdata');
 
-# explicit OCR keeps the loud, actionable error
+# explicit OCR keeps the loud, actionable error (does not use bundled eng when
+# tessdata_dir is set to a broken path)
 statement error
 SELECT * FROM read_pdf('test/data/blank_split.pdf', ocr := true, tessdata_dir := '/nonexistent/tessdata');
 ----

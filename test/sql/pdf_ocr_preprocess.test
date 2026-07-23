@@ -8,7 +8,7 @@ require pdf
 # Package managers do not ship one, so this whole suite is skipped unless the
 # environment provides a model directory. Run locally/CI with e.g.
 #   TESSDATA_PREFIX="/opt/homebrew/share/tessdata" make test
-require-env TESSDATA_PREFIX
+# eng bundled (0.8.0+): no require-env TESSDATA_PREFIX
 
 statement ok
 PRAGMA enable_verification

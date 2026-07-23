@@ -730,29 +730,37 @@ SELECT pdf_compress('excerpt.pdf', 'excerpt_small.pdf');
 
 Pages with no extractable text layer are OCR'd automatically (`auto_ocr`, on by default). Pass `ocr := true` to force OCR on every page, even ones that already have text. OCR applies to `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and `read_pdf_tables`.
 
-**OCR needs a Tesseract language model at runtime**, and package managers do **not** bundle one with the library. The good news: once you install one the usual way, **it just works — no environment variable required.** The extension auto-detects the standard model directories that Homebrew, apt, and the Windows installer write to, so for most people OCR is a one-line install:
+**English (eng) is bundled** into the community binary (tessdata_fast, extracted
+to a temp dir on first OCR). For the default language you do **not** need
+`brew install tesseract-lang` / apt eng models / `TESSDATA_PREFIX`.
+
+Other languages still need a model on disk. Install the usual way and the
+extension auto-detects standard package-manager paths:
 
 ```bash
-# macOS — install once, OCR works immediately (no TESSDATA_PREFIX needed)
-brew install tesseract tesseract-lang
+# Optional — only for non-English languages (or to override the bundled eng)
+# macOS
+brew install tesseract-lang
 
-# Debian / Ubuntu — likewise auto-detected
-sudo apt-get install tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu   # English, German
+# Debian / Ubuntu
+sudo apt-get install tesseract-ocr-deu   # German, etc.
 
-# Windows — the UB Mannheim installer (https://github.com/UB-Mannheim/tesseract/wiki)
-#   installs to C:\Program Files\Tesseract-OCR\tessdata, which is auto-detected.
+# Windows — UB Mannheim installer puts models under
+#   C:\Program Files\Tesseract-OCR\tessdata (auto-detected)
 ```
 
-The auto-detected locations are `/opt/homebrew/share/tessdata` and `/usr/local/share/tessdata` (macOS), `/usr/share/tessdata` and `/usr/share/tesseract-ocr/{5,4.00}/tessdata` (Linux), and `C:\Program Files\Tesseract-OCR\tessdata` (Windows).
-
-**Connecting an existing / non-standard install.** If your models live somewhere else, point at them directly per query — no global config:
+**Connecting an existing / non-standard install.** Point at it per query:
 
 ```sql
 SELECT page, text
 FROM read_pdf('scan.pdf', ocr := true, tessdata_dir := '/opt/models/tessdata');
 ```
 
-You can also set the `TESSDATA_PREFIX` environment variable (Tesseract's own mechanism). Resolution order is: **`tessdata_dir` parameter → `TESSDATA_PREFIX` → auto-detected standard paths.** If no model is found anywhere, *explicit* OCR (`ocr := true`) raises a clear, actionable error — it never silently returns empty text. The *implicit* `auto_ocr` fallback (a blank or scanned page encountered during a plain read) is best-effort instead: with no model available it degrades to empty text for that page, so reading a PDF that happens to contain a blank page never fails on a machine without Tesseract models.
+Resolution order: **`tessdata_dir` → `TESSDATA_PREFIX` → standard install paths → bundled eng.**
+An *explicit* `tessdata_dir` is sticky (a broken path does **not** fall through
+to the bundled model). If no model is found, *explicit* OCR (`ocr := true`)
+raises a clear error; *implicit* `auto_ocr` is best-effort (empty text for that
+page) so blank pages never fail the whole read.
 
 Select the language with the `ocr_language` parameter (default `eng`), and tune the OCR path with `ocr_dpi` (default 300), `ocr_psm`, and `ocr_oem`:
 

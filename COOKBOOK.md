@@ -107,20 +107,19 @@ WHERE source = 'ocr'
 ORDER BY page, y1 DESC, x0;
 ```
 
-**Gotcha:** OCR needs a **Tesseract language model at runtime** — package
-managers don't bundle one. Install it once (`brew install tesseract
-tesseract-lang`, or `apt-get install tesseract-ocr tesseract-ocr-eng`) and it is
-auto-detected — no env var. If your models live elsewhere, point at them per
-query; there is no global config:
+**English is bundled** (tessdata_fast eng, extracted on first OCR) — zero host
+tessdata install for the default language. Other languages need a model on
+disk (`brew install tesseract-lang`, `apt-get install tesseract-ocr-deu`, …)
+or an explicit path:
 
 ```sql
 SELECT page, text
 FROM read_pdf('scan.pdf', ocr := true, tessdata_dir := '/opt/models/tessdata');
 ```
 
-Resolution order is `tessdata_dir` param → `TESSDATA_PREFIX` env → standard
-paths. `auto_ocr` is on by default (OCR only pages with no text layer); `ocr :=
-true` forces OCR on every page.
+Resolution: `tessdata_dir` → `TESSDATA_PREFIX` → standard paths → **bundled eng**.
+`auto_ocr` is on by default (OCR only pages with no text layer); `ocr := true`
+forces OCR on every page.
 
 ---
 

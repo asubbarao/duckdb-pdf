@@ -223,14 +223,16 @@ std::string DirWithModel(const std::string &dir, const std::string &language) {
 
 // Resolve the tessdata directory that contains <language>.traineddata.
 // Order: explicit tessdata_dir → TESSDATA_PREFIX → standard package-manager
-// install locations. Returns empty if nothing was found.
+// install locations → bundled models extracted from this binary (eng).
+// Returns empty if nothing was found.
 std::string ResolveTessdataDir(const std::string &language, const std::string &explicit_dir) {
 	if (!explicit_dir.empty()) {
 		auto hit = DirWithModel(explicit_dir, language);
 		if (!hit.empty()) {
 			return hit;
 		}
-		// Caller forced a path — pass through so Init can emit a clear error.
+		// Caller forced a path — pass through so Init can emit a clear error
+		// (do NOT fall through to bundled/system; explicit path is sticky).
 		return explicit_dir;
 	}
 	const char *env = std::getenv("TESSDATA_PREFIX");
@@ -259,7 +261,8 @@ std::string ResolveTessdataDir(const std::string &language, const std::string &e
 			return hit;
 		}
 	}
-	return std::string();
+	// Zero host install: eng.traineddata is compiled into the extension.
+	return EnsureBundledTessdataDir(language);
 }
 
 // Convert raw poppler-style pixels into a 32bpp leptonica Pix. Returns nullptr
@@ -371,14 +374,19 @@ bool InitTesseract(tesseract::TessBaseAPI &api, const Options &opt) {
 		if (opt.best_effort) {
 			return false;
 		}
-		throw std::runtime_error(
-		    "read_pdf OCR: could not load the Tesseract model for language '" + opt.language +
-		    "'. Install a language model — macOS: `brew install tesseract-lang`; Debian/Ubuntu: "
-		    "`apt-get install tesseract-ocr-" +
-		    opt.language + "`; Windows: the UB Mannheim installer; or download " + opt.language +
-		    ".traineddata from https://github.com/tesseract-ocr/tessdata_fast. Standard install locations "
-		    "are auto-detected; if yours is non-standard, pass `tessdata_dir := '/path/to/tessdata'` or set "
-		    "the TESSDATA_PREFIX env var.");
+		std::string msg = "read_pdf OCR: could not load the Tesseract model for language '" + opt.language + "'.";
+		if (HasBundledTessdata(opt.language)) {
+			msg += " English (eng) is bundled in this extension; this usually means tessdata_dir pointed "
+			       "at a broken path, or the temp extract of the bundled model failed.";
+		} else {
+			msg += " Install a language model — macOS: `brew install tesseract-lang`; Debian/Ubuntu: "
+			       "`apt-get install tesseract-ocr-" +
+			       opt.language + "`; Windows: the UB Mannheim installer; or download " + opt.language +
+			       ".traineddata from https://github.com/tesseract-ocr/tessdata_fast.";
+		}
+		msg += " Resolution order: tessdata_dir → TESSDATA_PREFIX → standard install paths → "
+		       "bundled eng (when available).";
+		throw std::runtime_error(msg);
 	}
 	api.SetPageSegMode(static_cast<tesseract::PageSegMode>(opt.psm));
 	return true;

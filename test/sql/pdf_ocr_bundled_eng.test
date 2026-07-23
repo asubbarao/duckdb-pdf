@@ -1,0 +1,44 @@
+# name: test/sql/pdf_ocr_bundled_eng.test
+# description: English OCR works from the model embedded in the extension (no host tessdata)
+# group: [sql]
+
+require pdf
+
+# English (eng) is compiled into the extension (tessdata_fast) and extracted on
+# first OCR use. This suite must NOT require TESSDATA_PREFIX — community CI and
+# laptop users without brew/apt tessdata should still OCR English scans.
+
+# Explicit OCR on a scanned fixture returns words (source=ocr when available).
+query I
+SELECT count(*) > 0
+FROM read_pdf_words('test/data/scanned.pdf', ocr := true);
+----
+true
+
+query I
+SELECT count(*) > 0
+FROM read_pdf_words('test/data/scanned.pdf', ocr := true)
+WHERE source = 'ocr' OR source = 'text';
+----
+true
+
+# Page text via forced OCR is non-empty.
+query I
+SELECT length(text) > 0
+FROM read_pdf('test/data/scanned.pdf', ocr := true)
+LIMIT 1;
+----
+true
+
+# Known tokens from the scanned fixture (invoice-ish table).
+query I
+SELECT bool_or(word ILIKE 'Apples' OR word ILIKE 'Bananas' OR word ILIKE 'Price')
+FROM read_pdf_words('test/data/scanned.pdf', ocr := true);
+----
+true
+
+# Explicit broken tessdata_dir still fails loudly (does NOT silently use bundled).
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, tessdata_dir := '/nonexistent/tessdata');
+----
+could not load the Tesseract model

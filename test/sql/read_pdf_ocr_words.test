@@ -29,11 +29,9 @@ WHERE source = 'text';
 ----
 true
 
-# ── B. OCR-dependent tests — require TESSDATA_PREFIX ─────────────────────────
-# OCR needs a Tesseract language model at runtime.
-# Run locally with: TESSDATA_PREFIX="$(brew --prefix tesseract)/share/tessdata" make test
-
-require-env TESSDATA_PREFIX
+# ── B. OCR-dependent tests ──────────────────────────────────────────────────
+# eng is bundled (0.8.0+); no require-env TESSDATA_PREFIX. Host models still
+# win when present; community CI without brew/apt tessdata uses the extract.
 
 # B1. scanned.pdf — image-only PDF: read_pdf_words with auto_ocr (default)
 # should return OCR words with source='ocr' and numeric confidence.
