@@ -106,7 +106,8 @@ docs:
     normal way (`brew install tesseract-lang`, `apt-get install tesseract-ocr-deu`,
     …) or pass `tessdata_dir` / `TESSDATA_PREFIX`. Pick languages with
     `ocr_language := 'deu'`. Leptonica preprocess + confidence DPI retry by
-    default.
+    default. Page text from `read_pdf` / `pdf_to_text` is **trimmed once** at
+    emit (no trailing form-feeds).
 
     **Scope** — deterministic extraction, not ML document understanding:
     merged cells and borderless/sparse tables are out of scope (use docling /
