@@ -58,21 +58,22 @@ endif()
 set(BASE14_FONT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts)
 set(BASE14_FONT_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_base14_fonts.py)
 set(BASE14_FONT_GEN ${CMAKE_CURRENT_BINARY_DIR}/base14_font_data.cpp)
+# Poppler setupBaseFonts (no-fontconfig builds) expects these legacy URW names.
 set(BASE14_FONT_FILES
-  ${BASE14_FONT_DIR}/NimbusSans-Regular.otf
-  ${BASE14_FONT_DIR}/NimbusSans-Bold.otf
-  ${BASE14_FONT_DIR}/NimbusSans-Italic.otf
-  ${BASE14_FONT_DIR}/NimbusSans-BoldItalic.otf
-  ${BASE14_FONT_DIR}/NimbusRoman-Regular.otf
-  ${BASE14_FONT_DIR}/NimbusRoman-Bold.otf
-  ${BASE14_FONT_DIR}/NimbusRoman-Italic.otf
-  ${BASE14_FONT_DIR}/NimbusRoman-BoldItalic.otf
-  ${BASE14_FONT_DIR}/NimbusMonoPS-Regular.otf
-  ${BASE14_FONT_DIR}/NimbusMonoPS-Bold.otf
-  ${BASE14_FONT_DIR}/NimbusMonoPS-Italic.otf
-  ${BASE14_FONT_DIR}/NimbusMonoPS-BoldItalic.otf
-  ${BASE14_FONT_DIR}/StandardSymbolsPS.otf
-  ${BASE14_FONT_DIR}/D050000L.otf
+  ${BASE14_FONT_DIR}/n019003l.pfb
+  ${BASE14_FONT_DIR}/n019004l.pfb
+  ${BASE14_FONT_DIR}/n019023l.pfb
+  ${BASE14_FONT_DIR}/n019024l.pfb
+  ${BASE14_FONT_DIR}/n021003l.pfb
+  ${BASE14_FONT_DIR}/n021004l.pfb
+  ${BASE14_FONT_DIR}/n021023l.pfb
+  ${BASE14_FONT_DIR}/n021024l.pfb
+  ${BASE14_FONT_DIR}/n022003l.pfb
+  ${BASE14_FONT_DIR}/n022004l.pfb
+  ${BASE14_FONT_DIR}/n022023l.pfb
+  ${BASE14_FONT_DIR}/n022024l.pfb
+  ${BASE14_FONT_DIR}/s050000l.pfb
+  ${BASE14_FONT_DIR}/d050000l.pfb
 )
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_custom_command(
