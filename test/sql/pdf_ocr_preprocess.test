@@ -33,11 +33,10 @@ FROM read_pdf('test/data/skewed_scan.pdf', ocr:=true, ocr_preprocess:=true);
 true
 
 # ── ocr_preprocess:=false still runs cleanly ───────────────────────────────
-# We only assert it does NOT throw/crash — tesseract sometimes straightens mild
-# skew on its own, so we do not assert that disabling preprocessing loses the
-# text.
+# Must not throw; text may or may not recover full phrase without preprocess.
+# Assert non-empty page text (OCR still runs).
 query I
-SELECT length(text) >= 0
+SELECT text != ''
 FROM read_pdf('test/data/skewed_scan.pdf', ocr:=true, ocr_preprocess:=false);
 ----
 true

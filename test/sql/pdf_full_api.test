@@ -204,7 +204,7 @@ external
 
 # external + auto_ocr on image-only is best-effort empty (no plugin, no crash)
 query I
-SELECT length(trim(text)) < 5 AND used_ocr = false
+SELECT text = '' AND used_ocr = false
 FROM read_pdf('test/data/scanned.pdf', auto_ocr := true, ocr_backend := 'external');
 ----
 true

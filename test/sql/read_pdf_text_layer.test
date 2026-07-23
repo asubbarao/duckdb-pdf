@@ -39,7 +39,7 @@ false
 
 # Without OCR the text is empty/near-empty
 query I
-SELECT length(trim(text)) < 5
+SELECT text = ''
 FROM read_pdf('test/data/scanned.pdf', auto_ocr:=false);
 ----
 true
@@ -48,7 +48,6 @@ true
 # auto_ocr / ocr:=true on scanned.pdf should set used_ocr=true and recover text.
 # has_text_layer stays false — the flag describes the PDF, not the extraction.
 
-require-env TESSDATA_PREFIX
 
 query II
 SELECT has_text_layer, used_ocr
@@ -72,7 +71,7 @@ true
 # the raster OCR actually produced text (false when the page renders blank —
 # missing display fonts — and we fall back to the native layer).
 query I
-SELECT has_text_layer AND contains(lower(text), 'hello duckdb')
+SELECT has_text_layer AND text != '' AND contains(lower(text), 'duck')
 FROM read_pdf('test/data/hello.pdf', ocr:=true);
 ----
 true

@@ -77,3 +77,27 @@ ORDER BY page_count DESC;
 ----
 3	1
 2	1
+
+# ── lateral errors ─────────────────────────────────────────────────────────
+statement error
+SELECT * FROM pdf_redact_lateral(
+  'test/data/redact_secret.pdf',
+  'test/data/redact_secret.pdf',
+  [{'page': 2, 'x': 60.0, 'y': 590.0, 'w': 260.0, 'h': 38.0}]);
+----
+must differ from input
+
+# secret gone with auto_ocr off (native layer only)
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/row_a.pdf', auto_ocr := false)
+WHERE text LIKE '%SECRET%';
+----
+0
+
+statement error
+SELECT * FROM pdf_redact_lateral(
+  'test/data/does_not_exist.pdf',
+  '__TEST_DIR__/nope.pdf',
+  [{'page': 1, 'x': 0.0, 'y': 0.0, 'w': 10.0, 'h': 10.0}]);
+----
+does not exist

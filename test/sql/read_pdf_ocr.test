@@ -19,7 +19,7 @@ PRAGMA enable_verification
 # (image-only PDF has no embedded text; result may be empty string or whitespace).
 # auto_ocr defaults to true, so we must turn it off to observe the raw text layer.
 query I
-SELECT length(trim(text)) < 5
+SELECT text = ''
 FROM read_pdf('test/data/scanned.pdf', auto_ocr:=false);
 ----
 true
@@ -58,7 +58,7 @@ true
 # text layer flag from the source, and a stable substring when OCR is sane.
 
 query I
-SELECT length(trim(text)) > 0 AND has_text_layer
+SELECT text != '' AND has_text_layer
 FROM read_pdf('test/data/hello.pdf', ocr:=true);
 ----
 true

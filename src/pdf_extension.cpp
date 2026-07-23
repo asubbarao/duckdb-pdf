@@ -135,6 +135,31 @@ static string UStringToUtf8(const poppler::ustring &u) {
 	return string(b.begin(), b.end());
 }
 
+// Poppler (and OCR) often leave trailing form-feeds / CR / spaces on page text.
+// Trim once at the product boundary so callers and tests do not re-trim every query.
+static string TrimPdfPageText(string s) {
+	size_t start = 0;
+	while (start < s.size()) {
+		const unsigned char c = static_cast<unsigned char>(s[start]);
+		if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\f' && c != '\v') {
+			break;
+		}
+		start++;
+	}
+	size_t end = s.size();
+	while (end > start) {
+		const unsigned char c = static_cast<unsigned char>(s[end - 1]);
+		if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\f' && c != '\v') {
+			break;
+		}
+		end--;
+	}
+	if (start == 0 && end == s.size()) {
+		return s;
+	}
+	return s.substr(start, end - start);
+}
+
 static string TempDir();
 
 //===--------------------------------------------------------------------===//
@@ -1295,6 +1320,7 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 					}
 					// else: keep native (possibly empty on image-only pages)
 				}
+				text = TrimPdfPageText(std::move(text));
 			}
 		}
 
@@ -3326,10 +3352,14 @@ static string DocToText(poppler::document &doc, const string &layout_str) {
 		if (!page) {
 			continue;
 		}
+		string page_text = TrimPdfPageText(UStringToUtf8(page->text(poppler::rectf(), layout)));
+		if (page_text.empty()) {
+			continue;
+		}
 		if (!out.empty()) {
 			out.push_back('\n');
 		}
-		out += UStringToUtf8(page->text(poppler::rectf(), layout));
+		out += page_text;
 	}
 	return out;
 }
@@ -6068,6 +6098,12 @@ static vector<RedactBox> ParseRedactBoxes(const Value &list_val) {
 		box.h = DoubleValue::Get(RedactStructField(field_names, field_vals, "h").DefaultCastAs(LogicalType::DOUBLE));
 		if (box.page < 1) {
 			throw InvalidInputException("pdf_redact: redaction page must be >= 1 (got %d)", box.page);
+		}
+		// Zero/negative extent is never a true redaction (was accepted but left
+		// secrets extractable). Reject so callers cannot think a w=0 box scrubbed text.
+		if (!(box.w > 0.0) || !(box.h > 0.0)) {
+			throw InvalidInputException(
+			    "pdf_redact: redaction box w and h must be > 0 (got w=%f h=%f on page %d)", box.w, box.h, box.page);
 		}
 		boxes.push_back(box);
 	}

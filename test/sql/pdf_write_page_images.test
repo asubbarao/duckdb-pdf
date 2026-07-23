@@ -94,3 +94,22 @@ SELECT starts_with(hex(content), '89504E47') AND octet_length(content) > 100
 FROM read_blob('__TEST_DIR__/pages_hello/hello/p1.png');
 ----
 true
+
+# ── missing input ──────────────────────────────────────────────────────────
+statement error
+SELECT * FROM pdf_write_page_images('test/data/does_not_exist.pdf', '__TEST_DIR__/w');
+----
+does not exist
+
+# ── multi-file glob ────────────────────────────────────────────────────────
+query I
+SELECT count(*) FROM pdf_write_page_images(['test/data/hello.pdf', 'test/data/two_pages.pdf'],
+                                           '__TEST_DIR__/multi', dpi := 50);
+----
+3
+
+query I
+SELECT bool_and(starts_with(hex(content), '89504E47'))
+FROM glob('__TEST_DIR__/multi/**/*.png') g, LATERAL (SELECT content FROM read_blob(g.file)) b;
+----
+true

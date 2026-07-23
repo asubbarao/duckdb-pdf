@@ -18,7 +18,7 @@ PRAGMA enable_verification
 # sticky: auto_ocr must NOT fall through to bundled eng. used_ocr stays false;
 # content pages keep native text; blank pages stay empty.
 query III
-SELECT page, used_ocr, length(trim(text, E' \t\r\n\f')) > 0 AS has_text
+SELECT page, used_ocr, text != '' AS has_text
 FROM read_pdf('test/data/blank_split.pdf', tessdata_dir := '/nonexistent/tessdata')
 ORDER BY page;
 ----
@@ -39,7 +39,7 @@ WHERE page = 3;
 
 # image-only scan + auto_ocr + missing model: empty, not error, not used_ocr
 query II
-SELECT used_ocr, length(trim(text)) < 5
+SELECT used_ocr, text = ''
 FROM read_pdf('test/data/scanned.pdf', auto_ocr := true, tessdata_dir := '/nonexistent/tessdata');
 ----
 false	true

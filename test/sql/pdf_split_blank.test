@@ -29,17 +29,17 @@ ORDER BY document;
 # each emitted file is readable and carries the right content pages' text, in
 # order (poppler text extraction appends trailing whitespace/form-feeds, and \r on Windows — trim)
 query I
-SELECT list(trim(text, E' \r\n\f') ORDER BY page) FROM read_pdf('__TEST_DIR__/blank_split_doc1.pdf');
+SELECT list(text ORDER BY page) FROM read_pdf('__TEST_DIR__/blank_split_doc1.pdf');
 ----
 [DOC A PAGE 1, DOC A PAGE 2]
 
 query I
-SELECT list(trim(text, E' \r\n\f') ORDER BY page) FROM read_pdf('__TEST_DIR__/blank_split_doc2.pdf');
+SELECT list(text ORDER BY page) FROM read_pdf('__TEST_DIR__/blank_split_doc2.pdf');
 ----
 [DOC B PAGE 1]
 
 query I
-SELECT list(trim(text, E' \r\n\f') ORDER BY page) FROM read_pdf('__TEST_DIR__/blank_split_doc3.pdf');
+SELECT list(text ORDER BY page) FROM read_pdf('__TEST_DIR__/blank_split_doc3.pdf');
 ----
 [DOC C PAGE 1]
 
