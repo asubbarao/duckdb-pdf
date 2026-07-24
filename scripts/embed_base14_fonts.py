@@ -96,10 +96,12 @@ def main() -> int:
         out.write("#ifdef _WIN32\n")
         out.write("#include <direct.h>\n")
         out.write("#include <io.h>\n")
+        out.write("#include <windows.h>\n")
         out.write("#else\n")
         out.write("#include <sys/stat.h>\n")
         out.write("#include <sys/types.h>\n")
         out.write("#include <unistd.h>\n")
+        out.write("#include <cstdlib>\n")
         out.write("#endif\n\n")
 
         for base14_name, filename, data in blobs:
@@ -187,6 +189,41 @@ return true;
 
 namespace duckdb {
 
+// Absolute-ize path so setupBaseFonts openFile works even if process cwd moves
+// (extension CI / docker often chdir under the build tree).
+static std::string AbsPath(const std::string &path) {
+#ifdef _WIN32
+char buf[MAX_PATH];
+DWORD n = GetFullPathNameA(path.c_str(), MAX_PATH, buf, nullptr);
+if (n > 0 && n < MAX_PATH) {
+return std::string(buf, n);
+}
+return path;
+#else
+char *rp = realpath(path.c_str(), nullptr);
+if (rp) {
+std::string out(rp);
+free(rp);
+return out;
+}
+// realpath fails if last component missing — resolve parent + basename.
+std::string parent = path;
+auto slash = parent.find_last_of('/');
+if (slash == std::string::npos) {
+return path;
+}
+std::string base = parent.substr(slash + 1);
+parent.resize(slash == 0 ? 1 : slash);
+char *pp = realpath(parent.c_str(), nullptr);
+if (!pp) {
+return path;
+}
+std::string out = std::string(pp) + "/" + base;
+free(pp);
+return out;
+#endif
+}
+
 // Extract bundled URW Type1 base-14 fonts to a process temp dir and register
 // them with poppler so display-font resolution works without fontconfig.
 // Safe to call under PopplerMutex; idempotent once all files land.
@@ -207,22 +244,25 @@ const char sep = '\\';
 const char sep = '/';
 #endif
 // Bump dir suffix when font payload changes so stale bad trees are not reused.
-// v3 = real binary PFB (0x80 0x01 segments), not PFA text misnamed as .pfb.
-const std::string dir = Base14TempRoot() + sep + "duckdb_pdf_base14_fonts_v4_t1binary";
-if (!EnsureDir(dir)) {
+// v5 = absolute paths into setupBaseFonts (CI cwd is not stable).
+const std::string dir_rel = Base14TempRoot() + sep + "duckdb_pdf_base14_fonts_v5_t1binary";
+if (!EnsureDir(dir_rel)) {
 // Non-fatal: leave done=false so a later call can retry; poppler may
 // still find system fonts, and the fail-loudly path remains as a last resort.
 return;
 }
+const std::string dir = AbsPath(dir_rel);
 
 bool all_ok = true;
 for (size_t i = 0; i < kBase14FontCount; i++) {
 const Base14FontBlob &blob = kBase14Fonts[i];
-const std::string path = dir + sep + blob.filename;
-if (!WriteFileIfNeeded(path, blob.data, blob.size)) {
+const std::string path_rel = dir_rel + sep + blob.filename;
+if (!WriteFileIfNeeded(path_rel, blob.data, blob.size)) {
 all_ok = false;
+std::fprintf(stderr, "pdf: base14 write failed: %s\n", path_rel.c_str());
 continue;
 }
+const std::string path = AbsPath(path_rel);
 // External-font map (findFontFile) — covers callers that do not go through
 // the base-14 displayFontTab path.
 globalParams->addFontFile(std::string(blob.base14_name), path);
@@ -230,6 +270,7 @@ globalParams->addFontFile(std::string(blob.base14_name), path);
 // Critical for vcpkg poppler with fontconfig OFF: walk displayFontTab and
 // resolve Helvetica/etc. via the legacy n0*.pfb filenames we just wrote.
 // Files must be real binary PFB (FreeType rejects mislabeled PFA on some builds).
+// Pass absolute dir — relative fails when openFile is not cwd-relative.
 globalParams->setupBaseFonts(dir.c_str());
 
 // When poppler is built WITH fontconfig (community may enable it), point it at
