@@ -5,8 +5,7 @@
       "default-features": false,
       "features": [
         "zlib",
-        "private-api",
-        "fontconfig"
+        "private-api"
       ]
     },
     "tesseract",
