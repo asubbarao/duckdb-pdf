@@ -34,8 +34,7 @@ static void PdfPopplerErrorCallback(ErrorCategory /*category*/, Goffset pos, con
 	for (const char *p = msg; *p; ++p) {
 		lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*p))));
 	}
-	if (lower.find("no display font") != std::string::npos ||
-	    lower.find("couldn't find a font") != std::string::npos) {
+	if (lower.find("no display font") != std::string::npos || lower.find("couldn't find a font") != std::string::npos) {
 		g_poppler_missing_display_font = true;
 	}
 }

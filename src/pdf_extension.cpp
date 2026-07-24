@@ -6102,8 +6102,8 @@ static vector<RedactBox> ParseRedactBoxes(const Value &list_val) {
 		// Zero/negative extent is never a true redaction (was accepted but left
 		// secrets extractable). Reject so callers cannot think a w=0 box scrubbed text.
 		if (!(box.w > 0.0) || !(box.h > 0.0)) {
-			throw InvalidInputException(
-			    "pdf_redact: redaction box w and h must be > 0 (got w=%f h=%f on page %d)", box.w, box.h, box.page);
+			throw InvalidInputException("pdf_redact: redaction box w and h must be > 0 (got w=%f h=%f on page %d)",
+			                            box.w, box.h, box.page);
 		}
 		boxes.push_back(box);
 	}
