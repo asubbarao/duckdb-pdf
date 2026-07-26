@@ -108,8 +108,9 @@ SELECT count(*) FROM pdf_write_page_images(['test/data/hello.pdf', 'test/data/tw
 ----
 3
 
+# read_blob accepts globs; no lateral column-ref (TVF literal-only wall).
 query I
-SELECT bool_and(starts_with(hex(content), '89504E47'))
-FROM glob('__TEST_DIR__/multi/**/*.png') g, LATERAL (SELECT content FROM read_blob(g.file)) b;
+SELECT bool_and(starts_with(hex(content), '89504E47')) AND count(*) = 3
+FROM read_blob('__TEST_DIR__/multi/**/*.png');
 ----
 true

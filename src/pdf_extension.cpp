@@ -7735,7 +7735,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 		path_types.emplace_back(LogicalTypeId::VARCHAR);
 		path_types.push_back(LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
 		for (auto &path_type : path_types) {
-			TableFunction pdf_write_page_images("pdf_write_page_images", {path_type, LogicalType(LogicalTypeId::VARCHAR)},
+			TableFunction pdf_write_page_images("pdf_write_page_images",
+			                                    {path_type, LogicalType(LogicalTypeId::VARCHAR)},
 			                                    PdfWritePageImagesScan, PdfWritePageImagesBind, PdfWritePageImagesInit);
 			pdf_write_page_images.named_parameters["password"] = LogicalType::VARCHAR;
 			pdf_write_page_images.named_parameters["dpi"] = LogicalType::INTEGER;
