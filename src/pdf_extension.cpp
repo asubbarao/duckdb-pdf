@@ -7728,15 +7728,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(pdf_page_images);
 
 	// VARCHAR (path/glob) and LIST(VARCHAR) overloads — same bind/scan body.
+	// (Do not brace-init mixed LogicalTypeId + LogicalType — deduction fails on C++11 CI.)
 	TableFunctionSet pdf_write_page_images_set("pdf_write_page_images");
-	for (auto &path_type : {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}) {
-		TableFunction pdf_write_page_images("pdf_write_page_images", {path_type, LogicalType::VARCHAR},
-		                                    PdfWritePageImagesScan, PdfWritePageImagesBind, PdfWritePageImagesInit);
-		pdf_write_page_images.named_parameters["password"] = LogicalType::VARCHAR;
-		pdf_write_page_images.named_parameters["dpi"] = LogicalType::INTEGER;
-		pdf_write_page_images.named_parameters["first_page"] = LogicalType::INTEGER;
-		pdf_write_page_images.named_parameters["last_page"] = LogicalType::INTEGER;
-		pdf_write_page_images_set.AddFunction(std::move(pdf_write_page_images));
+	{
+		vector<LogicalType> path_types;
+		path_types.emplace_back(LogicalTypeId::VARCHAR);
+		path_types.push_back(LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+		for (auto &path_type : path_types) {
+			TableFunction pdf_write_page_images("pdf_write_page_images", {path_type, LogicalType(LogicalTypeId::VARCHAR)},
+			                                    PdfWritePageImagesScan, PdfWritePageImagesBind, PdfWritePageImagesInit);
+			pdf_write_page_images.named_parameters["password"] = LogicalType::VARCHAR;
+			pdf_write_page_images.named_parameters["dpi"] = LogicalType::INTEGER;
+			pdf_write_page_images.named_parameters["first_page"] = LogicalType::INTEGER;
+			pdf_write_page_images.named_parameters["last_page"] = LogicalType::INTEGER;
+			pdf_write_page_images_set.AddFunction(std::move(pdf_write_page_images));
+		}
 	}
 	loader.RegisterFunction(pdf_write_page_images_set);
 
