@@ -226,12 +226,13 @@ return out;
 
 // Extract bundled URW Type1 base-14 fonts to a process temp dir and register
 // them with poppler so display-font resolution works without fontconfig.
-// Safe to call under PopplerMutex; idempotent once all files land.
+//
+// Safe under PopplerMutex. Disk extract is once-per-process; *registration*
+// must re-run whenever globalParams is recreated. poppler-cpp's
+// GlobalParamsIniter destroys globalParams when the last document closes
+// (refcount → 0), wiping fontFiles — a permanent "done" flag then skips
+// re-register and every later redact/raster fails with "No display font".
 void EnsurePdfBase14Fonts() {
-static bool done = false;
-if (done) {
-return;
-}
 // poppler creates globalParams on first document open; without it we cannot
 // register fonts yet. Caller retries on the next render.
 if (!globalParams) {
@@ -244,15 +245,16 @@ const char sep = '\\';
 const char sep = '/';
 #endif
 // Bump dir suffix when font payload changes so stale bad trees are not reused.
-// v5 = absolute paths into setupBaseFonts (CI cwd is not stable).
-const std::string dir_rel = Base14TempRoot() + sep + "duckdb_pdf_base14_fonts_v5_t1binary";
+// v6 = re-register after GlobalParamsIniter teardown (not just extract once).
+const std::string dir_rel = Base14TempRoot() + sep + "duckdb_pdf_base14_fonts_v6_t1binary";
 if (!EnsureDir(dir_rel)) {
-// Non-fatal: leave done=false so a later call can retry; poppler may
-// still find system fonts, and the fail-loudly path remains as a last resort.
+// Non-fatal: poppler may still find system fonts; fail-loudly remains last resort.
 return;
 }
 const std::string dir = AbsPath(dir_rel);
 
+static bool extracted = false;
+if (!extracted) {
 bool all_ok = true;
 for (size_t i = 0; i < kBase14FontCount; i++) {
 const Base14FontBlob &blob = kBase14Fonts[i];
@@ -260,17 +262,26 @@ const std::string path_rel = dir_rel + sep + blob.filename;
 if (!WriteFileIfNeeded(path_rel, blob.data, blob.size)) {
 all_ok = false;
 std::fprintf(stderr, "pdf: base14 write failed: %s\n", path_rel.c_str());
-continue;
 }
+}
+if (all_ok) {
+extracted = true;
+}
+}
+
+for (size_t i = 0; i < kBase14FontCount; i++) {
+const Base14FontBlob &blob = kBase14Fonts[i];
+const std::string path_rel = dir_rel + sep + blob.filename;
 const std::string path = AbsPath(path_rel);
 // External-font map (findFontFile) — covers callers that do not go through
-// the base-14 displayFontTab path.
+// the base-14 displayFontTab path. Re-run every time globalParams is live.
 globalParams->addFontFile(std::string(blob.base14_name), path);
 }
 // Critical for vcpkg poppler with fontconfig OFF: walk displayFontTab and
 // resolve Helvetica/etc. via the legacy n0*.pfb filenames we just wrote.
 // Files must be real binary PFB (FreeType rejects mislabeled PFA on some builds).
 // Pass absolute dir — relative fails when openFile is not cwd-relative.
+// setupBaseFonts skips names already in fontFiles (addFontFile above).
 globalParams->setupBaseFonts(dir.c_str());
 
 // When poppler is built WITH fontconfig (community may enable it), point it at
@@ -297,10 +308,6 @@ setenv("FONTCONFIG_PATH", dir.c_str(), 0);
 }
 #endif
 }
-}
-
-if (all_ok) {
-done = true;
 }
 }
 

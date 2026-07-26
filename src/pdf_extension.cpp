@@ -7172,7 +7172,22 @@ static void PdfWriteBytesToFile(const string &path, const string &bytes, const c
 static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, TableFunctionBindInput &input,
                                                        vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<PdfWritePageImagesBindData>();
-	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	const auto &src = input.inputs[0];
+	if (src.type().id() == LogicalTypeId::LIST) {
+		// LIST(VARCHAR) — multi-file constant list (same shape as pdf_merge inputs).
+		for (auto &child : ListValue::GetChildren(src)) {
+			if (child.IsNull()) {
+				throw InvalidInputException("pdf_write_page_images: input list contains a NULL path");
+			}
+			auto resolved = ResolveFiles(context, StringValue::Get(child));
+			result->files.insert(result->files.end(), resolved.begin(), resolved.end());
+		}
+		if (result->files.empty()) {
+			throw InvalidInputException("pdf_write_page_images: input list is empty");
+		}
+	} else {
+		result->files = ResolveFiles(context, StringValue::Get(src));
+	}
 	result->out_dir = StringValue::Get(input.inputs[1]);
 	if (result->out_dir.empty()) {
 		throw InvalidInputException("pdf_write_page_images: out_dir must not be empty");
@@ -7712,13 +7727,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_page_images.named_parameters["last_page"] = LogicalType::INTEGER;
 	loader.RegisterFunction(pdf_page_images);
 
-	TableFunction pdf_write_page_images("pdf_write_page_images", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                    PdfWritePageImagesScan, PdfWritePageImagesBind, PdfWritePageImagesInit);
-	pdf_write_page_images.named_parameters["password"] = LogicalType::VARCHAR;
-	pdf_write_page_images.named_parameters["dpi"] = LogicalType::INTEGER;
-	pdf_write_page_images.named_parameters["first_page"] = LogicalType::INTEGER;
-	pdf_write_page_images.named_parameters["last_page"] = LogicalType::INTEGER;
-	loader.RegisterFunction(pdf_write_page_images);
+	// VARCHAR (path/glob) and LIST(VARCHAR) overloads — same bind/scan body.
+	TableFunctionSet pdf_write_page_images_set("pdf_write_page_images");
+	for (auto &path_type : {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}) {
+		TableFunction pdf_write_page_images("pdf_write_page_images", {path_type, LogicalType::VARCHAR},
+		                                    PdfWritePageImagesScan, PdfWritePageImagesBind, PdfWritePageImagesInit);
+		pdf_write_page_images.named_parameters["password"] = LogicalType::VARCHAR;
+		pdf_write_page_images.named_parameters["dpi"] = LogicalType::INTEGER;
+		pdf_write_page_images.named_parameters["first_page"] = LogicalType::INTEGER;
+		pdf_write_page_images.named_parameters["last_page"] = LogicalType::INTEGER;
+		pdf_write_page_images_set.AddFunction(std::move(pdf_write_page_images));
+	}
+	loader.RegisterFunction(pdf_write_page_images_set);
 
 	TableFunction pdf_qpdf_info("pdf_qpdf_info", {LogicalType::VARCHAR}, PdfQpdfInfoScan, PdfQpdfInfoBind,
 	                            PdfQpdfInfoInit);
