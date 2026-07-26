@@ -99,7 +99,7 @@ true
 statement error
 SELECT * FROM pdf_write_page_images('test/data/does_not_exist.pdf', '__TEST_DIR__/w');
 ----
-does not exist
+No such file or directory
 
 # ── multi-file glob ────────────────────────────────────────────────────────
 query I
