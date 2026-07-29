@@ -487,8 +487,7 @@ bool EnsureTesseract(const Options &opt) {
 	}
 
 	auto &eng = TlsTess();
-	const bool need_init =
-	    !eng.ready || eng.language != opt.language || eng.oem != opt.oem || eng.datapath != datadir;
+	const bool need_init = !eng.ready || eng.language != opt.language || eng.oem != opt.oem || eng.datapath != datadir;
 	if (need_init) {
 		if (eng.ready) {
 			eng.api.End();
@@ -498,8 +497,8 @@ bool EnsureTesseract(const Options &opt) {
 		{
 			// Verified path only — silence residual library chatter during Init.
 			StderrSilence silence;
-			init_rc = eng.api.Init(datadir.c_str(), opt.language.c_str(),
-			                       static_cast<tesseract::OcrEngineMode>(opt.oem));
+			init_rc =
+			    eng.api.Init(datadir.c_str(), opt.language.c_str(), static_cast<tesseract::OcrEngineMode>(opt.oem));
 		}
 		if (init_rc != 0) {
 			if (opt.best_effort) {

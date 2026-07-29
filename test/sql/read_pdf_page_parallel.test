@@ -1,6 +1,7 @@
 # name: test/sql/read_pdf_page_parallel.test
 # description: Intra-PDF page parallelism — multi-page single file under SET threads=N
 # group: [sql]
+
 #              must return the same multiset as a serial scan (order-independent).
 #              On Windows MaxThreads follows the scheduler (poppler still
 #              mutex-serialized via PopplerDocGuard); assertions still hold.

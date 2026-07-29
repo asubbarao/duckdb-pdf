@@ -1245,9 +1245,9 @@ struct ReadPdfFileSlot {
 	string path;
 	string bytes; // immutable after load_done; shared by all workers on this file
 	int page_count = 0;
-	int first_page_0 = 0;              // inclusive
-	int last_page_0 = 0;               // exclusive
-	std::atomic<int> next_page {0};    // next 0-based page to claim
+	int first_page_0 = 0;           // inclusive
+	int last_page_0 = 0;            // exclusive
+	std::atomic<int> next_page {0}; // next 0-based page to claim
 	std::atomic<bool> load_done {false};
 	std::atomic<bool> load_failed {false};
 	std::mutex load_mutex;
@@ -1438,10 +1438,9 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 			// discard readable embedded text. Image-only pages still get the
 			// loud missing-model error under force_ocr.
 			const bool best_effort = !bind.opt.force_ocr || has_text_layer;
-			string ocr =
-			    OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm, bind.opt.ocr_oem,
-			            bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry, best_effort,
-			            bind.opt.ocr_backend, bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
+			string ocr = OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
+			                     bind.opt.ocr_oem, bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry,
+			                     best_effort, bind.opt.ocr_backend, bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
 			if (!ocr.empty()) {
 				text = ocr;
 				used_ocr = true;
@@ -3608,8 +3607,8 @@ static PdfDocHandle LoadBlobDoc(const string &fn, const char *data, idx_t size) 
 		                            (unsigned long long)size);
 	}
 	string bytes(data, size);
-	auto doc = unique_ptr<poppler::document>(
-	    poppler::document::load_from_raw_data(bytes.data(), (int)bytes.size(), "", ""));
+	auto doc =
+	    unique_ptr<poppler::document>(poppler::document::load_from_raw_data(bytes.data(), (int)bytes.size(), "", ""));
 	if (!doc) {
 		throw InvalidInputException("%s: input BLOB is not a valid PDF (%llu bytes)", fn, (unsigned long long)size);
 	}
@@ -4044,12 +4043,11 @@ static void PopplerRenderPageFun(DataChunk &args, ExpressionState &state, Vector
 		    std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 		    int n = handle.doc->pages();
 		    if (page_no < 1 || page_no > n) {
-			    throw IOException("poppler_render_page: page %d is out of range (document has %d page%s)",
-			                      (int)page_no, n, n == 1 ? "" : "s");
+			    throw IOException("poppler_render_page: page %d is out of range (document has %d page%s)", (int)page_no,
+			                      n, n == 1 ? "" : "s");
 		    }
 		    if (dpi < 1 || dpi > 2400) {
-			    throw InvalidInputException("poppler_render_page: dpi must be between 1 and 2400 (got %d)",
-			                                (int)dpi);
+			    throw InvalidInputException("poppler_render_page: dpi must be between 1 and 2400 (got %d)", (int)dpi);
 		    }
 		    auto png = RenderPageToPngBytes(*handle.doc, page_no, dpi, "poppler_render_page");
 		    return StringVector::AddStringOrBlob(result, string_t(png.data(), static_cast<uint32_t>(png.size())));
@@ -4094,12 +4092,10 @@ static void TesseractOcrLangFun(DataChunk &args, ExpressionState &state, Vector 
 static void TesseractOcrLangPsmFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	(void)state;
 	TernaryExecutor::Execute<string_t, string_t, int32_t, string_t>(
-	    args.data[0], args.data[1], args.data[2], result, args.size(),
-	    [&](string_t blob, string_t lang, int32_t psm) {
+	    args.data[0], args.data[1], args.data[2], result, args.size(), [&](string_t blob, string_t lang, int32_t psm) {
 		    return StringVector::AddString(result, RunTesseractOcrOnBlob(blob, lang.GetString(), psm));
 	    });
 }
-
 
 //===--------------------------------------------------------------------===//
 // to_pdf(input_path[, output_path]) — convert an office/markup document
