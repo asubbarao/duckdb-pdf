@@ -10,6 +10,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -17,16 +18,26 @@ namespace duckdb {
 
 static bool g_poppler_missing_display_font = false;
 
+// Opt-in stderr for poppler library chatter. Equality check only (no regex).
+static bool PopplerLogToStderr() {
+	const char *e = std::getenv("PDF_POPPLER_LOG");
+	return e && std::strcmp(e, "1") == 0;
+}
+
 static void PdfPopplerErrorCallback(ErrorCategory /*category*/, Goffset pos, const char *msg) {
 	if (!msg) {
 		return;
 	}
-	// setErrorCallback replaces poppler's default stderr printer — re-emit so
-	// other diagnostics (malformed PDF, bad password, …) stay visible.
-	if (pos >= 0) {
-		std::fprintf(stderr, "poppler/error (%lld): %s\n", static_cast<long long>(pos), msg);
-	} else {
-		std::fprintf(stderr, "poppler/error: %s\n", msg);
+	// setErrorCallback replaces poppler's default stderr printer. We still
+	// track missing-display-font for fail-loud font paths, but do NOT spam the
+	// user terminal by default — corrupt/open failures throw via LoadDoc.
+	// Opt in: PDF_POPPLER_LOG=1.
+	if (PopplerLogToStderr()) {
+		if (pos >= 0) {
+			std::fprintf(stderr, "poppler/error (%lld): %s\n", static_cast<long long>(pos), msg);
+		} else {
+			std::fprintf(stderr, "poppler/error: %s\n", msg);
+		}
 	}
 	// Case-insensitive substring — do not invent a full error taxonomy.
 	std::string lower;

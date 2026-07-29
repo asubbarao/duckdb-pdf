@@ -15,6 +15,13 @@
 // the tesseract CLI; everything is in-process via TessBaseAPI for the default
 // backend.
 //
+// TessBaseAPI lifecycle: Init() is expensive (loads traineddata). Recognize*
+// reuses a thread_local TessBaseAPI keyed by (language, oem, datapath) and
+// Clear()s between pages — matching DuckDB's per-worker-thread LocalState
+// model without exposing tesseract types across this isolation boundary.
+// Init is never called unless <datapath>/<lang>.traineddata is verified on
+// disk first (stops "Failed loading language" stderr at the source).
+//
 // Backends
 // --------
 //   "tesseract" (default, linked): in-process TessBaseAPI + leptonica
@@ -111,6 +118,13 @@ TextResult RecognizeText(const unsigned char *data, int width, int height, int b
 
 WordsResult RecognizeWords(const unsigned char *data, int width, int height, int bytes_per_row, ImageFormat format,
                            const Options &opt);
+
+// OCR an encoded image BLOB (PNG/JPEG/etc. that leptonica pixReadMem accepts).
+// Uses the same thread_local TessBaseAPI path as RecognizeText. Throws
+// std::runtime_error on undecodable input or hard OCR failure when
+// best_effort is false. External backend is not supported on this entry
+// (decode → SetImage is tesseract/leptonica only).
+TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Options &opt);
 
 // Bundled tessdata (eng from tessdata_fast): extract to a process temp dir.
 // Implemented in generated tessdata_embed.cpp. Empty string if language is not

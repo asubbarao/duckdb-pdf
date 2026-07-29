@@ -14,6 +14,7 @@
 
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -25,9 +26,13 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <fcntl.h>
+#include <io.h>
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 namespace pdf_ocr {
@@ -367,28 +372,151 @@ Pix *PreprocessPixForOcr(Pix *pixs, int dpi) {
 	return pixb;
 }
 
-bool InitTesseract(tesseract::TessBaseAPI &api, const Options &opt) {
+// Silence tesseract/leptonica tprintf spam during Init only. Root cause of
+// "Failed loading language" on stderr is calling Init when traineddata is
+// missing or datapath is wrong — we never Init without a verified model file
+// (see EnsureTesseract). This guard only covers residual library chatter
+// (version banners, non-fatal path probes) so the DuckDB CLI stays clean.
+struct StderrSilence {
+#ifdef _WIN32
+	int saved = -1;
+	StderrSilence() {
+		fflush(stderr);
+		int devnull = _open("NUL", _O_WRONLY);
+		if (devnull >= 0) {
+			saved = _dup(_fileno(stderr));
+			if (saved >= 0) {
+				_dup2(devnull, _fileno(stderr));
+			}
+			_close(devnull);
+		}
+	}
+	~StderrSilence() {
+		if (saved >= 0) {
+			fflush(stderr);
+			_dup2(saved, _fileno(stderr));
+			_close(saved);
+		}
+	}
+#else
+	int saved = -1;
+	StderrSilence() {
+		fflush(stderr);
+		int devnull = open("/dev/null", O_WRONLY);
+		if (devnull >= 0) {
+			saved = dup(fileno(stderr));
+			if (saved >= 0) {
+				dup2(devnull, fileno(stderr));
+			}
+			close(devnull);
+		}
+	}
+	~StderrSilence() {
+		if (saved >= 0) {
+			fflush(stderr);
+			dup2(saved, fileno(stderr));
+			close(saved);
+		}
+	}
+#endif
+	StderrSilence(const StderrSilence &) = delete;
+	StderrSilence &operator=(const StderrSilence &) = delete;
+};
+
+static std::string MissingModelMessage(const Options &opt) {
+	std::string msg = "read_pdf OCR: could not load the Tesseract model for language '" + opt.language + "'.";
+	if (HasBundledTessdata(opt.language)) {
+		msg += " English (eng) is bundled in this extension; this usually means tessdata_dir pointed "
+		       "at a broken path, or the temp extract of the bundled model failed.";
+	} else {
+		msg += " Install a language model — macOS: `brew install tesseract-lang`; Debian/Ubuntu: "
+		       "`apt-get install tesseract-ocr-" +
+		       opt.language + "`; Windows: the UB Mannheim installer; or download " + opt.language +
+		       ".traineddata from https://github.com/tesseract-ocr/tessdata_fast.";
+	}
+	msg += " Resolution order: tessdata_dir → TESSDATA_PREFIX → standard install paths → "
+	       "bundled eng (when available).";
+	return msg;
+}
+
+// Thread-local TessBaseAPI lifecycle (the #1 OCR performance fix).
+//
+// TessBaseAPI is NOT safe to share across threads, but Init() reloads traineddata
+// from disk and rebuilds language models — doing that per page destroys throughput.
+// DuckDB table-function workers map 1:1 onto OS threads for a scan, so a
+// thread_local engine is the natural match for TableFunctionLocalState without
+// pulling tesseract types across the ocr_ops isolation boundary into pdf_extension.
+//
+// Reuse rules:
+//   - Init once per (thread, language, oem, datapath)
+//   - SetPageSegMode only when psm changes
+//   - Clear() between pages (free page bitmap/results) — never End() in the hot loop
+//   - Never call Init unless <datapath>/<lang>.traineddata exists on disk
+struct ThreadTessEngine {
+	tesseract::TessBaseAPI api;
+	bool ready = false;
+	std::string language;
+	int oem = -1;
+	std::string datapath;
+	int psm = -1;
+
+	~ThreadTessEngine() {
+		if (ready) {
+			api.End();
+			ready = false;
+		}
+	}
+};
+
+ThreadTessEngine &TlsTess() {
+	// thread_local: one persistent engine per worker thread
+	thread_local ThreadTessEngine eng;
+	return eng;
+}
+
+bool EnsureTesseract(const Options &opt) {
+	// Resolve + verify the model file BEFORE any TessBaseAPI::Init call.
+	// Init with a missing/wrong path is what prints "Failed loading language"
+	// and "Please make sure TESSDATA_PREFIX…" to stderr — fix at source.
 	std::string datadir = ResolveTessdataDir(opt.language, opt.tessdata_dir);
-	const char *datapath = datadir.empty() ? nullptr : datadir.c_str();
-	if (api.Init(datapath, opt.language.c_str(), static_cast<tesseract::OcrEngineMode>(opt.oem)) != 0) {
+	if (datadir.empty() || !ModelExistsIn(datadir, opt.language)) {
 		if (opt.best_effort) {
 			return false;
 		}
-		std::string msg = "read_pdf OCR: could not load the Tesseract model for language '" + opt.language + "'.";
-		if (HasBundledTessdata(opt.language)) {
-			msg += " English (eng) is bundled in this extension; this usually means tessdata_dir pointed "
-			       "at a broken path, or the temp extract of the bundled model failed.";
-		} else {
-			msg += " Install a language model — macOS: `brew install tesseract-lang`; Debian/Ubuntu: "
-			       "`apt-get install tesseract-ocr-" +
-			       opt.language + "`; Windows: the UB Mannheim installer; or download " + opt.language +
-			       ".traineddata from https://github.com/tesseract-ocr/tessdata_fast.";
-		}
-		msg += " Resolution order: tessdata_dir → TESSDATA_PREFIX → standard install paths → "
-		       "bundled eng (when available).";
-		throw std::runtime_error(msg);
+		throw std::runtime_error(MissingModelMessage(opt));
 	}
-	api.SetPageSegMode(static_cast<tesseract::PageSegMode>(opt.psm));
+
+	auto &eng = TlsTess();
+	const bool need_init =
+	    !eng.ready || eng.language != opt.language || eng.oem != opt.oem || eng.datapath != datadir;
+	if (need_init) {
+		if (eng.ready) {
+			eng.api.End();
+			eng.ready = false;
+		}
+		int init_rc;
+		{
+			// Verified path only — silence residual library chatter during Init.
+			StderrSilence silence;
+			init_rc = eng.api.Init(datadir.c_str(), opt.language.c_str(),
+			                       static_cast<tesseract::OcrEngineMode>(opt.oem));
+		}
+		if (init_rc != 0) {
+			if (opt.best_effort) {
+				return false;
+			}
+			throw std::runtime_error(MissingModelMessage(opt));
+		}
+		eng.ready = true;
+		eng.language = opt.language;
+		eng.oem = opt.oem;
+		eng.datapath = datadir;
+		eng.psm = -1; // force SetPageSegMode below
+	}
+	if (eng.psm != opt.psm) {
+		eng.api.SetPageSegMode(static_cast<tesseract::PageSegMode>(opt.psm));
+		eng.psm = opt.psm;
+	}
 	return true;
 }
 
@@ -423,10 +551,10 @@ TextResult RecognizeTesseractText(const unsigned char *data, int width, int heig
 		return out;
 	}
 
-	tesseract::TessBaseAPI api;
-	if (!InitTesseract(api, opt)) {
+	if (!EnsureTesseract(opt)) {
 		return out;
 	}
+	auto &api = TlsTess().api;
 
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
@@ -436,7 +564,8 @@ TextResult RecognizeTesseractText(const unsigned char *data, int width, int heig
 	out.text = text ? std::string(text) : std::string();
 	delete[] text;
 	out.confidence = api.MeanTextConf();
-	api.End();
+	// Keep the engine warm for the next page on this thread; free only page state.
+	api.Clear();
 	DestroyPixPair(processed, base);
 	return out;
 }
@@ -449,10 +578,10 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 		return out;
 	}
 
-	tesseract::TessBaseAPI api;
-	if (!InitTesseract(api, opt)) {
+	if (!EnsureTesseract(opt)) {
 		return out;
 	}
+	auto &api = TlsTess().api;
 
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
@@ -460,7 +589,7 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 
 	int rec = api.Recognize(0);
 	if (rec != 0) {
-		api.End();
+		api.Clear();
 		DestroyPixPair(processed, base);
 		return out;
 	}
@@ -493,7 +622,7 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 			}
 		} while (ri->Next(tesseract::RIL_WORD));
 	}
-	api.End();
+	api.Clear();
 	DestroyPixPair(processed, base);
 	return out;
 }
@@ -558,6 +687,72 @@ WordsResult RecognizeWords(const unsigned char *data, int width, int height, int
 		return wr;
 	}
 	return RecognizeTesseractWords(data, width, height, bytes_per_row, format, opt);
+}
+
+TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Options &opt) {
+	TextResult out;
+	out.backend_used = Backend::Tesseract;
+	if (!data || size == 0) {
+		if (opt.best_effort) {
+			return out;
+		}
+		throw std::runtime_error("tesseract_ocr: empty image BLOB");
+	}
+	if (opt.backend == Backend::External) {
+		if (opt.best_effort) {
+			out.backend_used = Backend::External;
+			return out;
+		}
+		throw std::runtime_error("tesseract_ocr: external OCR backend is not supported for encoded image BLOBs "
+		                         "(use tesseract, or decode externally and call the plugin C ABI)");
+	}
+
+	// leptonica owns the decoder (PNG/JPEG/TIFF/…); no poppler dependency here.
+	// Silence residual "Error in pixReadMem: …" chatter on bad inputs (same pattern
+	// as TessBaseAPI::Init — actionable errors go through our throw message).
+	Pix *pix = nullptr;
+	{
+		StderrSilence silence;
+		pix = pixReadMem(data, size);
+	}
+	if (!pix) {
+		if (opt.best_effort) {
+			return out;
+		}
+		throw std::runtime_error("tesseract_ocr: could not decode image BLOB "
+		                         "(expected PNG/JPEG/etc. readable by leptonica, e.g. from poppler_render_page)");
+	}
+
+	if (!EnsureTesseract(opt)) {
+		pixDestroy(&pix);
+		return out;
+	}
+	auto &api = TlsTess().api;
+
+	const int dpi = opt.dpi > 0 ? opt.dpi : 300;
+	// Prefer embedded resolution when present; otherwise stamp dpi for preprocess.
+	{
+		l_int32 xres = 0, yres = 0;
+		pixGetResolution(pix, &xres, &yres);
+		if (xres <= 0 || yres <= 0) {
+			pixSetResolution(pix, dpi, dpi);
+		}
+	}
+
+	Pix *processed = nullptr;
+	if (opt.preprocess) {
+		processed = PreprocessPixForOcr(pix, dpi);
+	}
+	Pix *use = processed ? processed : pix;
+	api.SetImage(use);
+
+	char *text = api.GetUTF8Text();
+	out.text = text ? std::string(text) : std::string();
+	delete[] text;
+	out.confidence = api.MeanTextConf();
+	api.Clear();
+	DestroyPixPair(processed, pix);
+	return out;
 }
 
 } // namespace pdf_ocr

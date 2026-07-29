@@ -1,0 +1,82 @@
+# name: test/sql/pdf_lowlevel_api.test
+# description: Low-level scalars: poppler_version, poppler_render_page, tesseract_ocr
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# ── poppler_version() ───────────────────────────────────────────────────────
+
+query I
+SELECT poppler_version() IS NOT NULL;
+----
+true
+
+query I
+SELECT length(poppler_version()) > 0;
+----
+true
+
+# ── poppler_render_page(blob, page, dpi) ────────────────────────────────────
+
+query I
+SELECT octet_length(poppler_render_page((SELECT content FROM read_blob('test/data/hello.pdf')), 1, 72)) > 100;
+----
+true
+
+query I
+SELECT poppler_render_page((SELECT content FROM read_blob('test/data/hello.pdf')), 1, 72)[1:4] = '\x89PNG'::BLOB;
+----
+true
+
+# page out of range (1-based, same style as pdf_to_png)
+statement error
+SELECT poppler_render_page((SELECT content FROM read_blob('test/data/hello.pdf')), 0, 72);
+----
+out of range
+
+statement error
+SELECT poppler_render_page((SELECT content FROM read_blob('test/data/hello.pdf')), 99, 72);
+----
+out of range
+
+statement error
+SELECT poppler_render_page((SELECT content FROM read_blob('test/data/hello.pdf')), 1, 0);
+----
+dpi must be between
+
+# ── tesseract_ocr on rendered page (optional OCR path) ──────────────────────
+# Render a scanned page then OCR the PNG BLOB. Bundled eng model must work.
+
+query I
+SELECT length(tesseract_ocr(
+  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150)
+)) > 0;
+----
+true
+
+# lang + psm overloads bind
+query I
+SELECT length(tesseract_ocr(
+  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
+  'eng'
+)) > 0;
+----
+true
+
+query I
+SELECT length(tesseract_ocr(
+  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
+  'eng',
+  3
+)) > 0;
+----
+true
+
+# garbage image BLOB fails
+statement error
+SELECT tesseract_ocr('\x00\x01\x02\x03'::BLOB);
+----
+could not decode image BLOB

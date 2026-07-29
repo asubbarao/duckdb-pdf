@@ -1,0 +1,41 @@
+# name: test/sql/read_pdf_layout.test
+# description: read_pdf_layout — high-level layout alias of read_pdf_words
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# Same grain as read_pdf_words: one row per word with bbox
+query I
+SELECT count(*) > 0 FROM read_pdf_layout('test/data/hello.pdf');
+----
+true
+
+query I
+SELECT bool_and(x1 >= x0 AND y1 >= y0)
+FROM read_pdf_layout('test/data/hello.pdf');
+----
+true
+
+# Equivalence: layout rows match words rows (filename normalized)
+query I
+WITH w AS (
+  SELECT replace(filename, chr(92), '/') AS filename, page, word, x0, y0, x1, y1, font_name, font_size, source
+  FROM read_pdf_words('test/data/hello.pdf')
+), l AS (
+  SELECT replace(filename, chr(92), '/') AS filename, page, word, x0, y0, x1, y1, font_name, font_size, source
+  FROM read_pdf_layout('test/data/hello.pdf')
+)
+SELECT (SELECT count(*) FROM (SELECT * FROM w EXCEPT SELECT * FROM l)) = 0
+   AND (SELECT count(*) FROM (SELECT * FROM l EXCEPT SELECT * FROM w)) = 0
+   AND (SELECT count(*) FROM w) = (SELECT count(*) FROM l);
+----
+true
+
+# Named params still bind — page 2 (Beta) has words
+query I
+SELECT count(*) > 0 FROM read_pdf_layout('test/data/two_pages.pdf', first_page := 2, last_page := 2);
+----
+true

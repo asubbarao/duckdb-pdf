@@ -1,0 +1,73 @@
+# name: test/sql/read_pdf_page_parallel.test
+# description: Intra-PDF page parallelism — multi-page single file under SET threads=N
+# group: [sql]
+#              must return the same multiset as a serial scan (order-independent).
+#              On Windows MaxThreads follows the scheduler (poppler still
+#              mutex-serialized via PopplerDocGuard); assertions still hold.
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+SET threads=4;
+
+# Build one multi-page PDF (8 pages) via the extension writer
+loop i 0 8
+
+statement ok
+COPY (SELECT 'page_parallel_marker_${i}' AS line) TO '__TEST_DIR__/pp_page_${i}.pdf' (FORMAT pdf);
+
+endloop
+
+# Merge into one multi-page document if pdf_merge exists; else UNION of single-page
+# files is already covered by read_pdf_parallel_scan. Here we stress ONE file with
+# many pages by concatenating via pdf_merge when available.
+
+statement ok
+SELECT pdf_merge(['__TEST_DIR__/pp_page_0.pdf','__TEST_DIR__/pp_page_1.pdf','__TEST_DIR__/pp_page_2.pdf','__TEST_DIR__/pp_page_3.pdf','__TEST_DIR__/pp_page_4.pdf','__TEST_DIR__/pp_page_5.pdf','__TEST_DIR__/pp_page_6.pdf','__TEST_DIR__/pp_page_7.pdf'], '__TEST_DIR__/pp_multi.pdf');
+
+query III
+SELECT count(*), count(DISTINCT page), max(page_count)
+FROM read_pdf('__TEST_DIR__/pp_multi.pdf');
+----
+8	8	8
+
+# Every page carries its own marker (right text on right page under parallel claim)
+query I
+SELECT bool_and(contains(text, concat('page_parallel_marker_', cast(page - 1 AS VARCHAR))))
+FROM read_pdf('__TEST_DIR__/pp_multi.pdf');
+----
+true
+
+# Parallel multi-page scan == serial (threads=1) result multiset
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE serial_pp AS
+SELECT page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pp_multi.pdf');
+
+statement ok
+SET threads=4;
+
+statement ok
+CREATE TEMP TABLE parallel_pp AS
+SELECT page, page_count, text, width, height FROM read_pdf('__TEST_DIR__/pp_multi.pdf');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM parallel_pp EXCEPT SELECT * FROM serial_pp)) = 0
+   AND (SELECT count(*) FROM (SELECT * FROM serial_pp EXCEPT SELECT * FROM parallel_pp)) = 0
+   AND (SELECT count(*) FROM parallel_pp) = (SELECT count(*) FROM serial_pp);
+----
+true
+
+# first_page / last_page still slice correctly under parallel page claim
+query II
+SELECT page, contains(text, 'page_parallel_marker_2')
+FROM read_pdf('__TEST_DIR__/pp_multi.pdf', first_page := 3, last_page := 4)
+ORDER BY page;
+----
+3	true
+4	false

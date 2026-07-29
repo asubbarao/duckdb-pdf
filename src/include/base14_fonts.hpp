@@ -24,6 +24,8 @@ namespace duckdb {
 void EnsurePdfBase14Fonts();
 
 // Install setErrorCallback once (poppler private API). Safe under PopplerMutex.
+// Tracks missing-display-font for fail-loud font paths; stderr only when
+// PDF_POPPLER_LOG=1 (default quiet — LoadDoc still throws on open failure).
 void EnsurePopplerErrorCallback();
 
 // Reset / read the missing-display-font flag set by the error callback.
