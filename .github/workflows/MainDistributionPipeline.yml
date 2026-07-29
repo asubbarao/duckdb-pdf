@@ -19,8 +19,10 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
-  cancel-in-progress: true
+  # Do not cancel in-progress multi-host builds — full linux/macOS/windows ×
+  # v1.5.3–v1.5.5 matrices take a long time; canceling wastes the run.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   resolve-matrix:
