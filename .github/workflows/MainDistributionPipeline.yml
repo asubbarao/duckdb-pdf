@@ -1,33 +1,140 @@
 #
-# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
+# Build, test, and (on tags) publish extension binaries.
+#
+# Host support floor: DuckDB v1.5.3 (quack) and later on the 1.5 line.
+#
+# Matrix policy:
+#   - push / pull_request → smoke build for tip only (v1.5.5)
+#   - workflow_dispatch with multi_version=true (default) → full matrix
+#   - tag push (v*) → full matrix + GitHub Release assets
+#
+# Platforms (via extension-ci-tools): linux_amd64, linux_arm64, osx_amd64,
+# osx_arm64, windows_amd64. Excludes wasm / MinGW / rtools / windows_arm64.
 #
 name: Main Extension Distribution Pipeline
 on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      multi_version:
+        description: "Build all supported DuckDB hosts (v1.5.3, v1.5.4, v1.5.5)"
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: true
 
 jobs:
+  resolve-matrix:
+    name: Resolve DuckDB version matrix
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.set.outputs.versions }}
+      multi: ${{ steps.set.outputs.multi }}
+    steps:
+      - id: set
+        run: |
+          set -euo pipefail
+          MULTI=false
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.multi_version }}" == "true" ]]; then
+              MULTI=true
+            fi
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            MULTI=true
+          fi
+          if $MULTI; then
+            # Floor = quack host v1.5.3; tip = community latest stable
+            echo 'versions=["v1.5.3","v1.5.4","v1.5.5"]' >> "$GITHUB_OUTPUT"
+            echo "multi=true" >> "$GITHUB_OUTPUT"
+            echo "Full matrix: v1.5.3 v1.5.4 v1.5.5"
+          else
+            echo 'versions=["v1.5.5"]' >> "$GITHUB_OUTPUT"
+            echo "multi=false" >> "$GITHUB_OUTPUT"
+            echo "Smoke: v1.5.5 only"
+          fi
+
   duckdb-stable-build:
-    name: Build extension binaries
+    name: Build extension binaries (${{ matrix.duckdb_version }})
+    needs: resolve-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        duckdb_version: ${{ fromJson(needs.resolve-matrix.outputs.versions) }}
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5.4
+      duckdb_version: ${{ matrix.duckdb_version }}
       ci_tools_version: v1.5-variegata
       extension_name: pdf
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools;windows_arm64
       vcpkg_commit: 84bab45d415d22042bd0b9081aea57f362da3f35
+      # Unique artifact names when multiple duckdb versions build in parallel
+      artifact_postfix: ""
 
   code-quality-check:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5.4
+      duckdb_version: v1.5.5
       ci_tools_version: v1.5-variegata
       extension_name: pdf
-      # disable 'tidy' (format_checks) because tidy-check container has no poppler-cpp for pkg-config REQUIRED in CMakeLists.txt
-      format_checks: 'format'
+      # disable tidy — tidy container lacks poppler-cpp for pkg-config REQUIRED
+      format_checks: "format"
+
+  # On tag pushes: attach all built .duckdb_extension artifacts to the GitHub Release.
+  # Artifact name pattern from extension-ci-tools:
+  #   pdf-<duckdb_version>-extension-<arch>
+  publish-github-release:
+    name: Publish GitHub Release assets
+    needs: [resolve-matrix, duckdb-stable-build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all extension artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: "pdf-*-extension-*"
+          merge-multiple: false
+
+      - name: Stage release files
+        run: |
+          set -euo pipefail
+          mkdir -p release_assets
+          # Flatten: pdf-v1.5.3-extension-linux_amd64/pdf.duckdb_extension → named asset
+          find artifacts -type f \( -name '*.duckdb_extension' -o -name '*.duckdb_extension.gz' -o -name '*.duckdb_extension.wasm' \) | while read -r f; do
+            # parent dir is artifact name: pdf-v1.5.4-extension-linux_amd64
+            parent="$(basename "$(dirname "$f")")"
+            base="$(basename "$f")"
+            # pdf-v1.5.4-extension-linux_amd64 + pdf.duckdb_extension
+            # → pdf-duckdb-v1.5.4-linux_amd64.duckdb_extension
+            # parent = pdf-<ver>-extension-<arch>
+            ver_arch="${parent#pdf-}"
+            # ver_arch = v1.5.4-extension-linux_amd64
+            ver="${ver_arch%%-extension-*}"
+            arch="${ver_arch#*-extension-}"
+            ext="${base##*.}"
+            if [[ "$base" == *.duckdb_extension.gz ]]; then
+              out="pdf-duckdb-${ver}-${arch}.duckdb_extension.gz"
+            elif [[ "$base" == *.duckdb_extension ]]; then
+              out="pdf-duckdb-${ver}-${arch}.duckdb_extension"
+            else
+              out="pdf-duckdb-${ver}-${arch}.${ext}"
+            fi
+            cp -v "$f" "release_assets/${out}"
+          done
+          ls -la release_assets
+          test "$(find release_assets -type f | wc -l)" -gt 0
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

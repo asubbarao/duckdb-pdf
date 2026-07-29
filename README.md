@@ -31,17 +31,50 @@ CREATE TABLE chunks AS FROM pdf_chunks('docs/*.pdf');
 
 ## Installation
 
+### Supported DuckDB hosts
+
+| | |
+|--|--|
+| **Minimum** | **DuckDB v1.5.3** (quack floor) and later on the 1.5 line |
+| **CI matrix** | `v1.5.3`, `v1.5.4`, `v1.5.5` × linux_amd64/arm64, osx_amd64/arm64, windows_amd64 |
+| **Community CDN** | Tip stable only (currently `v1.5.4`/`v1.5.5` paths as published) — exact host string must match |
+| **GitHub Releases** | Full multi-host assets on each `v*` tag (`pdf-duckdb-<ver>-<arch>.duckdb_extension`) |
+
+Among recent PyPI installs, most traffic is mid/late **1.5.x** (~85% of named modern volume is 1.5.2–1.5.4). We do **not** multi-build 1.4.
+
+### Community (signed, tip host)
+
 ```sql
 INSTALL pdf FROM community;
 LOAD pdf;
 ```
 
-Or equivalently:
+Requires a DuckDB build whose version has a published community binary (see CDN path `…/v{exact}/…`). Or:
 
 ```sql
 INSTALL pdf FROM 'https://community-extensions.duckdb.org';
 LOAD pdf;
 ```
+
+### GitHub Release (multi-host, including Windows + quack 1.5.3)
+
+After a tagged release, assets look like:
+
+```text
+pdf-duckdb-v1.5.3-linux_amd64.duckdb_extension
+pdf-duckdb-v1.5.3-windows_amd64.duckdb_extension
+pdf-duckdb-v1.5.4-osx_arm64.duckdb_extension
+…
+```
+
+```sh
+# pick asset matching SELECT version() and your platform
+curl -fsSL -o pdf.duckdb_extension \
+  "https://github.com/asubbarao/duckdb-pdf/releases/download/<tag>/pdf-duckdb-v1.5.3-osx_arm64.duckdb_extension"
+duckdb -unsigned -c "LOAD '$(pwd)/pdf.duckdb_extension';"
+```
+
+Trigger a full matrix without a tag: **Actions → Main Extension Distribution Pipeline → Run workflow** (`multi_version=true`). Artifacts stay on the workflow run; tags also attach them to the Release.
 
 ## Read & extract
 
@@ -63,6 +96,8 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 | `ocr_preprocess` | BOOLEAN | true | Run the Leptonica preprocessing pipeline (grayscale → deskew → binarize → despeckle) on the rendered page before OCR. |
 | `ocr_retry` | BOOLEAN | true | Re-render low-confidence pages (mean confidence < 55) at 2× DPI when the render was below 400 DPI, keeping whichever pass scores higher. |
 | `tessdata_dir` | VARCHAR | auto-detected | Explicit Tesseract model directory (see [OCR support](#ocr-support)). |
+| `ocr_vars` | MAP(VARCHAR, VARCHAR) | — | Tess `SetVariable` key/values applied after Init (same surface as CLI `-c name=value`). |
+| `ocr_config` | VARCHAR | — | Path or tessdata config name for `ReadConfigFile` (applied after Init, before `ocr_vars`). |
 | `ignore_errors` | BOOLEAN | false | `read_pdf` / `read_pdf_meta` only: skip unopenable files in a multi-file scan instead of aborting it. |
 
 `read_pdf_elements` and `pdf_chunks` accept only `password`, `first_page`, `last_page` (plus `pdf_chunks`' own `chunk_size` / `overlap`) — they read the native text layer only.
@@ -126,27 +161,43 @@ WHERE text ILIKE '%total due%';
 
 ### `read_pdf_words` — one row per word, with bounding boxes
 
-Columns: `filename`, `page`, `word`, `x0`, `y0`, `x1`, `y1` (PDF user-space points, origin bottom-left), `font_name`, `font_size`, `source`, `confidence`.
+Columns: `filename`, `page`, `word`, `x0`, `y0`, `x1`, `y1` (PDF points; poppler-cpp `text_list` y is top-down on typical pages — smaller `y0` is higher on the page), `font_name`, `font_size`, `source`, `confidence`, **`line`** (1-based geometric line id within the page), **`page_width`** / **`page_height`** (crop-box size in points for that page — same numbers as `read_pdf.width` / `height`).
 
-For scanned/image-only pages the words come from Tesseract's word-level iterator: `source` is `'ocr'` (vs `'text'` for native words) and `confidence` is a value in `[0, 100]` (`NULL` for native words). OCR words have `NULL` `font_name`/`font_size` — there is no font metadata in an image.
+`line` clusters words with the same vertical-overlap rule as `read_pdf_elements` (≥ 50% of the shorter word height). Use it to equi-join marks to line context or rebuild lines in one Poppler walk:
 
 ```sql
--- All words with coordinates
-SELECT page, word, x0, y0, x1, y1 FROM read_pdf_words('report.pdf');
+-- Line grain derived from the word pin (no second read_pdf_lines walk)
+SELECT filename, page, line,
+       string_agg(word, ' ' ORDER BY x0) AS text
+FROM read_pdf_words('docs/*.pdf')
+GROUP BY filename, page, line
+ORDER BY filename, page, line;
+```
 
--- Words in the top quarter of each page (approximate header zone;
--- page height is typically 792 pt for Letter)
-SELECT page, word, y0
+`page_width` / `page_height` remove the common max-bbox geometry hack (`max(x1)`, `max(y1)`). For page-only census without extracting words, prefer `pdf_pages_info` (media/crop/rotation/label) or `read_pdf` / `pdf_info`.
+
+For scanned/image-only pages the words come from Tesseract's word-level iterator: `source` is `'ocr'` (vs `'text'` for native words) and `confidence` is a value in `[0, 100]` (`NULL` for native words). OCR words have `NULL` `font_name`/`font_size` — there is no font metadata in an image. OCR words also get `line` / page size.
+
+```sql
+-- All words with coordinates + line association
+SELECT page, line, word, x0, y0, x1, y1, page_width, page_height
 FROM read_pdf_words('report.pdf')
-WHERE y0 > 594
-ORDER BY page, y0 DESC, x0;
+ORDER BY page, line, x0;
+
+-- Words on the first geometric line of each page
+SELECT page, word, x0
+FROM read_pdf_words('report.pdf')
+WHERE line = 1
+ORDER BY page, x0;
 
 -- OCR word boxes from a scanned document
-SELECT word, x0, y0, x1, y1, confidence
+SELECT word, x0, y0, x1, y1, confidence, line
 FROM read_pdf_words('scan.pdf')
 WHERE source = 'ocr'
-ORDER BY y1 DESC, x0;
+ORDER BY page, line, x0;
 ```
+
+> **Note:** `read_pdf_lines` still splits Poppler `page->text()` on newlines (layout/`physical`/`raw` aware). Geometric `line` on words is the join key for bbox work; text-split line numbers may differ on multi-column or unusually spaced pages. Prefer one pin: words (+ optional `string_agg` lines) when you need both grains.
 
 ### `read_pdf_tables` — structured table extraction
 
@@ -301,6 +352,16 @@ ORDER BY file_size DESC;
 SELECT producer, count(*) AS n, min(creation_date) AS earliest
 FROM pdf_info('docs/*.pdf')
 GROUP BY producer;
+```
+
+### `pdf_pages_info` — per-page geometry
+
+One row per page (not just first-page like `pdf_info.width`/`height`). Columns: `file`, `page`, `page_count`, `width`, `height` (crop box), `media_width`, `media_height`, `crop_width`, `crop_height`, `rotation` (0/90/180/270), `orientation`, `label`, `duration`. Prefer this when you need page size without extracting words; when you already pin `read_pdf_words`, use its `page_width`/`page_height` instead of a second open.
+
+```sql
+SELECT file, page, width, height, rotation, orientation
+FROM pdf_pages_info('docs/*.pdf')
+ORDER BY file, page;
 ```
 
 ### `read_pdf_meta` — legacy per-file metadata
@@ -788,6 +849,67 @@ SELECT filename, page, text
 FROM read_pdf('scans/*.pdf', ocr := true, ocr_preprocess := true, ocr_retry := true);
 ```
 
+### Expert OCR knobs (`ocr_vars` / `ocr_config`) + shellfs escape hatches
+
+Prefer **more parameters on existing functions**, not a pile of new SQL surfaces.
+In-process Tess knobs that experts already know from the CLI:
+
+```sql
+-- Whitelist digits only (invoice total lines, etc.)
+SELECT page, text
+FROM read_pdf('scan.pdf', ocr := true,
+  ocr_vars := MAP {'tessedit_char_whitelist': '0123456789.$'});
+
+-- Config file (tessdata/configs name or absolute path), then -c-style overrides
+SELECT page, text
+FROM read_pdf('scan.pdf', ocr := true,
+  ocr_config := 'digits',
+  ocr_vars := MAP {'classify_bln_numeric_mode': '1'});
+```
+
+Low-level image OCR scalar — **positional** overloads (DuckDB scalars have no
+named-param map); same richness as the table path:
+
+```sql
+-- blob | lang | psm | oem | tessdata_dir | preprocess | vars | config
+SELECT tesseract_ocr(
+  poppler_render_page(content, 1, 200),
+  'eng', 6, 3, '', true,
+  MAP {'tessedit_char_whitelist': '0123456789'},
+  ''
+)
+FROM read_blob('scan.pdf');
+```
+
+**Shellfs escape hatch** (full Tesseract CLI / `TESSDATA_PREFIX` before in-process
+parity, or any flag the extension has not lifted yet). Requires a DuckDB build
+with [shellfs](https://github.com/query-farm/shellfs) (or equivalent `cmd |`
+reader). Shape is one SQL pipe — no sidecar script:
+
+```sql
+-- Full CLI: env + tessdata + config + stdout as rows
+SELECT *
+FROM read_csv(
+  'TESSDATA_PREFIX=/opt/models tesseract /tmp/page.png stdout -l eng --psm 6 -c tessedit_char_whitelist=0123456789 |',
+  header := false, columns := {'text': 'VARCHAR'}
+);
+
+-- One-shot text blob
+SELECT * FROM read_text(
+  'tesseract /tmp/page.png stdout -l eng --tessdata-dir /opt/models/tessdata |'
+);
+```
+
+Render in-process (or export a PNG path yourself), then OCR out-of-process when
+you need a flag we have not wired:
+
+```sql
+-- Assume /tmp/page.png already exists (e.g. written from poppler_render_page BLOB)
+SELECT * FROM read_text(
+  'TESSDATA_PREFIX=/usr/share/tesseract-ocr/5 tesseract /tmp/page.png stdout -l eng |'
+);
+```
+
 ## Scope
 
 This extension targets the everyday PDF operations — reading at every grain, inspection, and document surgery — deterministically, using Poppler, Tesseract, qpdf, and libharu. It deliberately does **not** attempt ML-based layout analysis or table-structure recognition: table extraction combines ruled-line (lattice) detection with a precision-first geometric heuristic, so merged cells and borderless/sparse tables are out of scope. For state-of-the-art document understanding (complex tables, reading-order models), reach for purpose-built tools such as [docling](https://github.com/docling-project/docling), [marker](https://github.com/VikParuchuri/marker), or a cloud Document AI service. A Poppler/Tesseract expert can extend this extension's heuristics (e.g. Leptonica preprocessing) from the same building blocks it already exposes.
@@ -838,11 +960,12 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 |---|---|---|
 | `read_pdf(files)` | Table | One row per page: text plus page dimensions. Parallel multi-file scan; `ignore_errors` skips bad files. |
 | `read_pdf_lines(files)` | Table | One row per layout-preserving line. |
-| `read_pdf_words(files)` | Table | One row per word with bounding box, font, and OCR source/confidence. |
+| `read_pdf_words(files)` / `read_pdf_layout` | Table | One row per word: bbox, font, OCR source/confidence, geometric `line`, `page_width`/`page_height`. |
 | `read_pdf_tables(files)` | Table | One row per detected table row; cells as `VARCHAR[]`. |
 | `read_pdf_elements(files)` | Table | One row per layout element (`heading`/`paragraph`/`list_item`/`other`) with bbox. |
 | `pdf_chunks(files)` | Table | Retrieval-ready chunks with section headings; `chunk_size`/`overlap` knobs. |
 | `pdf_info(files)` | Table | Full per-file census: metadata, timestamps, dimensions, size, encryption. |
+| `pdf_pages_info(files)` | Table | One row per page: crop/media size, rotation, orientation, label, duration. |
 | `read_pdf_meta(files)` | Table | Legacy per-file metadata (subset of `pdf_info`). |
 | `pdf_outline(files)` | Table | One row per bookmark, depth-first. |
 | `pdf_attachments(files)` | Table | One row per embedded file, bytes as `BLOB`. |
