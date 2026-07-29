@@ -873,9 +873,13 @@ named maps). Returns one row: `text`, `confidence` (MeanTextConf 0–100), `form
 `GetTSVText` in-process:
 
 ```sql
+-- TVF first arg must be foldable (no subqueries) — SET VARIABLE is the usual path.
+SET VARIABLE page_png = (
+  SELECT poppler_render_page(content, 1, 200) FROM read_blob('scan.pdf')
+);
 SELECT text, confidence, format
 FROM ocr_image(
-  poppler_render_page((SELECT content FROM read_blob('scan.pdf')), 1, 200),
+  getvariable('page_png'),
   language := 'eng',
   psm := 6,
   vars := MAP {'tessedit_char_whitelist': '0123456789'},
@@ -973,7 +977,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 
 | Function | Type | Description |
 |---|---|---|
-| `read_pdf(files)` | Table | One row per page: text plus page dimensions. Parallel multi-file scan; `ignore_errors` skips bad files. |
+| `read_pdf(files)` | Table | One row per page: text, dimensions, `has_text_layer`, `used_ocr`, **`ocr_confidence`** (NULL if no OCR). Parallel multi-file scan; `ignore_errors` skips bad files. Named OCR knobs include `ocr_vars` MAP + `ocr_config`. |
 | `read_pdf_lines(files)` | Table | One row per layout-preserving line. |
 | `read_pdf_words(files)` / `read_pdf_layout` | Table | One row per word: bbox, font, OCR source/confidence, geometric `line`, `page_width`/`page_height`. |
 | `read_pdf_tables(files)` | Table | One row per detected table row; cells as `VARCHAR[]`. |
@@ -1001,6 +1005,10 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_to_xml(src)` | Scalar | Whole document as per-word-bbox XML. Path or `BLOB`. |
 | `pdf_to_svg(src, page [, dpi])` | Scalar | One page as SVG (embedded PNG raster). Path or `BLOB`. |
 | `pdf_to_png(src, page [, dpi])` | Scalar | One page as PNG bytes (`BLOB`). Path or `BLOB`. |
+| `poppler_version()` | Scalar | Linked Poppler version string. |
+| `poppler_render_page(blob, page, dpi)` | Scalar | One page of a PDF BLOB as PNG bytes (building block for OCR). |
+| `tesseract_ocr(blob[, …])` | Scalar | In-process OCR text from image BLOB (positional overloads: lang, psm, oem, tessdata_dir, preprocess, vars MAP, config). |
+| `ocr_image(blob, …)` | Table | Named-param image OCR: one row `(text, confidence, format)`. `format` = `text`\|`hocr`\|`tsv`; same knobs as readers (`language`, `psm`, `vars`, …). TVF arg must be foldable (use `SET VARIABLE` / `getvariable`). |
 | `pdf_merge(files[], out)` | Scalar | Concatenate PDFs in list order. |
 | `pdf_rotate(in, out, deg [, pages])` | Scalar | Rotate pages by multiples of 90°. |
 | `pdf_pages(in, out, range)` | Scalar | Extract a page subset (`'1-3,7'`, `'z'`, `'r2'`). |

@@ -58,14 +58,17 @@ docs:
     [github.com/asubbarao/duckdb-pdf](https://github.com/asubbarao/duckdb-pdf).
 
     **Read** — `read_pdf`, `read_pdf_lines`, `read_pdf_words` /
-    `read_pdf_layout` (word boxes), `read_pdf_elements`, `read_pdf_tables`,
-    `pdf_chunks`. Auto-OCR on image-only pages; English model bundled.
+    `read_pdf_layout` (word boxes + geometric `line` + page size),
+    `read_pdf_elements`, `read_pdf_tables`, `pdf_chunks`. Auto-OCR on
+    image-only pages; English model bundled.
 
-    **Inspect** — `pdf_info`, outline, attachments, form fields, annotations,
-    revisions, signatures, embedded images.
+    **Inspect** — `pdf_info`, `pdf_pages_info` (per-page geometry), outline,
+    attachments, form fields, annotations, revisions, signatures, embedded
+    images.
 
     **Convert / render** — text, markdown, HTML, XML, SVG, PNG; low-level
-    `poppler_render_page` + `tesseract_ocr` for blob pipelines.
+    `poppler_render_page` + `tesseract_ocr` / **`ocr_image`** (named params,
+    `format` text|hocr|tsv) for blob pipelines; `read_pdf.ocr_confidence`.
 
     **Transform & write** — merge, split, rotate, compress, encrypt/decrypt,
     watermark, Bates, sign, redact; `write_pdf` / `COPY … (FORMAT pdf)`;

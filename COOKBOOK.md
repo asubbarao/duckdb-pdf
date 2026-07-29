@@ -173,12 +173,16 @@ SELECT * FROM read_text(
 Prefer `ocr_vars` / `ocr_config` when the knob exists; use shellfs only for
 true CLI gaps (and leave a debt note if the gap should become a named param).
 
-**`ocr_image` TVF** — named params + HOCR/TSV without leaving the process:
+**`ocr_image` TVF** — named params + HOCR/TSV without leaving the process.
+First arg must be foldable (no subqueries):
 
 ```sql
+SET VARIABLE page_png = (
+  SELECT poppler_render_page(content, 1, 200) FROM read_blob('scan.pdf')
+);
 SELECT text, confidence, format
 FROM ocr_image(
-  poppler_render_page((SELECT content FROM read_blob('scan.pdf')), 1, 200),
+  getvariable('page_png'),
   language := 'eng',
   psm := 6,
   format := 'hocr',   -- text | hocr | tsv
