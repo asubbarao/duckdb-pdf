@@ -240,11 +240,13 @@ if(NOT WIN32)
       #   * CoreFoundation + SystemConfiguration — libcurl (pulled in by tesseract)
       #     references _CFRelease and _SCDynamicStoreCopyProxies to read the macOS
       #     system proxy configuration.
+      #   * Security — libcurl apple TLS verify (_SecTrustEvaluateWithError, …).
       # (On Linux iconv lives in glibc and curl needs no frameworks.)
       find_library(PDF_COREFOUNDATION CoreFoundation REQUIRED)
       find_library(PDF_SYSTEMCONFIGURATION SystemConfiguration REQUIRED)
+      find_library(PDF_SECURITY Security REQUIRED)
       set(PDF_POSIX_LINK ${VCPKG_STATIC_ARCHIVES} -liconv
-          ${PDF_COREFOUNDATION} ${PDF_SYSTEMCONFIGURATION})
+          ${PDF_COREFOUNDATION} ${PDF_SYSTEMCONFIGURATION} ${PDF_SECURITY})
     endif()
 
     target_link_libraries(${EXTENSION_NAME} ${PDF_POSIX_LINK})

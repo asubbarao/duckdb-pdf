@@ -121,6 +121,112 @@ Resolution: `tessdata_dir` → `TESSDATA_PREFIX` → standard paths → **bundle
 `auto_ocr` is on by default (OCR only pages with no text layer); `ocr := true`
 forces OCR on every page.
 
+### Expert escape hatches (vars / config / shellfs CLI)
+
+Same doctrine as the rest of the extension: **add parameters, not functions**.
+
+**In-process Tess `SetVariable` + config** (shared by `read_pdf*` and
+`tesseract_ocr`):
+
+```sql
+-- Digits-only OCR for a scanned amount field
+SELECT page, text
+FROM read_pdf('invoice_scan.pdf', ocr := true, ocr_psm := 7,
+  ocr_vars := MAP {
+    'tessedit_char_whitelist': '0123456789.,$',
+    'classify_bln_numeric_mode': '1'
+  });
+
+-- Named tess config (searches tessdata/configs) then override
+SELECT page, word, confidence
+FROM read_pdf_words('scan.pdf', ocr := true,
+  ocr_config := 'digits',
+  ocr_vars := MAP {'tessedit_char_blacklist': '|'});
+
+-- Scalar on a rendered PNG BLOB (positional: lang, psm, oem, tessdata_dir,
+-- preprocess, vars MAP, config path — empty string = default tessdata)
+SELECT tesseract_ocr(
+  poppler_render_page((SELECT content FROM read_blob('scan.pdf')), 1, 200),
+  'eng', 6, 3, '', true,
+  MAP {'tessedit_char_whitelist': 'ABC0123456789'},
+  ''
+);
+```
+
+**Shellfs CLI hatch** when you need the full Tesseract binary (env, obscure
+flags, alternate builds) before they land as in-process params. One CTE pipe —
+not a product `.sh`:
+
+```sql
+-- After writing a page PNG to a path the host tesseract can see:
+SELECT column0 AS text
+FROM read_csv(
+  'TESSDATA_PREFIX=/opt/tessdata tesseract /tmp/page.png stdout -l eng --psm 4 -c load_system_dawg=0 |',
+  header := false
+);
+
+SELECT * FROM read_text(
+  'tesseract /tmp/page.png stdout -l deu+eng --tessdata-dir /usr/share/tessdata |'
+);
+```
+
+Prefer `ocr_vars` / `ocr_config` when the knob exists; use shellfs only for
+true CLI gaps (and leave a debt note if the gap should become a named param).
+
+**`ocr_image` TVF** — named params + HOCR/TSV without leaving the process:
+
+```sql
+SELECT text, confidence, format
+FROM ocr_image(
+  poppler_render_page((SELECT content FROM read_blob('scan.pdf')), 1, 200),
+  language := 'eng',
+  psm := 6,
+  format := 'hocr',   -- text | hocr | tsv
+  vars := MAP {'tessedit_char_whitelist': '0123456789'}
+);
+
+-- page mean confidence on PDF OCR
+SELECT page, used_ocr, ocr_confidence, left(text, 80)
+FROM read_pdf('scan.pdf', ocr := true);
+```
+
+---
+
+## 3b. One Poppler walk: words + lines + page size (mark / detect packs)
+
+**Goal:** pin word boxes for highlights **and** line text for scoring without
+two full opens and without DIY `round(y0)` line clustering or `max(bbox)` page
+geometry.
+
+```sql
+-- Single pin. line is geometric (same rule as read_pdf_elements).
+CREATE TABLE pdf_words AS
+SELECT file_name(filename) AS filename, page AS page_no, line AS line_no,
+       word, (x0, y0, x1, y1) AS bbox, font_size,
+       page_width AS width_pt, page_height AS height_pt
+FROM read_pdf_words('docs/*.pdf');
+
+-- Line grain free from the word pin (no read_pdf_lines second walk)
+CREATE TABLE pdf_lines AS
+SELECT filename, page_no, line_no,
+       string_agg(word, ' ' ORDER BY bbox.x0) AS line_text
+FROM pdf_words
+GROUP BY filename, page_no, line_no;
+
+-- True page geometry (not max word extent)
+CREATE TABLE pages AS
+SELECT DISTINCT filename, page_no, width_pt, height_pt
+FROM pdf_words;
+```
+
+**Gotcha:** geometric `line` is the join key for bbox work. `read_pdf_lines`
+(Poppler `page->text()` split on `\n`) can still differ on multi-column pages —
+use it when you only need grep-style line context without boxes. Prefer
+`pdf_pages_info` when you need rotation/media box **without** extracting words.
+Raster previews: `pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100)` —
+do not shell `pdftoppm` (bundled base-14 fonts fix blank rasters on community
+builds).
+
 ---
 
 ## 4. Find and quarantine broken PDFs in a folder

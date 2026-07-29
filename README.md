@@ -104,7 +104,7 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 
 ### `read_pdf` — one row per page
 
-Columns: `filename`, `page`, `page_count`, `text`, `width`, `height` (page size in PDF points), `has_text_layer` (native embedded text is non-blank), `used_ocr` (Tesseract produced the returned text).
+Columns: `filename`, `page`, `page_count`, `text`, `width`, `height` (page size in PDF points), `has_text_layer` (native embedded text is non-blank), `used_ocr` (Tesseract produced the returned text), `ocr_confidence` (Tess MeanTextConf 0–100 when `used_ocr`, else NULL).
 
 `has_text_layer` describes the PDF itself (true even when `ocr:=true` forced a re-OCR of a text page). `used_ocr` is true when the page had no extractable text and auto-OCR ran, or when `ocr:=true` forced OCR and the engine returned text. Together they make image-only vs embedded-text detection first-class:
 
@@ -849,14 +849,14 @@ SELECT filename, page, text
 FROM read_pdf('scans/*.pdf', ocr := true, ocr_preprocess := true, ocr_retry := true);
 ```
 
-### Expert OCR knobs (`ocr_vars` / `ocr_config`) + shellfs escape hatches
+### Expert OCR knobs (`ocr_vars` / `ocr_config` / `ocr_image`) + shellfs
 
 Prefer **more parameters on existing functions**, not a pile of new SQL surfaces.
 In-process Tess knobs that experts already know from the CLI:
 
 ```sql
 -- Whitelist digits only (invoice total lines, etc.)
-SELECT page, text
+SELECT page, text, ocr_confidence
 FROM read_pdf('scan.pdf', ocr := true,
   ocr_vars := MAP {'tessedit_char_whitelist': '0123456789.$'});
 
@@ -867,8 +867,23 @@ FROM read_pdf('scan.pdf', ocr := true,
   ocr_vars := MAP {'classify_bln_numeric_mode': '1'});
 ```
 
-Low-level image OCR scalar — **positional** overloads (DuckDB scalars have no
-named-param map); same richness as the table path:
+**`ocr_image(blob, …)`** — table function with **named** params (scalars cannot take
+named maps). Returns one row: `text`, `confidence` (MeanTextConf 0–100), `format`.
+`format := 'text' | 'hocr' | 'tsv'` maps to Tess `GetUTF8Text` / `GetHOCRText` /
+`GetTSVText` in-process:
+
+```sql
+SELECT text, confidence, format
+FROM ocr_image(
+  poppler_render_page((SELECT content FROM read_blob('scan.pdf')), 1, 200),
+  language := 'eng',
+  psm := 6,
+  vars := MAP {'tessedit_char_whitelist': '0123456789'},
+  format := 'hocr'   -- or 'text' (default), 'tsv'
+);
+```
+
+Low-level scalar **`tesseract_ocr`** remains for one-line text (positional only):
 
 ```sql
 -- blob | lang | psm | oem | tessdata_dir | preprocess | vars | config

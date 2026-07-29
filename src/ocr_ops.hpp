@@ -16,11 +16,12 @@
 // backend.
 //
 // TessBaseAPI lifecycle: Init() is expensive (loads traineddata). Recognize*
-// reuses a thread_local TessBaseAPI keyed by (language, oem, datapath) and
-// Clear()s between pages — matching DuckDB's per-worker-thread LocalState
-// model without exposing tesseract types across this isolation boundary.
-// Init is never called unless <datapath>/<lang>.traineddata is verified on
-// disk first (stops "Failed loading language" stderr at the source).
+// reuses a thread_local TessBaseAPI keyed by (language, oem, datapath, config,
+// vars) and Clear()s between pages — matching DuckDB's per-worker-thread
+// LocalState model without exposing tesseract types across this isolation
+// boundary. After Init: optional ReadConfigFile(config) then SetVariable for
+// each vars entry. Init is never called unless <datapath>/<lang>.traineddata
+// is verified on disk first (stops "Failed loading language" stderr at source).
 //
 // Backends
 // --------
@@ -53,6 +54,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace pdf_ocr {
@@ -87,13 +89,29 @@ struct Options {
 	// error message pointing at the SQL pdf_page_images → llm pipeline instead
 	// of a silent empty OCR result when no plugin is loaded.
 	std::string external_endpoint;
+	// Tess SetVariable key/value pairs applied after Init (and after config).
+	// Same surface as the Tesseract CLI `-c name=value` / config-file params
+	// (e.g. tessedit_char_whitelist, classify_bln_numeric_mode).
+	std::vector<std::pair<std::string, std::string>> vars;
+	// Optional path for TessBaseAPI::ReadConfigFile (tessdata/configs name or
+	// absolute/relative file). Applied after Init, before vars.
+	std::string config;
+	// Output grain for RecognizeImageBlob / text path: "text" (default UTF-8),
+	// "hocr" (GetHOCRText), or "tsv" (GetTSVText). Word-box path ignores this.
+	std::string format = "text";
 };
+
+// Parse format name; unknown values throw std::runtime_error.
+// Accepts text|utf8|plain, hocr|html, tsv|tsvtext (case-insensitive).
+std::string NormalizeOutputFormat(const std::string &name);
 
 struct TextResult {
 	std::string text;
 	int confidence = 0; // MeanTextConf 0..100
 	// Which backend actually produced the text (or was attempted).
 	Backend backend_used = Backend::Tesseract;
+	// Echo of the format that filled `text` (text|hocr|tsv).
+	std::string format = "text";
 };
 
 // Word boxes in PDF user-space points (origin bottom-left), converted from

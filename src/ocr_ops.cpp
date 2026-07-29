@@ -448,10 +448,11 @@ static std::string MissingModelMessage(const Options &opt) {
 // pulling tesseract types across the ocr_ops isolation boundary into pdf_extension.
 //
 // Reuse rules:
-//   - Init once per (thread, language, oem, datapath)
+//   - Init once per (thread, language, oem, datapath, config, vars)
 //   - SetPageSegMode only when psm changes
 //   - Clear() between pages (free page bitmap/results) — never End() in the hot loop
 //   - Never call Init unless <datapath>/<lang>.traineddata exists on disk
+//   - After Init: ReadConfigFile (if set) then SetVariable for each vars entry
 struct ThreadTessEngine {
 	tesseract::TessBaseAPI api;
 	bool ready = false;
@@ -459,6 +460,7 @@ struct ThreadTessEngine {
 	int oem = -1;
 	std::string datapath;
 	int psm = -1;
+	std::string vars_key; // config path + serialized vars (Init-boundary knobs)
 
 	~ThreadTessEngine() {
 		if (ready) {
@@ -474,6 +476,34 @@ ThreadTessEngine &TlsTess() {
 	return eng;
 }
 
+// Fingerprint of post-Init Tess knobs so a changed config/vars forces re-Init
+// (SetVariable state is not rolled back without End).
+std::string VarsConfigKey(const Options &opt) {
+	std::string key = opt.config;
+	key.push_back('\0');
+	for (const auto &kv : opt.vars) {
+		key.append(kv.first);
+		key.push_back('=');
+		key.append(kv.second);
+		key.push_back('\0');
+	}
+	return key;
+}
+
+void ApplyTessConfigAndVars(tesseract::TessBaseAPI &api, const Options &opt) {
+	if (!opt.config.empty()) {
+		api.ReadConfigFile(opt.config.c_str());
+	}
+	for (const auto &kv : opt.vars) {
+		if (kv.first.empty()) {
+			continue;
+		}
+		// Tess returns false for unknown names; ignore so typos don't abort scans.
+		// (Known-good keys still take effect; shellfs CLI hatch remains for full CLI.)
+		(void)api.SetVariable(kv.first.c_str(), kv.second.c_str());
+	}
+}
+
 bool EnsureTesseract(const Options &opt) {
 	// Resolve + verify the model file BEFORE any TessBaseAPI::Init call.
 	// Init with a missing/wrong path is what prints "Failed loading language"
@@ -487,7 +517,9 @@ bool EnsureTesseract(const Options &opt) {
 	}
 
 	auto &eng = TlsTess();
-	const bool need_init = !eng.ready || eng.language != opt.language || eng.oem != opt.oem || eng.datapath != datadir;
+	const std::string vars_key = VarsConfigKey(opt);
+	const bool need_init = !eng.ready || eng.language != opt.language || eng.oem != opt.oem ||
+	                       eng.datapath != datadir || eng.vars_key != vars_key;
 	if (need_init) {
 		if (eng.ready) {
 			eng.api.End();
@@ -506,10 +538,13 @@ bool EnsureTesseract(const Options &opt) {
 			}
 			throw std::runtime_error(MissingModelMessage(opt));
 		}
+		// Config then vars — matches Tess CLI: config file, then -c overrides.
+		ApplyTessConfigAndVars(eng.api, opt);
 		eng.ready = true;
 		eng.language = opt.language;
 		eng.oem = opt.oem;
 		eng.datapath = datadir;
+		eng.vars_key = vars_key;
 		eng.psm = -1; // force SetPageSegMode below
 	}
 	if (eng.psm != opt.psm) {
@@ -542,6 +577,24 @@ void DestroyPixPair(Pix *processed, Pix *base) {
 	}
 }
 
+// Pull UTF-8 / HOCR / TSV from a TessBaseAPI that already has SetImage.
+// HOCR/TSV use page_number 0 (single image). Unknown format → text.
+void FillTextFromApi(tesseract::TessBaseAPI &api, const std::string &fmt, TextResult &out) {
+	out.format = fmt.empty() ? "text" : fmt;
+	char *buf = nullptr;
+	if (out.format == "hocr") {
+		buf = api.GetHOCRText(0);
+	} else if (out.format == "tsv") {
+		buf = api.GetTSVText(0);
+	} else {
+		out.format = "text";
+		buf = api.GetUTF8Text();
+	}
+	out.text = buf ? std::string(buf) : std::string();
+	delete[] buf;
+	out.confidence = api.MeanTextConf();
+}
+
 TextResult RecognizeTesseractText(const unsigned char *data, int width, int height, int bytes_per_row,
                                   ImageFormat format, const Options &opt) {
 	TextResult out;
@@ -559,10 +612,9 @@ TextResult RecognizeTesseractText(const unsigned char *data, int width, int heig
 	Pix *processed = nullptr;
 	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed);
 
-	char *text = api.GetUTF8Text();
-	out.text = text ? std::string(text) : std::string();
-	delete[] text;
-	out.confidence = api.MeanTextConf();
+	// read_pdf page path always wants plain text; format on Options is for
+	// RecognizeImageBlob / ocr_image TVF. Keep text-only here for stability.
+	FillTextFromApi(api, "text", out);
 	// Keep the engine warm for the next page on this thread; free only page state.
 	api.Clear();
 	DestroyPixPair(processed, base);
@@ -628,13 +680,17 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 
 } // namespace
 
-Backend BackendFromString(const std::string &name) {
-	// case-insensitive compare without pulling in more deps
+static std::string LowerAscii(const std::string &name) {
 	std::string lower;
 	lower.reserve(name.size());
 	for (unsigned char c : name) {
 		lower.push_back(static_cast<char>(std::tolower(c)));
 	}
+	return lower;
+}
+
+Backend BackendFromString(const std::string &name) {
+	std::string lower = LowerAscii(name);
 	if (lower.empty() || lower == "tesseract" || lower == "default") {
 		return Backend::Tesseract;
 	}
@@ -642,6 +698,20 @@ Backend BackendFromString(const std::string &name) {
 		return Backend::External;
 	}
 	throw std::runtime_error("read_pdf: ocr_backend must be 'tesseract' or 'external' (got '" + name + "')");
+}
+
+std::string NormalizeOutputFormat(const std::string &name) {
+	std::string lower = LowerAscii(name);
+	if (lower.empty() || lower == "text" || lower == "utf8" || lower == "plain") {
+		return "text";
+	}
+	if (lower == "hocr" || lower == "html" || lower == "hocr_html") {
+		return "hocr";
+	}
+	if (lower == "tsv" || lower == "tsvtext" || lower == "tsv_text") {
+		return "tsv";
+	}
+	throw std::runtime_error("ocr format must be 'text', 'hocr', or 'tsv' (got '" + name + "')");
 }
 
 const char *BackendName(Backend b) {
@@ -695,14 +765,15 @@ TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Opti
 		if (opt.best_effort) {
 			return out;
 		}
-		throw std::runtime_error("tesseract_ocr: empty image BLOB");
+		// Shared by tesseract_ocr scalar and ocr_image TVF — keep name-neutral.
+		throw std::runtime_error("empty image BLOB");
 	}
 	if (opt.backend == Backend::External) {
 		if (opt.best_effort) {
 			out.backend_used = Backend::External;
 			return out;
 		}
-		throw std::runtime_error("tesseract_ocr: external OCR backend is not supported for encoded image BLOBs "
+		throw std::runtime_error("external OCR backend is not supported for encoded image BLOBs "
 		                         "(use tesseract, or decode externally and call the plugin C ABI)");
 	}
 
@@ -718,7 +789,7 @@ TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Opti
 		if (opt.best_effort) {
 			return out;
 		}
-		throw std::runtime_error("tesseract_ocr: could not decode image BLOB "
+		throw std::runtime_error("could not decode image BLOB "
 		                         "(expected PNG/JPEG/etc. readable by leptonica, e.g. from poppler_render_page)");
 	}
 
@@ -745,10 +816,9 @@ TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Opti
 	Pix *use = processed ? processed : pix;
 	api.SetImage(use);
 
-	char *text = api.GetUTF8Text();
-	out.text = text ? std::string(text) : std::string();
-	delete[] text;
-	out.confidence = api.MeanTextConf();
+	// Callers (ocr_image) validate format; empty / default → text.
+	const std::string fmt = NormalizeOutputFormat(opt.format.empty() ? "text" : opt.format);
+	FillTextFromApi(api, fmt, out);
 	api.Clear();
 	DestroyPixPair(processed, pix);
 	return out;

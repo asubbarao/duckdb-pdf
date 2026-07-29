@@ -69,6 +69,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Process spawn + PATH probing for the runtime LibreOffice shell-out (to_pdf).
@@ -930,20 +931,87 @@ static pdf_ocr::ImageFormat PopplerFormatToOcr(poppler::image::format_enum fmt) 
 	return pdf_ocr::ImageFormat::ARGB32;
 }
 
-static pdf_ocr::Options MakeOcrOptions(const string &language, int dpi, int psm, int oem, const string &tessdata_dir,
-                                       bool preprocess, bool best_effort, const string &ocr_backend = "tesseract",
-                                       const string &ocr_plugin = "", const string &ocr_endpoint = "") {
+//===--------------------------------------------------------------------===//
+// Common options bag (shared by read_pdf / read_pdf_words)
+//===--------------------------------------------------------------------===//
+struct PdfOptions {
+	bool force_ocr = false;
+	bool auto_ocr = true;
+	string ocr_language = "eng";
+	int32_t ocr_dpi = 300;
+	int32_t ocr_psm = 3;        // PSM_AUTO
+	int32_t ocr_oem = 3;        // OEM_DEFAULT
+	bool ocr_preprocess = true; // leptonica grayscale/deskew/binarize/despeckle before OCR
+	bool ocr_retry = true;      // re-render low-confidence sub-400dpi pages at 2x and keep the better result
+	string tessdata_dir;        // optional: directory containing <lang>.traineddata
+	// Tess SetVariable map (post-Init) + optional ReadConfigFile path — shared by
+	// read_pdf* and tesseract_ocr (see ocr_ops Options::vars / ::config).
+	vector<pair<string, string>> ocr_vars;
+	string ocr_config;
+	string layout = "reading";
+	bool parse_tables = false;
+	string password;
+	int32_t first_page = 1;
+	int32_t last_page = -1; // -1 => through end
+	// Folder-scan fault isolation: when a glob matches many files, skip the ones
+	// that cannot be opened (corrupt / not-a-PDF / encrypted-without-password /
+	// truncated) instead of aborting the whole query on the first bad file.
+	// Default false preserves the strict "one bad file throws" contract. Skipped
+	// files are recoverable in SQL: glob(pattern) EXCEPT SELECT DISTINCT filename.
+	bool ignore_errors = false;
+	// OCR backend: "tesseract" (linked default) or "external" (plugin C ABI or
+	// SQL pdf_page_images → llm pipeline). See ocr_ops.hpp.
+	string ocr_backend = "tesseract";
+	string ocr_plugin;   // path to shared lib for external backend
+	string ocr_endpoint; // reserved; documented handoff only (no shell/HTTP here)
+};
+
+// MAP(VARCHAR,VARCHAR) → ordered (key,value) pairs for Tess SetVariable.
+static void ParseStringMapValue(const Value &v, vector<pair<string, string>> &out, const char *param_name) {
+	if (v.IsNull()) {
+		return;
+	}
+	if (v.type().id() != LogicalTypeId::MAP) {
+		throw InvalidInputException("%s must be MAP(VARCHAR, VARCHAR)", param_name);
+	}
+	for (auto &entry : MapValue::GetChildren(v)) {
+		auto &kv = StructValue::GetChildren(entry);
+		if (kv.size() < 2 || kv[0].IsNull()) {
+			continue;
+		}
+		string key = StringValue::Get(kv[0]);
+		string val = kv[1].IsNull() ? string() : kv[1].ToString();
+		out.emplace_back(std::move(key), std::move(val));
+	}
+}
+
+// pdf_ocr::Options::vars uses std::string pairs (isolation TU); duckdb::string
+// is not always the same reference type — copy through std::string.
+static void ParseStringMapValueStd(const Value &v, std::vector<std::pair<std::string, std::string>> &out,
+                                   const char *param_name) {
+	vector<pair<string, string>> tmp;
+	ParseStringMapValue(v, tmp, param_name);
+	out.clear();
+	out.reserve(tmp.size());
+	for (auto &p : tmp) {
+		out.emplace_back(std::string(p.first), std::string(p.second));
+	}
+}
+
+static pdf_ocr::Options MakeOcrOptions(const PdfOptions &po, bool best_effort) {
 	pdf_ocr::Options o;
-	o.language = language;
-	o.dpi = dpi;
-	o.psm = psm;
-	o.oem = oem;
-	o.tessdata_dir = tessdata_dir;
-	o.preprocess = preprocess;
+	o.language = po.ocr_language;
+	o.dpi = po.ocr_dpi;
+	o.psm = po.ocr_psm;
+	o.oem = po.ocr_oem;
+	o.tessdata_dir = po.tessdata_dir;
+	o.preprocess = po.ocr_preprocess;
 	o.best_effort = best_effort;
-	o.backend = pdf_ocr::BackendFromString(ocr_backend);
-	o.external_plugin = ocr_plugin;
-	o.external_endpoint = ocr_endpoint;
+	o.backend = pdf_ocr::BackendFromString(po.ocr_backend);
+	o.external_plugin = po.ocr_plugin;
+	o.external_endpoint = po.ocr_endpoint;
+	o.vars = po.ocr_vars;
+	o.config = po.ocr_config;
 	return o;
 }
 
@@ -990,41 +1058,39 @@ struct OcrWord {
 };
 
 // Render a poppler page and OCR it with tesseract, honoring engine knobs plus
-// the preprocessing (`preprocess`) and confidence-retry (`retry`) toggles. When
-// retry is on and the first pass is low-confidence at a sub-400 dpi render, we
-// re-render at 2x dpi and keep whichever pass scored higher.
-static string OcrPage(poppler::page *page, const string &language, int dpi, int psm, int oem,
-                      const string &tessdata_dir, bool preprocess, bool retry, bool best_effort,
-                      const string &ocr_backend = "tesseract", const string &ocr_plugin = "",
-                      const string &ocr_endpoint = "") {
-	auto opt = MakeOcrOptions(language, dpi, psm, oem, tessdata_dir, preprocess, best_effort, ocr_backend, ocr_plugin,
-	                          ocr_endpoint);
+// the preprocessing and confidence-retry toggles on PdfOptions. When retry is
+// on and the first pass is low-confidence at a sub-400 dpi render, we re-render
+// at 2x dpi and keep whichever pass scored higher. Returns text + MeanTextConf.
+static pdf_ocr::TextResult OcrPageResult(poppler::page *page, const PdfOptions &po, bool best_effort) {
+	auto opt = MakeOcrOptions(po, best_effort);
+	const int dpi = po.ocr_dpi;
 	poppler::image img = RenderPageForOcr(page, dpi);
 	pdf_ocr::TextResult first = OcrBitmapText(img, opt);
-	if (retry && first.confidence < 55 && dpi < 400) {
+	if (po.ocr_retry && first.confidence < 55 && dpi < 400) {
 		auto opt2 = opt;
 		opt2.dpi = dpi * 2;
 		poppler::image img2 = RenderPageForOcr(page, dpi * 2);
 		pdf_ocr::TextResult second = OcrBitmapText(img2, opt2);
 		if (second.confidence > first.confidence) {
-			return second.text;
+			return second;
 		}
 	}
-	return first.text;
+	return first;
+}
+
+static string OcrPage(poppler::page *page, const PdfOptions &po, bool best_effort) {
+	return OcrPageResult(page, po, best_effort).text;
 }
 
 // Word-level OCR with the same preprocessing + confidence-retry semantics as
 // OcrPage. On retry the higher-confidence pass wins, so the returned words carry
 // the confidences of whichever attempt was kept.
-static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &language, int dpi, int psm, int oem,
-                                         const string &tessdata_dir, bool preprocess, bool retry, bool best_effort,
-                                         const string &ocr_backend = "tesseract", const string &ocr_plugin = "",
-                                         const string &ocr_endpoint = "") {
-	auto opt = MakeOcrOptions(language, dpi, psm, oem, tessdata_dir, preprocess, best_effort, ocr_backend, ocr_plugin,
-	                          ocr_endpoint);
+static std::vector<OcrWord> OcrPageWords(poppler::page *page, const PdfOptions &po, bool best_effort) {
+	auto opt = MakeOcrOptions(po, best_effort);
+	const int dpi = po.ocr_dpi;
 	poppler::image img = RenderPageForOcr(page, dpi);
 	pdf_ocr::WordsResult first = OcrBitmapWords(img, opt);
-	if (retry && first.confidence < 55 && dpi < 400) {
+	if (po.ocr_retry && first.confidence < 55 && dpi < 400) {
 		auto opt2 = opt;
 		opt2.dpi = dpi * 2;
 		poppler::image img2 = RenderPageForOcr(page, dpi * 2);
@@ -1047,37 +1113,6 @@ static std::vector<OcrWord> OcrPageWords(poppler::page *page, const string &lang
 	}
 	return out;
 }
-
-//===--------------------------------------------------------------------===//
-// Common options bag (shared by read_pdf / read_pdf_words)
-//===--------------------------------------------------------------------===//
-struct PdfOptions {
-	bool force_ocr = false;
-	bool auto_ocr = true;
-	string ocr_language = "eng";
-	int32_t ocr_dpi = 300;
-	int32_t ocr_psm = 3;        // PSM_AUTO
-	int32_t ocr_oem = 3;        // OEM_DEFAULT
-	bool ocr_preprocess = true; // leptonica grayscale/deskew/binarize/despeckle before OCR
-	bool ocr_retry = true;      // re-render low-confidence sub-400dpi pages at 2x and keep the better result
-	string tessdata_dir;        // optional: directory containing <lang>.traineddata
-	string layout = "reading";
-	bool parse_tables = false;
-	string password;
-	int32_t first_page = 1;
-	int32_t last_page = -1; // -1 => through end
-	// Folder-scan fault isolation: when a glob matches many files, skip the ones
-	// that cannot be opened (corrupt / not-a-PDF / encrypted-without-password /
-	// truncated) instead of aborting the whole query on the first bad file.
-	// Default false preserves the strict "one bad file throws" contract. Skipped
-	// files are recoverable in SQL: glob(pattern) EXCEPT SELECT DISTINCT filename.
-	bool ignore_errors = false;
-	// OCR backend: "tesseract" (linked default) or "external" (plugin C ABI or
-	// SQL pdf_page_images → llm pipeline). See ocr_ops.hpp.
-	string ocr_backend = "tesseract";
-	string ocr_plugin;   // path to shared lib for external backend
-	string ocr_endpoint; // reserved; documented handoff only (no shell/HTTP here)
-};
 
 static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 	for (auto &kv : params) {
@@ -1118,6 +1153,11 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 			o.ocr_plugin = StringValue::Get(kv.second);
 		} else if (key == "ocr_endpoint") {
 			o.ocr_endpoint = StringValue::Get(kv.second);
+		} else if (key == "ocr_vars") {
+			o.ocr_vars.clear();
+			ParseStringMapValue(kv.second, o.ocr_vars, "read_pdf: ocr_vars");
+		} else if (key == "ocr_config") {
+			o.ocr_config = StringValue::Get(kv.second);
 		}
 	}
 
@@ -1169,6 +1209,8 @@ static void AddCommonNamedParams(TableFunction &fn) {
 	fn.named_parameters["ocr_backend"] = LogicalType::VARCHAR;
 	fn.named_parameters["ocr_plugin"] = LogicalType::VARCHAR;
 	fn.named_parameters["ocr_endpoint"] = LogicalType::VARCHAR;
+	fn.named_parameters["ocr_vars"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	fn.named_parameters["ocr_config"] = LogicalType::VARCHAR;
 }
 
 static vector<string> ResolveFiles(ClientContext &context, const string &pattern) {
@@ -1282,11 +1324,14 @@ static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctio
 
 	// has_text_layer: true when the native embedded text layer is non-blank.
 	// used_ocr: true when OCR produced (or replaced) the returned text.
+	// ocr_confidence: Tess MeanTextConf 0..100 when used_ocr, else NULL.
 	// Together they make image-only vs embedded-text detection first-class without
 	// a second pass over the file.
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BOOLEAN, LogicalType::BOOLEAN};
-	names = {"filename", "page", "page_count", "text", "width", "height", "has_text_layer", "used_ocr"};
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::DOUBLE};
+	names = {"filename", "page", "page_count", "text", "width", "height", "has_text_layer", "used_ocr",
+	         "ocr_confidence"};
 	return std::move(result);
 }
 
@@ -1409,6 +1454,8 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 		double height = 0.0;
 		bool has_text_layer = false;
 		bool used_ocr = false;
+		double ocr_confidence = 0.0;
+		bool has_ocr_confidence = false;
 		unique_ptr<poppler::page> page;
 		bool want_ocr = false;
 		{
@@ -1438,12 +1485,12 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 			// discard readable embedded text. Image-only pages still get the
 			// loud missing-model error under force_ocr.
 			const bool best_effort = !bind.opt.force_ocr || has_text_layer;
-			string ocr = OcrPage(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
-			                     bind.opt.ocr_oem, bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry,
-			                     best_effort, bind.opt.ocr_backend, bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
-			if (!ocr.empty()) {
-				text = ocr;
+			auto ocr = OcrPageResult(page.get(), bind.opt, best_effort);
+			if (!ocr.text.empty()) {
+				text = std::move(ocr.text);
 				used_ocr = true;
+				ocr_confidence = static_cast<double>(ocr.confidence);
+				has_ocr_confidence = true;
 			}
 			// else: keep native (possibly empty on image-only pages)
 		}
@@ -1459,6 +1506,11 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 		OutDouble(output.data[5], count, height);
 		OutBool(output.data[6], count, has_text_layer);
 		OutBool(output.data[7], count, used_ocr);
+		if (has_ocr_confidence) {
+			OutDouble(output.data[8], count, ocr_confidence);
+		} else {
+			OutDoubleNull(output.data[8], count);
+		}
 		count++;
 	}
 	output.SetCardinality(count);
@@ -2255,6 +2307,14 @@ static void PdfRevisionsScan(ClientContext &context, TableFunctionInput &data_p,
 
 //===--------------------------------------------------------------------===//
 // read_pdf_words  -> one row per word with bbox + font (layout/table substrate)
+//
+// Extra columns (app-LOC killers for mark / detect packs):
+//   line        — 1-based geometric line id within the page (vertical-overlap
+//                 clustering, same rule as read_pdf_elements). Enables equi-join
+//                 of words→lines and string_agg line rebuild without a second
+//                 Poppler walk or DIY y_key clustering.
+//   page_width  — crop-box width in points for the word's page (matches
+//   page_height    read_pdf width/height; no max-bbox geometry hacks).
 //===--------------------------------------------------------------------===//
 struct ReadPdfWordsBindData : public TableFunctionData {
 	vector<string> files;
@@ -2268,8 +2328,10 @@ static unique_ptr<FunctionData> ReadPdfWordsBind(ClientContext &context, TableFu
 	ParseNamed(input.named_parameters, result->opt);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::DOUBLE,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR,
-	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE};
-	names = {"filename", "page", "word", "x0", "y0", "x1", "y1", "font_name", "font_size", "source", "confidence"};
+	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::INTEGER,
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE};
+	names = {"filename", "page", "word", "x0", "y0", "x1", "y1", "font_name", "font_size", "source", "confidence",
+	         "line", "page_width", "page_height"};
 	return std::move(result);
 }
 
@@ -2283,12 +2345,108 @@ struct ReadPdfWordsState : public GlobalTableFunctionState {
 	unique_ptr<poppler::document> doc;
 	std::vector<poppler::text_box> boxes;
 	std::vector<OcrWord> ocr_boxes;
+	// Parallel to boxes / ocr_boxes (whichever is active for the page).
+	std::vector<int32_t> line_ids;
+	double page_width = 0.0;
+	double page_height = 0.0;
 	bool page_is_ocr = false;
 	string current_file;
 	idx_t MaxThreads() const override {
 		return 1;
 	}
 };
+
+// Geometric line ids for a page of word bboxes. Same vertical-overlap rule as
+// ElemBuildLines / read_pdf_elements (must stay equal to ELEM_LINE_OVERLAP_MIN_RATIO
+// — defined later with the elements contract; duplicated here because words scan
+// is registered above that block). Words sorted by (y0, x0); a word joins the
+// current line or starts a new one. Line numbers are 1-based in that order
+// (ascending y0 — reading order when poppler-cpp text_list uses top-down y).
+// Returns a vector parallel to the input index order (not sorted order).
+static constexpr double WORDS_LINE_OVERLAP_MIN_RATIO = 0.5;
+
+struct WordLineGeom {
+	size_t idx = 0;
+	double x0 = 0.0;
+	double y0 = 0.0;
+	double y1 = 0.0;
+};
+
+static std::vector<int32_t> AssignWordLineIds(std::vector<WordLineGeom> geoms) {
+	std::vector<int32_t> line_of(geoms.size(), 0);
+	if (geoms.empty()) {
+		return line_of;
+	}
+	std::sort(geoms.begin(), geoms.end(), [](const WordLineGeom &a, const WordLineGeom &b) {
+		if (a.y0 != b.y0) {
+			return a.y0 < b.y0;
+		}
+		return a.x0 < b.x0;
+	});
+	struct LineRun {
+		double y0 = 0.0;
+		double y1 = 0.0;
+		std::vector<size_t> idxs;
+	};
+	std::vector<LineRun> lines;
+	for (auto &w : geoms) {
+		bool joined = false;
+		if (!lines.empty()) {
+			auto &line = lines.back();
+			double overlap = MinValue<double>(w.y1, line.y1) - MaxValue<double>(w.y0, line.y0);
+			double shorter = MinValue<double>(w.y1 - w.y0, line.y1 - line.y0);
+			if (shorter > 0 && overlap >= WORDS_LINE_OVERLAP_MIN_RATIO * shorter) {
+				line.y0 = MinValue<double>(line.y0, w.y0);
+				line.y1 = MaxValue<double>(line.y1, w.y1);
+				line.idxs.push_back(w.idx);
+				joined = true;
+			}
+		}
+		if (!joined) {
+			LineRun line;
+			line.y0 = w.y0;
+			line.y1 = w.y1;
+			line.idxs.push_back(w.idx);
+			lines.push_back(std::move(line));
+		}
+	}
+	for (size_t li = 0; li < lines.size(); li++) {
+		int32_t line_no = static_cast<int32_t>(li + 1);
+		for (size_t idx : lines[li].idxs) {
+			line_of[idx] = line_no;
+		}
+	}
+	return line_of;
+}
+
+static std::vector<int32_t> AssignLineIdsNative(const std::vector<poppler::text_box> &boxes) {
+	std::vector<WordLineGeom> geoms;
+	geoms.reserve(boxes.size());
+	for (size_t i = 0; i < boxes.size(); i++) {
+		auto r = boxes[i].bbox();
+		WordLineGeom g;
+		g.idx = i;
+		g.x0 = r.x();
+		g.y0 = r.y();
+		g.y1 = r.y() + r.height();
+		geoms.push_back(g);
+	}
+	return AssignWordLineIds(std::move(geoms));
+}
+
+static std::vector<int32_t> AssignLineIdsOcr(const std::vector<OcrWord> &words) {
+	std::vector<WordLineGeom> geoms;
+	geoms.reserve(words.size());
+	for (size_t i = 0; i < words.size(); i++) {
+		WordLineGeom g;
+		g.idx = i;
+		g.x0 = words[i].x0;
+		g.y0 = words[i].y0;
+		g.y1 = words[i].y1;
+		geoms.push_back(g);
+	}
+	return AssignWordLineIds(std::move(geoms));
+}
 
 static void WordsOpenFile(ClientContext &context, const ReadPdfWordsBindData &bind, ReadPdfWordsState &g) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
@@ -2300,6 +2458,9 @@ static void WordsOpenFile(ClientContext &context, const ReadPdfWordsBindData &bi
 	g.last_page_0 = bind.opt.last_page < 0 ? g.page_count : MinValue<int>(bind.opt.last_page, g.page_count);
 	g.boxes.clear();
 	g.ocr_boxes.clear();
+	g.line_ids.clear();
+	g.page_width = 0.0;
+	g.page_height = 0.0;
 	g.page_is_ocr = false;
 	g.word_idx = 0;
 }
@@ -2308,6 +2469,9 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	g.boxes.clear();
 	g.ocr_boxes.clear();
+	g.line_ids.clear();
+	g.page_width = 0.0;
+	g.page_height = 0.0;
 	g.page_is_ocr = false;
 	g.word_idx = 0;
 	if (g.page_idx >= g.last_page_0) {
@@ -2315,6 +2479,10 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 	}
 	unique_ptr<poppler::page> page(g.doc->create_page(g.page_idx));
 	if (page) {
+		// Crop-box size in points — same default as read_pdf width/height.
+		auto rect = page->page_rect();
+		g.page_width = rect.width();
+		g.page_height = rect.height();
 		if (opt.force_ocr) {
 			// Prefer OCR; fall back to native words when the raster is blank
 			// (e.g. missing display fonts on a text-only PDF under vcpkg poppler).
@@ -2322,9 +2490,7 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 			// (loud missing-model error under explicit ocr:=true).
 			g.boxes = page->text_list(poppler::page::text_list_include_font);
 			const bool has_native = !g.boxes.empty();
-			g.ocr_boxes = OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem,
-			                           opt.tessdata_dir, opt.ocr_preprocess, opt.ocr_retry,
-			                           /*best_effort=*/has_native, opt.ocr_backend, opt.ocr_plugin, opt.ocr_endpoint);
+			g.ocr_boxes = OcrPageWords(page.get(), opt, /*best_effort=*/has_native);
 			if (!g.ocr_boxes.empty()) {
 				g.boxes.clear();
 				g.page_is_ocr = true;
@@ -2336,13 +2502,16 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 			if (!g.boxes.empty()) {
 				g.page_is_ocr = false;
 			} else if (opt.auto_ocr) {
-				g.ocr_boxes = OcrPageWords(page.get(), opt.ocr_language, opt.ocr_dpi, opt.ocr_psm, opt.ocr_oem,
-				                           opt.tessdata_dir, opt.ocr_preprocess, opt.ocr_retry, /*best_effort=*/true,
-				                           opt.ocr_backend, opt.ocr_plugin, opt.ocr_endpoint);
+				g.ocr_boxes = OcrPageWords(page.get(), opt, /*best_effort=*/true);
 				g.page_is_ocr = !g.ocr_boxes.empty();
 			} else {
 				g.page_is_ocr = false;
 			}
+		}
+		if (g.page_is_ocr) {
+			g.line_ids = AssignLineIdsOcr(g.ocr_boxes);
+		} else {
+			g.line_ids = AssignLineIdsNative(g.boxes);
 		}
 	}
 	return true;
@@ -2412,6 +2581,11 @@ static void ReadPdfWordsScan(ClientContext &context, TableFunctionInput &data_p,
 			OutString(output.data[9], count, "text");
 			OutDoubleNull(output.data[10], count); // NULL confidence for native
 		}
+		// line / page geometry (always set when the page loaded)
+		int32_t line_no = (g.word_idx < g.line_ids.size()) ? g.line_ids[g.word_idx] : 0;
+		OutInt32(output.data[11], count, line_no);
+		OutDouble(output.data[12], count, g.page_width);
+		OutDouble(output.data[13], count, g.page_height);
 		g.word_idx++;
 		count++;
 	}
@@ -2595,7 +2769,10 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 //===--------------------------------------------------------------------===//
 
 // Rule 1: min vertical-overlap ratio for a word to join a line.
+// Keep equal to WORDS_LINE_OVERLAP_MIN_RATIO (read_pdf_words.line assignment).
 static constexpr double ELEM_LINE_OVERLAP_MIN_RATIO = 0.5;
+static_assert(WORDS_LINE_OVERLAP_MIN_RATIO == ELEM_LINE_OVERLAP_MIN_RATIO,
+              "read_pdf_words.line and read_pdf_elements must share line clustering");
 // Rule 2a: vertical gap > this fraction of median line height starts a new block.
 static constexpr double ELEM_BLOCK_GAP_RATIO = 0.6;
 // Rule 2b: relative font-size change > this fraction starts a new block.
@@ -3385,10 +3562,7 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 			std::vector<PdfWord> words;
 			if (bind.opt.force_ocr) {
 				// Prefer OCR; fall back to native when the raster is blank.
-				auto ocr_words = OcrPageWords(
-				    page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm, bind.opt.ocr_oem,
-				    bind.opt.tessdata_dir, bind.opt.ocr_preprocess, bind.opt.ocr_retry,
-				    /*best_effort=*/true, bind.opt.ocr_backend, bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
+				auto ocr_words = OcrPageWords(page.get(), bind.opt, /*best_effort=*/true);
 				for (auto &ow : ocr_words) {
 					PdfWord w;
 					w.xMin = ow.x0;
@@ -3422,10 +3596,7 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 					words.push_back(std::move(w));
 				}
 				if (words.empty() && bind.opt.auto_ocr) {
-					auto ocr_words = OcrPageWords(page.get(), bind.opt.ocr_language, bind.opt.ocr_dpi, bind.opt.ocr_psm,
-					                              bind.opt.ocr_oem, bind.opt.tessdata_dir, bind.opt.ocr_preprocess,
-					                              bind.opt.ocr_retry, /*best_effort=*/true, bind.opt.ocr_backend,
-					                              bind.opt.ocr_plugin, bind.opt.ocr_endpoint);
+					auto ocr_words = OcrPageWords(page.get(), bind.opt, /*best_effort=*/true);
 					for (auto &ow : ocr_words) {
 						PdfWord w;
 						w.xMin = ow.x0;
@@ -4018,11 +4189,14 @@ static void PdfToPngBlobDpiFun(DataChunk &args, ExpressionState &state, Vector &
 // Low-level building blocks (Gemini checklist):
 //   poppler_version() -> VARCHAR
 //   poppler_render_page(pdf_blob, page, dpi) -> BLOB  (PNG)
-//   tesseract_ocr(image_blob[, lang[, psm]]) -> VARCHAR
+//   tesseract_ocr(image_blob[, lang[, psm[, oem[, tessdata_dir[, preprocess[, vars[, config]]]]]]])
 //
 // poppler_render_page reuses LoadBlobDoc + RenderPageToPngBytes (same raster
 // path as pdf_to_png BLOB overloads). tesseract_ocr runs in-process OCR on an
 // encoded image BLOB via pdf_ocr::RecognizeImageBlob (leptonica pixReadMem).
+// Scalar overloads are positional (DuckDB scalars have no named-param map);
+// table readers expose the same knobs as ocr_* named params including ocr_vars
+// MAP + ocr_config.
 //===--------------------------------------------------------------------===//
 
 static void PopplerVersionFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -4054,17 +4228,76 @@ static void PopplerRenderPageFun(DataChunk &args, ExpressionState &state, Vector
 	    });
 }
 
-static string RunTesseractOcrOnBlob(string_t image_blob, const string &lang, int32_t psm) {
-	if (psm < 0 || psm > 13) {
-		throw InvalidInputException("tesseract_ocr: psm must be between 0 and 13 (got %d)", (int)psm);
-	}
+// Build Options from tesseract_ocr positional arity (ColumnCount):
+//   1 blob
+//   2 +lang
+//   3 +psm
+//   4 +oem
+//   5 +tessdata_dir
+//   6 +preprocess
+//   7 +vars MAP
+//   8 +config path
+static pdf_ocr::Options TesseractOcrOptionsFromArgs(DataChunk &args, idx_t row) {
 	pdf_ocr::Options opt;
-	opt.language = lang.empty() ? "eng" : lang;
-	opt.psm = (int)psm;
-	opt.oem = 3; // OEM_DEFAULT
+	opt.language = "eng";
+	opt.psm = 3;
+	opt.oem = 3;
 	opt.preprocess = true;
 	opt.best_effort = false;
 	opt.backend = pdf_ocr::Backend::Tesseract;
+	const idx_t n = args.ColumnCount();
+	if (n >= 2) {
+		auto v = args.GetValue(1, row);
+		if (!v.IsNull()) {
+			opt.language = StringValue::Get(v);
+			if (opt.language.empty()) {
+				opt.language = "eng";
+			}
+		}
+	}
+	if (n >= 3) {
+		auto v = args.GetValue(2, row);
+		if (!v.IsNull()) {
+			opt.psm = IntegerValue::Get(v);
+		}
+	}
+	if (n >= 4) {
+		auto v = args.GetValue(3, row);
+		if (!v.IsNull()) {
+			opt.oem = IntegerValue::Get(v);
+		}
+	}
+	if (n >= 5) {
+		auto v = args.GetValue(4, row);
+		if (!v.IsNull()) {
+			opt.tessdata_dir = StringValue::Get(v);
+		}
+	}
+	if (n >= 6) {
+		auto v = args.GetValue(5, row);
+		if (!v.IsNull()) {
+			opt.preprocess = BooleanValue::Get(v);
+		}
+	}
+	if (n >= 7) {
+		ParseStringMapValueStd(args.GetValue(6, row), opt.vars, "tesseract_ocr: vars");
+	}
+	if (n >= 8) {
+		auto v = args.GetValue(7, row);
+		if (!v.IsNull()) {
+			opt.config = StringValue::Get(v);
+		}
+	}
+	if (opt.psm < 0 || opt.psm > 13) {
+		throw InvalidInputException("tesseract_ocr: psm must be between 0 and 13 (got %d)", opt.psm);
+	}
+	if (opt.oem < 0 || opt.oem > 3) {
+		throw InvalidInputException("tesseract_ocr: oem must be between 0 and 3 (got %d)", opt.oem);
+	}
+	return opt;
+}
+
+static string RunTesseractOcrOnBlob(string_t image_blob, const pdf_ocr::Options &opt) {
 	try {
 		auto r = pdf_ocr::RecognizeImageBlob(reinterpret_cast<const unsigned char *>(image_blob.GetDataUnsafe()),
 		                                     image_blob.GetSize(), opt);
@@ -4074,27 +4307,152 @@ static string RunTesseractOcrOnBlob(string_t image_blob, const string &lang, int
 	}
 }
 
-static void TesseractOcrFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	(void)state;
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t blob) {
-		return StringVector::AddString(result, RunTesseractOcrOnBlob(blob, "eng", 3));
-	});
+// Prefix IO errors for ocr_image; avoid double-prefix if message already has it.
+static void RethrowOcrImageError(const std::exception &e) {
+	string msg = e.what();
+	if (StringUtil::StartsWith(msg, "ocr_image:")) {
+		throw IOException("%s", msg);
+	}
+	throw IOException("ocr_image: %s", msg);
 }
 
-static void TesseractOcrLangFun(DataChunk &args, ExpressionState &state, Vector &result) {
+// Shared executor for every tesseract_ocr overload (arity via ColumnCount).
+// Flat GetValue loop so MAP / optional trailing args stay row-aligned.
+static void TesseractOcrDispatch(DataChunk &args, ExpressionState &state, Vector &result) {
 	(void)state;
-	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t blob, string_t lang) {
-		    return StringVector::AddString(result, RunTesseractOcrOnBlob(blob, lang.GetString(), 3));
-	    });
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto out = FlatVector::GetData<string_t>(result);
+	auto &validity = FlatVector::Validity(result);
+	for (idx_t i = 0; i < args.size(); i++) {
+		auto blob_v = args.GetValue(0, i);
+		if (blob_v.IsNull()) {
+			validity.SetInvalid(i);
+			continue;
+		}
+		string_t blob = StringValue::Get(blob_v);
+		auto opt = TesseractOcrOptionsFromArgs(args, i);
+		out[i] = StringVector::AddString(result, RunTesseractOcrOnBlob(blob, opt));
+	}
 }
 
-static void TesseractOcrLangPsmFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	(void)state;
-	TernaryExecutor::Execute<string_t, string_t, int32_t, string_t>(
-	    args.data[0], args.data[1], args.data[2], result, args.size(), [&](string_t blob, string_t lang, int32_t psm) {
-		    return StringVector::AddString(result, RunTesseractOcrOnBlob(blob, lang.GetString(), psm));
-	    });
+//===--------------------------------------------------------------------===//
+// ocr_image(blob, named…) — table-function image OCR with named params
+// (DuckDB scalars cannot take named maps). One row per call:
+//   text, confidence, format
+// format := 'text' | 'hocr' | 'tsv'  (in-process Tess GetUTF8/HOCR/TSV).
+//===--------------------------------------------------------------------===//
+
+struct OcrImageBindData : public TableFunctionData {
+	string image_blob; // copy of input BLOB bytes
+	pdf_ocr::Options opt;
+	string format = "text";
+};
+
+static unique_ptr<FunctionData> OcrImageBind(ClientContext &context, TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types, vector<string> &names) {
+	(void)context;
+	auto result = make_uniq<OcrImageBindData>();
+	auto blob_v = input.inputs[0];
+	if (blob_v.IsNull()) {
+		throw InvalidInputException("ocr_image: image BLOB must not be NULL");
+	}
+	string_t blob = StringValue::Get(blob_v);
+	result->image_blob.assign(blob.GetDataUnsafe(), blob.GetSize());
+
+	result->opt.language = "eng";
+	result->opt.psm = 3;
+	result->opt.oem = 3;
+	result->opt.preprocess = true;
+	result->opt.dpi = 300;
+	result->opt.best_effort = false;
+	result->opt.backend = pdf_ocr::Backend::Tesseract;
+
+	for (auto &kv : input.named_parameters) {
+		// NULL named args keep defaults (same idea as optional SQL kwargs).
+		if (kv.second.IsNull()) {
+			continue;
+		}
+		auto key = StringUtil::Lower(kv.first);
+		if (key == "language" || key == "lang" || key == "ocr_language") {
+			result->opt.language = StringValue::Get(kv.second);
+			if (result->opt.language.empty()) {
+				result->opt.language = "eng";
+			}
+		} else if (key == "psm" || key == "ocr_psm") {
+			result->opt.psm = IntegerValue::Get(kv.second);
+		} else if (key == "oem" || key == "ocr_oem") {
+			result->opt.oem = IntegerValue::Get(kv.second);
+		} else if (key == "tessdata_dir") {
+			result->opt.tessdata_dir = StringValue::Get(kv.second);
+		} else if (key == "preprocess" || key == "ocr_preprocess") {
+			result->opt.preprocess = BooleanValue::Get(kv.second);
+		} else if (key == "dpi" || key == "ocr_dpi") {
+			result->opt.dpi = IntegerValue::Get(kv.second);
+		} else if (key == "vars" || key == "ocr_vars") {
+			ParseStringMapValueStd(kv.second, result->opt.vars, "ocr_image: vars");
+		} else if (key == "config" || key == "ocr_config") {
+			result->opt.config = StringValue::Get(kv.second);
+		} else if (key == "format") {
+			try {
+				result->format = pdf_ocr::NormalizeOutputFormat(StringValue::Get(kv.second));
+			} catch (const std::exception &e) {
+				throw InvalidInputException("ocr_image: %s", string(e.what()));
+			}
+		} else {
+			throw InvalidInputException("ocr_image: unknown named parameter '%s'", kv.first);
+		}
+	}
+	if (result->opt.psm < 0 || result->opt.psm > 13) {
+		throw InvalidInputException("ocr_image: psm must be between 0 and 13 (got %d)", result->opt.psm);
+	}
+	if (result->opt.oem < 0 || result->opt.oem > 3) {
+		throw InvalidInputException("ocr_image: oem must be between 0 and 3 (got %d)", result->opt.oem);
+	}
+	if (result->opt.dpi < 1 || result->opt.dpi > 2400) {
+		throw InvalidInputException("ocr_image: dpi must be between 1 and 2400 (got %d)", result->opt.dpi);
+	}
+	result->opt.format = result->format;
+
+	return_types = {LogicalType::VARCHAR, LogicalType::DOUBLE, LogicalType::VARCHAR};
+	names = {"text", "confidence", "format"};
+	return std::move(result);
+}
+
+struct OcrImageState : public GlobalTableFunctionState {
+	bool done = false;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<GlobalTableFunctionState> OcrImageInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<OcrImageState>();
+}
+
+static void OcrImageScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	(void)context;
+	auto &bind = data_p.bind_data->Cast<OcrImageBindData>();
+	auto &st = data_p.global_state->Cast<OcrImageState>();
+	if (st.done) {
+		output.SetCardinality(0);
+		return;
+	}
+	st.done = true;
+	// Empty BLOB is a hard error (not a zero-row success) — same as scalar path.
+	if (bind.image_blob.empty()) {
+		throw IOException("ocr_image: empty image BLOB");
+	}
+	pdf_ocr::TextResult r;
+	try {
+		r = pdf_ocr::RecognizeImageBlob(reinterpret_cast<const unsigned char *>(bind.image_blob.data()),
+		                                bind.image_blob.size(), bind.opt);
+	} catch (const std::exception &e) {
+		RethrowOcrImageError(e);
+	}
+	OutString(output.data[0], 0, r.text);
+	OutDouble(output.data[1], 0, static_cast<double>(r.confidence));
+	OutString(output.data[2], 0, r.format.empty() ? bind.format : r.format);
+	output.SetCardinality(1);
 }
 
 //===--------------------------------------------------------------------===//
@@ -7803,13 +8161,54 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction("poppler_render_page",
 	                                       {LogicalType::BLOB, LogicalType::INTEGER, LogicalType::INTEGER},
 	                                       LogicalType::BLOB, PopplerRenderPageFun));
+	// tesseract_ocr positional overloads (scalar has no named-param map):
+	// blob [, lang [, psm [, oem [, tessdata_dir [, preprocess [, vars [, config]]]]]]]
+	const auto map_vv = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	ScalarFunctionSet tesseract_ocr_set("tesseract_ocr");
-	tesseract_ocr_set.AddFunction(ScalarFunction({LogicalType::BLOB}, LogicalType::VARCHAR, TesseractOcrFun));
+	tesseract_ocr_set.AddFunction(ScalarFunction({LogicalType::BLOB}, LogicalType::VARCHAR, TesseractOcrDispatch));
 	tesseract_ocr_set.AddFunction(
-	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR}, LogicalType::VARCHAR, TesseractOcrLangFun));
+	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR}, LogicalType::VARCHAR, TesseractOcrDispatch));
 	tesseract_ocr_set.AddFunction(ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER},
-	                                             LogicalType::VARCHAR, TesseractOcrLangPsmFun));
+	                                             LogicalType::VARCHAR, TesseractOcrDispatch));
+	tesseract_ocr_set.AddFunction(
+	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER},
+	                   LogicalType::VARCHAR, TesseractOcrDispatch));
+	tesseract_ocr_set.AddFunction(ScalarFunction(
+	    {LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR},
+	    LogicalType::VARCHAR, TesseractOcrDispatch));
+	tesseract_ocr_set.AddFunction(ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER,
+	                                              LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BOOLEAN},
+	                                             LogicalType::VARCHAR, TesseractOcrDispatch));
+	tesseract_ocr_set.AddFunction(ScalarFunction(
+	    {LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
+	     LogicalType::BOOLEAN, map_vv},
+	    LogicalType::VARCHAR, TesseractOcrDispatch));
+	tesseract_ocr_set.AddFunction(ScalarFunction(
+	    {LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
+	     LogicalType::BOOLEAN, map_vv, LogicalType::VARCHAR},
+	    LogicalType::VARCHAR, TesseractOcrDispatch));
 	loader.RegisterFunction(tesseract_ocr_set);
+
+	// Named-param image OCR (scalars cannot take named maps). format=text|hocr|tsv.
+	TableFunction ocr_image("ocr_image", {LogicalType::BLOB}, OcrImageScan, OcrImageBind, OcrImageInit);
+	ocr_image.named_parameters["language"] = LogicalType::VARCHAR;
+	ocr_image.named_parameters["lang"] = LogicalType::VARCHAR;
+	ocr_image.named_parameters["ocr_language"] = LogicalType::VARCHAR;
+	ocr_image.named_parameters["psm"] = LogicalType::INTEGER;
+	ocr_image.named_parameters["ocr_psm"] = LogicalType::INTEGER;
+	ocr_image.named_parameters["oem"] = LogicalType::INTEGER;
+	ocr_image.named_parameters["ocr_oem"] = LogicalType::INTEGER;
+	ocr_image.named_parameters["tessdata_dir"] = LogicalType::VARCHAR;
+	ocr_image.named_parameters["preprocess"] = LogicalType::BOOLEAN;
+	ocr_image.named_parameters["ocr_preprocess"] = LogicalType::BOOLEAN;
+	ocr_image.named_parameters["dpi"] = LogicalType::INTEGER;
+	ocr_image.named_parameters["ocr_dpi"] = LogicalType::INTEGER;
+	ocr_image.named_parameters["vars"] = map_vv;
+	ocr_image.named_parameters["ocr_vars"] = map_vv;
+	ocr_image.named_parameters["config"] = LogicalType::VARCHAR;
+	ocr_image.named_parameters["ocr_config"] = LogicalType::VARCHAR;
+	ocr_image.named_parameters["format"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(ocr_image);
 
 	ScalarFunctionSet to_pdf_set("to_pdf");
 	to_pdf_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, ToPdfFun));

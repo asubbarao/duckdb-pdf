@@ -1,5 +1,5 @@
 # name: test/sql/pdf_lowlevel_api.test
-# description: Low-level scalars: poppler_version, poppler_render_page, tesseract_ocr
+# description: Low-level: poppler_version, poppler_render_page, tesseract_ocr, ocr_image
 # group: [sql]
 
 require pdf
@@ -75,8 +75,121 @@ SELECT length(tesseract_ocr(
 ----
 true
 
+# richer positional overloads: oem + tessdata_dir + preprocess + vars MAP
+query I
+SELECT length(tesseract_ocr(
+  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
+  'eng', 3, 3, '', true,
+  MAP {'tessedit_char_whitelist': 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,;:''"!?-'}
+)) > 0;
+----
+true
+
+# full arity including empty config path
+query I
+SELECT length(tesseract_ocr(
+  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
+  'eng', 3, 3, '', true,
+  MAP {},
+  ''
+)) > 0;
+----
+true
+
+# bad psm / oem fail fast
+statement error
+SELECT tesseract_ocr(
+  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 72),
+  'eng', 99
+);
+----
+psm must be between
+
+statement error
+SELECT tesseract_ocr(
+  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 72),
+  'eng', 3, 9
+);
+----
+oem must be between
+
 # garbage image BLOB fails
 statement error
 SELECT tesseract_ocr('\x00\x01\x02\x03'::BLOB);
 ----
 could not decode image BLOB
+
+# ── ocr_image TVF: named params + format text|hocr|tsv ─────────────────────
+# TVF args must be foldable (no subqueries) — SET VARIABLE then getvariable().
+
+statement ok
+SET VARIABLE ocr_png = (
+  SELECT poppler_render_page(content, 1, 150) FROM read_blob('test/data/scanned.pdf')
+);
+
+query III
+SELECT length(text) > 0, confidence BETWEEN 0 AND 100, format
+FROM ocr_image(getvariable('ocr_png'), language := 'eng', psm := 3, format := 'text');
+----
+true	true	text
+
+query II
+SELECT length(text) > 20, format
+FROM ocr_image(getvariable('ocr_png'), format := 'hocr');
+----
+true	hocr
+
+query II
+SELECT length(text) > 0, format
+FROM ocr_image(getvariable('ocr_png'), format := 'tsv',
+  vars := MAP {'tessedit_char_whitelist': 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,;:''"!?-'});
+----
+true	tsv
+
+statement error
+SELECT * FROM ocr_image(getvariable('ocr_png'), format := 'not_a_format');
+----
+ocr format must be
+
+# NULL named params keep defaults (must not INTERNAL Error)
+query II
+SELECT length(text) > 0, format
+FROM ocr_image(getvariable('ocr_png'), language := NULL, psm := NULL, format := NULL, vars := NULL);
+----
+true	text
+
+statement error
+SELECT * FROM ocr_image(NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM ocr_image(''::BLOB);
+----
+empty image BLOB
+
+statement error
+SELECT * FROM ocr_image('\x00\x01\x02'::BLOB);
+----
+could not decode image BLOB
+
+# read_pdf exposes ocr_confidence when OCR runs
+query II
+SELECT used_ocr, ocr_confidence IS NOT NULL AND ocr_confidence BETWEEN 0 AND 100
+FROM read_pdf('test/data/scanned.pdf', ocr := true)
+LIMIT 1;
+----
+true	true
+
+query I
+SELECT ocr_confidence IS NULL
+FROM read_pdf('test/data/hello.pdf', auto_ocr := false)
+LIMIT 1;
+----
+true
+
+# missing file still errors (pre-existing path); confidence column present when readable
+statement error
+SELECT * FROM read_pdf('/no/such/file.pdf', auto_ocr := false);
+----
+Cannot open file

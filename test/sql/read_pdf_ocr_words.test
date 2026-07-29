@@ -129,3 +129,17 @@ FROM read_pdf_words('test/data/scanned.pdf', ocr:=true)
 WHERE source = 'ocr';
 ----
 true
+
+# ocr_vars MAP + ocr_config named params bind and still produce OCR words
+# (whitelist includes enough of the Latin alphabet for the fixture tokens).
+
+query I
+SELECT count(*) > 0
+FROM read_pdf_words('test/data/scanned.pdf', ocr := true,
+  ocr_vars := MAP {
+    'tessedit_char_whitelist': 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,;:$'
+  },
+  ocr_config := '')
+WHERE source = 'ocr';
+----
+true
