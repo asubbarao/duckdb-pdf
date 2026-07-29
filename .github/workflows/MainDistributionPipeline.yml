@@ -1,16 +1,12 @@
 #
 # Build, test, and (on tags) publish extension binaries.
 #
-# Host support floor: DuckDB v1.5.3 (quack) and later on the 1.5 line.
-#
-# Always build the full host × platform matrix so linux / macOS / windows
-# stay green for every supported DuckDB:
-#   hosts: v1.5.3 (quack floor), v1.5.4, v1.5.5 (community tip)
-#   platforms (extension-ci-tools): linux_amd64, linux_arm64, osx_amd64,
-#     osx_arm64, windows_amd64
+# Single supported DuckDB host: v1.5.5
+# Platforms (extension-ci-tools): linux_amd64, linux_arm64, osx_amd64,
+#   osx_arm64, windows_amd64
 # Excludes: wasm / MinGW / rtools / windows_arm64
 #
-# Tag push (v*) also attaches all artifacts to the GitHub Release.
+# Tag push (v*) attaches artifacts to the GitHub Release.
 #
 name: Main Extension Distribution Pipeline
 on:
@@ -19,41 +15,19 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Do not cancel in-progress multi-host builds — full linux/macOS/windows ×
-  # v1.5.3–v1.5.5 matrices take a long time; canceling wastes the run.
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
-  resolve-matrix:
-    name: Resolve DuckDB version matrix
-    runs-on: ubuntu-latest
-    outputs:
-      versions: ${{ steps.set.outputs.versions }}
-    steps:
-      - id: set
-        run: |
-          set -euo pipefail
-          # Floor = quack v1.5.3; tip = community latest stable
-          echo 'versions=["v1.5.3","v1.5.4","v1.5.5"]' >> "$GITHUB_OUTPUT"
-          echo "Full matrix: v1.5.3 v1.5.4 v1.5.5 × linux/macOS/windows_amd64"
-
   duckdb-stable-build:
-    name: Build extension binaries (${{ matrix.duckdb_version }})
-    needs: resolve-matrix
-    strategy:
-      fail-fast: false
-      matrix:
-        duckdb_version: ${{ fromJson(needs.resolve-matrix.outputs.versions) }}
+    name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
-      duckdb_version: ${{ matrix.duckdb_version }}
+      duckdb_version: v1.5.5
       ci_tools_version: v1.5-variegata
       extension_name: pdf
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools;windows_arm64
       vcpkg_commit: 84bab45d415d22042bd0b9081aea57f362da3f35
-      # Unique artifact names when multiple duckdb versions build in parallel
-      artifact_postfix: ""
 
   code-quality-check:
     name: Code Quality Check
@@ -62,15 +36,11 @@ jobs:
       duckdb_version: v1.5.5
       ci_tools_version: v1.5-variegata
       extension_name: pdf
-      # disable tidy — tidy container lacks poppler-cpp for pkg-config REQUIRED
       format_checks: "format"
 
-  # On tag pushes: attach all built .duckdb_extension artifacts to the GitHub Release.
-  # Artifact name pattern from extension-ci-tools:
-  #   pdf-<duckdb_version>-extension-<arch>
   publish-github-release:
     name: Publish GitHub Release assets
-    needs: [resolve-matrix, duckdb-stable-build]
+    needs: [duckdb-stable-build]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -87,25 +57,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release_assets
-          # Flatten: pdf-v1.5.3-extension-linux_amd64/pdf.duckdb_extension → named asset
-          find artifacts -type f \( -name '*.duckdb_extension' -o -name '*.duckdb_extension.gz' -o -name '*.duckdb_extension.wasm' \) | while read -r f; do
-            # parent dir is artifact name: pdf-v1.5.4-extension-linux_amd64
+          find artifacts -type f \( -name '*.duckdb_extension' -o -name '*.duckdb_extension.gz' \) | while read -r f; do
             parent="$(basename "$(dirname "$f")")"
             base="$(basename "$f")"
-            # pdf-v1.5.4-extension-linux_amd64 + pdf.duckdb_extension
-            # → pdf-duckdb-v1.5.4-linux_amd64.duckdb_extension
-            # parent = pdf-<ver>-extension-<arch>
             ver_arch="${parent#pdf-}"
-            # ver_arch = v1.5.4-extension-linux_amd64
             ver="${ver_arch%%-extension-*}"
             arch="${ver_arch#*-extension-}"
-            ext="${base##*.}"
             if [[ "$base" == *.duckdb_extension.gz ]]; then
               out="pdf-duckdb-${ver}-${arch}.duckdb_extension.gz"
-            elif [[ "$base" == *.duckdb_extension ]]; then
-              out="pdf-duckdb-${ver}-${arch}.duckdb_extension"
             else
-              out="pdf-duckdb-${ver}-${arch}.${ext}"
+              out="pdf-duckdb-${ver}-${arch}.duckdb_extension"
             fi
             cp -v "$f" "release_assets/${out}"
           done

@@ -31,50 +31,38 @@ CREATE TABLE chunks AS FROM pdf_chunks('docs/*.pdf');
 
 ## Installation
 
-### Supported DuckDB hosts
+### Supported DuckDB host
 
-| | |
-|--|--|
-| **Minimum** | **DuckDB v1.5.3** (quack floor) and later on the 1.5 line |
-| **CI matrix** | `v1.5.3`, `v1.5.4`, `v1.5.5` × linux_amd64/arm64, osx_amd64/arm64, windows_amd64 |
-| **Community CDN** | Tip stable only (currently `v1.5.4`/`v1.5.5` paths as published) — exact host string must match |
-| **GitHub Releases** | Full multi-host assets on each `v*` tag (`pdf-duckdb-<ver>-<arch>.duckdb_extension`) |
+**DuckDB v1.5.5 only** — linux_amd64/arm64, osx_amd64/arm64, windows_amd64.
 
-Among recent PyPI installs, most traffic is mid/late **1.5.x** (~85% of named modern volume is 1.5.2–1.5.4). We do **not** multi-build 1.4.
-
-### Community (signed, tip host)
+### Community (signed)
 
 ```sql
 INSTALL pdf FROM community;
 LOAD pdf;
 ```
 
-Requires a DuckDB build whose version has a published community binary (see CDN path `…/v{exact}/…`). Or:
+Requires **DuckDB v1.5.5**. Or:
 
 ```sql
 INSTALL pdf FROM 'https://community-extensions.duckdb.org';
 LOAD pdf;
 ```
 
-### GitHub Release (multi-host, including Windows + quack 1.5.3)
-
-After a tagged release, assets look like:
+### GitHub Release (offline / unsigned)
 
 ```text
-pdf-duckdb-v1.5.3-linux_amd64.duckdb_extension
-pdf-duckdb-v1.5.3-windows_amd64.duckdb_extension
-pdf-duckdb-v1.5.4-osx_arm64.duckdb_extension
+pdf-duckdb-v1.5.5-linux_amd64.duckdb_extension
+pdf-duckdb-v1.5.5-windows_amd64.duckdb_extension
+pdf-duckdb-v1.5.5-osx_arm64.duckdb_extension
 …
 ```
 
 ```sh
-# pick asset matching SELECT version() and your platform
 curl -fsSL -o pdf.duckdb_extension \
-  "https://github.com/asubbarao/duckdb-pdf/releases/download/<tag>/pdf-duckdb-v1.5.3-osx_arm64.duckdb_extension"
+  "https://github.com/asubbarao/duckdb-pdf/releases/download/<tag>/pdf-duckdb-v1.5.5-osx_arm64.duckdb_extension"
 duckdb -unsigned -c "LOAD '$(pwd)/pdf.duckdb_extension';"
 ```
-
-Trigger a full matrix without a tag: **Actions → Main Extension Distribution Pipeline → Run workflow** (`multi_version=true`). Artifacts stay on the workflow run; tags also attach them to the Release.
 
 ## Read & extract
 
