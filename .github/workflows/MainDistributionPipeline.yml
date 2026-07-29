@@ -3,24 +3,20 @@
 #
 # Host support floor: DuckDB v1.5.3 (quack) and later on the 1.5 line.
 #
-# Matrix policy:
-#   - push / pull_request → smoke build for tip only (v1.5.5)
-#   - workflow_dispatch with multi_version=true (default) → full matrix
-#   - tag push (v*) → full matrix + GitHub Release assets
+# Always build the full host × platform matrix so linux / macOS / windows
+# stay green for every supported DuckDB:
+#   hosts: v1.5.3 (quack floor), v1.5.4, v1.5.5 (community tip)
+#   platforms (extension-ci-tools): linux_amd64, linux_arm64, osx_amd64,
+#     osx_arm64, windows_amd64
+# Excludes: wasm / MinGW / rtools / windows_arm64
 #
-# Platforms (via extension-ci-tools): linux_amd64, linux_arm64, osx_amd64,
-# osx_arm64, windows_amd64. Excludes wasm / MinGW / rtools / windows_arm64.
+# Tag push (v*) also attaches all artifacts to the GitHub Release.
 #
 name: Main Extension Distribution Pipeline
 on:
   push:
   pull_request:
   workflow_dispatch:
-    inputs:
-      multi_version:
-        description: "Build all supported DuckDB hosts (v1.5.3, v1.5.4, v1.5.5)"
-        type: boolean
-        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
@@ -32,29 +28,13 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       versions: ${{ steps.set.outputs.versions }}
-      multi: ${{ steps.set.outputs.multi }}
     steps:
       - id: set
         run: |
           set -euo pipefail
-          MULTI=false
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            if [[ "${{ inputs.multi_version }}" == "true" ]]; then
-              MULTI=true
-            fi
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            MULTI=true
-          fi
-          if $MULTI; then
-            # Floor = quack host v1.5.3; tip = community latest stable
-            echo 'versions=["v1.5.3","v1.5.4","v1.5.5"]' >> "$GITHUB_OUTPUT"
-            echo "multi=true" >> "$GITHUB_OUTPUT"
-            echo "Full matrix: v1.5.3 v1.5.4 v1.5.5"
-          else
-            echo 'versions=["v1.5.5"]' >> "$GITHUB_OUTPUT"
-            echo "multi=false" >> "$GITHUB_OUTPUT"
-            echo "Smoke: v1.5.5 only"
-          fi
+          # Floor = quack v1.5.3; tip = community latest stable
+          echo 'versions=["v1.5.3","v1.5.4","v1.5.5"]' >> "$GITHUB_OUTPUT"
+          echo "Full matrix: v1.5.3 v1.5.4 v1.5.5 × linux/macOS/windows_amd64"
 
   duckdb-stable-build:
     name: Build extension binaries (${{ matrix.duckdb_version }})
