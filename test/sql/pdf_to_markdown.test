@@ -53,6 +53,17 @@ SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '- item one')
 ----
 true
 
+# Google Docs ● + ZWSP and 1.<ZWSP> normalize to markdown list lines
+query I
+SELECT contains(pdf_to_markdown('test/data/gdocs_lists.pdf'), '- Black circle item one');
+----
+true
+
+query I
+SELECT contains(pdf_to_markdown('test/data/gdocs_lists.pdf'), '1. Numbered zwsp item two');
+----
+true
+
 query I
 SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '- item two');
 ----

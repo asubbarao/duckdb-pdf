@@ -2757,9 +2757,12 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 //                  block that also opens with a list marker classifies
 //                  as heading, not list_item.
 //  5. list_item  : block's first line starts with a bullet glyph
-//                  (one of • – ▪, or '-' / '*' followed by a space) or a
-//                  numeric marker: 1-3 digits then '.' or ')' then a
-//                  space / end of text.
+//                  (• – ▪ ● ○ ◦ ∙ ‣ ⁃ · ▸, or '-' / '*' followed by a
+//                  space) or a numeric marker: 1-3 digits then '.' or ')'
+//                  then a space / end of text. Invisible format chars
+//                  (U+200B ZWSP and friends) around the marker are
+//                  skipped — Google Docs / Word inject them after ● and
+//                  after "1.".
 //  6. paragraph  : any remaining block with at least
 //                  ELEM_MIN_PARAGRAPH_WORDS words.
 //  7. other      : everything else (page numbers, isolated fragments).
@@ -2790,6 +2793,12 @@ static constexpr size_t ELEM_CAPS_HEADING_MIN_ALPHA = 4;
 // ...where at least this fraction of the alphabetic characters are
 // uppercase is a heading regardless of font size.
 static constexpr double ELEM_CAPS_HEADING_UPPER_RATIO = 0.8;
+// Running-header demotion: a heading whose exact text repeats on this
+// many distinct pages AND sits in the top/bottom band on every hit is
+// a page chrome (even/odd running title), not a section heading.
+// "Takeaway" repeating mid-page is not demoted — position is the gate.
+static constexpr int ELEM_RUNNING_MIN_PAGES = 5;
+static constexpr double ELEM_RUNNING_BAND_FRAC = 0.12;
 
 struct ElemWord {
 	double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
@@ -2858,15 +2867,64 @@ static bool ElemIsAllCapsHeading(const string &block_text, size_t word_count) {
 	       (double)upper_chars >= ELEM_CAPS_HEADING_UPPER_RATIO * (double)alpha_chars;
 }
 
+// Google Docs / Word inject zero-width format chars after list markers
+// (●<ZWSP>Item, 1.<ZWSP> Item). Skip them so the marker check sees the
+// real next character. Not a space skip — space is significant after "-".
+static size_t ElemSkipZw(const string &s, size_t i) {
+	while (i < s.size()) {
+		auto c0 = (unsigned char)s[i];
+		if (i + 2 < s.size() && c0 == 0xE2) {
+			auto c1 = (unsigned char)s[i + 1];
+			auto c2 = (unsigned char)s[i + 2];
+			// U+200B ZWSP / U+200C ZWNJ / U+200D ZWJ = E2 80 8B..8D
+			if (c1 == 0x80 && c2 >= 0x8B && c2 <= 0x8D) {
+				i += 3;
+				continue;
+			}
+			// U+2060 WORD JOINER = E2 81 A0
+			if (c1 == 0x81 && c2 == 0xA0) {
+				i += 3;
+				continue;
+			}
+		}
+		// U+FEFF BOM / ZWNBSP = EF BB BF
+		if (i + 2 < s.size() && c0 == 0xEF && (unsigned char)s[i + 1] == 0xBB &&
+		    (unsigned char)s[i + 2] == 0xBF) {
+			i += 3;
+			continue;
+		}
+		break;
+	}
+	return i;
+}
+
+// Shared by read_pdf_elements and pdf_to_markdown. UTF-8 bullets Word /
+// Google Docs actually emit (● U+25CF) plus the historical • – ▪ set.
+static const char *kElemBulletGlyphs[] = {
+    "\xE2\x80\xA2", // • U+2022
+    "\xE2\x80\x93", // – U+2013
+    "\xE2\x96\xAA", // ▪ U+25AA
+    "\xE2\x97\x8F", // ● U+25CF  (Google Docs / Word default)
+    "\xE2\x97\x8B", // ○ U+25CB
+    "\xE2\x97\xA6", // ◦ U+25E6
+    "\xE2\x88\x99", // ∙ U+2219
+    "\xE2\x80\xA3", // ‣ U+2023
+    "\xE2\x81\x83", // ⁃ U+2043
+    "\xC2\xB7",     // · U+00B7
+    "\xE2\x96\xB8", // ▸ U+25B8
+};
+
 // Rule 5: does this line text open with a bullet glyph or numeric marker?
 static bool ElemIsListMarkerLine(const string &line_text) {
 	size_t i = line_text.find_first_not_of(" \t");
 	if (i == string::npos) {
 		return false;
 	}
-	// Multi-byte bullet glyphs (UTF-8): • U+2022, – U+2013, ▪ U+25AA.
-	static const char *kBulletGlyphs[] = {"\xE2\x80\xA2", "\xE2\x80\x93", "\xE2\x96\xAA"};
-	for (auto glyph : kBulletGlyphs) {
+	i = ElemSkipZw(line_text, i);
+	if (i >= line_text.size()) {
+		return false;
+	}
+	for (auto glyph : kElemBulletGlyphs) {
 		if (line_text.compare(i, strlen(glyph), glyph) == 0) {
 			return true;
 		}
@@ -2876,15 +2934,118 @@ static bool ElemIsListMarkerLine(const string &line_text) {
 	if ((line_text[i] == '-' || line_text[i] == '*') && i + 1 < line_text.size() && line_text[i + 1] == ' ') {
 		return true;
 	}
-	// Numeric marker: 1-3 digits, then '.' or ')', then space or end of text.
+	// Numeric marker: 1-3 digits, then '.' or ')', then ZWSP*, then
+	// space or end of text. "1.\u200b Higher" is a Google Docs numbered list.
 	size_t d = i;
 	while (d < line_text.size() && isdigit((unsigned char)line_text[d]) && d - i < 3) {
 		d++;
 	}
 	if (d > i && d < line_text.size() && (line_text[d] == '.' || line_text[d] == ')')) {
-		return d + 1 >= line_text.size() || line_text[d + 1] == ' ';
+		size_t after = ElemSkipZw(line_text, d + 1);
+		return after >= line_text.size() || line_text[after] == ' ';
 	}
 	return false;
+}
+
+// pdf_to_markdown: turn a detected list line into a GitHub-flavoured item.
+// Unicode bullets become "- "; numbered markers keep their digits, ZWSP gone.
+static string ElemMarkdownListLine(const string &plain) {
+	size_t i = plain.find_first_not_of(" \t");
+	if (i == string::npos) {
+		return plain;
+	}
+	i = ElemSkipZw(plain, i);
+	if (i >= plain.size()) {
+		return plain;
+	}
+	for (auto glyph : kElemBulletGlyphs) {
+		size_t glen = strlen(glyph);
+		if (plain.compare(i, glen, glyph) == 0) {
+			size_t j = ElemSkipZw(plain, i + glen);
+			if (j < plain.size() && plain[j] == ' ') {
+				j++;
+			}
+			return "- " + plain.substr(j);
+		}
+	}
+	// Strip ZWSP between "1." / "1)" and the item text.
+	size_t d = i;
+	while (d < plain.size() && isdigit((unsigned char)plain[d]) && d - i < 3) {
+		d++;
+	}
+	if (d > i && d < plain.size() && (plain[d] == '.' || plain[d] == ')')) {
+		size_t after = ElemSkipZw(plain, d + 1);
+		if (after != d + 1) {
+			string out = plain.substr(0, d + 1);
+			if (after < plain.size() && plain[after] == ' ') {
+				out.push_back(' ');
+				after++;
+			} else if (after < plain.size()) {
+				out.push_back(' ');
+			}
+			out += plain.substr(after);
+			return out;
+		}
+	}
+	return plain;
+}
+
+// After per-page classify: demote repeating header/footer chrome so
+// pdf_chunks.heading is a section title, not "TIM MADDEN" / running title.
+// Per-instance: a mid-page cover byline with the same text stays a heading.
+// A hit is chrome when THIS instance sits in the band AND the same text
+// sits in that band on >= ELEM_RUNNING_MIN_PAGES distinct pages.
+static bool ElemInRunningBand(double y0, double page_h, bool &in_header, bool &in_footer) {
+	in_header = false;
+	in_footer = false;
+	if (page_h <= 0.0) {
+		return false;
+	}
+	in_header = y0 <= ELEM_RUNNING_BAND_FRAC * page_h;
+	in_footer = y0 >= (1.0 - ELEM_RUNNING_BAND_FRAC) * page_h;
+	return in_header || in_footer;
+}
+
+static void ElemDemoteRunningHeaders(std::vector<PdfElementRow> &rows, const std::map<int, double> &page_h) {
+	std::map<string, std::set<int>> header_pages;
+	std::map<string, std::set<int>> footer_pages;
+	for (auto &row : rows) {
+		if (row.element_type != "heading") {
+			continue;
+		}
+		auto it = page_h.find(row.page_number);
+		double ph = it == page_h.end() ? 0.0 : it->second;
+		bool in_header = false, in_footer = false;
+		ElemInRunningBand(row.y0, ph, in_header, in_footer);
+		if (in_header) {
+			header_pages[row.text].insert(row.page_number);
+		}
+		if (in_footer) {
+			footer_pages[row.text].insert(row.page_number);
+		}
+	}
+	for (auto &row : rows) {
+		if (row.element_type != "heading") {
+			continue;
+		}
+		auto it = page_h.find(row.page_number);
+		double ph = it == page_h.end() ? 0.0 : it->second;
+		bool in_header = false, in_footer = false;
+		if (!ElemInRunningBand(row.y0, ph, in_header, in_footer)) {
+			continue;
+		}
+		int n = 0;
+		if (in_header) {
+			auto hp = header_pages.find(row.text);
+			n = hp == header_pages.end() ? 0 : (int)hp->second.size();
+		} else {
+			auto fp = footer_pages.find(row.text);
+			n = fp == footer_pages.end() ? 0 : (int)fp->second.size();
+		}
+		if (n >= ELEM_RUNNING_MIN_PAGES) {
+			row.element_type = "other";
+		}
+	}
 }
 
 // Rule 1: cluster one page's words into lines.
@@ -3043,12 +3204,14 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 	int last_0 = opt.last_page < 0 ? page_count : MinValue<int>(opt.last_page, page_count);
 
 	std::vector<std::pair<int, std::vector<ElemLine>>> page_lines; // (1-based page, lines)
+	std::map<int, double> page_h;                                 // 1-based page -> crop height
 	ElemFontHistogram doc_hist;
 	for (int p = first_0; p < last_0; p++) {
 		unique_ptr<poppler::page> page(doc->create_page(p));
 		if (!page) {
 			continue;
 		}
+		page_h[p + 1] = page->page_rect().height();
 		std::vector<ElemWord> words;
 		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
 			ElemWord w;
@@ -3076,6 +3239,7 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 	for (auto &pl : page_lines) {
 		ElemEmitPageBlocks(pl.second, pl.first, body_size, rows);
 	}
+	ElemDemoteRunningHeaders(rows, page_h);
 }
 
 struct ReadPdfElementsBindData : public TableFunctionData {
@@ -5523,25 +5687,9 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 			}
 			bool is_h = hl > 0;
 
-			bool is_l = false;
-			if (plain.size() >= 2 && (plain.substr(0, 2) == "- " || plain.substr(0, 2) == "* ")) {
-				is_l = true;
-			} else {
-				size_t k = 0;
-				auto isdig = [](char c) {
-					return c >= '0' && c <= '9';
-				};
-				while (k < plain.size() && isdig(plain[k]))
-					++k;
-				if (k > 0 && k + 1 < plain.size() && plain[k] == '.' && plain[k + 1] == ' ') {
-					is_l = true;
-				}
-			}
-			if (plain.size() >= 2 && (plain.substr(0, 2) == "• " || plain.substr(0, 2) == "◦ ")) {
-				if (formatted.size() >= 2 && (formatted.substr(0, 2) == "• " || formatted.substr(0, 2) == "◦ ")) {
-					formatted = "- " + formatted.substr(2);
-				}
-				is_l = true;
+			bool is_l = ElemIsListMarkerLine(plain);
+			if (is_l) {
+				formatted = ElemMarkdownListLine(plain);
 			}
 
 			if (is_h) {

@@ -258,6 +258,46 @@ WHERE element_type = 'paragraph';
 ----
 3
 
+# ── Google Docs / Word list markers (● + ZWSP, 1.<ZWSP>) ─────────────────────
+# Fixture: test/data/gdocs_lists.pdf (Arial; COPY FORMAT pdf is WinAnsi and
+# drops U+25CF / U+200B). Word/Docs emit ● and stick ZWSP after the marker.
+
+query I
+SELECT COUNT(*) FROM read_pdf_elements('test/data/gdocs_lists.pdf')
+WHERE element_type = 'list_item';
+----
+2
+
+query I
+SELECT COUNT(*) FROM read_pdf_elements('test/data/gdocs_lists.pdf')
+WHERE element_type = 'list_item'
+  AND (contains(text, 'Black circle') OR contains(text, 'Numbered zwsp'));
+----
+2
+
+# ── running-header demotion ──────────────────────────────────────────────────
+# Fixture: test/data/running_header.pdf — 6 pages, "RUNNING HEADER" in the
+# top band every page plus a mid-page byline on page 1. Band instances
+# become other; the cover byline stays heading.
+
+query I
+SELECT COUNT(*) FROM read_pdf_elements('test/data/running_header.pdf')
+WHERE element_type = 'heading' AND text = 'RUNNING HEADER';
+----
+1
+
+query I
+SELECT COUNT(*) FROM read_pdf_elements('test/data/running_header.pdf')
+WHERE element_type = 'other' AND text = 'RUNNING HEADER';
+----
+6
+
+query I
+SELECT page_number FROM read_pdf_elements('test/data/running_header.pdf')
+WHERE element_type = 'heading' AND text = 'RUNNING HEADER';
+----
+1
+
 # ── error handling ────────────────────────────────────────────────────────────
 
 statement error

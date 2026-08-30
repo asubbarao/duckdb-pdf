@@ -212,7 +212,7 @@ ORDER BY filename, page, table_index, row_index;
 
 Columns: `file`, `page_number` (1-based), `element_idx` (1-based within page), `element_type`, `text`, `font_size` (dominant size of the element, `NULL` when the PDF carries no font info), `bbox_x0`, `bbox_y0`, `bbox_x1`, `bbox_y1`.
 
-Elements are built by deterministic geometry over Poppler's positioned word list — words cluster into lines by vertical overlap, lines into blocks by vertical gap (> 0.6× median line height), font-size change (> 15%), or a list marker starting a line. Classification: `heading` = dominant font ≥ 1.15× the document's modal body size and < 200 chars, OR a short ALL-CAPS block at any font size; `list_item` = first line starts with a bullet glyph or an `N.` / `N)` marker; `paragraph` = any other block of ≥ 3 words; `other` = the rest (page numbers, isolated fragments). Reads the native text layer only (no OCR) and does not attempt table detection — use `read_pdf_tables` for tables.
+Elements are built by deterministic geometry over Poppler's positioned word list — words cluster into lines by vertical overlap, lines into blocks by vertical gap (> 0.6× median line height), font-size change (> 15%), or a list marker starting a line. Classification: `heading` = dominant font ≥ 1.15× the document's modal body size and < 200 chars, OR a short ALL-CAPS block at any font size; `list_item` = first line starts with a bullet glyph (`• – ▪ ● ○ ◦ ∙ ‣ ⁃ · ▸`, or `- ` / `* `) or an `N.` / `N)` marker (zero-width format chars after the marker — Google Docs `●<ZWSP>` / `1.<ZWSP>` — are skipped); `paragraph` = any other block of ≥ 3 words; `other` = the rest (page numbers, isolated fragments, and **running headers/footers**). A heading instance that sits in the top or bottom 12% of the page is demoted to `other` when the same text occupies that band on ≥ 5 pages (even/odd running titles). A mid-page cover byline with the same words stays a heading. Reads the native text layer only (no OCR) and does not attempt table detection — use `read_pdf_tables` for tables.
 
 ```sql
 -- Document outline: just the headings
@@ -288,7 +288,7 @@ SELECT file, page, out_path, width, height, bytes
 FROM pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100);
 ```
 
-`pdf_to_markdown` converts using only Poppler's word-level geometry — no AI, no external tools, fully deterministic and local. It detects **headings** (font ≥ 1.15× body size, level by descending size rank), **tables** (aligned word columns emitted as GitHub pipe tables), **bold spans** (font name contains "Bold"), **lists** (`-`, `*`, `•`, `◦`, `N.` markers), and **paragraphs** (consecutive same-indent lines merged). Pages are joined with `\n\n`; `NULL` input → `NULL` output; missing or encrypted files raise an error.
+`pdf_to_markdown` converts using only Poppler's word-level geometry — no AI, no external tools, fully deterministic and local. It detects **headings** (font ≥ 1.15× body size, level by descending size rank), **tables** (aligned word columns emitted as GitHub pipe tables), **bold spans** (font name contains "Bold"), **lists** (same marker set as `read_pdf_elements`: `-` / `*` / `• – ▪ ● ○ ◦ ∙ ‣ ⁃ · ▸` / `N.` / `N)`, with Google Docs ZWSP skipped; unicode bullets emit as `- `), and **paragraphs** (consecutive same-indent lines merged). Pages are joined with `\n\n`; `NULL` input → `NULL` output; missing or encrypted files raise an error.
 
 ```sql
 SELECT pdf_to_markdown('report.pdf') AS md;

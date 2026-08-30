@@ -98,6 +98,61 @@ WHERE font_size IS NULL OR font_size <= 0;
 ----
 true
 
+# ── line: geometric line id (1-based per page) ────────────────────────────
+
+# Hello + DuckDB share a single visual line
+query I
+SELECT bool_and(line = 1) AND count(*) = 2
+FROM read_pdf_words('test/data/hello.pdf');
+----
+true
+
+# two_pages: line 1 = header, line 2 = body; line numbers dense from 1
+query I
+SELECT bool_and(line >= 1)
+   AND max(line) = count(DISTINCT line)
+   AND count(DISTINCT line) FILTER (WHERE page = 1) = 2
+FROM read_pdf_words('test/data/two_pages.pdf');
+----
+true
+
+# Same-y0 words share a line number (table header row)
+query I
+SELECT count(DISTINCT line) = 1
+FROM read_pdf_words('test/data/table.pdf')
+WHERE lower(word) IN ('item', 'qty', 'price');
+----
+true
+
+# Line rebuild without a second Poppler walk: header row joins left-to-right
+query I
+SELECT string_agg(word, ' ' ORDER BY x0)
+FROM read_pdf_words('test/data/table.pdf')
+WHERE line = 1;
+----
+Item Qty Price
+
+# ── page_width / page_height: crop-box geometry (no max-bbox) ─────────────
+
+query I
+SELECT bool_and(page_width > 0 AND page_height > 0)
+   AND bool_and(page_width = (SELECT width FROM read_pdf('test/data/hello.pdf', auto_ocr := false)))
+   AND bool_and(page_height = (SELECT height FROM read_pdf('test/data/hello.pdf', auto_ocr := false)))
+FROM read_pdf_words('test/data/hello.pdf');
+----
+true
+
+# Page size is constant within each page (two_pages has 2 pages)
+query I
+SELECT count(*) = 2 AND bool_and(nw = 1 AND nh = 1)
+FROM (
+  SELECT page, count(DISTINCT page_width) AS nw, count(DISTINCT page_height) AS nh
+  FROM read_pdf_words('test/data/two_pages.pdf')
+  GROUP BY page
+);
+----
+true
+
 # ── error: missing file ───────────────────────────────────────────────────
 
 statement error
