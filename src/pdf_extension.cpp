@@ -5773,6 +5773,22 @@ static string PdfOpsStem(const string &path) {
 	return base;
 }
 
+// pdf_write_page_images writes out_dir/<stem>/pN.png. A stem of '.' or '..'
+// (from filenames like '..pdf' / '...pdf') resolves to out_dir itself or its
+// parent, so preview files would land outside the caller-supplied directory.
+static void PdfOpsCheckOutputStem(const char *fn, const string &stem, const string &path) {
+	if (stem.empty()) {
+		throw InvalidInputException("%s: could not derive a stem from '%s'", fn, path);
+	}
+	if (stem == "." || stem == "..") {
+		throw InvalidInputException("%s: refusing output stem '%s' from '%s' (would write outside out_dir/<stem>/)", fn,
+		                            stem, path);
+	}
+	if (stem.find_first_of("/\\") != string::npos) {
+		throw InvalidInputException("%s: refusing output stem '%s' from '%s' (path separator in stem)", fn, stem, path);
+	}
+}
+
 static void PdfOpsCheckInputExists(const char *fn, const string &path) {
 	auto fs = FileSystem::CreateLocal();
 	if (!fs->FileExists(path)) {
@@ -7881,9 +7897,7 @@ static void PdfWritePageImagesCheckStemCollisions(const vector<string> &files) {
 	std::map<string, string> claimed;
 	for (auto &path : files) {
 		string stem = PdfOpsStem(path);
-		if (stem.empty()) {
-			throw InvalidInputException("pdf_write_page_images: could not derive a stem from '%s'", path);
-		}
+		PdfOpsCheckOutputStem("pdf_write_page_images", stem, path);
 		string key = StringUtil::Lower(stem);
 		auto it = claimed.find(key);
 		if (it != claimed.end()) {
@@ -7978,9 +7992,7 @@ static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePage
 		}
 
 		string stem = PdfOpsStem(path);
-		if (stem.empty()) {
-			throw InvalidInputException("pdf_write_page_images: could not derive a stem from '%s'", path);
-		}
+		PdfOpsCheckOutputStem("pdf_write_page_images", stem, path);
 		string stem_dir = PdfWriteJoinPath(bind.out_dir, stem);
 		if (!fs->DirectoryExists(stem_dir)) {
 			try {
