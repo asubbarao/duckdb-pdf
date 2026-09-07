@@ -7874,6 +7874,27 @@ static string PdfWriteJoinPath(const string &dir, const string &leaf) {
 	return dir + sep + leaf;
 }
 
+// Output layout is out_dir/<stem>/p{N}.png. Two inputs that share a stem would
+// silently overwrite each other. Compare stems case-insensitively so Windows
+// (and case-insensitive macOS) cannot collide on Hello.pdf vs hello.pdf.
+static void PdfWritePageImagesCheckStemCollisions(const vector<string> &files) {
+	std::map<string, string> claimed;
+	for (auto &path : files) {
+		string stem = PdfOpsStem(path);
+		if (stem.empty()) {
+			throw InvalidInputException("pdf_write_page_images: could not derive a stem from '%s'", path);
+		}
+		string key = StringUtil::Lower(stem);
+		auto it = claimed.find(key);
+		if (it != claimed.end()) {
+			throw InvalidInputException(
+			    "pdf_write_page_images: output collision: inputs '%s' and '%s' both map to stem '%s'", it->second,
+			    path, key);
+		}
+		claimed[key] = path;
+	}
+}
+
 static void PdfWriteBytesToFile(const string &path, const string &bytes, const char *fn_name) {
 	std::ofstream of(path, std::ios::binary | std::ios::trunc);
 	if (!of) {
@@ -7917,6 +7938,7 @@ static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, T
 	if (result->dpi < 1 || result->dpi > 2400) {
 		throw InvalidInputException("pdf_write_page_images: dpi must be between 1 and 2400 (got %d)", result->dpi);
 	}
+	PdfWritePageImagesCheckStemCollisions(result->files);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BIGINT};
 	names = {"file", "page", "out_path", "width", "height", "bytes"};
@@ -7929,6 +7951,9 @@ static unique_ptr<GlobalTableFunctionState> PdfWritePageImagesInit(ClientContext
 
 static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePageImagesBindData &bind,
                                       std::vector<PdfWritePageImagesRow> &rows) {
+	// Reject colliding stems before any mkdir/write. Bind already checks; this
+	// is the scan-time gate so a future bind skip cannot create a partial tree.
+	PdfWritePageImagesCheckStemCollisions(bind.files);
 	auto fs = FileSystem::CreateLocal();
 	// Ensure the top-level preview root exists (create, don't require the caller
 	// to mkdir first — this is an export tree, not a surgical in-place write).
