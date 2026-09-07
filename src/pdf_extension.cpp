@@ -5816,6 +5816,11 @@ static string PdfMergeImpl(const vector<string> &inputs, const string &output) {
 	}
 	for (auto &in_path : inputs) {
 		PdfOpsCheckInputExists("pdf_merge", in_path);
+		// Same contract as pdf_rotate / PdfOpsCheckInOut: qpdf pulls source
+		// objects lazily during write, and overwriting an input destroys it.
+		if (in_path == output) {
+			throw InvalidInputException("pdf_merge: output path must differ from input path '%s'", output);
+		}
 	}
 	PdfOpsCheckOutputDir("pdf_merge", PdfOpsParentDir(output));
 	try {
