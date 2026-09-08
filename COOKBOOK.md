@@ -10,8 +10,10 @@ Every recipe assumes the extension is loaded:
 INSTALL pdf FROM community; LOAD pdf;
 ```
 
-Every function takes a single path **or a glob**, so the natural unit of work is
-a folder of PDFs. Recipes below use `docs/*.pdf`; substitute your own path.
+Table-function **readers and inspectors** take a path or glob (`docs/*.pdf` in
+the recipes below). **Scalars and writers** take one path (or a `LIST` where
+registered — `pdf_merge`, `pdf_write_page_images`); they do not glob a folder
+string. Only `pdf_to_text` / `html` / `xml` / `svg` / `png` have BLOB overloads.
 
 ---
 
@@ -173,21 +175,15 @@ SELECT * FROM read_text(
 Prefer `ocr_vars` / `ocr_config` when the knob exists; use shellfs only for
 true CLI gaps (and leave a debt note if the gap should become a named param).
 
-**`ocr_image` TVF** — named params + HOCR/TSV without leaving the process.
-First arg must be foldable (no subqueries):
+**`ocr_image` TVF** — named params + HOCR/TSV. The image argument must be a
+**foldable BLOB literal** (no subquery, no column). For per-row PNGs use
+`tesseract_ocr` (scalar, column-safe). Do not orchestrate with
+`SET VARIABLE` / `getvariable` in application SQL.
 
 ```sql
-SET VARIABLE page_png = (
-  SELECT poppler_render_page(content, 1, 200) FROM read_blob('scan.pdf')
-);
-SELECT text, confidence, format
-FROM ocr_image(
-  getvariable('page_png'),
-  language := 'eng',
-  psm := 6,
-  format := 'hocr',   -- text | hocr | tsv
-  vars := MAP {'tessedit_char_whitelist': '0123456789'}
-);
+-- Per-page text OCR (composable)
+SELECT file, page, tesseract_ocr(png, 'eng', 6) AS text
+FROM pdf_page_images('scan.pdf', dpi := 200);
 
 -- page mean confidence on PDF OCR
 SELECT page, used_ocr, ocr_confidence, left(text, 80)
@@ -293,6 +289,33 @@ valid over its own byte range, but later incremental revisions changed the
 visible document. Cross-check with `pdf_revisions` to recover what the document
 said before the last edit (truncate the file at an earlier `eof_offset`).
 
+### Permissions, fonts, destinations, qpdf inspect, repair
+
+```sql
+-- Poppler permission / form / JS census (path or glob; password named param)
+SELECT file, is_encrypted, perm_print, form_type, has_javascript
+FROM pdf_permissions('contracts/*.pdf');
+
+-- Embedded fonts
+SELECT file, page, name, type, embedded, subset
+FROM pdf_fonts('contract.pdf');
+
+-- Named destinations (zero rows if the file has none)
+SELECT file, name, type, page
+FROM pdf_destinations('manual.pdf');
+
+-- qpdf xref + encryption method (distinct from pdf_info / pdf_permissions)
+SELECT file, page_count, object_count, is_encrypted, stream_method, allow_extract
+FROM pdf_qpdf_info('contracts/*.pdf');
+
+-- Structural JSON dump + rewrite (one path; optional password arg)
+SELECT contains(pdf_json('contract.pdf'), 'qpdf');
+SELECT pdf_repair('contract.pdf', 'contract_repaired.pdf');
+```
+
+`pdf_form_fields` / `pdf_annotations` glob but **do not** take `password :=`.
+Encrypted files for those two need a decrypted copy (`pdf_decrypt`) first.
+
 ---
 
 ## 6. Bulk document surgery
@@ -378,6 +401,10 @@ base-14 fonts as `pdf_page_images` / `pdf_to_png`:
 -- Creates out_dir and per-stem subdirs if missing.
 SELECT file, page, out_path, width, height, bytes
 FROM pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100);
+
+-- LIST(VARCHAR) overload (each element may itself be a glob)
+SELECT file, page, out_path
+FROM pdf_write_page_images(['a.pdf', 'b.pdf'], 'pages', dpi := 72);
 
 -- Page range + password (same named params as the readers)
 SELECT *
@@ -475,9 +502,10 @@ SELECT pdf_to_text(content)          AS body,
 FROM read_blob('https://example.com/report.pdf');
 ```
 
-**Gotcha:** the **scalar** readers (`pdf_to_text`/`html`/`xml`/`svg`/`png`)
-accept a `BLOB`, so `read_blob(url) → scalar` needs no temp file. The **table**
-functions (`read_pdf`, `pdf_chunks`, `read_pdf_tables`, ...) and the qpdf writers
-take a **path or glob, not a BLOB** — for those, give the URL as the path (they
-route through the VFS) rather than piping bytes. The qpdf writers additionally
-require a **local** output path.
+**Gotcha:** `pdf_to_text` / `html` / `xml` / `svg` / `png` accept a `BLOB`, so
+`read_blob(url) → scalar` needs no temp file. **`pdf_to_markdown` is path-only**
+(no BLOB). The **table** functions (`read_pdf`, `pdf_chunks`, `read_pdf_tables`,
+inspectors, …) take a **path or glob, not a BLOB** — give the URL as the path
+(they route through the VFS). qpdf writers (`pdf_compress`, `pdf_json`,
+`pdf_repair`, …) take **one local path**, not a glob and not a BLOB; output
+paths must be local.

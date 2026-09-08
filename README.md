@@ -2,7 +2,7 @@
 
 **Everything PDF, in SQL.** A DuckDB community extension (`pdf`) that turns PDFs into tables and tables into PDFs: read text at every grain (page, line, word, layout element, retrieval chunk), inspect metadata / outlines / attachments / form fields / annotations / revisions / digital signatures, and do the everyday document operations people open Adobe Acrobat for — merge, split, rotate, compress, encrypt, decrypt, extract pages, write new PDFs. Built on [Poppler](https://poppler.freedesktop.org/) (parsing/rendering), [Tesseract](https://github.com/tesseract-ocr/tesseract) (OCR for scanned documents), [qpdf](https://qpdf.sourceforge.io/) (document surgery), and [libharu](https://github.com/libharu/libharu) (native PDF writing) — all in the DuckDB process, no external tools required at runtime.
 
-Every function accepts a single path **or a glob**, so the natural unit of work is a folder of PDFs:
+**Path vs glob vs BLOB is per-function, not universal.** Table-function **readers and inspectors** resolve a VARCHAR through DuckDB `GlobFiles` (a single path or a glob). **Scalars** take one path (or a BLOB where overloaded) and do **not** glob — build a list in SQL and pass it (`pdf_merge(list(file), …)`). **Writers** (`pdf_compress`, `pdf_encrypt`, `pdf_split`, `pdf_redact`, …) take exact local paths. Only `pdf_to_text` / `html` / `xml` / `svg` / `png` have BLOB overloads; `pdf_to_markdown`, `pdf_json`, and qpdf writers do not.
 
 ```sql
 INSTALL pdf FROM community; LOAD pdf;
@@ -15,6 +15,7 @@ FROM pdf_info('docs/*.pdf') ORDER BY file_size DESC;
 SELECT filename, page, text FROM read_pdf('docs/*.pdf') WHERE text ILIKE '%revenue%';
 
 -- merge the folder into one PDF, then structurally compress it
+-- (pdf_merge takes LIST(VARCHAR), not a glob string)
 SELECT pdf_compress(
          pdf_merge(list(file ORDER BY file), 'combined.pdf'),
          'combined_small.pdf')
@@ -66,9 +67,9 @@ duckdb -unsigned -c "LOAD '$(pwd)/pdf.duckdb_extension';"
 
 ## Read & extract
 
-Six table functions read a PDF at six grains, plus scalar converters for whole-document output. All of them take a single path or a glob; the extraction never leaves the DuckDB process.
+Table-function readers cover page / line / word (also as `read_pdf_layout`) / table / layout-element / chunk grains. Scalar converters return a whole document or one rendered page. The table readers take a path or glob; the scalars take one path (and a BLOB where listed below). Extraction never leaves the DuckDB process.
 
-Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and `read_pdf_tables`:
+Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words` / `read_pdf_layout`, and `read_pdf_tables`:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -86,7 +87,10 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 | `tessdata_dir` | VARCHAR | auto-detected | Explicit Tesseract model directory (see [OCR support](#ocr-support)). |
 | `ocr_vars` | MAP(VARCHAR, VARCHAR) | — | Tess `SetVariable` key/values applied after Init (same surface as CLI `-c name=value`). |
 | `ocr_config` | VARCHAR | — | Path or tessdata config name for `ReadConfigFile` (applied after Init, before `ocr_vars`). |
-| `ignore_errors` | BOOLEAN | false | `read_pdf` / `read_pdf_meta` only: skip unopenable files in a multi-file scan instead of aborting it. |
+| `ocr_backend` | VARCHAR | `'tesseract'` | `'tesseract'` (default) or `'external'`. Invalid names fail at bind. |
+| `ocr_plugin` | VARCHAR | — | Shared-library path for `ocr_backend := 'external'` (`pdf_ocr_plugin_recognize` C ABI). |
+| `ocr_endpoint` | VARCHAR | — | Reserved; in-process HTTP is **not** wired. Setting it only adds a note to the external-backend error. |
+| `ignore_errors` | BOOLEAN | false | **`read_pdf` / `read_pdf_meta` only** (not on other readers): skip unopenable files in a multi-file scan instead of aborting it. |
 
 `read_pdf_elements` and `pdf_chunks` accept only `password`, `first_page`, `last_page` (plus `pdf_chunks`' own `chunk_size` / `overlap`) — they read the native text layer only.
 
@@ -162,6 +166,8 @@ GROUP BY filename, page, line
 ORDER BY filename, page, line;
 ```
 
+`read_pdf_layout` is a registered alias of the same bind/scan as `read_pdf_words` (same columns, same named parameters).
+
 `page_width` / `page_height` remove the common max-bbox geometry hack (`max(x1)`, `max(y1)`). For page-only census without extracting words, prefer `pdf_pages_info` (media/crop/rotation/label) or `read_pdf` / `pdf_info`.
 
 For scanned/image-only pages the words come from Tesseract's word-level iterator: `source` is `'ocr'` (vs `'text'` for native words) and `confidence` is a value in `[0, 100]` (`NULL` for native words). OCR words have `NULL` `font_name`/`font_size` — there is no font metadata in an image. OCR words also get `line` / page size.
@@ -232,12 +238,17 @@ ORDER BY file, page_number, element_idx;
 
 `pdf_chunks(files, chunk_size := 1200, overlap := 150)` packs the `read_pdf_elements` grain into retrieval-ready chunks. Columns: `file`, `chunk_idx` (1-based per file), `text`, `page_start`, `page_end`, `n_chars` (length of the emitted text, overlap included), and `heading` (text of the nearest preceding `heading` element — every chunk carries its section context; `NULL` before the first heading).
 
+`chunk_size` and `overlap` are UTF-8 **byte** budgets; `n_chars` counts Unicode
+codepoints, matching SQL `length(text)`. Splits preserve complete codepoints: a
+single codepoint may exceed a tiny byte budget. Heading attachment can also exceed
+the normal chunk budget.
+
 Deterministic chunking rules (no ML, no tokenizers):
 
 1. Elements pack into a chunk in reading order until the next one would push the chunk past `chunk_size`.
 2. An element is never split across chunks — unless it alone exceeds `chunk_size`, in which case it splits at the last whitespace before the limit (repeatedly for very long elements).
 3. A `heading` never ends a chunk: it glues forward to start the next one, keeping headers attached to their section.
-4. Each chunk after the first is prefixed with the trailing `overlap` characters of the previous chunk's text, trimmed to a whitespace boundary so no word is cut.
+4. Each chunk after the first is prefixed with up to `overlap` trailing bytes of the previous chunk's text, trimmed to a whitespace boundary so no word is cut.
 
 ```sql
 -- One statement from a folder of PDFs to a chunk table
@@ -260,9 +271,9 @@ Scalar converters return the whole document (or one rendered page) as a single v
 | `pdf_to_xml` | `(path_or_blob)` | pdftoxml-style XML with per-word bounding boxes. |
 | `pdf_to_svg` | `(path_or_blob, page [, dpi])` | SVG embedding a base64 PNG raster of the page. Default DPI 150, range 1–2400. |
 | `pdf_to_png` | `(path_or_blob, page [, dpi])` | Raw PNG bytes as a `BLOB`. Same raster and DPI rules as `pdf_to_svg`. |
-| `pdf_write_page_images` | `(path_or_glob, out_dir [, dpi, first_page, last_page, password])` | **Table** — write each page as a PNG under `out_dir/<stem>/p{N}.png` (1-based, no zero-pad). Returns `(file, page, out_path, width, height, bytes)`. Same raster + bundled base-14 fonts as `pdf_page_images` / `pdf_to_png`. |
+| `pdf_write_page_images` | `(path_or_glob, out_dir)` or `(LIST(VARCHAR), out_dir)` | **Table** — write each page as a PNG under `out_dir/<stem>/p{N}.png` (1-based, no zero-pad). Named: `dpi`, `first_page`, `last_page`, `password`. Returns `(file, page, out_path, width, height, bytes)`. Same raster + bundled base-14 fonts as `pdf_page_images` / `pdf_to_png`. |
 
-**Paths go through DuckDB's FileSystem**, so `pdf_to_text('s3://...')` or `pdf_to_html('https://...')` work when `httpfs` (or another VFS) is loaded. **BLOB overloads** take the raw bytes directly — no filesystem involved:
+**These scalars do not glob.** `pdf_to_text('docs/*.pdf')` is one path string, not a folder scan — use `FROM glob(...)` / `pdf_info` and apply the scalar per file. **Paths go through DuckDB's FileSystem**, so `pdf_to_text('s3://...')` or `pdf_to_html('https://...')` work when `httpfs` (or another VFS) is loaded. **BLOB overloads** (text/html/xml/svg/png only — not markdown) take the raw bytes directly:
 
 ```sql
 -- Full text of a PDF as one value
@@ -286,7 +297,16 @@ SELECT octet_length(pdf_to_png('report.pdf', 1))      AS png_150dpi,
 -- Write page previews to disk (replaces pdftoppm loops): pages/report/p1.png, …
 SELECT file, page, out_path, width, height, bytes
 FROM pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100);
+
+-- Same bind/scan, LIST(VARCHAR) overload (each element may itself be a glob)
+SELECT file, page, out_path
+FROM pdf_write_page_images(['a.pdf', 'b.pdf'], 'pages', dpi := 72);
 ```
+
+Input stems must be unique, compared case-insensitively for portable output paths.
+Repeated inputs or `folder_a/report.pdf` and `folder_b/report.pdf` raise an output
+collision error before any directories or PNGs are written. Re-running a valid
+export still replaces existing PNGs at its output paths.
 
 `pdf_to_markdown` converts using only Poppler's word-level geometry — no AI, no external tools, fully deterministic and local. It detects **headings** (font ≥ 1.15× body size, level by descending size rank), **tables** (aligned word columns emitted as GitHub pipe tables), **bold spans** (font name contains "Bold"), **lists** (same marker set as `read_pdf_elements`: `-` / `*` / `• – ▪ ● ○ ◦ ∙ ‣ ⁃ · ▸` / `N.` / `N)`, with Google Docs ZWSP skipped; unicode bullets emit as `- `), and **paragraphs** (consecutive same-indent lines merged). Pages are joined with `\n\n`; `NULL` input → `NULL` output; missing or encrypted files raise an error.
 
@@ -320,7 +340,7 @@ FROM pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100);
 
 ## Inspect
 
-These table functions answer "what is in this file?" without extracting body text. All take a path or glob; `password := '...'` is accepted by `pdf_info`, `read_pdf_meta`, `pdf_outline`, `pdf_attachments`, `pdf_revisions`, `pdf_signatures`, and `pdf_images`.
+These table functions answer "what is in this file?" without extracting body text. Readers/inspectors that take a VARCHAR resolve it as a **path or glob**. `password := '...'` is registered on `pdf_info`, `read_pdf_meta`, `pdf_outline`, `pdf_attachments`, `pdf_revisions`, `pdf_signatures`, `pdf_images`, `pdf_pages_info`, `pdf_permissions`, `pdf_fonts`, `pdf_destinations`, `pdf_qpdf_info`, `pdf_page_images`, and `pdf_write_page_images`. **`pdf_form_fields` and `pdf_annotations` have no `password` named parameter** (path/glob only).
 
 ### `pdf_info` — full per-file census
 
@@ -350,6 +370,33 @@ One row per page (not just first-page like `pdf_info.width`/`height`). Columns: 
 SELECT file, page, width, height, rotation, orientation
 FROM pdf_pages_info('docs/*.pdf')
 ORDER BY file, page;
+```
+
+### `pdf_permissions` — encryption, permission bits, form/JS, IDs
+
+One row per file. Columns: `file`, `is_encrypted`, `is_locked`, `perm_print`, `perm_print_high_resolution`, `perm_change`, `perm_copy`, `perm_add_notes`, `perm_fill_forms`, `perm_accessibility`, `perm_assemble`, `has_javascript`, `form_type` (`'none'` / `'acro'` / `'xfa'`), `is_linearized`, `page_mode`, `page_layout`, `permanent_id`, `update_id`.
+
+```sql
+SELECT file, is_encrypted, is_locked, perm_print, form_type, has_javascript
+FROM pdf_permissions('docs/*.pdf');
+```
+
+### `pdf_fonts` — embedded font inventory
+
+One row per font occurrence (page-walking iterator when Poppler provides it; otherwise document-level with `page` NULL). Columns: `file`, `page` (1-based, or NULL when unknown), `name`, `type` (Poppler font type, e.g. `type1`, `truetype`, `cid_truetype_ot`), `embedded`, `subset`, `font_file`.
+
+```sql
+SELECT file, page, name, type, embedded, subset
+FROM pdf_fonts('report.pdf');
+```
+
+### `pdf_destinations` — named destinations
+
+One row per named destination. Files with none yield **zero rows**, not an error. Columns: `file`, `name`, `type` (`xyz` / `fit` / `fit_h` / `fit_v` / `fit_r` / `fit_b` / `fit_b_h` / `fit_b_v` / `unknown`), `page`, `left`, `bottom`, `right`, `top`, `zoom`, `change_left`, `change_top`, `change_zoom`.
+
+```sql
+SELECT file, name, type, page
+FROM pdf_destinations('manual.pdf');
 ```
 
 ### `read_pdf_meta` — legacy per-file metadata
@@ -477,6 +524,19 @@ COPY (
 
 The `png`/`jpeg` rows drop straight into DuckDB's image tooling or any downstream writer; `raw` rows need the `colorspace`/`bits_per_component`/`width`/`height` columns to interpret the sample bytes.
 
+### `pdf_qpdf_info` — qpdf structure + encryption census
+
+One row per file from qpdf (not Poppler): xref/object counts, linearization, encryption method, and permission flags. Named parameter: `password`. Columns: `file`, `is_linearized`, `linearized_ok`, `page_count`, `object_count`, `xref_total`, `xref_free`, `xref_uncompressed`, `xref_compressed`, `is_encrypted`, `enc_R`, `enc_P`, `enc_V`, `stream_method`, `string_method`, `file_method`, `owner_password_matched`, `user_password_matched`, `allow_accessibility`, `allow_extract`, `allow_print_low`, `allow_print_high`, `allow_modify_assembly`, `allow_modify_form`, `allow_modify_annotation`, `allow_modify_other`, `allow_modify_all`, `warning_count`.
+
+```sql
+SELECT file, page_count, object_count, is_encrypted, stream_method, allow_extract
+FROM pdf_qpdf_info('docs/*.pdf');
+
+-- After encrypt: stream_method is aes / aesv3 / rc4; enc_R is the revision
+SELECT is_encrypted, enc_R >= 4, stream_method, allow_extract
+FROM pdf_qpdf_info('locked.pdf', password := 'secret');
+```
+
 ## Transform & write
 
 Document-level operations powered by qpdf are content-preserving structural transforms — no rasterization, no re-typesetting; page content streams are carried over byte-identically. Conventions shared by all of them: **local filesystem paths exactly as given**; an existing output file is overwritten (`COPY TO` semantics); a missing output *directory* is an error, never created; in-place operation (`input == output`) is refused because qpdf reads the source lazily during the write. Scalars return the output path, which makes them composable — the output of one is the input of the next.
@@ -540,7 +600,19 @@ SELECT pdf_encrypt('report.pdf', 'report_locked2.pdf', 'user-secret', 'owner-sec
 SELECT pdf_decrypt('report_locked.pdf', 'report_plain.pdf', 'user-secret');
 ```
 
-Encrypted files stay readable in place, too — every reader takes `password := '...'`:
+### `pdf_json` / `pdf_repair`
+
+qpdf structural dump and rewrite. **Path only** (no BLOB, no glob). `pdf_json(path [, password])` returns a VARCHAR JSON document (qpdf JSON, decode level 2). `pdf_repair(input, output [, password])` rewrites the file through qpdf and returns the output path (same in/out conventions as the other writers).
+
+```sql
+SELECT contains(pdf_json('report.pdf'), 'qpdf');
+SELECT pdf_json('locked.pdf', 'user-secret');
+
+SELECT pdf_repair('report.pdf', 'report_repaired.pdf');
+SELECT page_count FROM pdf_qpdf_info('report_repaired.pdf');
+```
+
+Encrypted files stay readable in place, too — readers that register `password` take `password := '...'`:
 
 ```sql
 SELECT page, text FROM read_pdf('report_locked.pdf', password := 'user-secret');
@@ -777,7 +849,9 @@ SELECT pdf_compress('excerpt.pdf', 'excerpt_small.pdf');
 
 ## OCR support
 
-Pages with no extractable text layer are OCR'd automatically (`auto_ocr`, on by default). Pass `ocr := true` to force OCR on every page, even ones that already have text. OCR applies to `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and `read_pdf_tables`.
+Pages with no extractable text layer are OCR'd automatically (`auto_ocr`, on by default). Pass `ocr := true` to force OCR on every page, even ones that already have text. OCR applies to `read_pdf`, `read_pdf_lines`, `read_pdf_words` / `read_pdf_layout`, and `read_pdf_tables`.
+
+`ocr_backend` defaults to `'tesseract'`. `'external'` requires `ocr_plugin` (C ABI shared library); without a plugin, **forced** OCR (`ocr := true`) raises, and **auto** OCR on image-only pages is best-effort empty (`text = ''`, `used_ocr = false`). `ocr_endpoint` is reserved (no in-process HTTP).
 
 **English (eng) is bundled** into the community binary (tessdata_fast, extracted
 to a temp dir on first OCR). For the default language you do **not** need
@@ -855,30 +929,25 @@ FROM read_pdf('scan.pdf', ocr := true,
   ocr_vars := MAP {'classify_bln_numeric_mode': '1'});
 ```
 
-**`ocr_image(blob, …)`** — table function with **named** params (scalars cannot take
+**`ocr_image(blob, …)`** — table function with **named** params (DuckDB scalars cannot take
 named maps). Returns one row: `text`, `confidence` (MeanTextConf 0–100), `format`.
 `format := 'text' | 'hocr' | 'tsv'` maps to Tess `GetUTF8Text` / `GetHOCRText` /
-`GetTSVText` in-process:
+`GetTSVText` in-process. Named knobs (aliases of the reader names): `language` /
+`lang` / `ocr_language`, `psm` / `ocr_psm`, `oem` / `ocr_oem`, `tessdata_dir`,
+`preprocess` / `ocr_preprocess`, `dpi` / `ocr_dpi`, `vars` / `ocr_vars`,
+`config` / `ocr_config`, `format`.
+
+The image argument must be a **foldable BLOB expression**, evaluated at bind time.
+This function has no column-input overload. For per-row PNGs use the **scalar**
+`tesseract_ocr` (positional
+overloads: blob [, lang [, psm [, oem [, tessdata_dir [, preprocess [, vars [,
+config]]]]]]]):
 
 ```sql
--- TVF first arg must be foldable (no subqueries) — SET VARIABLE is the usual path.
-SET VARIABLE page_png = (
-  SELECT poppler_render_page(content, 1, 200) FROM read_blob('scan.pdf')
-);
-SELECT text, confidence, format
-FROM ocr_image(
-  getvariable('page_png'),
-  language := 'eng',
-  psm := 6,
-  vars := MAP {'tessedit_char_whitelist': '0123456789'},
-  format := 'hocr'   -- or 'text' (default), 'tsv'
-);
-```
+-- Composable: scalar OCR over rendered pages (column / subquery OK)
+SELECT file, page, tesseract_ocr(png, 'eng', 6) AS text
+FROM pdf_page_images('scan.pdf', dpi := 200);
 
-Low-level scalar **`tesseract_ocr`** remains for one-line text (positional only):
-
-```sql
--- blob | lang | psm | oem | tessdata_dir | preprocess | vars | config
 SELECT tesseract_ocr(
   poppler_render_page(content, 1, 200),
   'eng', 6, 3, '', true,
@@ -886,7 +955,12 @@ SELECT tesseract_ocr(
   ''
 )
 FROM read_blob('scan.pdf');
+
 ```
+
+Use `tesseract_ocr` for image columns. For HOCR/TSV through `ocr_image`, provide
+valid encoded image bytes as a constant BLOB expression and set `format := 'hocr'`
+or `format := 'tsv'`.
 
 **Shellfs escape hatch** (full Tesseract CLI / `TESSDATA_PREFIX` before in-process
 parity, or any flag the extension has not lifted yet). Requires a DuckDB build
@@ -967,37 +1041,43 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 |---|---|---|
 | `read_pdf(files)` | Table | One row per page: text, dimensions, `has_text_layer`, `used_ocr`, **`ocr_confidence`** (NULL if no OCR). Parallel multi-file scan; `ignore_errors` skips bad files. Named OCR knobs include `ocr_vars` MAP + `ocr_config`. |
 | `read_pdf_lines(files)` | Table | One row per layout-preserving line. |
-| `read_pdf_words(files)` / `read_pdf_layout` | Table | One row per word: bbox, font, OCR source/confidence, geometric `line`, `page_width`/`page_height`. |
+| `read_pdf_words(files)` / `read_pdf_layout` | Table | Same function: one row per word — bbox, font, OCR source/confidence, geometric `line`, `page_width`/`page_height`. |
 | `read_pdf_tables(files)` | Table | One row per detected table row; cells as `VARCHAR[]`. |
-| `read_pdf_elements(files)` | Table | One row per layout element (`heading`/`paragraph`/`list_item`/`other`) with bbox. |
+| `read_pdf_elements(files)` | Table | One row per layout element (`heading`/`paragraph`/`list_item`/`other`) with bbox. Path/glob; `password` / page range only (no OCR knobs). |
 | `pdf_chunks(files)` | Table | Retrieval-ready chunks with section headings; `chunk_size`/`overlap` knobs. |
-| `pdf_info(files)` | Table | Full per-file census: metadata, timestamps, dimensions, size, encryption. |
-| `pdf_pages_info(files)` | Table | One row per page: crop/media size, rotation, orientation, label, duration. |
-| `read_pdf_meta(files)` | Table | Legacy per-file metadata (subset of `pdf_info`). |
-| `pdf_outline(files)` | Table | One row per bookmark, depth-first. |
-| `pdf_attachments(files)` | Table | One row per embedded file, bytes as `BLOB`. |
-| `pdf_form_fields(files)` | Table | One row per AcroForm field with type and value. |
-| `pdf_annotations(files)` | Table | One row per annotation; `WHERE subtype = 'Link'` extracts hyperlinks. |
-| `pdf_revisions(file)` | Table | One row per incremental-update revision, oldest first. |
-| `pdf_signatures(files)` | Table | One row per digital signature: metadata + OpenSSL CMS verification. |
-| `pdf_images(files)` | Table | One row per embedded image XObject; `data` is JPEG/JP2/PNG/raw bytes per `format`. |
+| `pdf_info(files)` | Table | Full per-file census: metadata, timestamps, dimensions, size, encryption. Path/glob; `password`. |
+| `pdf_pages_info(files)` | Table | One row per page: crop/media size, rotation, orientation, label, duration. Path/glob; `password`. |
+| `pdf_permissions(files)` | Table | One row per file: encryption, permission bits, form type, JS, IDs. Path/glob; `password`. |
+| `pdf_fonts(files)` | Table | One row per font: page, name, type, embedded, subset, `font_file`. Path/glob; `password`. |
+| `pdf_destinations(files)` | Table | One row per named destination (zero rows if none). Path/glob; `password`. |
+| `pdf_qpdf_info(files)` | Table | qpdf structure/encryption census (xref, enc_R/P/V, stream method, allow_*). Path/glob; `password`. |
+| `read_pdf_meta(files)` | Table | Legacy per-file metadata (subset of `pdf_info`). Path/glob; `password`, `ignore_errors`. |
+| `pdf_outline(files)` | Table | One row per bookmark, depth-first. Path/glob; `password`. |
+| `pdf_attachments(files)` | Table | One row per embedded file, bytes as `BLOB`. Path/glob; `password`. |
+| `pdf_form_fields(files)` | Table | One row per AcroForm field with type and value. Path/glob; **no** `password` param. |
+| `pdf_annotations(files)` | Table | One row per annotation; `WHERE subtype = 'Link'` extracts hyperlinks. Path/glob; **no** `password` param. |
+| `pdf_revisions(files)` | Table | One row per incremental-update revision, oldest first. Path/glob; `password` accepted for API parity. |
+| `pdf_signatures(files)` | Table | One row per digital signature: metadata + OpenSSL CMS verification. Path/glob; `password`. |
+| `pdf_images(files)` | Table | One row per embedded image XObject; `data` is JPEG/JP2/PNG/raw bytes per `format`. Path/glob; `password`. |
 | `pdf_page_images(files)` | Table | One row per page with a rendered PNG (`png` BLOB); `dpi` / page-range / `password`. No `pdftoppm`. |
-| `pdf_write_page_images(files, out_dir)` | Table | Write page PNGs to `out_dir/<stem>/p{N}.png` (1-based, no pad); `(file, page, out_path, width, height, bytes)`. |
-| `pdf_split(file, dir)` | Table | One single-page PDF per page; one row per emitted file. |
-| `pdf_split_blank(file, dir[, blank_threshold])` | Table | Splits on blank-page separators (mailroom batches); one row per emitted document. |
-| `pdf_redact(in, out, boxes [, dpi, password])` | Table | True raster redaction: replace boxed pages with image-only pages (text removed, not covered); one row per output page. |
+| `pdf_write_page_images(files, out_dir)` | Table | VARCHAR path/glob **or** `LIST(VARCHAR)`; write `out_dir/<stem>/p{N}.png`; `(file, page, out_path, width, height, bytes)`. |
+| `pdf_split(file, dir)` | Table | One single-page PDF per page; **one input file** (not a glob). |
+| `pdf_split_blank(file, dir[, blank_threshold])` | Table | Splits on blank-page separators; **one input file**. |
+| `pdf_redact(in, out, boxes [, dpi, password])` | Table | True raster redaction; constant-arg form; one row per output page. |
 | `pdf_redact_lateral(in, out, boxes)` | Table (in-out) | Column-ref / dependent-join form of `pdf_redact` (positional only; dpi=200, password=''). |
-| `pdf_to_text(src [, layout])` | Scalar | Whole document as plain text. Path or `BLOB`. |
-| `pdf_to_markdown(path)` | Scalar | Whole document as GitHub-flavoured Markdown. |
+| `pdf_to_text(src [, layout])` | Scalar | Whole document as plain text. **One** path or `BLOB` (no glob). |
+| `pdf_to_markdown(path)` | Scalar | Whole document as GitHub-flavoured Markdown. **Path only** (no BLOB). |
 | `pdf_to_html(src)` | Scalar | Whole document as positioned HTML. Path or `BLOB`. |
 | `pdf_to_xml(src)` | Scalar | Whole document as per-word-bbox XML. Path or `BLOB`. |
 | `pdf_to_svg(src, page [, dpi])` | Scalar | One page as SVG (embedded PNG raster). Path or `BLOB`. |
 | `pdf_to_png(src, page [, dpi])` | Scalar | One page as PNG bytes (`BLOB`). Path or `BLOB`. |
 | `poppler_version()` | Scalar | Linked Poppler version string. |
-| `poppler_render_page(blob, page, dpi)` | Scalar | One page of a PDF BLOB as PNG bytes (building block for OCR). |
-| `tesseract_ocr(blob[, …])` | Scalar | In-process OCR text from image BLOB (positional overloads: lang, psm, oem, tessdata_dir, preprocess, vars MAP, config). |
-| `ocr_image(blob, …)` | Table | Named-param image OCR: one row `(text, confidence, format)`. `format` = `text`\|`hocr`\|`tsv`; same knobs as readers (`language`, `psm`, `vars`, …). TVF arg must be foldable (use `SET VARIABLE` / `getvariable`). |
-| `pdf_merge(files[], out)` | Scalar | Concatenate PDFs in list order. |
+| `poppler_render_page(blob, page, dpi)` | Scalar | One page of a PDF **BLOB** as PNG bytes (no path overload). |
+| `tesseract_ocr(blob[, …])` | Scalar | In-process OCR text from image BLOB. Positional overloads 1–8: lang, psm, oem, tessdata_dir, preprocess, vars MAP, config. Column-safe. |
+| `ocr_image(blob, …)` | Table | Named-param image OCR: one row `(text, confidence, format)`. `format` = `text`\|`hocr`\|`tsv`. First arg must be a **foldable BLOB expression**; no column-input overload. |
+| `pdf_json(path [, password])` | Scalar | qpdf JSON dump of one file (no BLOB, no glob). |
+| `pdf_repair(in, out [, password])` | Scalar | qpdf rewrite; returns output path. |
+| `pdf_merge(files[], out)` | Scalar | Concatenate PDFs in list order (`LIST(VARCHAR)`, not a glob string). |
 | `pdf_rotate(in, out, deg [, pages])` | Scalar | Rotate pages by multiples of 90°. |
 | `pdf_pages(in, out, range)` | Scalar | Extract a page subset (`'1-3,7'`, `'z'`, `'r2'`). |
 | `pdf_watermark(in, out, text [, opacity])` | Scalar | Stamp a diagonal gray text watermark on every page (real text; default opacity 0.30). |
@@ -1005,7 +1085,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_compress(in, out)` | Scalar | Structural compression + linearization. |
 | `pdf_encrypt(in, out, userpw [, ownerpw])` | Scalar | AES-256 password protection. |
 | `pdf_decrypt(in, out, pw)` | Scalar | Remove password protection. |
-| `pdf_sign(in, out, cert, key)` | Table | Apply an `adbe.pkcs7.detached` CMS signature (PEM cert+key); verifies via `pdf_signatures`. |
+| `pdf_sign(in, out, cert, key)` | Table | Apply an `adbe.pkcs7.detached` CMS signature (PEM cert+key); verifies via `pdf_signatures`. Single file, not a glob. |
 | `write_pdf(text [, out])` | Scalar | Native text-to-PDF via libharu. |
 | `to_pdf(in [, out])` | Scalar | Office/markup document to PDF via LibreOffice (runtime shell-out). |
 | `COPY ... (FORMAT pdf)` | Copy | Query result to a typeset PDF; `TITLE`/`AUTHOR`/`HEADER`/`FOOTER`/`FONT_SIZE`/`PAGE_SIZE`/`MARGIN`. |

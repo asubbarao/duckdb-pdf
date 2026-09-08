@@ -7,23 +7,30 @@ function reference.
 ## Shipped
 
 - **Readers** — `read_pdf` (page grain), `read_pdf_lines`, `read_pdf_words`
-  (bounding boxes + OCR confidence + **`line`** geometric line id +
-  **`page_width`/`page_height`**), `read_pdf_tables`, `read_pdf_elements`
-  (layout elements in reading order), `pdf_chunks` (retrieval-ready chunking).
-- **Whole-document scalars** — `pdf_to_text` / `pdf_to_markdown` /
-  `pdf_to_html` / `pdf_to_xml` / `pdf_to_svg` / `pdf_to_png`, on paths, globs,
-  and BLOBs.
+  / `read_pdf_layout` (same bind/scan: bounding boxes + OCR confidence +
+  **`line`** geometric line id + **`page_width`/`page_height`**),
+  `read_pdf_tables`, `read_pdf_elements` (layout elements in reading order),
+  `pdf_chunks` (retrieval-ready chunking).
+- **Whole-document scalars** — `pdf_to_text` / `pdf_to_html` / `pdf_to_xml` /
+  `pdf_to_svg` / `pdf_to_png` on **one path or a BLOB** (they do **not** glob);
+  `pdf_to_markdown` is **path only**. Folder scans use table readers or
+  `FROM glob` / `pdf_info` plus a scalar per file.
 - **Page previews (no `pdftoppm`)** — `pdf_page_images` (PNG BLOB per page),
-  `pdf_write_page_images` (on-disk `out_dir/<stem>/p{N}.png` trees). Bundled
-  URW base-14 fonts so community/vcpkg builds do not raster blank pages.
+  `pdf_write_page_images` (VARCHAR path/glob **or** `LIST(VARCHAR)` →
+  `out_dir/<stem>/p{N}.png` trees). Bundled URW base-14 fonts so
+  community/vcpkg builds do not raster blank pages.
 - **Inspectors** — `pdf_info` (per-file census, incl. PDF/A `pdfa_part` /
   `pdfa_conformance` detection), `pdf_pages_info` (per-page media/crop/
-  rotation/label), `read_pdf_meta`, `pdf_outline`, `pdf_attachments`,
-  `pdf_form_fields`, `pdf_annotations`, `pdf_revisions` (incremental-update
-  forensics), `pdf_signatures` (detect + verify).
-- **Transforms** — `pdf_merge`, `pdf_split`, `pdf_split_blank`, `pdf_rotate`,
-  `pdf_pages`, `pdf_compress`, `pdf_encrypt`, `pdf_decrypt`, `pdf_watermark` /
-  `pdf_bates`, `pdf_images` (embedded XObjects).
+  rotation/label), `pdf_permissions`, `pdf_fonts`, `pdf_destinations`,
+  `pdf_qpdf_info` (qpdf xref/encryption census), `read_pdf_meta`,
+  `pdf_outline`, `pdf_attachments`, `pdf_form_fields`, `pdf_annotations`
+  (path/glob, **no** password named param), `pdf_revisions`
+  (incremental-update forensics), `pdf_signatures` (detect + verify).
+- **Transforms** — `pdf_merge` (`LIST(VARCHAR)`), `pdf_split` /
+  `pdf_split_blank` (one input file), `pdf_rotate`, `pdf_pages`,
+  `pdf_compress`, `pdf_encrypt`, `pdf_decrypt`, `pdf_watermark` /
+  `pdf_bates`, `pdf_json` (qpdf JSON dump), `pdf_repair` (qpdf rewrite),
+  `pdf_images` (embedded XObjects).
 - **Redaction** — `pdf_redact` (constant-arg) + `pdf_redact_lateral` (column-ref
   / dependent join): raster true-removal of boxed regions; fails loudly if
   Poppler has no display fonts (bundled base-14 makes that path rare).
@@ -33,9 +40,12 @@ function reference.
   pdf)`, and `to_pdf` (office documents via LibreOffice).
 - **OCR** — Tesseract-backed, auto-triggered on pages with no text layer; Leptonica
   preprocess + confidence retry via `ocr_dpi` / `ocr_psm` / `ocr_oem` /
-  `ocr_preprocess` / `ocr_retry` / `tessdata_dir`. **English (eng) model is
-  bundled** (tessdata_fast) so community binaries OCR scans with zero host
-  tessdata install.
+  `ocr_preprocess` / `ocr_retry` / `tessdata_dir`. `ocr_backend`
+  (`tesseract` | `external`) + `ocr_plugin` / reserved `ocr_endpoint`.
+  Image surfaces: `ocr_image` (named-param TVF, foldable BLOB, HOCR/TSV),
+  `tesseract_ocr` (positional scalar, column-safe), `poppler_render_page` /
+  `poppler_version`. **English (eng) model is bundled** (tessdata_fast) so
+  community binaries OCR scans with zero host tessdata install.
 
 ## In progress
 
@@ -62,8 +72,9 @@ function reference.
   validate conformance against the PDF/A profile.
 - **`write_pdf_table`** — typeset a query result as a multi-column table PDF
   (issue #19).
-- **Standalone `ocr` extension** — a generic image-OCR extension for non-PDF
-  inputs, factored out once the PDF OCR surface stabilizes further.
+- **Standalone `ocr` extension** — factor `ocr_image` / `tesseract_ocr` out of
+  `pdf` for non-PDF inputs. Those functions **already ship** on this extension;
+  the planned work is a separate package, not first OCR support.
 
 ## Non-goals
 
