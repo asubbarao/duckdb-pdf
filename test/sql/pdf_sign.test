@@ -55,6 +55,29 @@ FROM pdf_signatures('__TEST_DIR__/signed_named.pdf');
 ----
 ApprovalSig	true	true
 
+# field_name may literally contain "/ByteRange" (PDF string value). Sign must
+# still patch the real /ByteRange key next to /Contents — not the substring
+# inside /T — and the closed loop must verify.
+statement ok
+SELECT * FROM pdf_sign('test/data/hello.pdf', '__TEST_DIR__/signed_br_name.pdf',
+                       'test/data/sign_cert.pem', 'test/data/sign_key.pem',
+                       field_name := 'Pre/ByteRange/Post');
+
+query III
+SELECT field_name, covers_whole_file, verified
+FROM pdf_signatures('__TEST_DIR__/signed_br_name.pdf');
+----
+Pre/ByteRange/Post	true	true
+
+# empty field_name falls back to Signature1
+query II
+SELECT output LIKE '%signed_empty_name.pdf', field_name
+FROM pdf_sign('test/data/hello.pdf', '__TEST_DIR__/signed_empty_name.pdf',
+              'test/data/sign_cert.pem', 'test/data/sign_key.pem',
+              field_name := '');
+----
+true	Signature1
+
 # ── original input is left unchanged ──
 
 query I

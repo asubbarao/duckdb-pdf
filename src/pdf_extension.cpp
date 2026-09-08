@@ -72,6 +72,10 @@
 #include <utility>
 #include <vector>
 
+// In-memory PNG encode for RenderPageToPngBytes (avoids temp-file roundtrip).
+// Same zlib surface qpdf_ops EncodePng already uses; libz is linked via poppler/qpdf.
+#include <zlib.h>
+
 // Process spawn + PATH probing for the runtime LibreOffice shell-out (to_pdf).
 // These are the ONLY new system headers; no new library is linked.
 #ifdef _WIN32
@@ -3339,13 +3343,15 @@ static void ReadPdfElementsScan(ClientContext &context, TableFunctionInput &data
 //      pre-split at the last ASCII whitespace at or before the limit,
 //      repeatedly, into pieces each <= chunk_size bytes. A whitespace-free
 //      run longer than chunk_size is hard-cut at a UTF-8 codepoint
-//      boundary.
+//      boundary. If chunk_size is smaller than the next codepoint, emit
+//      that whole scalar anyway (single-codepoint budget exception) —
+//      never split a codepoint (invalid VARCHAR).
 //  C3. HEADINGS GLUE FORWARD: a 'heading' element never ends a chunk. If
 //      packing would leave a heading last, the heading moves to the front
 //      of the next chunk instead. If the heading is the ONLY element in
 //      the chunk, the next element is glued to it even when that exceeds
-//      chunk_size (the one documented budget exception; a trailing
-//      heading at end-of-file is emitted as-is — there is no next chunk).
+//      chunk_size (heading glue budget exception; a trailing heading at
+//      end-of-file is emitted as-is — there is no next chunk).
 //  C4. OVERLAP: each chunk after the first is prefixed with the trailing
 //      `overlap` bytes of the previous chunk's emitted text, trimmed
 //      forward to the next whitespace boundary so no word is cut, then
@@ -3356,7 +3362,9 @@ static void ReadPdfElementsScan(ClientContext &context, TableFunctionInput &data
 //      '\n' joining overlap to core), except when C3's glue exception
 //      fires (then core may reach one heading + '\n' + chunk_size).
 //      Budgets are counted in bytes; n_chars is codepoints, so the
-//      invariant holds a fortiori for non-ASCII text.
+//      invariant holds a fortiori for non-ASCII text. C2's single-codepoint
+//      exception may emit one scalar whose byte length exceeds chunk_size;
+//      n_chars for that piece is still 1.
 //  C6. HEADING COLUMN: the text of the most recent 'heading' element at
 //      or before the chunk's first non-overlap element (a chunk that
 //      starts with a heading reports that heading). NULL before the
@@ -3402,9 +3410,24 @@ static int64_t Utf8CodepointCount(const string &text) {
 	return count;
 }
 
+// Exclusive end of the UTF-8 codepoint that starts at `pos`. Always
+// advances at least one byte when `pos < text.size()` (well-formed or not).
+static size_t Utf8CodepointEnd(const string &text, size_t pos) {
+	if (pos >= text.size()) {
+		return pos;
+	}
+	size_t end = pos + 1;
+	while (end < text.size() && ((unsigned char)text[end] & 0xC0) == 0x80) {
+		end++;
+	}
+	return end;
+}
+
 // C2: split one oversized element text into pieces each <= limit bytes,
 // cutting at the last ASCII whitespace at or before the limit (hard cut at
 // a codepoint boundary only when a single "word" exceeds the limit).
+// Single-codepoint budget exception: if `limit` is smaller than the next
+// scalar, emit that whole codepoint rather than invalid UTF-8.
 static std::vector<string> ChunkSplitLongText(const string &text, size_t limit) {
 	std::vector<string> pieces;
 	size_t pos = 0;
@@ -3423,8 +3446,8 @@ static std::vector<string> ChunkSplitLongText(const string &text, size_t limit) 
 				cut--;
 			}
 			if (cut == pos) {
-				// limit smaller than one codepoint: split it rather than loop
-				cut = pos + limit;
+				// limit smaller than one codepoint: emit the scalar (C2 exception)
+				cut = Utf8CodepointEnd(text, pos);
 			}
 			pieces.push_back(text.substr(pos, cut - pos));
 			pos = cut;
@@ -4079,12 +4102,11 @@ static void PdfToHtmlFun(DataChunk &args, ExpressionState &state, Vector &result
 // pdf_to_svg(path, page[, dpi]) — REAL raster render of ONE 1-based page.
 //
 // The page is rasterized with poppler::page_renderer (the same render path the
-// OCR code uses) and saved to a unique temp file as PNG via image::save(...,
-// "png"). poppler's PNG writer uses libpng, which is ALREADY linked through
-// poppler — no external process, no new dependency. The PNG bytes are read back,
-// base64-encoded, and embedded as a <image href="data:image/png;base64,..."/>
+// OCR code uses). PNG bytes are encoded in-memory from the raster buffer
+// (zlib deflate IDAT) — no temp-file write/read roundtrip. The bytes are then
+// base64-encoded and embedded as a <image href="data:image/png;base64,..."/>
 // inside an <svg> sized to the page's POINT dimensions, so the raster scales to
-// the page box. The temp file is always removed (RAII guard), even on error.
+// the page box.
 //===--------------------------------------------------------------------===//
 
 // Portable temp directory (avoids std::filesystem, which is unavailable on some
@@ -4111,9 +4133,90 @@ static string TempDir() {
 	return ".";
 }
 
-// Shared PNG rasterization + temp-file roundtrip used by BOTH pdf_to_svg (to embed base64 raster)
-// and pdf_to_png (to return raw BLOB). Exact same render hints, UUID naming, TempFileGuard,
-// image::save + binary read + magic validation as the original pdf_to_svg path.
+static void PngPutU32(string &s, uint32_t v) {
+	s.push_back(static_cast<char>((v >> 24) & 0xff));
+	s.push_back(static_cast<char>((v >> 16) & 0xff));
+	s.push_back(static_cast<char>((v >> 8) & 0xff));
+	s.push_back(static_cast<char>(v & 0xff));
+}
+
+static void PngAppendChunk(string &out, const char *type, const string &data) {
+	PngPutU32(out, static_cast<uint32_t>(data.size()));
+	const size_t crc_start = out.size();
+	out.append(type, 4);
+	out.append(data);
+	uLong crc = crc32(0L, Z_NULL, 0);
+	crc = crc32(crc, reinterpret_cast<const Bytef *>(out.data() + crc_start),
+	            static_cast<uInt>(4 + data.size()));
+	PngPutU32(out, static_cast<uint32_t>(crc));
+}
+
+// Encode poppler RGB24 / ARGB32 raster to a PNG byte string (IHDR+IDAT+IEND).
+// Returns empty on unsupported format or zlib failure so the caller can error.
+static string EncodePopplerImagePng(const poppler::image &img) {
+	const int width = img.width();
+	const int height = img.height();
+	const int bpr = img.bytes_per_row();
+	const char *base = img.const_data();
+	if (!base || width <= 0 || height <= 0 || bpr <= 0) {
+		return string();
+	}
+	const auto fmt = img.format();
+	const bool is_rgb24 = (fmt == poppler::image::format_rgb24);
+	const bool is_argb32 = (fmt == poppler::image::format_argb32);
+	if (!is_rgb24 && !is_argb32) {
+		return string();
+	}
+
+	// Pack tightly as RGB8 (PNG color type 2). ARGB32 is B,G,R,A in memory.
+	const size_t row_bytes = static_cast<size_t>(width) * 3;
+	string raw;
+	raw.reserve((row_bytes + 1) * static_cast<size_t>(height));
+	for (int y = 0; y < height; y++) {
+		raw.push_back(0); // filter None
+		const unsigned char *row =
+		    reinterpret_cast<const unsigned char *>(base) + static_cast<size_t>(y) * static_cast<size_t>(bpr);
+		if (is_rgb24) {
+			raw.append(reinterpret_cast<const char *>(row), row_bytes);
+		} else {
+			for (int x = 0; x < width; x++) {
+				const unsigned char *px = row + static_cast<size_t>(x) * 4;
+				raw.push_back(static_cast<char>(px[2])); // R
+				raw.push_back(static_cast<char>(px[1])); // G
+				raw.push_back(static_cast<char>(px[0])); // B
+			}
+		}
+	}
+
+	uLongf bound = compressBound(static_cast<uLong>(raw.size()));
+	string idat;
+	idat.resize(bound);
+	int rc = compress2(reinterpret_cast<Bytef *>(&idat[0]), &bound, reinterpret_cast<const Bytef *>(raw.data()),
+	                   static_cast<uLong>(raw.size()), Z_DEFAULT_COMPRESSION);
+	if (rc != Z_OK) {
+		return string();
+	}
+	idat.resize(bound);
+
+	string out;
+	static const unsigned char kSig[8] = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+	out.append(reinterpret_cast<const char *>(kSig), 8);
+	string ihdr;
+	PngPutU32(ihdr, static_cast<uint32_t>(width));
+	PngPutU32(ihdr, static_cast<uint32_t>(height));
+	ihdr.push_back(8); // bit depth
+	ihdr.push_back(2); // truecolor
+	ihdr.push_back(0); // compression: deflate
+	ihdr.push_back(0); // filter method
+	ihdr.push_back(0); // no interlace
+	PngAppendChunk(out, "IHDR", ihdr);
+	PngAppendChunk(out, "IDAT", idat);
+	PngAppendChunk(out, "IEND", string());
+	return out;
+}
+
+// Shared PNG rasterization used by pdf_to_svg (base64 embed), pdf_to_png (BLOB),
+// pdf_page_images, and pdf_write_page_images. Encodes in-memory — no temp PNG on disk.
 static string RenderPageToPngBytes(poppler::document &doc, int32_t page_no, int32_t dpi, const string &fn_name) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	EnsurePdfBase14Fonts();
@@ -4132,36 +4235,11 @@ static string RenderPageToPngBytes(poppler::document &doc, int32_t page_no, int3
 		throw IOException("%s: failed to render page %d", fn_name.c_str(), (int)page_no);
 	}
 
-	// Write the raster to a unique temp file as PNG. image::save() needs a real
-	// on-disk path; we build one from a portable temp dir plus a random UUID for a
-	// thread-safe, cross-platform unique name, and always remove it on scope exit.
-#ifdef _WIN32
-	const char sep = '\\';
-#else
-	const char sep = '/';
-#endif
-	string unique = BaseUUID::ToString(UUID::GenerateRandomUUID());
-	string tmp_path = TempDir() + sep + fn_name + "_" + unique + ".png";
-	TempFileGuard guard(tmp_path);
-
-	if (!img.save(tmp_path, "png", dpi)) {
-		// poppler returns false if it was built without a PNG writer, or on I/O
-		// failure. Fail loudly — never silently degrade.
-		throw IOException("%s: poppler could not write a PNG for page %d (this poppler build may lack "
-		                  "the PNG image writer)",
-		                  fn_name.c_str(), (int)page_no);
-	}
-
-	// Read the PNG bytes back.
-	std::ifstream in(tmp_path, std::ios::binary);
-	if (!in) {
-		throw IOException("%s: could not reopen rendered PNG for page %d", fn_name.c_str(), (int)page_no);
-	}
-	string png((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-	in.close();
+	string png = EncodePopplerImagePng(img);
 	if (png.size() < 8 || static_cast<unsigned char>(png[0]) != 0x89 || png[1] != 'P' || png[2] != 'N' ||
 	    png[3] != 'G') {
-		throw IOException("%s: rendered output for page %d is not a valid PNG", fn_name.c_str(), (int)page_no);
+		throw IOException("%s: could not encode PNG for page %d (unsupported raster format or zlib failure)",
+		                  fn_name.c_str(), (int)page_no);
 	}
 	return png;
 }
@@ -4282,8 +4360,8 @@ static void PdfToSvgBlobDpiFun(DataChunk &args, ExpressionState &state, Vector &
 // pdf_to_png(data BLOB, page INTEGER[, dpi INTEGER]) -> BLOB
 //
 // Real raster render of a single 1-based page to PNG bytes (as BLOB).
-// Reuses LoadRenderDoc/LoadBlobDoc, RenderPageToPngBytes (the exact raster+
-// TempFileGuard+image::save path from pdf_to_svg), and error text conventions.
+// Reuses LoadRenderDoc/LoadBlobDoc and RenderPageToPngBytes (in-memory PNG
+// encode from the poppler raster — same path as pdf_to_svg).
 // Default dpi matches pdf_to_svg (150). Validation 1..2400 per ocr_dpi style.
 //===--------------------------------------------------------------------===//
 
@@ -5800,6 +5878,11 @@ static string PdfMergeImpl(const vector<string> &inputs, const string &output) {
 	}
 	for (auto &in_path : inputs) {
 		PdfOpsCheckInputExists("pdf_merge", in_path);
+		// Same contract as pdf_rotate / PdfOpsCheckInOut: qpdf pulls source
+		// objects lazily during write, and overwriting an input destroys it.
+		if (in_path == output) {
+			throw InvalidInputException("pdf_merge: output path must differ from input path '%s'", output);
+		}
 	}
 	PdfOpsCheckOutputDir("pdf_merge", PdfOpsParentDir(output));
 	try {
@@ -6680,6 +6763,11 @@ static unique_ptr<FunctionData> PdfSignBind(ClientContext &context, TableFunctio
 	}
 	if (result->field_name.empty()) {
 		result->field_name = "Signature1";
+	}
+	// Embedded NUL would truncate at the C API boundary and confuse AcroForm
+	// name matching; reject rather than silently renaming the field.
+	if (result->field_name.find('\0') != string::npos) {
+		throw InvalidInputException("pdf_sign: field_name must not contain NUL bytes");
 	}
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
 	names = {"output", "field_name"};
@@ -7874,6 +7962,27 @@ static string PdfWriteJoinPath(const string &dir, const string &leaf) {
 	return dir + sep + leaf;
 }
 
+// Output layout is out_dir/<stem>/p{N}.png. Two inputs that share a stem would
+// silently overwrite each other. Compare stems case-insensitively so Windows
+// (and case-insensitive macOS) cannot collide on Hello.pdf vs hello.pdf.
+static void PdfWritePageImagesCheckStemCollisions(const vector<string> &files) {
+	std::map<string, string> claimed;
+	for (auto &path : files) {
+		string stem = PdfOpsStem(path);
+		if (stem.empty()) {
+			throw InvalidInputException("pdf_write_page_images: could not derive a stem from '%s'", path);
+		}
+		string key = StringUtil::Lower(stem);
+		auto it = claimed.find(key);
+		if (it != claimed.end()) {
+			throw InvalidInputException(
+			    "pdf_write_page_images: output collision: inputs '%s' and '%s' both map to stem '%s'", it->second,
+			    path, key);
+		}
+		claimed[key] = path;
+	}
+}
+
 static void PdfWriteBytesToFile(const string &path, const string &bytes, const char *fn_name) {
 	std::ofstream of(path, std::ios::binary | std::ios::trunc);
 	if (!of) {
@@ -7917,6 +8026,7 @@ static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, T
 	if (result->dpi < 1 || result->dpi > 2400) {
 		throw InvalidInputException("pdf_write_page_images: dpi must be between 1 and 2400 (got %d)", result->dpi);
 	}
+	PdfWritePageImagesCheckStemCollisions(result->files);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BIGINT};
 	names = {"file", "page", "out_path", "width", "height", "bytes"};
@@ -7929,6 +8039,9 @@ static unique_ptr<GlobalTableFunctionState> PdfWritePageImagesInit(ClientContext
 
 static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePageImagesBindData &bind,
                                       std::vector<PdfWritePageImagesRow> &rows) {
+	// Reject colliding stems before any mkdir/write. Bind already checks; this
+	// is the scan-time gate so a future bind skip cannot create a partial tree.
+	PdfWritePageImagesCheckStemCollisions(bind.files);
 	auto fs = FileSystem::CreateLocal();
 	// Ensure the top-level preview root exists (create, don't require the caller
 	// to mkdir first — this is an export tree, not a surgical in-place write).

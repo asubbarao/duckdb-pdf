@@ -189,6 +189,84 @@ FROM pdf_chunks('__TEST_DIR__/chunks_glob*.pdf');
 ----
 2	2
 
+# ── UTF-8: chunk_size smaller than a codepoint (C2 single-codepoint exception)
+# chunks_utf8.pdf (committed fixture): whitespace-free runs
+#   page 1: eight U+1F600 (4-byte), page 2: eight U+4E2D (3-byte),
+#   page 3: eight U+00E9 (2-byte). Tiny budgets 1/2/3 must emit complete
+#   scalars, stay valid VARCHAR, and terminate.
+
+query I
+SELECT string_agg(text, '' ORDER BY chunk_idx) = repeat(chr(128512), 8)
+   AND bool_and(text = chr(128512) AND n_chars = 1 AND strlen(text) = 4)
+FROM pdf_chunks('test/data/chunks_utf8.pdf', chunk_size := 1, overlap := 0, first_page := 1, last_page := 1);
+----
+true
+
+query I
+SELECT string_agg(text, '' ORDER BY chunk_idx) = repeat(chr(128512), 8)
+   AND bool_and(text = chr(128512) AND n_chars = 1 AND strlen(text) = 4)
+FROM pdf_chunks('test/data/chunks_utf8.pdf', chunk_size := 2, overlap := 0, first_page := 1, last_page := 1);
+----
+true
+
+query I
+SELECT string_agg(text, '' ORDER BY chunk_idx) = repeat(chr(128512), 8)
+   AND bool_and(text = chr(128512) AND n_chars = 1 AND strlen(text) = 4)
+FROM pdf_chunks('test/data/chunks_utf8.pdf', chunk_size := 3, overlap := 0, first_page := 1, last_page := 1);
+----
+true
+
+query I
+SELECT string_agg(text, '' ORDER BY chunk_idx) = repeat(chr(20013), 8)
+   AND bool_and(text = chr(20013) AND n_chars = 1 AND strlen(text) = 3)
+FROM pdf_chunks('test/data/chunks_utf8.pdf', chunk_size := 1, overlap := 0, first_page := 2, last_page := 2);
+----
+true
+
+query I
+SELECT string_agg(text, '' ORDER BY chunk_idx) = repeat(chr(20013), 8)
+   AND bool_and(text = chr(20013) AND n_chars = 1 AND strlen(text) = 3)
+FROM pdf_chunks('test/data/chunks_utf8.pdf', chunk_size := 2, overlap := 0, first_page := 2, last_page := 2);
+----
+true
+
+query I
+SELECT string_agg(text, '' ORDER BY chunk_idx) = repeat(chr(233), 8)
+   AND bool_and(text = chr(233) AND n_chars = 1 AND strlen(text) = 2)
+FROM pdf_chunks('test/data/chunks_utf8.pdf', chunk_size := 1, overlap := 0, first_page := 3, last_page := 3);
+----
+true
+
+# ASCII hard-cut runs: PDF rendering may insert a line break, but chunks still
+# make progress without losing text.
+statement ok
+COPY (SELECT repeat('Z', 16) AS c)
+TO '__TEST_DIR__/chunks_nows.pdf' (FORMAT pdf);
+
+query I
+SELECT replace(string_agg(text, '' ORDER BY chunk_idx), chr(10), '') = repeat('Z', 16)
+   AND bool_and(n_chars > 0 AND strlen(text) = n_chars)
+   AND bool_or(text = 'Z')
+FROM pdf_chunks('__TEST_DIR__/chunks_nows.pdf', chunk_size := 1, overlap := 0);
+----
+true
+
+query I
+SELECT replace(string_agg(text, '' ORDER BY chunk_idx), chr(10), '') = repeat('Z', 16)
+   AND bool_and(n_chars > 0 AND strlen(text) = n_chars)
+   AND bool_or(text = 'ZZ')
+FROM pdf_chunks('__TEST_DIR__/chunks_nows.pdf', chunk_size := 2, overlap := 0);
+----
+true
+
+query I
+SELECT replace(string_agg(text, '' ORDER BY chunk_idx), chr(10), '') = repeat('Z', 16)
+   AND bool_and(n_chars > 0 AND strlen(text) = n_chars)
+   AND bool_or(text = 'ZZZ')
+FROM pdf_chunks('__TEST_DIR__/chunks_nows.pdf', chunk_size := 3, overlap := 0);
+----
+true
+
 # ── validation ───────────────────────────────────────────────────────────────
 
 statement error

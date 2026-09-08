@@ -53,6 +53,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -727,12 +728,13 @@ std::vector<SignatureInfo> ReadSignatures(const std::string &path, const std::st
 		std::string cms_der;
 		auto contents = value.getKey("/Contents");
 		if (contents.isString()) {
-			// qpdf returns the decoded string bytes (hex already unhexed).
+			// qpdf returns the decoded string bytes (hex already unhexed). Fixed-width
+			// writers (including pdf_sign) leave trailing NUL padding after the DER.
+			// Do NOT rstrip NULs: a legitimate CMS DER ends with 0x00 ~1/256 of the
+			// time (RSA ciphertext), and stripping that byte truncates ASN.1 so
+			// CMS_verify fails. d2i_CMS_ContentInfo (in CmsVerify / CmsSignerCN)
+			// already stops at the ASN.1 object and ignores trailing padding.
 			cms_der = contents.getStringValue();
-			// Strip trailing NUL padding writers leave in the fixed-width hex hole.
-			while (!cms_der.empty() && cms_der.back() == '\0') {
-				cms_der.pop_back();
-			}
 		}
 
 		// Tier 2 cryptographic verification.
@@ -1491,15 +1493,53 @@ void SignDetached(const std::string &input, const std::string &output, const std
 	// Hole capacity in hex digits (between '<' and '>').
 	size_t hole_hex = c_gt - c_lt - 1;
 
-	// Locate and patch /ByteRange in place. The array occupies [lb, rb].
-	size_t br_key = bytes.find("/ByteRange");
-	if (br_key == std::string::npos) {
-		throw std::runtime_error("could not locate /ByteRange in written PDF");
+	// Locate /ByteRange for THIS signature dict — not a "/ByteRange" substring
+	// inside a PDF string. Named params (field_name / reason / location /
+	// signer_name) may literally contain "/ByteRange"; a naive bytes.find
+	// would patch the wrong span and leave a damaged, unverifiable file
+	// (the Linux amd64 pdf_sign.test custom-field failure mode).
+	// Require a real dictionary key: "/ByteRange" then optional whitespace
+	// then '[' — that rejects "(Pre/ByteRange/Post)" where the next char is '/'.
+	// Prefer the hit nearest the Contents hole (same sig dict).
+	const size_t kBrWindow = 4096;
+	const char kBrKey[] = "/ByteRange";
+	const size_t kBrKeyLen = sizeof(kBrKey) - 1;
+	size_t window_lo = (c_lt > kBrWindow) ? (c_lt - kBrWindow) : 0;
+	size_t window_hi = std::min(bytes.size(), c_gt + kBrWindow);
+	size_t br_key = std::string::npos;
+	size_t lb = std::string::npos;
+	size_t rb = std::string::npos;
+	size_t br_dist = std::numeric_limits<size_t>::max();
+	for (size_t pos = window_lo; pos < window_hi;) {
+		size_t hit = bytes.find(kBrKey, pos);
+		if (hit == std::string::npos || hit >= window_hi) {
+			break;
+		}
+		pos = hit + 1;
+		if (hit >= c_lt && hit <= c_gt) {
+			continue; // inside the Contents hex hole
+		}
+		size_t i = hit + kBrKeyLen;
+		while (i < bytes.size() && (bytes[i] == ' ' || bytes[i] == '\t' || bytes[i] == '\r' || bytes[i] == '\n')) {
+			i++;
+		}
+		if (i >= bytes.size() || bytes[i] != '[') {
+			continue; // not a /ByteRange array key (e.g. "/ByteRange/Post" in /T)
+		}
+		size_t close = bytes.find(']', i);
+		if (close == std::string::npos) {
+			continue;
+		}
+		size_t dist = (hit < c_lt) ? (c_lt - hit) : (hit - c_gt);
+		if (dist < br_dist) {
+			br_dist = dist;
+			br_key = hit;
+			lb = i;
+			rb = close;
+		}
 	}
-	size_t lb = bytes.find('[', br_key);
-	size_t rb = (lb == std::string::npos) ? std::string::npos : bytes.find(']', lb);
-	if (lb == std::string::npos || rb == std::string::npos) {
-		throw std::runtime_error("malformed /ByteRange array in written PDF");
+	if (br_key == std::string::npos || lb == std::string::npos || rb == std::string::npos) {
+		throw std::runtime_error("could not locate /ByteRange in written PDF");
 	}
 
 	// ByteRange = [0, len_before_hole, offset_after_hole, len_after_hole]. The
