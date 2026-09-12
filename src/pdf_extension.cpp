@@ -8217,6 +8217,18 @@ static void PdfRepairNoPwFun(DataChunk &args, ExpressionState &state, Vector &re
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	// Scalar PDF writers have observable filesystem side effects. Mark them
+	// volatile so constant expressions are executed instead of being folded.
+	auto register_volatile_scalar = [&loader](ScalarFunction function) {
+		function.SetVolatile();
+		loader.RegisterFunction(std::move(function));
+	};
+	auto mark_volatile_scalars = [](ScalarFunctionSet &functions) {
+		for (auto &function : functions.functions) {
+			function.SetVolatile();
+		}
+	};
+
 	TableFunction read_pdf("read_pdf", {LogicalType::VARCHAR}, ReadPdfScan, ReadPdfBind, ReadPdfInitGlobal,
 	                       ReadPdfInitLocal);
 	AddCommonNamedParams(read_pdf);
@@ -8397,17 +8409,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	to_pdf_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, ToPdfFun));
 	to_pdf_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, ToPdfOutFun));
+	mark_volatile_scalars(to_pdf_set);
 	loader.RegisterFunction(to_pdf_set);
 
 	ScalarFunctionSet write_pdf_set("write_pdf");
 	write_pdf_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, WritePdfFun));
 	write_pdf_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, WritePdfOutFun));
+	mark_volatile_scalars(write_pdf_set);
 	loader.RegisterFunction(write_pdf_set);
 
 	// document-level qpdf operations
-	loader.RegisterFunction(ScalarFunction("pdf_merge", {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
-	                                       LogicalType::VARCHAR, PdfMergeFun));
+	register_volatile_scalar(ScalarFunction("pdf_merge",
+	                                        {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
+	                                        LogicalType::VARCHAR, PdfMergeFun));
 
 	ScalarFunctionSet pdf_rotate_set("pdf_rotate");
 	pdf_rotate_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER},
@@ -8415,6 +8430,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_rotate_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR},
 	                   LogicalType::VARCHAR, PdfRotatePagesFun));
+	mark_volatile_scalars(pdf_rotate_set);
 	loader.RegisterFunction(pdf_rotate_set);
 
 	TableFunction pdf_split("pdf_split", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfSplitScan, PdfSplitBind,
@@ -8427,8 +8443,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(pdf_split_blank);
 
 	// qpdf everyday suite
-	loader.RegisterFunction(ScalarFunction("pdf_compress", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                       LogicalType::VARCHAR, PdfCompressFun));
+	register_volatile_scalar(ScalarFunction("pdf_compress", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                        LogicalType::VARCHAR, PdfCompressFun));
 
 	ScalarFunctionSet pdf_encrypt_set("pdf_encrypt");
 	pdf_encrypt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -8436,15 +8452,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_encrypt_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                   LogicalType::VARCHAR, PdfEncryptOwnerFun));
+	mark_volatile_scalars(pdf_encrypt_set);
 	loader.RegisterFunction(pdf_encrypt_set);
 
-	loader.RegisterFunction(ScalarFunction("pdf_decrypt",
-	                                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                       LogicalType::VARCHAR, PdfDecryptFun));
+	register_volatile_scalar(ScalarFunction("pdf_decrypt",
+	                                        {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                        LogicalType::VARCHAR, PdfDecryptFun));
 
-	loader.RegisterFunction(ScalarFunction("pdf_pages",
-	                                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                       LogicalType::VARCHAR, PdfPagesFun));
+	register_volatile_scalar(ScalarFunction("pdf_pages",
+	                                        {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                        LogicalType::VARCHAR, PdfPagesFun));
 
 	// pdf_watermark: 3-arg (default opacity 0.30) + 4-arg (explicit opacity).
 	ScalarFunctionSet pdf_watermark_set("pdf_watermark");
@@ -8453,9 +8470,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_watermark_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::DOUBLE},
 	                   LogicalType::VARCHAR, PdfWatermarkOpacityFun));
+	mark_volatile_scalars(pdf_watermark_set);
 	loader.RegisterFunction(pdf_watermark_set);
 
-	loader.RegisterFunction(ScalarFunction(
+	register_volatile_scalar(ScalarFunction(
 	    "pdf_bates", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
 	    LogicalType::VARCHAR, PdfBatesFun));
 
@@ -8577,6 +8595,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfRepairNoPwFun));
 	pdf_repair_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                                          LogicalType::VARCHAR, PdfRepairFun));
+	mark_volatile_scalars(pdf_repair_set);
 	loader.RegisterFunction(pdf_repair_set);
 
 	// COPY TO pdf
