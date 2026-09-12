@@ -5784,9 +5784,6 @@ static void PdfOpsCheckOutputStem(const char *fn, const string &stem, const stri
 		throw InvalidInputException("%s: refusing output stem '%s' from '%s' (would write outside out_dir/<stem>/)", fn,
 		                            stem, path);
 	}
-	if (stem.find_first_of("/\\") != string::npos) {
-		throw InvalidInputException("%s: refusing output stem '%s' from '%s' (path separator in stem)", fn, stem, path);
-	}
 }
 
 static void PdfOpsCheckInputExists(const char *fn, const string &path) {
@@ -7970,9 +7967,6 @@ static unique_ptr<GlobalTableFunctionState> PdfWritePageImagesInit(ClientContext
 
 static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePageImagesBindData &bind,
                                       std::vector<PdfWritePageImagesRow> &rows) {
-	// Reject colliding stems before any mkdir/write. Bind already checks; this
-	// is the scan-time gate so a future bind skip cannot create a partial tree.
-	PdfWritePageImagesCheckStemCollisions(bind.files);
 	auto fs = FileSystem::CreateLocal();
 	// Ensure the top-level preview root exists (create, don't require the caller
 	// to mkdir first — this is an export tree, not a surgical in-place write).
@@ -7997,7 +7991,6 @@ static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePage
 		}
 
 		string stem = PdfOpsStem(path);
-		PdfOpsCheckOutputStem("pdf_write_page_images", stem, path);
 		string stem_dir = PdfWriteJoinPath(bind.out_dir, stem);
 		if (!fs->DirectoryExists(stem_dir)) {
 			try {
