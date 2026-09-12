@@ -1327,11 +1327,11 @@ static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctio
 	// ocr_confidence: Tess MeanTextConf 0..100 when used_ocr, else NULL.
 	// Together they make image-only vs embedded-text detection first-class without
 	// a second pass over the file.
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::DOUBLE};
-	names = {"filename", "page", "page_count", "text", "width", "height", "has_text_layer", "used_ocr",
-	         "ocr_confidence"};
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::DOUBLE,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::DOUBLE};
+	names = {"filename", "page",           "page_count", "text",          "width",
+	         "height",   "has_text_layer", "used_ocr",   "ocr_confidence"};
 	return std::move(result);
 }
 
@@ -2330,8 +2330,8 @@ static unique_ptr<FunctionData> ReadPdfWordsBind(ClientContext &context, TableFu
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR,
 	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::INTEGER,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE};
-	names = {"filename", "page", "word", "x0", "y0", "x1", "y1", "font_name", "font_size", "source", "confidence",
-	         "line", "page_width", "page_height"};
+	names = {"filename",  "page",      "word",   "x0",         "y0",   "x1",         "y1",
+	         "font_name", "font_size", "source", "confidence", "line", "page_width", "page_height"};
 	return std::move(result);
 }
 
@@ -2888,8 +2888,7 @@ static size_t ElemSkipZw(const string &s, size_t i) {
 			}
 		}
 		// U+FEFF BOM / ZWNBSP = EF BB BF
-		if (i + 2 < s.size() && c0 == 0xEF && (unsigned char)s[i + 1] == 0xBB &&
-		    (unsigned char)s[i + 2] == 0xBF) {
+		if (i + 2 < s.size() && c0 == 0xEF && (unsigned char)s[i + 1] == 0xBB && (unsigned char)s[i + 2] == 0xBF) {
 			i += 3;
 			continue;
 		}
@@ -3204,7 +3203,7 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 	int last_0 = opt.last_page < 0 ? page_count : MinValue<int>(opt.last_page, page_count);
 
 	std::vector<std::pair<int, std::vector<ElemLine>>> page_lines; // (1-based page, lines)
-	std::map<int, double> page_h;                                 // 1-based page -> crop height
+	std::map<int, double> page_h;                                  // 1-based page -> crop height
 	ElemFontHistogram doc_hist;
 	for (int p = first_0; p < last_0; p++) {
 		unique_ptr<poppler::page> page(doc->create_page(p));
@@ -7904,8 +7903,8 @@ static void PdfWritePageImagesCheckStemCollisions(const vector<string> &files) {
 		auto it = claimed.find(key);
 		if (it != claimed.end()) {
 			throw InvalidInputException(
-			    "pdf_write_page_images: output collision: inputs '%s' and '%s' both map to stem '%s'", it->second,
-			    path, key);
+			    "pdf_write_page_images: output collision: inputs '%s' and '%s' both map to stem '%s'", it->second, path,
+			    key);
 		}
 		claimed[key] = path;
 	}
@@ -8374,14 +8373,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	tesseract_ocr_set.AddFunction(ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER,
 	                                              LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BOOLEAN},
 	                                             LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(ScalarFunction(
-	    {LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
-	     LogicalType::BOOLEAN, map_vv},
-	    LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(ScalarFunction(
-	    {LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
-	     LogicalType::BOOLEAN, map_vv, LogicalType::VARCHAR},
-	    LogicalType::VARCHAR, TesseractOcrDispatch));
+	tesseract_ocr_set.AddFunction(
+	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
+	                    LogicalType::VARCHAR, LogicalType::BOOLEAN, map_vv},
+	                   LogicalType::VARCHAR, TesseractOcrDispatch));
+	tesseract_ocr_set.AddFunction(
+	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
+	                    LogicalType::VARCHAR, LogicalType::BOOLEAN, map_vv, LogicalType::VARCHAR},
+	                   LogicalType::VARCHAR, TesseractOcrDispatch));
 	loader.RegisterFunction(tesseract_ocr_set);
 
 	// Named-param image OCR (scalars cannot take named maps). format=text|hocr|tsv.
