@@ -88,12 +88,31 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 // Shared helpers
 //===--------------------------------------------------------------------===//
+// The values `layout` accepts. 'auto' is not a poppler mode: it is the geometry
+// engine (see "Page layout over positioned words"), and it is the default
+// because it is the only one of the four that knows a page can have columns.
+static bool LayoutIsAuto(const string &s) {
+	return StringUtil::Lower(s) == "auto";
+}
+
+// Rejecting an unrecognised value is the whole point. Falling back to a default
+// here used to make `layout := true` (which casts to the string 'true') and any
+// typo silently produce the wrong text on multi-column pages, with no signal.
+static void ValidateLayout(const string &s) {
+	auto l = StringUtil::Lower(s);
+	if (l != "auto" && l != "physical" && l != "reading" && l != "raw") {
+		throw InvalidInputException("read_pdf: layout must be one of ['auto', 'physical', 'reading', 'raw'], not '%s'",
+		                            s);
+	}
+}
+
 static poppler::page::text_layout_enum LayoutFromString(const string &s, bool parse_tables) {
 	if (parse_tables) {
 		// physical layout preserves column alignment — the portable approximation of
 		// poppler core's table mode (true cell extraction is a core-engine follow-up).
 		return poppler::page::physical_layout;
 	}
+	ValidateLayout(s);
 	auto l = StringUtil::Lower(s);
 	if (l == "physical") {
 		return poppler::page::physical_layout;
@@ -101,6 +120,9 @@ static poppler::page::text_layout_enum LayoutFromString(const string &s, bool pa
 	if (l == "raw") {
 		return poppler::page::raw_order_layout;
 	}
+	// 'auto' never gets here — callers test LayoutIsAuto first and run the
+	// geometry engine. It maps to 'reading' so a caller that has no word list
+	// still returns text rather than nothing.
 	return poppler::page::non_raw_non_physical_layout; // 'reading'
 }
 
@@ -299,6 +321,305 @@ static std::vector<double> Cluster1D(std::vector<double> vals, double tol) {
 		centers.push_back(Median(bucket));
 	}
 	return centers;
+}
+
+//===--------------------------------------------------------------------===//
+// Page layout over positioned words
+//
+// Reading order is a geometric fact, not a rendering hint. Words arrive from
+// page::text_list() (or OCR) with bounding boxes, and everything a reader needs
+// — which column a word sits in, which line, and what order the lines go in —
+// follows from those boxes. This is the single implementation: read_pdf,
+// read_pdf_words, read_pdf_lines, read_pdf_elements and pdf_to_markdown all
+// group words through it, so they cannot disagree about what a line is.
+//
+// Poppler's own text modes stay reachable through `layout` because they answer
+// different questions: 'physical' pads with spaces to imitate the printed page,
+// 'raw' reports content-stream order. Neither of them knows what a column is.
+//===--------------------------------------------------------------------===//
+struct LayoutWord {
+	double x0 = 0.0;
+	double y0 = 0.0;
+	double x1 = 0.0;
+	double y1 = 0.0;
+	double font_size = 0.0; // 0 when unknown (OCR); only used to spot display type
+	string text;
+};
+
+// A word joins a line when it overlaps that line vertically by at least this
+// fraction of the shorter of the two heights.
+static constexpr double LAYOUT_LINE_OVERLAP_MIN_RATIO = 0.5;
+// A candidate gutter must be this many median character widths wide, measured
+// in the units the page itself chose rather than in absolute points.
+static constexpr double LAYOUT_GUTTER_MIN_CHARS = 3.0;
+// ...and every column a gutter produces must be at least this fraction of the
+// page wide. This is what separates a column boundary from the regular gaps
+// inside a table: on the DuckDB Friendly SQL calendar the prose/grid gutter is
+// 53.8pt and leaves columns 42% and 40% of the page wide, while the gaps
+// between weekday columns are 20.6pt and would leave columns 3% wide.
+static constexpr double LAYOUT_BAND_MIN_WIDTH_RATIO = 0.12;
+// ...and wide enough to hold a line of text, measured in the page's own
+// characters. A page fraction alone is not enough, because a small page can
+// carry a narrow table whose cell columns are a large fraction of it:
+// test/data/table.pdf splits Item | Qty | Price into bands 34% and 47% of the
+// page, but only 12 characters wide. Real reading columns are far wider — the
+// calendar's are 65 characters, a two-column paper's around 45.
+static constexpr double LAYOUT_BAND_MIN_CHARS = 20.0;
+// Pages with less text than this are never split.
+static constexpr size_t LAYOUT_MIN_WORDS_TO_SPLIT = 12;
+static constexpr size_t LAYOUT_MAX_BANDS = 8;
+// Words set this much larger than the body font are display type — titles and
+// banners, which routinely straddle a gutter. They get no vote on where the
+// gutters are, but they are still placed in a band afterwards.
+static constexpr double LAYOUT_DISPLAY_FONT_RATIO = 1.6;
+
+static double LayoutMedianCharWidth(const std::vector<LayoutWord> &words) {
+	std::vector<double> widths;
+	widths.reserve(words.size());
+	for (const auto &w : words) {
+		if (!w.text.empty() && w.x1 > w.x0) {
+			widths.push_back((w.x1 - w.x0) / static_cast<double>(w.text.size()));
+		}
+	}
+	return Median(std::move(widths));
+}
+
+// Vertical whitespace corridors at least `min_width` wide that no word crosses.
+// Sweeping the x-intervals in x0 order is enough: a word that straddled a
+// corridor would have been seen earlier and raised the running maximum.
+static std::vector<std::pair<double, double>> LayoutGutters(const std::vector<LayoutWord> &words, double min_width) {
+	std::vector<std::pair<double, double>> spans;
+	spans.reserve(words.size());
+	for (const auto &w : words) {
+		spans.emplace_back(w.x0, w.x1);
+	}
+	std::sort(spans.begin(), spans.end());
+	std::vector<std::pair<double, double>> gutters;
+	if (spans.empty()) {
+		return gutters;
+	}
+	double run_max = spans.front().second;
+	for (size_t i = 1; i < spans.size(); i++) {
+		if (spans[i].first - run_max >= min_width) {
+			gutters.emplace_back(run_max, spans[i].first);
+		}
+		run_max = MaxValue<double>(run_max, spans[i].second);
+	}
+	return gutters;
+}
+
+// Split a page into reading columns. Returns a 0-based band id per input word,
+// parallel to `words`; an all-zero result means one column.
+static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &words, double page_width) {
+	std::vector<int32_t> band_of(words.size(), 0);
+	if (words.size() < LAYOUT_MIN_WORDS_TO_SPLIT || page_width <= 0.0) {
+		return band_of;
+	}
+	std::vector<double> sizes;
+	for (const auto &w : words) {
+		if (w.font_size > 0.0) {
+			sizes.push_back(w.font_size);
+		}
+	}
+	const double body = Median(std::move(sizes));
+	std::vector<LayoutWord> body_words;
+	body_words.reserve(words.size());
+	for (const auto &w : words) {
+		if (body <= 0.0 || w.font_size <= 0.0 || w.font_size <= LAYOUT_DISPLAY_FONT_RATIO * body) {
+			body_words.push_back(w);
+		}
+	}
+	if (body_words.size() < LAYOUT_MIN_WORDS_TO_SPLIT) {
+		return band_of;
+	}
+	const double char_width = LayoutMedianCharWidth(body_words);
+	const double min_gutter = MaxValue<double>(LAYOUT_GUTTER_MIN_CHARS * char_width, 1.0);
+	auto gutters = LayoutGutters(body_words, min_gutter);
+	if (gutters.empty()) {
+		return band_of;
+	}
+	double left = body_words.front().x0;
+	double right = body_words.front().x1;
+	for (const auto &w : body_words) {
+		left = MinValue<double>(left, w.x0);
+		right = MaxValue<double>(right, w.x1);
+	}
+	// Corridors of the same width are one phenomenon — a table's cell pitch, or
+	// the gutters of an N-column layout — so they are accepted or rejected as a
+	// class. Judging them one at a time does not work: three of the DuckDB
+	// calendar's seven 20.6pt cell gaps sit far enough apart to pass the
+	// band-width test individually, which chops its date grid into four columns.
+	const double width_tol = MaxValue<double>(1.5, 0.25 * char_width);
+	std::vector<double> class_width;                 // representative width per class
+	std::vector<std::vector<double>> class_cuts;     // gutter midpoints in that class
+	for (const auto &g : gutters) {
+		const double w = g.second - g.first;
+		size_t at = class_width.size();
+		for (size_t i = 0; i < class_width.size(); i++) {
+			if (std::fabs(class_width[i] - w) <= width_tol) {
+				at = i;
+				break;
+			}
+		}
+		if (at == class_width.size()) {
+			class_width.push_back(w);
+			class_cuts.emplace_back();
+		}
+		class_cuts[at].push_back(0.5 * (g.first + g.second));
+	}
+	std::vector<size_t> by_width(class_width.size());
+	for (size_t i = 0; i < by_width.size(); i++) {
+		by_width[i] = i;
+	}
+	std::sort(by_width.begin(), by_width.end(),
+	          [&](size_t a, size_t b) { return class_width[a] > class_width[b]; });
+
+	// Widest class first, and take a class only while every column it leaves
+	// behind is still wide enough to be a column rather than a cell.
+	const double min_band = MaxValue<double>(LAYOUT_BAND_MIN_WIDTH_RATIO * page_width,
+	                                        LAYOUT_BAND_MIN_CHARS * char_width);
+	std::vector<double> cuts;
+	for (size_t ci : by_width) {
+		const auto &members = class_cuts[ci];
+		if (cuts.size() + members.size() + 1 > LAYOUT_MAX_BANDS) {
+			continue;
+		}
+		auto trial = cuts;
+		trial.insert(trial.end(), members.begin(), members.end());
+		std::sort(trial.begin(), trial.end());
+		bool ok = true;
+		double prev = left;
+		for (double c : trial) {
+			if (c - prev < min_band) {
+				ok = false;
+				break;
+			}
+			prev = c;
+		}
+		if (ok && right - prev >= min_band) {
+			cuts = std::move(trial);
+		}
+	}
+	if (cuts.empty()) {
+		return band_of;
+	}
+	for (size_t i = 0; i < words.size(); i++) {
+		const double mid = 0.5 * (words[i].x0 + words[i].x1);
+		int32_t band = 0;
+		for (double c : cuts) {
+			if (mid > c) {
+				band++;
+			}
+		}
+		band_of[i] = band;
+	}
+	return band_of;
+}
+
+// 1-based line ids in reading order: columns left to right, lines top to bottom
+// within a column. Parallel to `words`.
+static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, const std::vector<int32_t> &bands) {
+	std::vector<int32_t> line_of(words.size(), 0);
+	if (words.empty()) {
+		return line_of;
+	}
+	std::vector<size_t> order(words.size());
+	for (size_t i = 0; i < order.size(); i++) {
+		order[i] = i;
+	}
+	std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+		if (bands[a] != bands[b]) {
+			return bands[a] < bands[b];
+		}
+		if (words[a].y0 != words[b].y0) {
+			return words[a].y0 < words[b].y0;
+		}
+		return words[a].x0 < words[b].x0;
+	});
+	int32_t line_no = 0;
+	int32_t cur_band = -1;
+	double cur_y0 = 0.0;
+	double cur_y1 = 0.0;
+	for (size_t idx : order) {
+		const auto &w = words[idx];
+		bool joined = false;
+		if (line_no > 0 && bands[idx] == cur_band) {
+			const double overlap = MinValue<double>(w.y1, cur_y1) - MaxValue<double>(w.y0, cur_y0);
+			const double shorter = MinValue<double>(w.y1 - w.y0, cur_y1 - cur_y0);
+			if (shorter > 0.0 && overlap >= LAYOUT_LINE_OVERLAP_MIN_RATIO * shorter) {
+				cur_y0 = MinValue<double>(cur_y0, w.y0);
+				cur_y1 = MaxValue<double>(cur_y1, w.y1);
+				joined = true;
+			}
+		}
+		if (!joined) {
+			line_no++;
+			cur_band = bands[idx];
+			cur_y0 = w.y0;
+			cur_y1 = w.y1;
+		}
+		line_of[idx] = line_no;
+	}
+	return line_of;
+}
+
+// The page as text, one line per geometric line, columns in reading order.
+static string LayoutPageText(const std::vector<LayoutWord> &words, double page_width) {
+	if (words.empty()) {
+		return string();
+	}
+	auto bands = LayoutColumnBands(words, page_width);
+	auto lines = LayoutLineIds(words, bands);
+	int32_t max_line = 0;
+	for (int32_t l : lines) {
+		max_line = MaxValue<int32_t>(max_line, l);
+	}
+	if (max_line <= 0) {
+		return string();
+	}
+	std::vector<std::vector<size_t>> by_line(static_cast<size_t>(max_line));
+	for (size_t i = 0; i < words.size(); i++) {
+		if (lines[i] > 0) {
+			by_line[static_cast<size_t>(lines[i] - 1)].push_back(i);
+		}
+	}
+	string out;
+	for (auto &idxs : by_line) {
+		std::sort(idxs.begin(), idxs.end(), [&](size_t a, size_t b) { return words[a].x0 < words[b].x0; });
+		if (!out.empty()) {
+			out += "\n";
+		}
+		for (size_t k = 0; k < idxs.size(); k++) {
+			if (k > 0) {
+				out += " ";
+			}
+			out += words[idxs[k]].text;
+		}
+	}
+	return out;
+}
+
+// poppler text_list() -> the layout engine's word grain. Boxes that carry no
+// glyphs are dropped so they cannot anchor a phantom line.
+static std::vector<LayoutWord> LayoutWordsFromBoxes(const std::vector<poppler::text_box> &boxes) {
+	std::vector<LayoutWord> words;
+	words.reserve(boxes.size());
+	for (const auto &b : boxes) {
+		string text = UStringToUtf8(b.text());
+		if (text.find_first_not_of(" \t\r\n\f\v") == string::npos) {
+			continue;
+		}
+		auto r = b.bbox();
+		LayoutWord w;
+		w.x0 = r.x();
+		w.y0 = r.y();
+		w.x1 = r.x() + r.width();
+		w.y1 = r.y() + r.height();
+		w.font_size = b.has_font_info() ? b.get_font_size() : 0.0;
+		w.text = std::move(text);
+		words.push_back(std::move(w));
+	}
+	return words;
 }
 
 // Geometry consumer for the qpdf-collected ruling segments — no qpdf here.
@@ -948,7 +1269,7 @@ struct PdfOptions {
 	// read_pdf* and tesseract_ocr (see ocr_ops Options::vars / ::config).
 	vector<pair<string, string>> ocr_vars;
 	string ocr_config;
-	string layout = "reading";
+	string layout = "auto"; // geometry engine; see ValidateLayout for the alternatives
 	bool parse_tables = false;
 	string password;
 	int32_t first_page = 1;
@@ -1174,6 +1495,7 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 	if (o.ocr_oem < 0 || o.ocr_oem > 3) {
 		throw InvalidInputException("read_pdf: ocr_oem must be between 0 and 3 (got %d)", o.ocr_oem);
 	}
+	ValidateLayout(o.layout);
 	if (o.first_page < 1) {
 		throw InvalidInputException("read_pdf: first_page must be >= 1 (got %d)", o.first_page);
 	}
@@ -1201,7 +1523,6 @@ static void AddCommonNamedParams(TableFunction &fn) {
 	fn.named_parameters["ocr_preprocess"] = LogicalType::BOOLEAN;
 	fn.named_parameters["ocr_retry"] = LogicalType::BOOLEAN;
 	fn.named_parameters["tessdata_dir"] = LogicalType::VARCHAR;
-	fn.named_parameters["layout"] = LogicalType::VARCHAR;
 	fn.named_parameters["parse_tables"] = LogicalType::BOOLEAN;
 	fn.named_parameters["password"] = LogicalType::VARCHAR;
 	fn.named_parameters["first_page"] = LogicalType::INTEGER;
@@ -1441,6 +1762,7 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 	auto &bind = data_p.bind_data->Cast<ReadPdfBindData>();
 	auto &g = data_p.global_state->Cast<ReadPdfGlobalState>();
 	auto &l = data_p.local_state->Cast<ReadPdfLocalState>();
+	const bool auto_layout = !bind.opt.parse_tables && LayoutIsAuto(bind.opt.layout);
 	auto layout = LayoutFromString(bind.opt.layout, bind.opt.parse_tables);
 
 	idx_t count = 0;
@@ -1473,7 +1795,11 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 				// Probe the native text layer even under force_ocr so the
 				// has_text_layer flag always reflects the PDF itself, not the
 				// extraction path chosen by the caller.
-				string native = UStringToUtf8(page->text(poppler::rectf(), layout));
+				string native =
+				    auto_layout
+				        ? LayoutPageText(
+				              LayoutWordsFromBoxes(page->text_list(poppler::page::text_list_include_font)), width)
+				        : UStringToUtf8(page->text(poppler::rectf(), layout));
 				has_text_layer = native.find_first_not_of(" \t\r\n\f\v") != string::npos;
 				text = native;
 				want_ocr = bind.opt.force_ocr || (bind.opt.auto_ocr && !has_text_layer);
@@ -2329,9 +2655,9 @@ static unique_ptr<FunctionData> ReadPdfWordsBind(ClientContext &context, TableFu
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::DOUBLE,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR,
 	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::INTEGER,
-	                LogicalType::DOUBLE,  LogicalType::DOUBLE};
-	names = {"filename", "page", "word", "x0", "y0", "x1", "y1", "font_name", "font_size", "source", "confidence",
-	         "line", "page_width", "page_height"};
+	                LogicalType::INTEGER, LogicalType::DOUBLE,  LogicalType::DOUBLE};
+	names = {"filename", "page",      "word",   "x0",     "y0",          "x1",         "y1", "font_name",
+	         "font_size", "source",    "confidence", "line", "column_index", "page_width", "page_height"};
 	return std::move(result);
 }
 
@@ -2347,6 +2673,7 @@ struct ReadPdfWordsState : public GlobalTableFunctionState {
 	std::vector<OcrWord> ocr_boxes;
 	// Parallel to boxes / ocr_boxes (whichever is active for the page).
 	std::vector<int32_t> line_ids;
+	std::vector<int32_t> column_ids;
 	double page_width = 0.0;
 	double page_height = 0.0;
 	bool page_is_ocr = false;
@@ -2357,95 +2684,77 @@ struct ReadPdfWordsState : public GlobalTableFunctionState {
 };
 
 // Geometric line ids for a page of word bboxes. Same vertical-overlap rule as
-// ElemBuildLines / read_pdf_elements (must stay equal to ELEM_LINE_OVERLAP_MIN_RATIO
-// — defined later with the elements contract; duplicated here because words scan
-// is registered above that block). Words sorted by (y0, x0); a word joins the
-// current line or starts a new one. Line numbers are 1-based in that order
-// (ascending y0 — reading order when poppler-cpp text_list uses top-down y).
-// Returns a vector parallel to the input index order (not sorted order).
-static constexpr double WORDS_LINE_OVERLAP_MIN_RATIO = 0.5;
-
-struct WordLineGeom {
-	size_t idx = 0;
-	double x0 = 0.0;
-	double y0 = 0.0;
-	double y1 = 0.0;
+// Word grouping for read_pdf_words / read_pdf_layout. Both the line id and the
+// column id come from the shared layout engine, so `line` means the same thing
+// here, in read_pdf_lines and in read_pdf_elements: words that share a line of
+// a column. Grouping words by vertical overlap alone — which is what this used
+// to do — fuses the two halves of a multi-column page into one line.
+struct WordGrouping {
+	std::vector<int32_t> line;   // 1-based, reading order; 0 for blank boxes
+	std::vector<int32_t> column; // 0-based, left to right
 };
 
-static std::vector<int32_t> AssignWordLineIds(std::vector<WordLineGeom> geoms) {
-	std::vector<int32_t> line_of(geoms.size(), 0);
-	if (geoms.empty()) {
-		return line_of;
+// `words` and `origin` are parallel and hold only the boxes that carry glyphs;
+// the result is scattered back out to `total` entries so callers can index it
+// by their own box index.
+static WordGrouping GroupLayoutWords(const std::vector<LayoutWord> &words, const std::vector<size_t> &origin,
+                                     size_t total, double page_width) {
+	WordGrouping out;
+	out.line.assign(total, 0);
+	out.column.assign(total, 0);
+	auto bands = LayoutColumnBands(words, page_width);
+	auto lines = LayoutLineIds(words, bands);
+	for (size_t i = 0; i < origin.size(); i++) {
+		out.line[origin[i]] = lines[i];
+		out.column[origin[i]] = bands[i];
 	}
-	std::sort(geoms.begin(), geoms.end(), [](const WordLineGeom &a, const WordLineGeom &b) {
-		if (a.y0 != b.y0) {
-			return a.y0 < b.y0;
-		}
-		return a.x0 < b.x0;
-	});
-	struct LineRun {
-		double y0 = 0.0;
-		double y1 = 0.0;
-		std::vector<size_t> idxs;
-	};
-	std::vector<LineRun> lines;
-	for (auto &w : geoms) {
-		bool joined = false;
-		if (!lines.empty()) {
-			auto &line = lines.back();
-			double overlap = MinValue<double>(w.y1, line.y1) - MaxValue<double>(w.y0, line.y0);
-			double shorter = MinValue<double>(w.y1 - w.y0, line.y1 - line.y0);
-			if (shorter > 0 && overlap >= WORDS_LINE_OVERLAP_MIN_RATIO * shorter) {
-				line.y0 = MinValue<double>(line.y0, w.y0);
-				line.y1 = MaxValue<double>(line.y1, w.y1);
-				line.idxs.push_back(w.idx);
-				joined = true;
-			}
-		}
-		if (!joined) {
-			LineRun line;
-			line.y0 = w.y0;
-			line.y1 = w.y1;
-			line.idxs.push_back(w.idx);
-			lines.push_back(std::move(line));
-		}
-	}
-	for (size_t li = 0; li < lines.size(); li++) {
-		int32_t line_no = static_cast<int32_t>(li + 1);
-		for (size_t idx : lines[li].idxs) {
-			line_of[idx] = line_no;
-		}
-	}
-	return line_of;
+	return out;
 }
 
-static std::vector<int32_t> AssignLineIdsNative(const std::vector<poppler::text_box> &boxes) {
-	std::vector<WordLineGeom> geoms;
-	geoms.reserve(boxes.size());
+static WordGrouping GroupWordsNative(const std::vector<poppler::text_box> &boxes, double page_width) {
+	std::vector<LayoutWord> words;
+	std::vector<size_t> origin;
+	words.reserve(boxes.size());
+	origin.reserve(boxes.size());
 	for (size_t i = 0; i < boxes.size(); i++) {
+		string text = UStringToUtf8(boxes[i].text());
+		if (text.find_first_not_of(" \t\r\n\f\v") == string::npos) {
+			continue;
+		}
 		auto r = boxes[i].bbox();
-		WordLineGeom g;
-		g.idx = i;
-		g.x0 = r.x();
-		g.y0 = r.y();
-		g.y1 = r.y() + r.height();
-		geoms.push_back(g);
+		LayoutWord w;
+		w.x0 = r.x();
+		w.y0 = r.y();
+		w.x1 = r.x() + r.width();
+		w.y1 = r.y() + r.height();
+		w.font_size = boxes[i].has_font_info() ? boxes[i].get_font_size() : 0.0;
+		w.text = std::move(text);
+		words.push_back(std::move(w));
+		origin.push_back(i);
 	}
-	return AssignWordLineIds(std::move(geoms));
+	return GroupLayoutWords(words, origin, boxes.size(), page_width);
 }
 
-static std::vector<int32_t> AssignLineIdsOcr(const std::vector<OcrWord> &words) {
-	std::vector<WordLineGeom> geoms;
-	geoms.reserve(words.size());
-	for (size_t i = 0; i < words.size(); i++) {
-		WordLineGeom g;
-		g.idx = i;
-		g.x0 = words[i].x0;
-		g.y0 = words[i].y0;
-		g.y1 = words[i].y1;
-		geoms.push_back(g);
+static WordGrouping GroupWordsOcr(const std::vector<OcrWord> &ocr, double page_width) {
+	std::vector<LayoutWord> words;
+	std::vector<size_t> origin;
+	words.reserve(ocr.size());
+	origin.reserve(ocr.size());
+	for (size_t i = 0; i < ocr.size(); i++) {
+		if (ocr[i].text.find_first_not_of(" \t\r\n\f\v") == string::npos) {
+			continue;
+		}
+		LayoutWord w;
+		w.x0 = ocr[i].x0;
+		w.y0 = ocr[i].y0;
+		w.x1 = ocr[i].x1;
+		w.y1 = ocr[i].y1;
+		w.font_size = 0.0; // OCR reports no font; every word votes on the gutters
+		w.text = ocr[i].text;
+		words.push_back(std::move(w));
+		origin.push_back(i);
 	}
-	return AssignWordLineIds(std::move(geoms));
+	return GroupLayoutWords(words, origin, ocr.size(), page_width);
 }
 
 static void WordsOpenFile(ClientContext &context, const ReadPdfWordsBindData &bind, ReadPdfWordsState &g) {
@@ -2459,6 +2768,7 @@ static void WordsOpenFile(ClientContext &context, const ReadPdfWordsBindData &bi
 	g.boxes.clear();
 	g.ocr_boxes.clear();
 	g.line_ids.clear();
+	g.column_ids.clear();
 	g.page_width = 0.0;
 	g.page_height = 0.0;
 	g.page_is_ocr = false;
@@ -2470,6 +2780,7 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 	g.boxes.clear();
 	g.ocr_boxes.clear();
 	g.line_ids.clear();
+	g.column_ids.clear();
 	g.page_width = 0.0;
 	g.page_height = 0.0;
 	g.page_is_ocr = false;
@@ -2508,11 +2819,10 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 				g.page_is_ocr = false;
 			}
 		}
-		if (g.page_is_ocr) {
-			g.line_ids = AssignLineIdsOcr(g.ocr_boxes);
-		} else {
-			g.line_ids = AssignLineIdsNative(g.boxes);
-		}
+		auto grouping = g.page_is_ocr ? GroupWordsOcr(g.ocr_boxes, g.page_width)
+		                              : GroupWordsNative(g.boxes, g.page_width);
+		g.line_ids = std::move(grouping.line);
+		g.column_ids = std::move(grouping.column);
 	}
 	return true;
 }
@@ -2581,11 +2891,13 @@ static void ReadPdfWordsScan(ClientContext &context, TableFunctionInput &data_p,
 			OutString(output.data[9], count, "text");
 			OutDoubleNull(output.data[10], count); // NULL confidence for native
 		}
-		// line / page geometry (always set when the page loaded)
+		// line / column / page geometry (always set when the page loaded)
 		int32_t line_no = (g.word_idx < g.line_ids.size()) ? g.line_ids[g.word_idx] : 0;
+		int32_t column_no = (g.word_idx < g.column_ids.size()) ? g.column_ids[g.word_idx] : 0;
 		OutInt32(output.data[11], count, line_no);
-		OutDouble(output.data[12], count, g.page_width);
-		OutDouble(output.data[13], count, g.page_height);
+		OutInt32(output.data[12], count, column_no);
+		OutDouble(output.data[13], count, g.page_width);
+		OutDouble(output.data[14], count, g.page_height);
 		g.word_idx++;
 		count++;
 	}
@@ -2646,10 +2958,18 @@ static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 	if (g.page_idx >= g.last_page_0) {
 		return false;
 	}
+	const bool auto_layout = LayoutIsAuto(opt.layout);
 	auto layout = LayoutFromString(opt.layout, false);
 	unique_ptr<poppler::page> page(g.doc->create_page(g.page_idx));
 	if (page) {
-		string text = UStringToUtf8(page->text(poppler::rectf(), layout));
+		// 'auto' takes the geometry engine, so a line here is the same object a
+		// read_pdf_words `line` id names. The poppler modes still split rendered
+		// page text on newlines, which is why their line numbers can disagree on
+		// a multi-column page.
+		string text = auto_layout ? LayoutPageText(LayoutWordsFromBoxes(
+		                                               page->text_list(poppler::page::text_list_include_font)),
+		                                           page->page_rect().width())
+		                          : UStringToUtf8(page->text(poppler::rectf(), layout));
 		size_t start = 0;
 		while (start <= text.size()) {
 			size_t nl = text.find('\n', start);
@@ -2772,9 +3092,9 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 //===--------------------------------------------------------------------===//
 
 // Rule 1: min vertical-overlap ratio for a word to join a line.
-// Keep equal to WORDS_LINE_OVERLAP_MIN_RATIO (read_pdf_words.line assignment).
+// Keep equal to LAYOUT_LINE_OVERLAP_MIN_RATIO (the shared layout engine).
 static constexpr double ELEM_LINE_OVERLAP_MIN_RATIO = 0.5;
-static_assert(WORDS_LINE_OVERLAP_MIN_RATIO == ELEM_LINE_OVERLAP_MIN_RATIO,
+static_assert(LAYOUT_LINE_OVERLAP_MIN_RATIO == ELEM_LINE_OVERLAP_MIN_RATIO,
               "read_pdf_words.line and read_pdf_elements must share line clustering");
 // Rule 2a: vertical gap > this fraction of median line height starts a new block.
 static constexpr double ELEM_BLOCK_GAP_RATIO = 0.6;
@@ -8185,6 +8505,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction read_pdf("read_pdf", {LogicalType::VARCHAR}, ReadPdfScan, ReadPdfBind, ReadPdfInitGlobal,
 	                       ReadPdfInitLocal);
 	AddCommonNamedParams(read_pdf);
+	// layout is registered per function rather than in AddCommonNamedParams, so a
+	// reader that works off word geometry does not advertise a knob it ignores
+	// (the same reason ignore_errors is registered here and not there).
+	read_pdf.named_parameters["layout"] = LogicalType::VARCHAR;
 	// Registered individually (not in AddCommonNamedParams) so it is only
 	// advertised on functions that actually implement the skip behavior.
 	read_pdf.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
@@ -8233,6 +8557,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction read_pdf_lines("read_pdf_lines", {LogicalType::VARCHAR}, ReadPdfLinesScan, ReadPdfLinesBind,
 	                             ReadPdfLinesInit);
 	AddCommonNamedParams(read_pdf_lines);
+	read_pdf_lines.named_parameters["layout"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(read_pdf_lines);
 
 	// read_pdf_elements takes only the params it honors (native text layer

@@ -45,9 +45,13 @@ SELECT count(*) FROM range(50) t, lateral (SELECT pdf_to_xml(concat('test/data/h
 
 # ── lines + words each bound+executed 9x via UNION ALL of distinct paths ─────
 # (scanned.pdf excluded: yields 0 rows from lines/words, filename never appears)
+#
+# 9 lines per pass: hello 1, two_pages 4, table 4 — the lines actually on the
+# pages. It was 28 when read_pdf_lines split poppler's rendered page text on
+# newlines, which emitted a row per text run plus the blanks between them.
 
 query I
-SELECT l.dl = 3 AND l.nl = 84 AND w.dw = 3 AND w.nw = 117 FROM
+SELECT l.dl = 3 AND l.nl = 27 AND w.dw = 3 AND w.nw = 117 FROM
   (SELECT count(DISTINCT filename) AS dl, count(*) AS nl FROM (
     SELECT filename FROM read_pdf_lines('test/data/hello.pdf', auto_ocr := false)
     UNION ALL SELECT filename FROM read_pdf_lines('test/data/two_pages.pdf', auto_ocr := false)

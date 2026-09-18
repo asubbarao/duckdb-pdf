@@ -1,0 +1,61 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.276 841.89] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 1661 >>
+stream
+BT /F1 9.0 Tf 1 0 0 1 40.00 760.00 Tm (Prefix aliases let you name an expression before you write it.) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 40.00 746.00 Tm (The alias comes first and the expression follows, which reads) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 40.00 732.00 Tm (the way the query was thought of rather than the way SQL) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 40.00 718.00 Tm (normally forces you to write it down.) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 330.00 760.00 Tm (MON) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 363.00 760.00 Tm (TUE) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 396.00 760.00 Tm (WED) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 429.00 760.00 Tm (THU) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 462.00 760.00 Tm (FRI) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 495.00 760.00 Tm (SAT) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 528.00 760.00 Tm (SUN) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 429.00 738.00 Tm (01) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 462.00 738.00 Tm (02) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 495.00 738.00 Tm (03) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 528.00 738.00 Tm (04) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 330.00 716.00 Tm (05) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 363.00 716.00 Tm (06) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 396.00 716.00 Tm (07) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 429.00 716.00 Tm (08) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 462.00 716.00 Tm (09) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 495.00 716.00 Tm (10) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 528.00 716.00 Tm (11) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 330.00 694.00 Tm (12) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 363.00 694.00 Tm (13) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 396.00 694.00 Tm (14) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 429.00 694.00 Tm (15) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 462.00 694.00 Tm (16) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 495.00 694.00 Tm (17) Tj ET
+BT /F1 9.0 Tf 1 0 0 1 528.00 694.00 Tm (18) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000254 00000 n 
+0000001966 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+2063
+%%EOF

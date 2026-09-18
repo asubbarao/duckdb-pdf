@@ -1,0 +1,117 @@
+# name: test/sql/read_pdf_url.test
+# description: read_pdf over https, against published DuckDB PDFs
+# group: [sql]
+
+require pdf
+
+# httpfs is not linked into this repo's test binary (it lives out of tree in
+# DuckDB 1.5), so this file is skipped by a plain `make test`. It runs against a
+# DuckDB that already has httpfs — including the release CLI with the built
+# extension side-loaded:
+#   duckdb -unsigned -c "LOAD 'build/release/extension/pdf/pdf.duckdb_extension'; ..."
+require httpfs
+
+# Network test. Opt in with PDF_NETWORK_TESTS=1 so an offline `make test` and a
+# CI runner without egress both stay green.
+require-env PDF_NETWORK_TESTS
+
+statement ok
+PRAGMA enable_verification
+
+# read_pdf takes a path, a glob, or a URL, because it opens files through
+# DuckDB's filesystem rather than fopen. Nothing here is downloaded first.
+
+# ── the Friendly SQL Calendar: the document the layout engine was built for ──
+#
+# https://duckdb.org/docs/current/sql/dialect/friendly_sql links this PDF. One
+# cover page plus twelve months; each month pairs a prose column on the left
+# with a calendar grid on the right.
+
+query I
+SELECT page_count = 13
+FROM read_pdf('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
+              first_page := 1, last_page := 1);
+----
+true
+
+# January, with no layout parameter. The grid must survive the 240pt corridor
+# between the code sample and the dates.
+query I
+SELECT COUNT(*) = 1
+FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
+                    first_page := 2, last_page := 2)
+WHERE text = 'MON TUE WED THU FRI SAT SUN';
+----
+true
+
+# 1 January 2026 is a Thursday, so the first row holds exactly four dates.
+# Reading the page without horizontal position yields '1 2 3 4 5 6 7' instead —
+# the failure that motivated layout := 'auto'.
+query I
+SELECT COUNT(*) = 1
+FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
+                    first_page := 2, last_page := 2)
+WHERE text = '1 2 3 4';
+----
+true
+
+# The prose column is not interleaved into the grid.
+query I
+SELECT COUNT(*) = 1
+FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
+                    first_page := 2, last_page := 2)
+WHERE text = 'JANUARY';
+----
+true
+
+# Every month's first row is short in exactly the way its weekday demands. This
+# is the assertion that caught the original bug across all twelve pages.
+query I
+SELECT COUNT(*) = 12 FROM (
+  SELECT page
+  FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
+                      first_page := 2, last_page := 13)
+  WHERE text = 'MON TUE WED THU FRI SAT SUN'
+);
+----
+true
+
+# ── the DuckLake documentation: long-form single-column prose ───────────────
+#
+# A published multi-hundred-page document, to prove the column detector leaves
+# ordinary prose alone. Page count and wording drift with each docs build, so
+# only structural facts are asserted.
+
+query I
+SELECT has_text_layer AND NOT used_ocr AND length(text) > 200
+FROM read_pdf('https://blobs.duckdb.org/docs/ducklake-docs.pdf', first_page := 3, last_page := 3);
+----
+true
+
+query I
+SELECT page_count > 50
+FROM read_pdf('https://blobs.duckdb.org/docs/ducklake-docs.pdf', first_page := 1, last_page := 1);
+----
+true
+
+# ── a URL is a file everywhere the API takes a file ─────────────────────────
+
+query I
+SELECT page_count = 13
+FROM pdf_info('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf');
+----
+true
+
+query I
+SELECT COUNT(*) > 0
+FROM read_pdf_words('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
+                    first_page := 2, last_page := 2)
+WHERE word = 'JANUARY';
+----
+true
+
+# A URL that does not exist fails as an HTTP error, not as a parse error.
+statement error
+SELECT * FROM read_pdf('https://blobs.duckdb.org/merch/no-such-calendar.pdf');
+----
+404
