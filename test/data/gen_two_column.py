@@ -108,11 +108,7 @@ def build() -> bytes:
             f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W} {PAGE_H}] "
             f"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
         ).encode("latin-1"),
-        b"<< /Length "
-        + str(len(stream)).encode("latin-1")
-        + b" >>\nstream\n"
-        + stream
-        + b"endstream",
+        b"<< /Length " + str(len(stream)).encode("latin-1") + b" >>\nstream\n" + stream + b"endstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
     ]
 
@@ -128,11 +124,7 @@ def build() -> bytes:
     out += b"0000000000 65535 f \n"
     for off in offsets[1:]:
         out += f"{off:010d} 00000 n \n".encode("latin-1")
-    out += (
-        f"trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n".encode(
-            "latin-1"
-        )
-    )
+    out += f"trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n".encode("latin-1")
     return bytes(out)
 
 

@@ -450,8 +450,8 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 	// calendar's seven 20.6pt cell gaps sit far enough apart to pass the
 	// band-width test individually, which chops its date grid into four columns.
 	const double width_tol = MaxValue<double>(1.5, 0.25 * char_width);
-	std::vector<double> class_width;                 // representative width per class
-	std::vector<std::vector<double>> class_cuts;     // gutter midpoints in that class
+	std::vector<double> class_width;             // representative width per class
+	std::vector<std::vector<double>> class_cuts; // gutter midpoints in that class
 	for (const auto &g : gutters) {
 		const double w = g.second - g.first;
 		size_t at = class_width.size();
@@ -471,13 +471,12 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 	for (size_t i = 0; i < by_width.size(); i++) {
 		by_width[i] = i;
 	}
-	std::sort(by_width.begin(), by_width.end(),
-	          [&](size_t a, size_t b) { return class_width[a] > class_width[b]; });
+	std::sort(by_width.begin(), by_width.end(), [&](size_t a, size_t b) { return class_width[a] > class_width[b]; });
 
 	// Widest class first, and take a class only while every column it leaves
 	// behind is still wide enough to be a column rather than a cell.
-	const double min_band = MaxValue<double>(LAYOUT_BAND_MIN_WIDTH_RATIO * page_width,
-	                                        LAYOUT_BAND_MIN_CHARS * char_width);
+	const double min_band =
+	    MaxValue<double>(LAYOUT_BAND_MIN_WIDTH_RATIO * page_width, LAYOUT_BAND_MIN_CHARS * char_width);
 	std::vector<double> cuts;
 	for (size_t ci : by_width) {
 		const auto &members = class_cuts[ci];
@@ -1648,11 +1647,11 @@ static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctio
 	// ocr_confidence: Tess MeanTextConf 0..100 when used_ocr, else NULL.
 	// Together they make image-only vs embedded-text detection first-class without
 	// a second pass over the file.
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::DOUBLE};
-	names = {"filename", "page", "page_count", "text", "width", "height", "has_text_layer", "used_ocr",
-	         "ocr_confidence"};
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::DOUBLE,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::DOUBLE};
+	names = {"filename", "page",           "page_count", "text",          "width",
+	         "height",   "has_text_layer", "used_ocr",   "ocr_confidence"};
 	return std::move(result);
 }
 
@@ -1797,8 +1796,8 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 				// extraction path chosen by the caller.
 				string native =
 				    auto_layout
-				        ? LayoutPageText(
-				              LayoutWordsFromBoxes(page->text_list(poppler::page::text_list_include_font)), width)
+				        ? LayoutPageText(LayoutWordsFromBoxes(page->text_list(poppler::page::text_list_include_font)),
+				                         width)
 				        : UStringToUtf8(page->text(poppler::rectf(), layout));
 				has_text_layer = native.find_first_not_of(" \t\r\n\f\v") != string::npos;
 				text = native;
@@ -2656,8 +2655,8 @@ static unique_ptr<FunctionData> ReadPdfWordsBind(ClientContext &context, TableFu
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR,
 	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::INTEGER,
 	                LogicalType::INTEGER, LogicalType::DOUBLE,  LogicalType::DOUBLE};
-	names = {"filename", "page",      "word",   "x0",     "y0",          "x1",         "y1", "font_name",
-	         "font_size", "source",    "confidence", "line", "column_index", "page_width", "page_height"};
+	names = {"filename",  "page",   "word",       "x0",   "y0",           "x1",         "y1",         "font_name",
+	         "font_size", "source", "confidence", "line", "column_index", "page_width", "page_height"};
 	return std::move(result);
 }
 
@@ -2819,8 +2818,8 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 				g.page_is_ocr = false;
 			}
 		}
-		auto grouping = g.page_is_ocr ? GroupWordsOcr(g.ocr_boxes, g.page_width)
-		                              : GroupWordsNative(g.boxes, g.page_width);
+		auto grouping =
+		    g.page_is_ocr ? GroupWordsOcr(g.ocr_boxes, g.page_width) : GroupWordsNative(g.boxes, g.page_width);
 		g.line_ids = std::move(grouping.line);
 		g.column_ids = std::move(grouping.column);
 	}
@@ -2966,10 +2965,10 @@ static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 		// read_pdf_words `line` id names. The poppler modes still split rendered
 		// page text on newlines, which is why their line numbers can disagree on
 		// a multi-column page.
-		string text = auto_layout ? LayoutPageText(LayoutWordsFromBoxes(
-		                                               page->text_list(poppler::page::text_list_include_font)),
-		                                           page->page_rect().width())
-		                          : UStringToUtf8(page->text(poppler::rectf(), layout));
+		string text = auto_layout
+		                  ? LayoutPageText(LayoutWordsFromBoxes(page->text_list(poppler::page::text_list_include_font)),
+		                                   page->page_rect().width())
+		                  : UStringToUtf8(page->text(poppler::rectf(), layout));
 		size_t start = 0;
 		while (start <= text.size()) {
 			size_t nl = text.find('\n', start);
@@ -3208,8 +3207,7 @@ static size_t ElemSkipZw(const string &s, size_t i) {
 			}
 		}
 		// U+FEFF BOM / ZWNBSP = EF BB BF
-		if (i + 2 < s.size() && c0 == 0xEF && (unsigned char)s[i + 1] == 0xBB &&
-		    (unsigned char)s[i + 2] == 0xBF) {
+		if (i + 2 < s.size() && c0 == 0xEF && (unsigned char)s[i + 1] == 0xBB && (unsigned char)s[i + 2] == 0xBF) {
 			i += 3;
 			continue;
 		}
@@ -3535,7 +3533,7 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 	int last_0 = opt.last_page < 0 ? page_count : MinValue<int>(opt.last_page, page_count);
 
 	std::vector<std::pair<int, std::vector<ElemLine>>> page_lines; // (1-based page, lines)
-	std::map<int, double> page_h;                                 // 1-based page -> crop height
+	std::map<int, double> page_h;                                  // 1-based page -> crop height
 	ElemFontHistogram doc_hist;
 	for (int p = first_0; p < last_0; p++) {
 		unique_ptr<poppler::page> page(doc->create_page(p));
@@ -8672,14 +8670,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	tesseract_ocr_set.AddFunction(ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER,
 	                                              LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BOOLEAN},
 	                                             LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(ScalarFunction(
-	    {LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
-	     LogicalType::BOOLEAN, map_vv},
-	    LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(ScalarFunction(
-	    {LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
-	     LogicalType::BOOLEAN, map_vv, LogicalType::VARCHAR},
-	    LogicalType::VARCHAR, TesseractOcrDispatch));
+	tesseract_ocr_set.AddFunction(
+	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
+	                    LogicalType::VARCHAR, LogicalType::BOOLEAN, map_vv},
+	                   LogicalType::VARCHAR, TesseractOcrDispatch));
+	tesseract_ocr_set.AddFunction(
+	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
+	                    LogicalType::VARCHAR, LogicalType::BOOLEAN, map_vv, LogicalType::VARCHAR},
+	                   LogicalType::VARCHAR, TesseractOcrDispatch));
 	loader.RegisterFunction(tesseract_ocr_set);
 
 	// Named-param image OCR (scalars cannot take named maps). format=text|hocr|tsv.
