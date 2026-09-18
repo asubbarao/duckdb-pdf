@@ -3042,12 +3042,12 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 // below; the rules are the spec.
 //
 // SEGMENTATION CONTRACT
-//  1. LINE CLUSTERING: words sorted by (y0, x0); a word joins the current
-//     line when its vertical overlap with the line bbox is at least
-//     ELEM_LINE_OVERLAP_MIN_RATIO of the shorter of the two heights.
-//     Words within a line are re-sorted by x0 and joined with spaces.
-//     (Multi-column pages: words on the same visual row across columns
-//     merge into one line — a documented v1 limitation.)
+//  1. LINE CLUSTERING: delegated to the shared layout engine. Words are
+//     grouped into reading columns, then into lines within a column by
+//     vertical overlap of at least ELEM_LINE_OVERLAP_MIN_RATIO of the shorter
+//     of the two heights; words within a line are ordered by x0 and joined
+//     with spaces, and columns are emitted left to right. Multi-column pages
+//     no longer merge words from different columns into one line.
 //  2. BLOCK SEGMENTATION: lines in top-down order start a new block when
 //     any of these fire:
 //       a. GAP BREAK: vertical gap (line.y0 - prev.y1) exceeds
@@ -3369,45 +3369,55 @@ static void ElemDemoteRunningHeaders(std::vector<PdfElementRow> &rows, const std
 }
 
 // Rule 1: cluster one page's words into lines.
-static std::vector<ElemLine> ElemBuildLines(std::vector<ElemWord> words) {
-	std::vector<ElemLine> lines;
-	std::sort(words.begin(), words.end(), [](const ElemWord &a, const ElemWord &b) {
-		if (a.y0 != b.y0) {
-			return a.y0 < b.y0;
+// Lines for read_pdf_elements. Grouping and reading order come from the shared
+// layout engine, so a two-column page no longer merges words from both columns
+// into one line — the limitation the segmentation contract above documented.
+// This function only adds the element-specific payload: the joined text and the
+// line's dominant font size.
+static std::vector<ElemLine> ElemBuildLines(std::vector<ElemWord> words, double page_width) {
+	std::vector<LayoutWord> geom;
+	geom.reserve(words.size());
+	for (const auto &w : words) {
+		LayoutWord g;
+		g.x0 = w.x0;
+		g.y0 = w.y0;
+		g.x1 = w.x1;
+		g.y1 = w.y1;
+		g.font_size = w.has_font ? w.font_size : 0.0;
+		g.text = w.text;
+		geom.push_back(std::move(g));
+	}
+	auto bands = LayoutColumnBands(geom, page_width);
+	auto line_ids = LayoutLineIds(geom, bands);
+	int32_t line_count = 0;
+	for (int32_t l : line_ids) {
+		line_count = MaxValue<int32_t>(line_count, l);
+	}
+	std::vector<std::vector<size_t>> members(static_cast<size_t>(line_count));
+	for (size_t i = 0; i < words.size(); i++) {
+		if (line_ids[i] > 0) {
+			members[static_cast<size_t>(line_ids[i] - 1)].push_back(i);
 		}
-		return a.x0 < b.x0;
-	});
-	for (auto &w : words) {
-		bool joined = false;
-		if (!lines.empty()) {
-			auto &line = lines.back();
-			double overlap = MinValue<double>(w.y1, line.y1) - MaxValue<double>(w.y0, line.y0);
-			double shorter = MinValue<double>(w.y1 - w.y0, line.y1 - line.y0);
-			if (shorter > 0 && overlap >= ELEM_LINE_OVERLAP_MIN_RATIO * shorter) {
+	}
+	std::vector<ElemLine> lines(static_cast<size_t>(line_count));
+	for (size_t li = 0; li < members.size(); li++) {
+		auto &idxs = members[li];
+		std::sort(idxs.begin(), idxs.end(), [&](size_t a, size_t b) { return words[a].x0 < words[b].x0; });
+		auto &line = lines[li];
+		ElemFontHistogram line_hist;
+		for (size_t k = 0; k < idxs.size(); k++) {
+			const auto &w = words[idxs[k]];
+			if (k == 0) {
+				line.x0 = w.x0;
+				line.y0 = w.y0;
+				line.x1 = w.x1;
+				line.y1 = w.y1;
+			} else {
 				line.x0 = MinValue<double>(line.x0, w.x0);
 				line.y0 = MinValue<double>(line.y0, w.y0);
 				line.x1 = MaxValue<double>(line.x1, w.x1);
 				line.y1 = MaxValue<double>(line.y1, w.y1);
-				line.words.push_back(std::move(w));
-				joined = true;
 			}
-		}
-		if (!joined) {
-			ElemLine line;
-			line.x0 = w.x0;
-			line.y0 = w.y0;
-			line.x1 = w.x1;
-			line.y1 = w.y1;
-			line.words.push_back(std::move(w));
-			lines.push_back(std::move(line));
-		}
-	}
-	// Finalize: order words by x0, join text, compute dominant font size.
-	for (auto &line : lines) {
-		std::sort(line.words.begin(), line.words.end(),
-		          [](const ElemWord &a, const ElemWord &b) { return a.x0 < b.x0; });
-		ElemFontHistogram line_hist;
-		for (auto &w : line.words) {
 			if (!line.text.empty()) {
 				line.text += " ";
 			}
@@ -3415,6 +3425,7 @@ static std::vector<ElemLine> ElemBuildLines(std::vector<ElemWord> words) {
 			if (w.has_font) {
 				ElemFontTally(line_hist, w.font_size, w.text.size());
 			}
+			line.words.push_back(w);
 		}
 		line.font_size = ElemModalFontSize(line_hist);
 	}
@@ -3552,7 +3563,7 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 			words.push_back(std::move(w));
 		}
 		if (!words.empty()) {
-			page_lines.emplace_back(p + 1, ElemBuildLines(std::move(words)));
+			page_lines.emplace_back(p + 1, ElemBuildLines(std::move(words), page->page_rect().width()));
 		}
 	}
 	double body_size = ElemModalFontSize(doc_hist);
@@ -5684,12 +5695,14 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 	int n = doc->pages();
 
 	std::vector<std::vector<MdWord>> pages_words(n);
+	std::vector<double> page_widths(n, 0.0);
 	std::vector<double> all_font_sizes;
 	for (int p = 0; p < n; p++) {
 		unique_ptr<poppler::page> page(doc->create_page(p));
 		if (!page) {
 			continue;
 		}
+		page_widths[p] = page->page_rect().width();
 		std::vector<MdWord> page_words;
 		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
 			auto r = b.bbox();
@@ -5855,41 +5868,48 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 		if (page_words.empty())
 			continue;
 
-		// per-page row clustering (same rules as ReconstructPageGrid)
-		std::vector<double> heights;
+		// Rows come from the shared layout engine, so markdown sees the same
+		// lines — and the same column order — as read_pdf and read_pdf_lines.
+		std::vector<LayoutWord> geom;
+		geom.reserve(page_words.size());
 		for (const auto &w : page_words) {
-			double h = w.yMax - w.yMin;
-			if (h > 0)
-				heights.push_back(h);
+			LayoutWord g;
+			g.x0 = w.xMin;
+			g.y0 = w.yMin;
+			g.x1 = w.xMax;
+			g.y1 = w.yMax;
+			g.font_size = w.font_size;
+			g.text = w.text;
+			geom.push_back(std::move(g));
 		}
-		double med_h = Median(heights);
-		if (med_h <= 0)
-			med_h = 10.0;
-		double row_tol = med_h * 0.5;
-
-		std::sort(page_words.begin(), page_words.end(),
-		          [](const MdWord &a, const MdWord &b) { return a.yMin < b.yMin; });
-
-		std::vector<std::vector<MdWord>> rows;
+		auto md_bands = LayoutColumnBands(geom, page_widths[p]);
+		auto md_lines = LayoutLineIds(geom, md_bands);
+		int32_t md_line_count = 0;
+		for (int32_t l : md_lines) {
+			md_line_count = MaxValue<int32_t>(md_line_count, l);
+		}
+		std::vector<std::vector<MdWord>> rows(static_cast<size_t>(md_line_count));
+		for (size_t i = 0; i < page_words.size(); i++) {
+			if (md_lines[i] > 0) {
+				rows[static_cast<size_t>(md_lines[i] - 1)].push_back(page_words[i]);
+			}
+		}
+		double med_h = 0.0;
 		{
-			std::vector<MdWord> cur;
-			double row_anchor = page_words.front().yMin;
-			for (auto &w : page_words) {
-				if (cur.empty()) {
-					cur.push_back(w);
-					row_anchor = w.yMin;
-				} else if (std::fabs(w.yMin - row_anchor) <= row_tol) {
-					cur.push_back(w);
-				} else {
-					rows.push_back(cur);
-					cur.clear();
-					cur.push_back(w);
-					row_anchor = w.yMin;
+			std::vector<double> heights;
+			for (const auto &w : page_words) {
+				if (w.yMax - w.yMin > 0) {
+					heights.push_back(w.yMax - w.yMin);
 				}
 			}
-			if (!cur.empty())
-				rows.push_back(cur);
+			med_h = Median(std::move(heights));
+			if (med_h <= 0) {
+				med_h = 10.0;
+			}
 		}
+		// Still needed below: the tolerance that decides whether a row falls
+		// inside a detected table zone, and the paragraph-break gap.
+		const double row_tol = med_h * 0.5;
 		for (auto &r : rows) {
 			std::sort(r.begin(), r.end(), [](const MdWord &a, const MdWord &b) { return a.xMin < b.xMin; });
 		}
