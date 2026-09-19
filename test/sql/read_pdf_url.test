@@ -1,14 +1,15 @@
 # name: test/sql/read_pdf_url.test
-# description: read_pdf over https, against published DuckDB PDFs
+# description: the real corpus — six published DuckDB PDFs, read over https
 # group: [sql]
 
 require pdf
 
-# httpfs is not linked into this repo's test binary (it lives out of tree in
-# DuckDB 1.5), so this file is skipped by a plain `make test`. It runs against a
-# DuckDB that already has httpfs — including the release CLI with the built
-# extension side-loaded:
-#   duckdb -unsigned -c "LOAD 'build/release/extension/pdf/pdf.duckdb_extension'; ..."
+# httpfs is out of tree in DuckDB 1.5, so the test binary only has it when the
+# runner is allowed to autoload. The repo Makefile exports
+# DUCKDB_TEST_AUTOLOADING=all for exactly that reason; running this file by hand:
+#
+#   DUCKDB_TEST_AUTOLOADING=all PDF_NETWORK_TESTS=1 \
+#     ./build/release/test/unittest test/sql/read_pdf_url.test
 require httpfs
 
 # Network test. Opt in with PDF_NETWORK_TESTS=1 so an offline `make test` and a
@@ -20,81 +21,72 @@ PRAGMA enable_verification
 
 # read_pdf takes a path, a glob, or a URL, because it opens files through
 # DuckDB's filesystem rather than fopen. Nothing here is downloaded first.
+#
+# Six documents, each carrying something none of the others do. What may be
+# asserted about each differs, and the difference is the document's own:
+#
+#   - Conference decks are the safest thing on blobs.duckdb.org: uploaded once
+#     and never rewritten (the DuckCon 3/4/5 assets all still carry their 2024
+#     upload date), so their wording can be asserted verbatim.
+#   - The merch calendar's content is frozen too, but its URL is year-scoped —
+#     the 2025 and 2024 URLs already 404 — so the URL is the fragile part.
+#   - docs/*.pdf are regenerated on every release: page 1 prints a version and a
+#     build timestamp, and the page count, file size and outline all move. Only
+#     structure is asserted there, never wording and never an exact count.
+#   - OCR output depends on the bundled Tesseract and the render DPI, so the OCR
+#     page asserts that OCR ran and scored, never what it read.
+#
+# Not used here: docs/duckdb-docs.pdf. It is 40 MB and 2306 pages, and reading
+# it whole on every CI run buys nothing the 104-page DuckLake docs do not.
+
+# ── DuckCon 3, KalDB: the smallest real DuckDB PDF ──────────────────────────
+#
+# 178 KB / 12 pages, Google Slides export. The fast default for anything that
+# just needs a real document.
+
+query I
+SELECT page_count = 12
+FROM pdf_info('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf');
+----
+true
+
+query II
+SELECT line, text
+FROM read_pdf_lines('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf',
+                    first_page := 1, last_page := 1)
+WHERE line <= 2 ORDER BY line;
+----
+1	KalDB: Log analytics with DuckDB
+2	Suman Karumuri
+
+# A slide deck's tables are sparse — six rows across twelve pages — which is
+# exactly the shape that catches a table reader inventing structure.
+query I
+SELECT COUNT(*) = 6
+FROM read_pdf_tables('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf');
+----
+true
+
+# ── "One Size Fits All" (ICDE 2015): a real two-column paper ────────────────
+#
+# PDF 1.3 out of Acrobat Distiller 5 — the oldest producer in the corpus, and
+# the document the column tests are written against (test/sql/read_pdf_columns.test).
+
+query IIII
+SELECT pdf_version, producer, page_count, is_encrypted
+FROM pdf_info('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf');
+----
+1.3	Acrobat Distiller 5.0.5 (Windows)	10	false
+
+query I
+SELECT COUNT(*) = 1
+FROM read_pdf_lines('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf',
+                    first_page := 1, last_page := 1)
+WHERE text = '“One Size Fits All”: An Idea Whose Time Has Come and Gone';
+----
+true
 
 # ── the Friendly SQL Calendar: the document the layout engine was built for ──
-#
-# https://duckdb.org/docs/current/sql/dialect/friendly_sql links this PDF. One
-# cover page plus twelve months; each month pairs a prose column on the left
-# with a calendar grid on the right.
-
-query I
-SELECT page_count = 13
-FROM read_pdf('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
-              first_page := 1, last_page := 1);
-----
-true
-
-# January, with no layout parameter. The grid must survive the 240pt corridor
-# between the code sample and the dates.
-query I
-SELECT COUNT(*) = 1
-FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
-                    first_page := 2, last_page := 2)
-WHERE text = 'MON TUE WED THU FRI SAT SUN';
-----
-true
-
-# 1 January 2026 is a Thursday, so the first row holds exactly four dates.
-# Reading the page without horizontal position yields '1 2 3 4 5 6 7' instead —
-# the failure that motivated layout := 'auto'.
-query I
-SELECT COUNT(*) = 1
-FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
-                    first_page := 2, last_page := 2)
-WHERE text = '1 2 3 4';
-----
-true
-
-# The prose column is not interleaved into the grid.
-query I
-SELECT COUNT(*) = 1
-FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
-                    first_page := 2, last_page := 2)
-WHERE text = 'JANUARY';
-----
-true
-
-# Every month's first row is short in exactly the way its weekday demands. This
-# is the assertion that caught the original bug across all twelve pages.
-query I
-SELECT COUNT(*) = 12 FROM (
-  SELECT page
-  FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
-                      first_page := 2, last_page := 13)
-  WHERE text = 'MON TUE WED THU FRI SAT SUN'
-);
-----
-true
-
-# ── the DuckLake documentation: long-form single-column prose ───────────────
-#
-# A published multi-hundred-page document, to prove the column detector leaves
-# ordinary prose alone. Page count and wording drift with each docs build, so
-# only structural facts are asserted.
-
-query I
-SELECT has_text_layer AND NOT used_ocr AND length(text) > 200
-FROM read_pdf('https://blobs.duckdb.org/docs/ducklake-docs.pdf', first_page := 3, last_page := 3);
-----
-true
-
-query I
-SELECT page_count > 50
-FROM read_pdf('https://blobs.duckdb.org/docs/ducklake-docs.pdf', first_page := 1, last_page := 1);
-----
-true
-
-# ── a URL is a file everywhere the API takes a file ─────────────────────────
 
 query I
 SELECT page_count = 13
@@ -109,6 +101,154 @@ FROM read_pdf_words('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar
 WHERE word = 'JANUARY';
 ----
 true
+
+# ── DuckCon 6, "How not to use DuckDB": the OCR path ────────────────────────
+#
+# Page 1 has a text layer; page 2 is a screenshot with none, so auto_ocr fires
+# on one page of a document and not the other — the mixed case a scanned-file
+# fixture cannot produce.
+
+query IIII
+SELECT page, has_text_layer, used_ocr, length(text) > 0
+FROM read_pdf('https://blobs.duckdb.org/events/duckcon6/sam-jewell-how-not-to-use-duckdb-how-we-introduced-a-cvss-9-9-vulnerability-into-grafana.pdf',
+              first_page := 1, last_page := 2)
+ORDER BY page;
+----
+1	true	false	true
+2	false	true	true
+
+# Tesseract's version and the render DPI decide the wording, so only the fact
+# that OCR ran and scored is asserted.
+query I
+SELECT ocr_confidence > 40
+FROM read_pdf('https://blobs.duckdb.org/events/duckcon6/sam-jewell-how-not-to-use-duckdb-how-we-introduced-a-cvss-9-9-vulnerability-into-grafana.pdf',
+              first_page := 2, last_page := 2);
+----
+true
+
+# Word-grain OCR agrees with the page grain: every word on that page comes from
+# OCR, and the column detector runs on OCR boxes exactly as it does on native
+# ones — this slide is three columns wide.
+query II
+SELECT list(DISTINCT source) AS sources, list(DISTINCT column_index ORDER BY column_index) AS bands
+FROM read_pdf_words('https://blobs.duckdb.org/events/duckcon6/sam-jewell-how-not-to-use-duckdb-how-we-introduced-a-cvss-9-9-vulnerability-into-grafana.pdf',
+                    first_page := 2, last_page := 2);
+----
+[ocr]	[0, 1, 2]
+
+# ── the DuckLake documentation: long-form prose with a real bookmark tree ────
+#
+# Regenerated every release, so nothing here is a count or a quotation.
+
+query IIII
+SELECT title, is_encrypted, pdf_version, page_count > 50
+FROM pdf_info('https://blobs.duckdb.org/docs/ducklake-docs.pdf');
+----
+DuckLake Documentation	false	1.5	true
+
+query I
+SELECT COUNT(*) > 20 FROM pdf_outline('https://blobs.duckdb.org/docs/ducklake-docs.pdf');
+----
+true
+
+# A bookmark tree that is actually nested, and a document that asks readers to
+# open on it.
+query I
+SELECT list_contains(list(DISTINCT depth), 1) AND list_contains(list(DISTINCT depth), 2)
+FROM pdf_outline('https://blobs.duckdb.org/docs/ducklake-docs.pdf');
+----
+true
+
+query I
+SELECT page_mode = 'use_outlines' FROM pdf_permissions('https://blobs.duckdb.org/docs/ducklake-docs.pdf');
+----
+true
+
+# Ordinary prose: a text layer, no OCR, and no column split.
+query III
+SELECT has_text_layer, used_ocr, length(text) > 200
+FROM read_pdf('https://blobs.duckdb.org/docs/ducklake-docs.pdf', first_page := 3, last_page := 3);
+----
+true	false	true
+
+# ── DuckCon 7, State of the Duck: the negative case ─────────────────────────
+#
+# A graphic cover page with no text layer that OCR also cannot read, on 16:9
+# slide geometry rather than everyone else's A4. The page that must produce
+# nothing rather than something.
+
+query III
+SELECT has_text_layer, used_ocr, length(text) = 0
+FROM read_pdf('https://blobs.duckdb.org/events/duckcon7/hannes-muehleisen-mark-raasveldt-duckcon7-state-of-the-duck.pdf',
+              first_page := 1, last_page := 1);
+----
+false	false	true
+
+# TODO(after the read_pdf/read_pdf_words used_ocr fix lands): page 1 of this
+# deck currently returns seven rows from read_pdf_words whose `word` is the
+# empty string, at source = 'ocr' and confidence 95.0, while read_pdf above
+# reports used_ocr = false. Once the two grains agree, assert here that the
+# page yields no words at all.
+
+query II
+SELECT DISTINCT width, height
+FROM read_pdf('https://blobs.duckdb.org/events/duckcon7/hannes-muehleisen-mark-raasveldt-duckcon7-state-of-the-duck.pdf',
+              first_page := 1, last_page := 2);
+----
+1920	1080
+
+# Page 2 does have a text layer, and it round-trips non-ASCII.
+query I
+SELECT contains(text, 'State of the Duck') AND contains(text, 'Mühleisen')
+FROM read_pdf('https://blobs.duckdb.org/events/duckcon7/hannes-muehleisen-mark-raasveldt-duckcon7-state-of-the-duck.pdf',
+              first_page := 2, last_page := 2);
+----
+true
+
+# ── DuckLake on Hetzner: a second small multi-column deck ───────────────────
+
+query II
+SELECT page, list(DISTINCT column_index ORDER BY column_index) AS bands
+FROM read_pdf_words('https://blobs.duckdb.org/events/duckcon7/floyd-berndsen-ducklake-on-hetzner.pdf',
+                    first_page := 2, last_page := 3)
+GROUP BY page ORDER BY page;
+----
+2	[0, 1]
+3	[0, 1]
+
+query I
+SELECT contains(text, '€')
+FROM read_pdf('https://blobs.duckdb.org/events/duckcon7/floyd-berndsen-ducklake-on-hetzner.pdf',
+              first_page := 1, last_page := 1);
+----
+true
+
+# ── a URL is a file everywhere the API takes a file ─────────────────────────
+
+query I
+SELECT contains(pdf_to_text('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf'),
+                'KalDB');
+----
+true
+
+query I
+SELECT COUNT(*) = 12
+FROM pdf_pages_info('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf');
+----
+true
+
+# Rasterizing over https too. The paper renders without poppler diagnostics on
+# stderr, which the slide decks' gradient fills do not.
+query I
+SELECT octet_length(pdf_to_png('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf', 1, 36)) > 0;
+----
+true
+
+# TODO(after the qpdf-reader filesystem fix lands): pdf_images, pdf_json,
+# pdf_qpdf_info, pdf_form_fields, pdf_annotations and pdf_signatures still open
+# the local disk, so a URL fails with "input file '<url>' does not exist".
+# Once they read through DuckDB's filesystem like everything above, assert here
+# that pdf_images on the KalDB deck returns its 12 embedded JPEGs.
 
 # A URL that does not exist fails as an HTTP error, not as a parse error.
 statement error
