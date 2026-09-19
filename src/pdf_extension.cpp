@@ -1567,6 +1567,17 @@ static void ReadAllBytes(ClientContext &context, const string &path, string &out
 	}
 }
 
+// Input side of every qpdf-backed reader: one filesystem (DuckDB's, so URLs and
+// object stores work) and one missing-file message, named for the SQL function
+// the user called.
+static void ReadPdfInput(ClientContext &context, const char *fn, const string &path, string &bytes) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	if (!fs.FileExists(path)) {
+		throw InvalidInputException("%s: input file '%s' does not exist", fn, path);
+	}
+	ReadAllBytes(context, path, bytes);
+}
+
 static unique_ptr<poppler::document> LoadDoc(const string &bytes, const string &password, const string &path) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	// poppler's load_from_raw_data takes an int length; guard against silent
@@ -6766,11 +6777,12 @@ static string PdfFormFieldTypeText(const string &raw_type) {
 	return raw_type; // unknown: pass qpdf's raw name through untouched
 }
 
-static void PdfFormFieldsExecute(const string &path, std::vector<std::vector<Value>> &rows) {
-	PdfOpsCheckInputExists("pdf_form_fields", path);
+static void PdfFormFieldsExecute(ClientContext &context, const string &path, std::vector<std::vector<Value>> &rows) {
+	string bytes;
+	ReadPdfInput(context, "pdf_form_fields", path, bytes);
 	std::vector<pdf_qpdf::FormField> fields;
 	try {
-		fields = pdf_qpdf::ReadFormFields(path);
+		fields = pdf_qpdf::ReadFormFields(bytes);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_form_fields: %s", string(e.what()));
 	}
@@ -6788,7 +6800,7 @@ static void PdfFormFieldsScan(ClientContext &context, TableFunctionInput &data_p
 	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
 	if (!st.executed) {
 		for (auto &path : bind.files) {
-			PdfFormFieldsExecute(path, st.rows);
+			PdfFormFieldsExecute(context, path, st.rows);
 		}
 		st.executed = true;
 	}
@@ -6810,11 +6822,12 @@ static unique_ptr<FunctionData> PdfAnnotationsBind(ClientContext &context, Table
 	return std::move(result);
 }
 
-static void PdfAnnotationsExecute(const string &path, std::vector<std::vector<Value>> &rows) {
-	PdfOpsCheckInputExists("pdf_annotations", path);
+static void PdfAnnotationsExecute(ClientContext &context, const string &path, std::vector<std::vector<Value>> &rows) {
+	string bytes;
+	ReadPdfInput(context, "pdf_annotations", path, bytes);
 	std::vector<pdf_qpdf::Annotation> annotations;
 	try {
-		annotations = pdf_qpdf::ReadAnnotations(path);
+		annotations = pdf_qpdf::ReadAnnotations(bytes);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_annotations: %s", string(e.what()));
 	}
@@ -6832,7 +6845,7 @@ static void PdfAnnotationsScan(ClientContext &context, TableFunctionInput &data_
 	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
 	if (!st.executed) {
 		for (auto &path : bind.files) {
-			PdfAnnotationsExecute(path, st.rows);
+			PdfAnnotationsExecute(context, path, st.rows);
 		}
 		st.executed = true;
 	}
@@ -6933,11 +6946,13 @@ static unique_ptr<FunctionData> PdfSignaturesBind(ClientContext &context, TableF
 	return std::move(result);
 }
 
-static void PdfSignaturesExecute(const string &path, const string &password, std::vector<std::vector<Value>> &rows) {
-	PdfOpsCheckInputExists("pdf_signatures", path);
+static void PdfSignaturesExecute(ClientContext &context, const string &path, const string &password,
+                                 std::vector<std::vector<Value>> &rows) {
+	string bytes;
+	ReadPdfInput(context, "pdf_signatures", path, bytes);
 	std::vector<pdf_qpdf::SignatureInfo> sigs;
 	try {
-		sigs = pdf_qpdf::ReadSignatures(path, password);
+		sigs = pdf_qpdf::ReadSignatures(bytes, password);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_signatures: %s", string(e.what()));
 	}
@@ -6960,7 +6975,7 @@ static void PdfSignaturesScan(ClientContext &context, TableFunctionInput &data_p
 	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
 	if (!st.executed) {
 		for (auto &path : bind.files) {
-			PdfSignaturesExecute(path, bind.password, st.rows);
+			PdfSignaturesExecute(context, path, bind.password, st.rows);
 		}
 		st.executed = true;
 	}
@@ -7521,11 +7536,13 @@ static unique_ptr<FunctionData> PdfImagesBind(ClientContext &context, TableFunct
 	return std::move(result);
 }
 
-static void PdfImagesExecute(const string &path, const string &password, std::vector<std::vector<Value>> &rows) {
-	PdfOpsCheckInputExists("pdf_images", path);
+static void PdfImagesExecute(ClientContext &context, const string &path, const string &password,
+                             std::vector<std::vector<Value>> &rows) {
+	string bytes;
+	ReadPdfInput(context, "pdf_images", path, bytes);
 	std::vector<pdf_qpdf::EmbeddedImage> imgs;
 	try {
-		imgs = pdf_qpdf::ReadImages(path, password);
+		imgs = pdf_qpdf::ReadImages(bytes, password);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_images: %s", string(e.what()));
 	}
@@ -7543,7 +7560,7 @@ static void PdfImagesScan(ClientContext &context, TableFunctionInput &data_p, Da
 	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
 	if (!st.executed) {
 		for (auto &path : bind.files) {
-			PdfImagesExecute(path, bind.password, st.rows);
+			PdfImagesExecute(context, path, bind.password, st.rows);
 		}
 		st.executed = true;
 	}
@@ -8420,15 +8437,11 @@ static void PdfQpdfInfoScan(ClientContext &context, TableFunctionInput &data_p, 
 	idx_t count = 0;
 	while (count < STANDARD_VECTOR_SIZE && st.idx < bind.files.size()) {
 		auto &path = bind.files[st.idx];
-		// Existence check via DuckDB FS so virtual paths still work; qpdf opens
-		// the host path itself (same pattern as other qpdf table functions).
-		auto &fs = FileSystem::GetFileSystem(context);
-		if (!fs.FileExists(path)) {
-			throw IOException("pdf_qpdf_info: file '%s' does not exist", path);
-		}
+		string bytes;
+		ReadPdfInput(context, "pdf_qpdf_info", path, bytes);
 		pdf_qpdf::DocumentStats s;
 		try {
-			s = pdf_qpdf::InspectDocument(path, bind.password);
+			s = pdf_qpdf::InspectDocument(bytes, bind.password);
 		} catch (const std::exception &e) {
 			throw IOException("pdf_qpdf_info: %s", string(e.what()));
 		}
@@ -8470,11 +8483,12 @@ static void PdfQpdfInfoScan(ClientContext &context, TableFunctionInput &data_p, 
 //---- pdf_json (scalar) ----------------------------------------------------
 static void PdfJsonFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
-	(void)context;
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
 	    args.data[0], args.data[1], result, args.size(), [&](string_t path, string_t password) {
 		    try {
-			    auto json = pdf_qpdf::WriteJson(path.GetString(), password.GetString(), 2);
+			    string bytes;
+			    ReadPdfInput(context, "pdf_json", path.GetString(), bytes);
+			    auto json = pdf_qpdf::WriteJson(bytes, password.GetString(), 2);
 			    return StringVector::AddString(result, json);
 		    } catch (const std::exception &e) {
 			    throw IOException("pdf_json: %s", string(e.what()));
@@ -8483,9 +8497,12 @@ static void PdfJsonFun(DataChunk &args, ExpressionState &state, Vector &result) 
 }
 
 static void PdfJsonPathOnlyFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
 	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
 		try {
-			auto json = pdf_qpdf::WriteJson(path.GetString(), "", 2);
+			string bytes;
+			ReadPdfInput(context, "pdf_json", path.GetString(), bytes);
+			auto json = pdf_qpdf::WriteJson(bytes, "", 2);
 			return StringVector::AddString(result, json);
 		} catch (const std::exception &e) {
 			throw IOException("pdf_json: %s", string(e.what()));
