@@ -69,6 +69,15 @@ static std::recursive_mutex &QpdfMutex() {
 	return m;
 }
 
+// Every read-only entry point opens from a byte buffer rather than a path, so
+// the caller reads the file through DuckDB's filesystem and an https:// or
+// s3:// document is as readable as a local one. `name` is only qpdf's label in
+// error messages. Writers still take paths: qpdf streams the source lazily into
+// the output file it owns.
+static void OpenQpdfBytes(QPDF &doc, const char *name, const std::string &pdf_bytes, const std::string &password) {
+	doc.processMemoryFile(name, pdf_bytes.data(), pdf_bytes.size(), password.empty() ? nullptr : password.c_str());
+}
+
 void Merge(const std::vector<std::string> &inputs, const std::string &output) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	QPDF merged;
@@ -240,11 +249,11 @@ void Pages(const std::string &input, const std::string &output, const std::strin
 	writer.write();
 }
 
-std::vector<FormField> ReadFormFields(const std::string &path) {
+std::vector<FormField> ReadFormFields(const std::string &pdf_bytes) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	std::vector<FormField> fields;
 	QPDF doc;
-	doc.processFile(path.c_str());
+	OpenQpdfBytes(doc, "pdf_form_fields", pdf_bytes, "");
 	QPDFAcroFormDocumentHelper acroform(doc);
 	if (!acroform.hasAcroForm()) {
 		return fields;
@@ -283,11 +292,11 @@ std::vector<FormField> ReadFormFields(const std::string &path) {
 	return fields;
 }
 
-std::vector<Annotation> ReadAnnotations(const std::string &path) {
+std::vector<Annotation> ReadAnnotations(const std::string &pdf_bytes) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	std::vector<Annotation> annotations;
 	QPDF doc;
-	doc.processFile(path.c_str());
+	OpenQpdfBytes(doc, "pdf_annotations", pdf_bytes, "");
 	QPDFPageDocumentHelper doc_pages(doc);
 	auto pages = doc_pages.getAllPages();
 	for (size_t page_idx = 0; page_idx < pages.size(); page_idx++) {
@@ -478,8 +487,7 @@ std::vector<RuledSegment> ExtractRulingLines(const std::string &pdf_bytes, const
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	std::vector<RuledSegment> out;
 	QPDF qpdf;
-	qpdf.processMemoryFile("read_pdf_tables", pdf_bytes.data(), pdf_bytes.size(),
-	                       password.empty() ? nullptr : password.c_str());
+	OpenQpdfBytes(qpdf, "read_pdf_tables", pdf_bytes, password);
 	auto pages = QPDFPageDocumentHelper(qpdf).getAllPages();
 	for (size_t pi = 0; pi < pages.size(); ++pi) {
 		auto &page = pages[pi];
@@ -527,19 +535,6 @@ std::vector<RuledSegment> ExtractRulingLines(const std::string &pdf_bytes, const
 // from the ByteRange spans and CMS_verify the /Contents PKCS#7/CMS blob with
 // OpenSSL. Signing (creation) is out of scope; detection + verification only.
 //===--------------------------------------------------------------------===//
-
-// Reads the whole file into memory for ByteRange coverage + CMS message rebuild.
-// qpdf's processFile reads the local filesystem, so pdf_signatures is already
-// local-path-only; a plain std::ifstream matches that constraint.
-static std::string ReadFileBytes(const std::string &path) {
-	std::ifstream f(path, std::ios::binary);
-	if (!f) {
-		throw std::runtime_error("could not read '" + path + "'");
-	}
-	std::ostringstream ss;
-	ss << f.rdbuf();
-	return ss.str();
-}
 
 // Read a PDF-string value from a dict key as UTF-8; empty string means absent
 // (the caller maps empty to SQL NULL).
@@ -638,20 +633,16 @@ static std::string CmsSignerCN(const std::string &cms_der) {
 	return cn;
 }
 
-std::vector<SignatureInfo> ReadSignatures(const std::string &path, const std::string &password) {
+std::vector<SignatureInfo> ReadSignatures(const std::string &pdf_bytes, const std::string &password) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	std::vector<SignatureInfo> sigs;
 
-	// File length + raw bytes for ByteRange coverage and CMS message rebuild.
-	std::string file_bytes = ReadFileBytes(path);
+	// The same bytes serve the ByteRange coverage check and the CMS message rebuild.
+	const std::string &file_bytes = pdf_bytes;
 	const int64_t file_size = static_cast<int64_t>(file_bytes.size());
 
 	QPDF doc;
-	if (password.empty()) {
-		doc.processFile(path.c_str());
-	} else {
-		doc.processFile(path.c_str(), password.c_str());
-	}
+	OpenQpdfBytes(doc, "pdf_signatures", pdf_bytes, password);
 	QPDFAcroFormDocumentHelper acroform(doc);
 	if (!acroform.hasAcroForm()) {
 		return sigs;
@@ -1066,15 +1057,11 @@ void AppendStampOnTop(QPDF &doc, QPDFPageObjectHelper &page, const std::string &
 
 } // namespace
 
-std::vector<EmbeddedImage> ReadImages(const std::string &path, const std::string &password) {
+std::vector<EmbeddedImage> ReadImages(const std::string &pdf_bytes, const std::string &password) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	std::vector<EmbeddedImage> images;
 	QPDF doc;
-	if (password.empty()) {
-		doc.processFile(path.c_str());
-	} else {
-		doc.processFile(path.c_str(), password.c_str());
-	}
+	OpenQpdfBytes(doc, "pdf_images", pdf_bytes, password);
 	QPDFPageDocumentHelper doc_pages(doc);
 	auto pages = doc_pages.getAllPages();
 	for (size_t page_idx = 0; page_idx < pages.size(); page_idx++) {
@@ -1659,14 +1646,10 @@ static const char *EncryptionMethodName(QPDF::encryption_method_e m) {
 	}
 }
 
-static void OpenQpdf(QPDF &doc, const std::string &path, const std::string &password) {
-	doc.processFile(path.c_str(), password.empty() ? nullptr : password.c_str());
-}
-
-DocumentStats InspectDocument(const std::string &path, const std::string &password) {
+DocumentStats InspectDocument(const std::string &pdf_bytes, const std::string &password) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	QPDF doc;
-	OpenQpdf(doc, path, password);
+	OpenQpdfBytes(doc, "pdf_qpdf_info", pdf_bytes, password);
 
 	DocumentStats s;
 	s.is_linearized = doc.isLinearized();
@@ -1732,14 +1715,14 @@ DocumentStats InspectDocument(const std::string &path, const std::string &passwo
 	return s;
 }
 
-std::string WriteJson(const std::string &path, const std::string &password, int json_version) {
+std::string WriteJson(const std::string &pdf_bytes, const std::string &password, int json_version) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	if (json_version < 1) {
 		throw std::runtime_error("pdf_json: json_version must be >= 1");
 	}
 	QPDF doc;
 	doc.setSuppressWarnings(true);
-	OpenQpdf(doc, path, password);
+	OpenQpdfBytes(doc, "pdf_json", pdf_bytes, password);
 	std::string out;
 	Pl_String pipe("pdf_json", nullptr, out);
 	// Structure-only: do not inline stream bytes (images/fonts) into the JSON.
@@ -1753,7 +1736,7 @@ void Repair(const std::string &input, const std::string &output, const std::stri
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	QPDF doc;
 	doc.setSuppressWarnings(true);
-	OpenQpdf(doc, input, password);
+	doc.processFile(input.c_str(), password.empty() ? nullptr : password.c_str());
 	// Resolve dangling indirect refs (PDF-spec: treat as null) and rewrite with
 	// content-stream normalization + stream recompression. This is the portable
 	// "qpdf --check --normalize-content=y --compress-streams=y" repair path,

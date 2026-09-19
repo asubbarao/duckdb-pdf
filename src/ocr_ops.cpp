@@ -668,7 +668,7 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 			w.y0 = (height - bottom) * 72.0 / dpi;
 			w.y1 = (height - top) * 72.0 / dpi;
 			w.confidence = conf;
-			if (!w.text.empty()) {
+			if (HasGlyphs(w.text)) {
 				out.words.push_back(std::move(w));
 			}
 		} while (ri->Next(tesseract::RIL_WORD));
@@ -743,7 +743,7 @@ WordsResult RecognizeWords(const unsigned char *data, int width, int height, int
 		wr.backend_used = Backend::External;
 		TextResult tr = RecognizeExternal(data, width, height, bytes_per_row, format, opt);
 		wr.confidence = tr.confidence;
-		if (!tr.text.empty()) {
+		if (HasGlyphs(tr.text)) {
 			Word w;
 			w.text = tr.text;
 			w.x0 = 0;

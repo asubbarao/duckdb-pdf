@@ -29,6 +29,32 @@ jobs:
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools;windows_arm64
       vcpkg_commit: 84bab45d415d22042bd0b9081aea57f362da3f35
 
+  # The tests that read real published PDFs over https (read_pdf_url.test,
+  # read_pdf_columns.test) are gated on PDF_NETWORK_TESTS so an offline machine
+  # still gets a green `make test`. They run here, in their own job on one
+  # platform, rather than inside the matrix above: blobs.duckdb.org being slow
+  # or down must not turn a release build red on five platforms at once.
+  #
+  # This is a second call to the same reusable workflow rather than hand-rolled
+  # build steps, because the assertions only execute inside
+  # build/release/test/unittest and that binary is not among the artifacts the
+  # workflow publishes — so there is nothing to download, and anything else
+  # would be a copy of its docker/vcpkg/ccache plumbing that drifts.
+  # test_env_variables is the workflow's own hook for extra test env; the
+  # DUCKDB_TEST_AUTOLOADING the runner needs to find httpfs is exported by this
+  # repo's Makefile, so it reaches every build including the matrix above.
+  network-tests:
+    name: Network tests (real published PDFs)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    with:
+      duckdb_version: v1.5.5
+      ci_tools_version: v1.5-variegata
+      extension_name: pdf
+      exclude_archs: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools;windows_arm64;windows_amd64;osx_amd64;osx_arm64;linux_arm64;linux_amd64_musl;linux_arm64_musl
+      vcpkg_commit: 84bab45d415d22042bd0b9081aea57f362da3f35
+      artifact_postfix: -network
+      test_config: '{"test_env_variables": {"PDF_NETWORK_TESTS": "1"}}'
+
   code-quality-check:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata

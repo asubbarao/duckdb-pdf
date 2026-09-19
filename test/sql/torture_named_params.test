@@ -51,17 +51,40 @@ SELECT COUNT(*) = 1 FROM read_pdf('test/data/two_pages.pdf', last_page := 1, aut
 ----
 true
 
-# ── bogus layout falls back silently (no error) ─────────────────────────────
+# ── bogus layout is rejected, loudly, at bind time ──────────────────────────
+#
+# This used to fall through to 'reading' in silence, which meant layout := true
+# (cast to the string 'true') and every typo quietly produced the wrong text on
+# multi-column pages. The error names the alternatives because an agent holding
+# only the binary has no other way to learn them.
 
-query I
-SELECT COUNT(*) = 1 FROM read_pdf('test/data/hello.pdf', layout := 'bogus', auto_ocr := false);
+statement error
+SELECT COUNT(*) FROM read_pdf('test/data/hello.pdf', layout := 'bogus', auto_ocr := false);
 ----
-true
+layout must be one of ['auto', 'physical', 'reading', 'raw'], not 'bogus'
 
-query I
+# A boolean casts to a string and must not be mistaken for "turn layout on".
+statement error
+SELECT COUNT(*) FROM read_pdf('test/data/hello.pdf', layout := true, auto_ocr := false);
+----
+layout must be one of ['auto', 'physical', 'reading', 'raw'], not 'true'
+
+# Bind-time, so a bad layout is caught even when the file cannot be opened.
+statement error
+SELECT COUNT(*) FROM read_pdf('test/data/does_not_exist.pdf', layout := 'bogus');
+----
+layout must be one of ['auto', 'physical', 'reading', 'raw'], not 'bogus'
+
+statement error
 SELECT contains( pdf_to_text('test/data/hello.pdf', 'bogus'), 'Hello' );
 ----
-true
+layout must be one of ['auto', 'physical', 'reading', 'raw'], not 'bogus'
+
+# Readers that work off word geometry never used layout; they no longer offer it.
+statement error
+SELECT COUNT(*) FROM read_pdf_words('test/data/hello.pdf', layout := 'physical');
+----
+Invalid named parameter "layout"
 
 # ── pdf_to_svg page edges: pages are 1-based and range-checked ──────────────
 
