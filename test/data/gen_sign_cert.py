@@ -9,6 +9,9 @@ Produces (committed so test runs are hermetic — no openssl needed at test time
 
 Uses the openssl CLI only (no Python crypto deps). Deterministic subject/serial
 so re-running yields functionally identical material.
+
+Synthetic by necessity: signing has to be tested against a key the test owns,
+and no PDF DuckDB publishes is signed.
 """
 
 from __future__ import annotations

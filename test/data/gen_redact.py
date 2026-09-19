@@ -10,6 +10,10 @@ without any filter dependency:
             pdf_redact test can target it with a box.
   * Page 3: "PAGE THREE FOOTER"
 
+The secret's position is the point: a redaction test must aim a box at known
+coordinates and then prove the text underneath is gone, which no published
+document can offer — its secrets, if any, are not labelled.
+
 Hand-assembled (no pypdf) exactly like gen_incremental_pdf.py so the byte layout
 and xref offsets are fully controlled.
 

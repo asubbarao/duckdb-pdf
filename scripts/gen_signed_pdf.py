@@ -8,6 +8,10 @@ Creates:
   - test/data/signed_fixture_key.pem / signed_fixture_cert.pem  — self-signed
     material used to produce the CMS blob (committed so rebuilds are identical)
 
+Synthetic by necessity: a verification test needs a signature it can trust the
+provenance of, and a tamper test needs a file someone deliberately damaged after
+signing. No published document is either.
+
 Requires: python3, openssl on PATH, cryptography (for key/cert generation only).
 """
 
