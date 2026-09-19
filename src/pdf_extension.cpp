@@ -605,7 +605,7 @@ static std::vector<LayoutWord> LayoutWordsFromBoxes(const std::vector<poppler::t
 	words.reserve(boxes.size());
 	for (const auto &b : boxes) {
 		string text = UStringToUtf8(b.text());
-		if (text.find_first_not_of(" \t\r\n\f\v") == string::npos) {
+		if (!pdf_ocr::HasGlyphs(text)) {
 			continue;
 		}
 		auto r = b.bbox();
@@ -619,6 +619,15 @@ static std::vector<LayoutWord> LayoutWordsFromBoxes(const std::vector<poppler::t
 		words.push_back(std::move(w));
 	}
 	return words;
+}
+
+// The same drop, applied to the box list itself. A page left with no boxes has
+// no text layer, which is the word-grain spelling of read_pdf's has_text_layer —
+// so both grains route the same pages to OCR and report the same used_ocr.
+static void DropGlyphlessBoxes(std::vector<poppler::text_box> &boxes) {
+	boxes.erase(std::remove_if(boxes.begin(), boxes.end(),
+	                           [](const poppler::text_box &b) { return !pdf_ocr::HasGlyphs(UStringToUtf8(b.text())); }),
+	            boxes.end());
 }
 
 // Geometry consumer for the qpdf-collected ruling segments — no qpdf here.
@@ -1810,7 +1819,7 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 				        ? LayoutPageText(LayoutWordsFromBoxes(page->text_list(poppler::page::text_list_include_font)),
 				                         width)
 				        : UStringToUtf8(page->text(poppler::rectf(), layout));
-				has_text_layer = native.find_first_not_of(" \t\r\n\f\v") != string::npos;
+				has_text_layer = pdf_ocr::HasGlyphs(native);
 				text = native;
 				want_ocr = bind.opt.force_ocr || (bind.opt.auto_ocr && !has_text_layer);
 			}
@@ -1822,7 +1831,7 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 			// loud missing-model error under force_ocr.
 			const bool best_effort = !bind.opt.force_ocr || has_text_layer;
 			auto ocr = OcrPageResult(page.get(), bind.opt, best_effort);
-			if (!ocr.text.empty()) {
+			if (pdf_ocr::HasGlyphs(ocr.text)) {
 				text = std::move(ocr.text);
 				used_ocr = true;
 				ocr_confidence = static_cast<double>(ocr.confidence);
@@ -2728,7 +2737,7 @@ static WordGrouping GroupWordsNative(const std::vector<poppler::text_box> &boxes
 	origin.reserve(boxes.size());
 	for (size_t i = 0; i < boxes.size(); i++) {
 		string text = UStringToUtf8(boxes[i].text());
-		if (text.find_first_not_of(" \t\r\n\f\v") == string::npos) {
+		if (!pdf_ocr::HasGlyphs(text)) {
 			continue;
 		}
 		auto r = boxes[i].bbox();
@@ -2751,7 +2760,7 @@ static WordGrouping GroupWordsOcr(const std::vector<OcrWord> &ocr, double page_w
 	words.reserve(ocr.size());
 	origin.reserve(ocr.size());
 	for (size_t i = 0; i < ocr.size(); i++) {
-		if (ocr[i].text.find_first_not_of(" \t\r\n\f\v") == string::npos) {
+		if (!pdf_ocr::HasGlyphs(ocr[i].text)) {
 			continue;
 		}
 		LayoutWord w;
@@ -2810,6 +2819,7 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 			// Probe native first so best_effort can stay false on image-only pages
 			// (loud missing-model error under explicit ocr:=true).
 			g.boxes = page->text_list(poppler::page::text_list_include_font);
+			DropGlyphlessBoxes(g.boxes);
 			const bool has_native = !g.boxes.empty();
 			g.ocr_boxes = OcrPageWords(page.get(), opt, /*best_effort=*/has_native);
 			if (!g.ocr_boxes.empty()) {
@@ -2820,6 +2830,7 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 			}
 		} else {
 			g.boxes = page->text_list(poppler::page::text_list_include_font);
+			DropGlyphlessBoxes(g.boxes);
 			if (!g.boxes.empty()) {
 				g.page_is_ocr = false;
 			} else if (opt.auto_ocr) {
@@ -3556,7 +3567,7 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
 			ElemWord w;
 			w.text = UStringToUtf8(b.text());
-			if (w.text.find_first_not_of(" \t\r\n\f\v") == string::npos) {
+			if (!pdf_ocr::HasGlyphs(w.text)) {
 				continue;
 			}
 			auto r = b.bbox();
@@ -6424,7 +6435,7 @@ static void PdfSplitBlankExecute(ClientContext &context, const string &input, co
 				continue; // unreadable page: never treat as a separator
 			}
 			string text = UStringToUtf8(page->text(poppler::rectf(), poppler::page::physical_layout));
-			bool text_blank = text.find_first_not_of(" \t\r\n\f\v") == string::npos;
+			bool text_blank = !pdf_ocr::HasGlyphs(text);
 			is_separator[i] = text_blank && PageRendersNearWhite(page.get(), blank_threshold);
 		}
 	}

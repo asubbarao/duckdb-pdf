@@ -105,6 +105,15 @@ struct Options {
 // Accepts text|utf8|plain, hocr|html, tsv|tsvtext (case-insensitive).
 std::string NormalizeOutputFormat(const std::string &name);
 
+// A run of whitespace is not text. Tesseract reports a glyph-less region as a
+// word box holding a single space, and poppler reports whitespace-only text
+// boxes; every "did this page yield text?" decision in the extension — native
+// and OCR, page grain and word grain — asks this one predicate, so the page
+// functions cannot disagree about whether a page has content.
+inline bool HasGlyphs(const std::string &s) {
+	return s.find_first_not_of(" \t\r\n\f\v") != std::string::npos;
+}
+
 struct TextResult {
 	std::string text;
 	int confidence = 0; // MeanTextConf 0..100
