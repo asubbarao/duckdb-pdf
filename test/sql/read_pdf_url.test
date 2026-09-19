@@ -267,14 +267,15 @@ SELECT length(pdf_json('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-
 ----
 true
 
-# The three that return nothing for this document still have to READ it rather
-# than fail to open it, so an empty result is the pass.
+# These still have to READ the document rather than fail to open it. It has no
+# form fields or signatures, but page 7 carries one Link annotation (a citation
+# to the talk this deck is based on), so that column is 1, not 0.
 query III
 SELECT (SELECT count(*) FROM pdf_form_fields('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf')),
        (SELECT count(*) FROM pdf_annotations('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf')),
        (SELECT count(*) FROM pdf_signatures('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf'));
 ----
-0	0	0
+0	1	0
 
 # A URL that does not exist fails as an HTTP error, not as a parse error.
 statement error

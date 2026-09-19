@@ -1,0 +1,13 @@
+# name: test/sql/zz_build_guard.test
+# description: the suite is testing the build in this tree, not one from ~/.duckdb
+# group: [sql]
+
+require pdf
+
+require-env EXPECTED_EXT_VERSION
+
+query I
+SELECT extension_version = '${EXPECTED_EXT_VERSION}'
+FROM duckdb_extensions() WHERE extension_name = 'pdf';
+----
+true
