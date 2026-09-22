@@ -5,6 +5,7 @@ fixtures are committed binaries. Re-run:
 
     uv run --with reportlab python3 test/data/gen_gdocs_lists.py
 """
+
 from pathlib import Path
 
 from reportlab.pdfbase import pdfmetrics

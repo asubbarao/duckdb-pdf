@@ -1327,11 +1327,11 @@ static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctio
 	// ocr_confidence: Tess MeanTextConf 0..100 when used_ocr, else NULL.
 	// Together they make image-only vs embedded-text detection first-class without
 	// a second pass over the file.
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::DOUBLE};
-	names = {"filename", "page", "page_count", "text", "width", "height", "has_text_layer", "used_ocr",
-	         "ocr_confidence"};
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::DOUBLE,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::DOUBLE};
+	names = {"filename", "page",           "page_count", "text",          "width",
+	         "height",   "has_text_layer", "used_ocr",   "ocr_confidence"};
 	return std::move(result);
 }
 
@@ -2330,8 +2330,8 @@ static unique_ptr<FunctionData> ReadPdfWordsBind(ClientContext &context, TableFu
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR,
 	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::INTEGER,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE};
-	names = {"filename", "page", "word", "x0", "y0", "x1", "y1", "font_name", "font_size", "source", "confidence",
-	         "line", "page_width", "page_height"};
+	names = {"filename",  "page",      "word",   "x0",         "y0",   "x1",         "y1",
+	         "font_name", "font_size", "source", "confidence", "line", "page_width", "page_height"};
 	return std::move(result);
 }
 
@@ -2888,8 +2888,7 @@ static size_t ElemSkipZw(const string &s, size_t i) {
 			}
 		}
 		// U+FEFF BOM / ZWNBSP = EF BB BF
-		if (i + 2 < s.size() && c0 == 0xEF && (unsigned char)s[i + 1] == 0xBB &&
-		    (unsigned char)s[i + 2] == 0xBF) {
+		if (i + 2 < s.size() && c0 == 0xEF && (unsigned char)s[i + 1] == 0xBB && (unsigned char)s[i + 2] == 0xBF) {
 			i += 3;
 			continue;
 		}
@@ -3204,7 +3203,7 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 	int last_0 = opt.last_page < 0 ? page_count : MinValue<int>(opt.last_page, page_count);
 
 	std::vector<std::pair<int, std::vector<ElemLine>>> page_lines; // (1-based page, lines)
-	std::map<int, double> page_h;                                 // 1-based page -> crop height
+	std::map<int, double> page_h;                                  // 1-based page -> crop height
 	ElemFontHistogram doc_hist;
 	for (int p = first_0; p < last_0; p++) {
 		unique_ptr<poppler::page> page(doc->create_page(p));
@@ -5773,6 +5772,19 @@ static string PdfOpsStem(const string &path) {
 	return base;
 }
 
+// pdf_write_page_images writes out_dir/<stem>/pN.png. A stem of '.' or '..'
+// (from filenames like '..pdf' / '...pdf') resolves to out_dir itself or its
+// parent, so preview files would land outside the caller-supplied directory.
+static void PdfOpsCheckOutputStem(const char *fn, const string &stem, const string &path) {
+	if (stem.empty()) {
+		throw InvalidInputException("%s: could not derive a stem from '%s'", fn, path);
+	}
+	if (stem == "." || stem == "..") {
+		throw InvalidInputException("%s: refusing output stem '%s' from '%s' (would write outside out_dir/<stem>/)", fn,
+		                            stem, path);
+	}
+}
+
 static void PdfOpsCheckInputExists(const char *fn, const string &path) {
 	auto fs = FileSystem::CreateLocal();
 	if (!fs->FileExists(path)) {
@@ -5800,6 +5812,11 @@ static string PdfMergeImpl(const vector<string> &inputs, const string &output) {
 	}
 	for (auto &in_path : inputs) {
 		PdfOpsCheckInputExists("pdf_merge", in_path);
+		// Same contract as pdf_rotate / PdfOpsCheckInOut: qpdf pulls source
+		// objects lazily during write, and overwriting an input destroys it.
+		if (in_path == output) {
+			throw InvalidInputException("pdf_merge: output path must differ from input path '%s'", output);
+		}
 	}
 	PdfOpsCheckOutputDir("pdf_merge", PdfOpsParentDir(output));
 	try {
@@ -7874,6 +7891,25 @@ static string PdfWriteJoinPath(const string &dir, const string &leaf) {
 	return dir + sep + leaf;
 }
 
+// Output layout is out_dir/<stem>/p{N}.png. Two inputs that share a stem would
+// silently overwrite each other. Compare stems case-insensitively so Windows
+// (and case-insensitive macOS) cannot collide on Hello.pdf vs hello.pdf.
+static void PdfWritePageImagesCheckStemCollisions(const vector<string> &files) {
+	std::map<string, string> claimed;
+	for (auto &path : files) {
+		string stem = PdfOpsStem(path);
+		PdfOpsCheckOutputStem("pdf_write_page_images", stem, path);
+		string key = StringUtil::Lower(stem);
+		auto it = claimed.find(key);
+		if (it != claimed.end()) {
+			throw InvalidInputException(
+			    "pdf_write_page_images: output collision: inputs '%s' and '%s' both map to stem '%s'", it->second, path,
+			    key);
+		}
+		claimed[key] = path;
+	}
+}
+
 static void PdfWriteBytesToFile(const string &path, const string &bytes, const char *fn_name) {
 	std::ofstream of(path, std::ios::binary | std::ios::trunc);
 	if (!of) {
@@ -7917,6 +7953,7 @@ static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, T
 	if (result->dpi < 1 || result->dpi > 2400) {
 		throw InvalidInputException("pdf_write_page_images: dpi must be between 1 and 2400 (got %d)", result->dpi);
 	}
+	PdfWritePageImagesCheckStemCollisions(result->files);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BIGINT};
 	names = {"file", "page", "out_path", "width", "height", "bytes"};
@@ -7953,9 +7990,6 @@ static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePage
 		}
 
 		string stem = PdfOpsStem(path);
-		if (stem.empty()) {
-			throw InvalidInputException("pdf_write_page_images: could not derive a stem from '%s'", path);
-		}
 		string stem_dir = PdfWriteJoinPath(bind.out_dir, stem);
 		if (!fs->DirectoryExists(stem_dir)) {
 			try {
@@ -8182,6 +8216,18 @@ static void PdfRepairNoPwFun(DataChunk &args, ExpressionState &state, Vector &re
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	// Scalar PDF writers have observable filesystem side effects. Mark them
+	// volatile so constant expressions are executed instead of being folded.
+	auto register_volatile_scalar = [&loader](ScalarFunction function) {
+		function.SetVolatile();
+		loader.RegisterFunction(std::move(function));
+	};
+	auto mark_volatile_scalars = [](ScalarFunctionSet &functions) {
+		for (auto &function : functions.functions) {
+			function.SetVolatile();
+		}
+	};
+
 	TableFunction read_pdf("read_pdf", {LogicalType::VARCHAR}, ReadPdfScan, ReadPdfBind, ReadPdfInitGlobal,
 	                       ReadPdfInitLocal);
 	AddCommonNamedParams(read_pdf);
@@ -8327,14 +8373,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	tesseract_ocr_set.AddFunction(ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER,
 	                                              LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BOOLEAN},
 	                                             LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(ScalarFunction(
-	    {LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
-	     LogicalType::BOOLEAN, map_vv},
-	    LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(ScalarFunction(
-	    {LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
-	     LogicalType::BOOLEAN, map_vv, LogicalType::VARCHAR},
-	    LogicalType::VARCHAR, TesseractOcrDispatch));
+	tesseract_ocr_set.AddFunction(
+	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
+	                    LogicalType::VARCHAR, LogicalType::BOOLEAN, map_vv},
+	                   LogicalType::VARCHAR, TesseractOcrDispatch));
+	tesseract_ocr_set.AddFunction(
+	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
+	                    LogicalType::VARCHAR, LogicalType::BOOLEAN, map_vv, LogicalType::VARCHAR},
+	                   LogicalType::VARCHAR, TesseractOcrDispatch));
 	loader.RegisterFunction(tesseract_ocr_set);
 
 	// Named-param image OCR (scalars cannot take named maps). format=text|hocr|tsv.
@@ -8362,17 +8408,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	to_pdf_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, ToPdfFun));
 	to_pdf_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, ToPdfOutFun));
+	mark_volatile_scalars(to_pdf_set);
 	loader.RegisterFunction(to_pdf_set);
 
 	ScalarFunctionSet write_pdf_set("write_pdf");
 	write_pdf_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, WritePdfFun));
 	write_pdf_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, WritePdfOutFun));
+	mark_volatile_scalars(write_pdf_set);
 	loader.RegisterFunction(write_pdf_set);
 
 	// document-level qpdf operations
-	loader.RegisterFunction(ScalarFunction("pdf_merge", {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
-	                                       LogicalType::VARCHAR, PdfMergeFun));
+	register_volatile_scalar(ScalarFunction("pdf_merge",
+	                                        {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
+	                                        LogicalType::VARCHAR, PdfMergeFun));
 
 	ScalarFunctionSet pdf_rotate_set("pdf_rotate");
 	pdf_rotate_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER},
@@ -8380,6 +8429,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_rotate_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR},
 	                   LogicalType::VARCHAR, PdfRotatePagesFun));
+	mark_volatile_scalars(pdf_rotate_set);
 	loader.RegisterFunction(pdf_rotate_set);
 
 	TableFunction pdf_split("pdf_split", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfSplitScan, PdfSplitBind,
@@ -8392,8 +8442,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(pdf_split_blank);
 
 	// qpdf everyday suite
-	loader.RegisterFunction(ScalarFunction("pdf_compress", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                       LogicalType::VARCHAR, PdfCompressFun));
+	register_volatile_scalar(ScalarFunction("pdf_compress", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                        LogicalType::VARCHAR, PdfCompressFun));
 
 	ScalarFunctionSet pdf_encrypt_set("pdf_encrypt");
 	pdf_encrypt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -8401,15 +8451,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_encrypt_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                   LogicalType::VARCHAR, PdfEncryptOwnerFun));
+	mark_volatile_scalars(pdf_encrypt_set);
 	loader.RegisterFunction(pdf_encrypt_set);
 
-	loader.RegisterFunction(ScalarFunction("pdf_decrypt",
-	                                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                       LogicalType::VARCHAR, PdfDecryptFun));
+	register_volatile_scalar(ScalarFunction("pdf_decrypt",
+	                                        {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                        LogicalType::VARCHAR, PdfDecryptFun));
 
-	loader.RegisterFunction(ScalarFunction("pdf_pages",
-	                                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                       LogicalType::VARCHAR, PdfPagesFun));
+	register_volatile_scalar(ScalarFunction("pdf_pages",
+	                                        {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                        LogicalType::VARCHAR, PdfPagesFun));
 
 	// pdf_watermark: 3-arg (default opacity 0.30) + 4-arg (explicit opacity).
 	ScalarFunctionSet pdf_watermark_set("pdf_watermark");
@@ -8418,9 +8469,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_watermark_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::DOUBLE},
 	                   LogicalType::VARCHAR, PdfWatermarkOpacityFun));
+	mark_volatile_scalars(pdf_watermark_set);
 	loader.RegisterFunction(pdf_watermark_set);
 
-	loader.RegisterFunction(ScalarFunction(
+	register_volatile_scalar(ScalarFunction(
 	    "pdf_bates", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
 	    LogicalType::VARCHAR, PdfBatesFun));
 
@@ -8542,6 +8594,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfRepairNoPwFun));
 	pdf_repair_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                                          LogicalType::VARCHAR, PdfRepairFun));
+	mark_volatile_scalars(pdf_repair_set);
 	loader.RegisterFunction(pdf_repair_set);
 
 	// COPY TO pdf
