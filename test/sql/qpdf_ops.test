@@ -209,6 +209,17 @@ SELECT pdf_merge(['__TEST_DIR__/qm1.pdf', NULL], '__TEST_DIR__/qnull.pdf');
 ----
 input list contains a NULL path
 
+# merge onto an input path is refused (would clobber a source file)
+statement error
+SELECT pdf_merge(['__TEST_DIR__/qm1.pdf', '__TEST_DIR__/qm2.pdf'], '__TEST_DIR__/qm1.pdf');
+----
+output path must differ from input path
+
+statement error
+SELECT pdf_merge(['__TEST_DIR__/qm1.pdf', '__TEST_DIR__/qm2.pdf'], '__TEST_DIR__/qm2.pdf');
+----
+output path must differ from input path
+
 # rotate in place is refused (qpdf reads the source lazily during write)
 statement error
 SELECT pdf_rotate('__TEST_DIR__/qrot90.pdf', '__TEST_DIR__/qrot90.pdf', 90);

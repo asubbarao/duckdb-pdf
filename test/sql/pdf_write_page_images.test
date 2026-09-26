@@ -116,3 +116,36 @@ SELECT bool_and(starts_with(hex(content), '89504E47')) AND count(*) = 3
 FROM read_blob('__TEST_DIR__/multi/**/*.png');
 ----
 true
+
+# ── stem collision preflight: no silent overwrite of out_dir/<stem>/ ───────
+
+statement error
+SELECT * FROM pdf_write_page_images(['test/data/hello.pdf', 'test/data/hello.pdf'],
+                                    '__TEST_DIR__/collision', dpi := 50);
+----
+output collision
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/collision/**');
+----
+0
+
+# ── reserved parent stem must not escape out_dir/<stem>/ ────────────────────
+
+statement ok
+COPY (SELECT 'dotdot stem fixture' AS t) TO '__TEST_DIR__/...pdf' (FORMAT pdf);
+
+statement error
+SELECT * FROM pdf_write_page_images('__TEST_DIR__/...pdf', '__TEST_DIR__/escape_out', dpi := 50);
+----
+refusing output stem
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/escape_out/**');
+----
+0
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/p1.png');
+----
+0
