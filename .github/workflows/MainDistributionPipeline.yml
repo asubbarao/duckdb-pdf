@@ -42,7 +42,8 @@ jobs:
   # would be a copy of its docker/vcpkg/ccache plumbing that drifts.
   # test_env_variables is the workflow's own hook for extra test env; the
   # DUCKDB_TEST_AUTOLOADING the runner needs to find httpfs is exported by this
-  # repo's Makefile, so it reaches every build including the matrix above.
+  # repo's Makefile, so it reaches every build including the matrix above, and
+  # the Makefile installs the published httpfs when PDF_NETWORK_TESTS is set.
   network-tests:
     name: Network tests (real published PDFs)
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata

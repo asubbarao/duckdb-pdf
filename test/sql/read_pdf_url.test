@@ -5,9 +5,12 @@
 require pdf
 
 # httpfs is out of tree in DuckDB 1.5, so the test binary only has it when the
-# runner is allowed to autoload. The repo Makefile exports
-# DUCKDB_TEST_AUTOLOADING=all for exactly that reason; running this file by hand:
+# runner is allowed to autoload, and the runner autoinstalls only from the
+# build's own repository, which has no httpfs. So with PDF_NETWORK_TESTS set
+# the repo Makefile installs the published one, and it exports
+# DUCKDB_TEST_AUTOLOADING=all. Running this file by hand:
 #
+#   ./build/release/duckdb -c "INSTALL httpfs;"
 #   DUCKDB_TEST_AUTOLOADING=all PDF_NETWORK_TESTS=1 \
 #     ./build/release/test/unittest test/sql/read_pdf_url.test
 require httpfs

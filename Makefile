@@ -24,12 +24,24 @@ test_release_internal: force_install_release
 test_debug_internal: force_install_debug
 test_reldebug_internal: force_install_reldebug
 
+# The runner autoinstalls only from build/<type>/repository, which holds what
+# this tree builds — and httpfs is not among it. So the network tests need the
+# published httpfs installed before they run; without it their first remote
+# statement fails with "Failed to install local extension httpfs". Only when
+# they are enabled, so an offline `make test` never reaches for the network.
+ifneq ($(PDF_NETWORK_TESTS),)
+INSTALL_HTTPFS = ./build/$(1)/duckdb -c "INSTALL httpfs;"
+endif
+
 force_install_release:
 	@$(call FORCE_INSTALL_LOCAL,release)
+	@$(call INSTALL_HTTPFS,release)
 force_install_debug:
 	@$(call FORCE_INSTALL_LOCAL,debug)
+	@$(call INSTALL_HTTPFS,debug)
 force_install_reldebug:
 	@$(call FORCE_INSTALL_LOCAL,reldebug)
+	@$(call INSTALL_HTTPFS,reldebug)
 
 .PHONY: force_install_release force_install_debug force_install_reldebug
 
