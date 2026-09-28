@@ -377,45 +377,71 @@ Pix *PreprocessPixForOcr(Pix *pixs, int dpi) {
 // missing or datapath is wrong — we never Init without a verified model file
 // (see EnsureTesseract). This guard only covers residual library chatter
 // (version banners, non-fatal path probes) so the DuckDB CLI stays clean.
+//
+// fd 2 belongs to the whole process and scan threads initialise their engines
+// at the same time. Guards that each saved and restored it could save the
+// /dev/null another guard installed and restore that last, silencing stderr
+// for the rest of the process. So they share one saved fd under a lock: the
+// first guard in redirects, the last one out restores.
+static std::mutex g_stderr_silence_lock;
+static int g_stderr_silence_depth = 0;
+static int g_stderr_saved = -1;
+
 struct StderrSilence {
 #ifdef _WIN32
-	int saved = -1;
 	StderrSilence() {
+		std::lock_guard<std::mutex> guard(g_stderr_silence_lock);
+		if (g_stderr_silence_depth++ > 0) {
+			return;
+		}
 		fflush(stderr);
 		int devnull = _open("NUL", _O_WRONLY);
 		if (devnull >= 0) {
-			saved = _dup(_fileno(stderr));
-			if (saved >= 0) {
+			g_stderr_saved = _dup(_fileno(stderr));
+			if (g_stderr_saved >= 0) {
 				_dup2(devnull, _fileno(stderr));
 			}
 			_close(devnull);
 		}
 	}
 	~StderrSilence() {
-		if (saved >= 0) {
+		std::lock_guard<std::mutex> guard(g_stderr_silence_lock);
+		if (--g_stderr_silence_depth > 0) {
+			return;
+		}
+		if (g_stderr_saved >= 0) {
 			fflush(stderr);
-			_dup2(saved, _fileno(stderr));
-			_close(saved);
+			_dup2(g_stderr_saved, _fileno(stderr));
+			_close(g_stderr_saved);
+			g_stderr_saved = -1;
 		}
 	}
 #else
-	int saved = -1;
 	StderrSilence() {
+		std::lock_guard<std::mutex> guard(g_stderr_silence_lock);
+		if (g_stderr_silence_depth++ > 0) {
+			return;
+		}
 		fflush(stderr);
 		int devnull = open("/dev/null", O_WRONLY);
 		if (devnull >= 0) {
-			saved = dup(fileno(stderr));
-			if (saved >= 0) {
+			g_stderr_saved = dup(fileno(stderr));
+			if (g_stderr_saved >= 0) {
 				dup2(devnull, fileno(stderr));
 			}
 			close(devnull);
 		}
 	}
 	~StderrSilence() {
-		if (saved >= 0) {
+		std::lock_guard<std::mutex> guard(g_stderr_silence_lock);
+		if (--g_stderr_silence_depth > 0) {
+			return;
+		}
+		if (g_stderr_saved >= 0) {
 			fflush(stderr);
-			dup2(saved, fileno(stderr));
-			close(saved);
+			dup2(g_stderr_saved, fileno(stderr));
+			close(g_stderr_saved);
+			g_stderr_saved = -1;
 		}
 	}
 #endif
