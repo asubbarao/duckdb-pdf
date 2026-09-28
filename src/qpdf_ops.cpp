@@ -720,9 +720,13 @@ std::vector<SignatureInfo> ReadSignatures(const std::string &pdf_bytes, const st
 		if (contents.isString()) {
 			// qpdf returns the decoded string bytes (hex already unhexed).
 			cms_der = contents.getStringValue();
-			// Strip trailing NUL padding writers leave in the fixed-width hex hole.
-			while (!cms_der.empty() && cms_der.back() == '\0') {
-				cms_der.pop_back();
+			// Writers pad the fixed-width hole with NULs after the DER. The DER
+			// itself can end in 0x00 — its last bytes are the signature value —
+			// so stripping NULs would truncate one signature in 256. d2i takes
+			// the length from the DER header and ignores the padding; only an
+			// all-NUL hole (an unfilled placeholder) means there is no blob.
+			if (cms_der.find_first_not_of('\0') == std::string::npos) {
+				cms_der.clear();
 			}
 		}
 
