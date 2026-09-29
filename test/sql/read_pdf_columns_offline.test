@@ -1,0 +1,47 @@
+# name: test/sql/read_pdf_columns_offline.test
+# description: a spanning word does not disable two-column detection
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# One word crosses the gutter, but twenty lines in each column still establish
+# the page as a two-column layout.
+query I
+SELECT COUNT(DISTINCT column_index) >= 2
+FROM read_pdf_words('test/data/two_columns_crossing.pdf');
+----
+true
+
+query I
+SELECT COUNT(*) = 1
+FROM read_pdf_words('test/data/two_columns_crossing.pdf')
+WHERE x0 < 330 AND x1 > 300;
+----
+true
+
+query I
+SELECT max(line) FILTER (column_index = 0) < min(line) FILTER (column_index = 1)
+FROM read_pdf_words('test/data/two_columns_crossing.pdf');
+----
+true
+
+# The opposite failure: a four-column table with full-width prose above and below it
+# has column gaps that line up like a gutter, but most of the page's words are prose
+# lines crossing them. Cutting there would slice each prose line in two, so the page
+# stays one column.
+query I
+SELECT list(DISTINCT column_index) = [0]
+FROM read_pdf_words('test/data/single_column_table.pdf');
+----
+true
+
+# Every prose line is still one line, in reading order.
+query I
+SELECT count(*) = 14
+FROM read_pdf_lines('test/data/single_column_table.pdf')
+WHERE starts_with(text, 'Prose line') AND ends_with(text, 'never stops early.');
+----
+true
