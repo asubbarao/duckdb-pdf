@@ -92,7 +92,7 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 | `ocr_config` | VARCHAR | — | Path or tessdata config name for `ReadConfigFile` (applied after Init, before `ocr_vars`). |
 | `ignore_errors` | BOOLEAN | false | `read_pdf` / `read_pdf_meta` only: skip unopenable files in a multi-file scan instead of aborting it. |
 
-`read_pdf_elements` and `pdf_chunks` accept only `password`, `first_page`, `last_page` (plus `pdf_chunks`' own `chunk_size` / `overlap`) — they read the native text layer only.
+`read_pdf_elements` and `pdf_chunks` accept the OCR options above, plus `password`, `first_page`, and `last_page` (`pdf_chunks` also has `chunk_size` / `overlap`). Their legacy default remains native-only; set `auto_ocr := true` or `ocr := true` to include OCR words.
 
 ### `read_pdf` — one row per page
 
@@ -218,7 +218,7 @@ ORDER BY filename, page, table_index, row_index;
 
 Columns: `file`, `page_number` (1-based), `element_idx` (1-based within page), `element_type`, `text`, `font_size` (dominant size of the element, `NULL` when the PDF carries no font info), `bbox_x0`, `bbox_y0`, `bbox_x1`, `bbox_y1`.
 
-Elements are built by deterministic geometry over Poppler's positioned word list — words cluster into lines by vertical overlap, lines into blocks by vertical gap (> 0.6× median line height), font-size change (> 15%), or a list marker starting a line. Classification: `heading` = dominant font ≥ 1.15× the document's modal body size and < 200 chars, OR a short ALL-CAPS block at any font size; `list_item` = first line starts with a bullet glyph (`• – ▪ ● ○ ◦ ∙ ‣ ⁃ · ▸`, or `- ` / `* `) or an `N.` / `N)` marker (zero-width format chars after the marker — Google Docs `●<ZWSP>` / `1.<ZWSP>` — are skipped); `paragraph` = any other block of ≥ 3 words; `other` = the rest (page numbers, isolated fragments, and **running headers/footers**). A heading instance that sits in the top or bottom 12% of the page is demoted to `other` when the same text occupies that band on ≥ 5 pages (even/odd running titles). A mid-page cover byline with the same words stays a heading. Reads the native text layer only (no OCR) and does not attempt table detection — use `read_pdf_tables` for tables.
+Elements are built by deterministic geometry over the shared Poppler/Tesseract positioned word list — words cluster into lines by vertical overlap, lines into blocks by vertical gap (> 0.6× median line height), font-size (or OCR box-height) change (> 15%), or a list marker starting a line. Classification: `heading` = dominant font/box-height ≥ 1.15× the document/page body size and < 200 chars, OR a short ALL-CAPS block at any size; `list_item` = first line starts with a bullet glyph (`• – ▪ ● ○ ◦ ∙ ‣ ⁃ · ▸`, or `- ` / `* `) or an `N.` / `N)` marker (zero-width format chars after the marker — Google Docs `●<ZWSP>` / `1.<ZWSP>` — are skipped); `paragraph` = any other block of ≥ 3 words; `other` = the rest (page numbers, isolated fragments, and **running headers/footers**). A heading instance that sits in the top or bottom 12% of the page is demoted to `other` when the same text occupies that band on ≥ 5 pages (even/odd running titles). A mid-page cover byline with the same words stays a heading. OCR elements report `NULL` for `font_size` and `font_name`; table detection remains the job of `read_pdf_tables`.
 
 ```sql
 -- Document outline: just the headings
@@ -975,8 +975,8 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `read_pdf_lines(files)` | Table | One row per layout-preserving line with the printed page `label`. |
 | `read_pdf_words(files)` / `read_pdf_layout` | Table | One row per word: bbox, font, OCR source/confidence, geometric `line`, `page_width`/`page_height`, and printed page `label` on `read_pdf_words`. |
 | `read_pdf_tables(files)` | Table | One row per detected table row; cells as `VARCHAR[]`. |
-| `read_pdf_elements(files)` | Table | One row per layout element (`heading`/`paragraph`/`list_item`/`other`) with bbox and dominant font name. |
-| `pdf_chunks(files)` | Table | Retrieval-ready chunks with section headings; `chunk_size`/`overlap` knobs. |
+| `read_pdf_elements(files)` | Table | One row per layout element with bbox, OCR support, and dominant font name. |
+| `pdf_chunks(files)` | Table | Retrieval-ready chunks with section headings and OCR support; `chunk_size`/`overlap` knobs. |
 | `pdf_info(files)` | Table | Full per-file census: metadata, timestamps, dimensions, size, encryption. |
 | `pdf_pages_info(files)` | Table | One row per page: crop/media size, rotation, orientation, label, duration. |
 | `read_pdf_meta(files)` | Table | Legacy per-file metadata (subset of `pdf_info`). |

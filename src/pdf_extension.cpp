@@ -2137,6 +2137,34 @@ struct OcrWord {
 	float confidence;
 };
 
+static std::vector<OcrWord> OcrPageWords(poppler::page *page, const PdfOptions &po, bool best_effort);
+
+// read_pdf_words and read_pdf_elements must make the same OCR/native choice
+// for a page so their text and geometry cannot drift apart.
+static bool LoadWordsForPage(poppler::page *page, const PdfOptions &opt, std::vector<MergedTextBox> &boxes,
+                             std::vector<OcrWord> &ocr_boxes) {
+	boxes.clear();
+	ocr_boxes.clear();
+	if (opt.force_ocr) {
+		// Probe native first so best_effort can stay false on image-only pages
+		// (loud missing-model error under explicit ocr:=true).
+		boxes = MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font));
+		const bool has_native = !boxes.empty();
+		ocr_boxes = OcrPageWords(page, opt, /*best_effort=*/has_native);
+		if (!ocr_boxes.empty()) {
+			boxes.clear();
+			return true;
+		}
+		return false;
+	}
+	boxes = MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font));
+	if (!boxes.empty() || !opt.auto_ocr) {
+		return false;
+	}
+	ocr_boxes = OcrPageWords(page, opt, /*best_effort=*/true);
+	return !ocr_boxes.empty();
+}
+
 // Render a poppler page and OCR it with tesseract, honoring engine knobs plus
 // the preprocessing and confidence-retry toggles on PdfOptions. When retry is
 // on and the first pass is low-confidence at a sub-400 dpi render, we re-render
@@ -2274,7 +2302,7 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 	}
 }
 
-static void AddCommonNamedParams(TableFunction &fn) {
+static void AddOcrNamedParams(TableFunction &fn) {
 	fn.named_parameters["ocr"] = LogicalType::BOOLEAN;
 	fn.named_parameters["auto_ocr"] = LogicalType::BOOLEAN;
 	fn.named_parameters["ocr_language"] = LogicalType::VARCHAR;
@@ -2293,6 +2321,14 @@ static void AddCommonNamedParams(TableFunction &fn) {
 	fn.named_parameters["ocr_endpoint"] = LogicalType::VARCHAR;
 	fn.named_parameters["ocr_vars"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	fn.named_parameters["ocr_config"] = LogicalType::VARCHAR;
+}
+
+static void AddCommonNamedParams(TableFunction &fn) {
+	AddOcrNamedParams(fn);
+	fn.named_parameters["parse_tables"] = LogicalType::BOOLEAN;
+	fn.named_parameters["password"] = LogicalType::VARCHAR;
+	fn.named_parameters["first_page"] = LogicalType::INTEGER;
+	fn.named_parameters["last_page"] = LogicalType::INTEGER;
 }
 
 static vector<string> ResolveFiles(ClientContext &context, const string &pattern) {
@@ -3713,31 +3749,7 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 		if (g.has_page_labels) {
 			g.page_label = std::move(poppler_label);
 		}
-		if (opt.force_ocr) {
-			// Prefer OCR; fall back to native words when the raster is blank
-			// (e.g. missing display fonts on a text-only PDF under vcpkg poppler).
-			// Probe native first so best_effort can stay false on image-only pages
-			// (loud missing-model error under explicit ocr:=true).
-			g.boxes = MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font));
-			const bool has_native = !g.boxes.empty();
-			g.ocr_boxes = OcrPageWords(page.get(), opt, /*best_effort=*/has_native);
-			if (!g.ocr_boxes.empty()) {
-				g.boxes.clear();
-				g.page_is_ocr = true;
-			} else {
-				g.page_is_ocr = false;
-			}
-		} else {
-			g.boxes = MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font));
-			if (!g.boxes.empty()) {
-				g.page_is_ocr = false;
-			} else if (opt.auto_ocr) {
-				g.ocr_boxes = OcrPageWords(page.get(), opt, /*best_effort=*/true);
-				g.page_is_ocr = !g.ocr_boxes.empty();
-			} else {
-				g.page_is_ocr = false;
-			}
-		}
+		g.page_is_ocr = LoadWordsForPage(page.get(), opt, g.boxes, g.ocr_boxes);
 		auto grouping =
 		    g.page_is_ocr ? GroupWordsOcr(g.ocr_boxes, g.page_width) : GroupWordsNative(g.boxes, g.page_width);
 		g.line_ids = std::move(grouping.line);
@@ -3965,9 +3977,8 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 //   (file, page_number, element_idx, element_type, text, font_size,
 //    bbox_x0, bbox_y0, bbox_x1, bbox_y1, font_name)
 //
-// Deterministic geometry over poppler-cpp's positioned word list
-// (page::text_list with font info). No OCR path in v1: pages without a
-// native text layer emit no elements. Pipeline: words -> lines -> blocks
+// Deterministic geometry over the shared native/OCR word source
+// (page::text_list with font info, or tesseract boxes). Pipeline: words -> lines -> blocks
 // -> classified elements. All thresholds live in the named constants
 // below; the rules are the spec.
 //
@@ -3987,10 +3998,8 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 //          (relative to the previous line's size);
 //       c. LIST BREAK: the line begins with a list marker (see rule 4)
 //          — every list item becomes its own block regardless of gaps.
-//  3. BODY SIZE: the document's body font size is the modal font size
-//     weighted by character count across every word in the scanned page
-//     range (the size that renders the most characters wins; ties go to
-//     the smaller size for determinism).
+//  3. BODY SIZE: native pages use the document's modal font size weighted by
+//     character count; OCR pages use their median line height as the baseline.
 //
 // CLASSIFICATION CONTRACT (first match wins, in this order)
 //  4. heading    : EITHER (a) block's dominant font size >=
@@ -4058,13 +4067,17 @@ struct ElemWord {
 	string font_name;
 	double font_size = 0.0;
 	bool has_font = false;
+	double size_signal = 0.0;
+	bool has_size_signal = false;
 };
 
 struct ElemLine {
 	double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
 	std::vector<ElemWord> words;
 	string text;
-	double font_size = 0.0; // dominant (modal by char count); 0 => unknown
+	double font_size = 0.0;   // dominant (modal by char count); 0 => unknown
+	double size_signal = 0.0; // classification size; font size or OCR box height
+	bool has_font = false;
 };
 
 struct PdfElementRow {
@@ -4354,7 +4367,7 @@ static std::vector<ElemLine> ElemBuildLines(std::vector<ElemWord> words, double 
 		g.y0 = w.y0;
 		g.x1 = w.x1;
 		g.y1 = w.y1;
-		g.font_size = w.has_font ? w.font_size : 0.0;
+		g.font_size = w.has_size_signal ? w.size_signal : (w.has_font ? w.font_size : 0.0);
 		g.text = w.text;
 		geom.push_back(std::move(g));
 	}
@@ -4377,6 +4390,7 @@ static std::vector<ElemLine> ElemBuildLines(std::vector<ElemWord> words, double 
 		std::sort(idxs.begin(), idxs.end(), [&](size_t a, size_t b) { return words[a].x0 < words[b].x0; });
 		auto &line = lines[li];
 		ElemFontHistogram line_hist;
+		ElemFontHistogram line_size_hist;
 		for (size_t k = 0; k < idxs.size(); k++) {
 			const auto &w = words[idxs[k]];
 			if (k == 0) {
@@ -4397,16 +4411,23 @@ static std::vector<ElemLine> ElemBuildLines(std::vector<ElemWord> words, double 
 			if (w.has_font) {
 				ElemFontTally(line_hist, w.font_size, w.text.size());
 			}
+			if (w.has_size_signal) {
+				ElemFontTally(line_size_hist, w.size_signal, w.text.size());
+			} else if (w.has_font) {
+				ElemFontTally(line_size_hist, w.font_size, w.text.size());
+			}
 			line.words.push_back(w);
 		}
 		line.font_size = ElemModalFontSize(line_hist);
+		line.size_signal = ElemModalFontSize(line_size_hist);
+		line.has_font = !line_hist.empty();
 	}
 	return lines;
 }
 
 // Rules 2 + 4-7: segment one page's lines into blocks and classify them.
-// body_size is the document-wide modal size (rule 3); rows are appended in
-// reading order with 1-based element_idx.
+// body_size follows rule 3; rows are appended in reading order with 1-based
+// element_idx.
 static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_number, double body_size,
                                std::vector<PdfElementRow> &rows) {
 	if (lines.empty()) {
@@ -4429,9 +4450,9 @@ static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_numb
 			double gap = cur.y0 - prev.y1;
 			bool gap_break = median_height > 0 && gap > ELEM_BLOCK_GAP_RATIO * median_height; // rule 2a
 			bool font_break =
-			    prev.font_size > 0 && cur.font_size > 0 &&
-			    std::fabs(cur.font_size - prev.font_size) > ELEM_FONT_CHANGE_RATIO * prev.font_size; // rule 2b
-			bool list_break = ElemIsListMarkerLine(cur.text);                                        // rule 2c
+			    prev.size_signal > 0 && cur.size_signal > 0 &&
+			    std::fabs(cur.size_signal - prev.size_signal) > ELEM_FONT_CHANGE_RATIO * prev.size_signal; // rule 2b
+			bool list_break = ElemIsListMarkerLine(cur.text);                                              // rule 2c
 			start_new = gap_break || font_break || list_break;
 		}
 		if (start_new) {
@@ -4446,6 +4467,7 @@ static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_numb
 		row.page_number = page_number;
 		row.element_idx = ++element_idx;
 		ElemFontHistogram block_hist;
+		ElemFontHistogram block_size_hist;
 		ElemFontNameHistogram block_font_hist;
 		size_t word_count = 0;
 		size_t word_order = 0;
@@ -4472,18 +4494,24 @@ static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_numb
 					ElemFontTally(block_hist, w.font_size, w.text.size());
 					ElemFontTally(block_font_hist, w.font_name, w.text.size(), word_order);
 				}
+				if (w.has_size_signal) {
+					ElemFontTally(block_size_hist, w.size_signal, w.text.size());
+				} else if (w.has_font) {
+					ElemFontTally(block_size_hist, w.font_size, w.text.size());
+				}
 				word_order++;
 			}
 		}
 		row.font_size = ElemModalFontSize(block_hist);
 		row.has_font = row.font_size > 0;
+		double block_size = ElemModalFontSize(block_size_hist);
 		row.font_name = ElemModalFontName(block_font_hist);
 		row.has_font_name = !block_font_hist.empty();
 
 		const string &first_line_text = lines[block.front()].text;
-		if ((row.has_font && body_size > 0 && row.font_size >= ELEM_HEADING_SIZE_RATIO * body_size &&
+		if ((block_size > 0 && body_size > 0 && block_size >= ELEM_HEADING_SIZE_RATIO * body_size &&
 		     row.text.size() < ELEM_HEADING_MAX_CHARS) ||
-		    ((!row.has_font || body_size <= 0 || row.font_size >= ELEM_CAPS_HEADING_MIN_SIZE_RATIO * body_size) &&
+		    ((body_size <= 0 || block_size >= ELEM_CAPS_HEADING_MIN_SIZE_RATIO * body_size) &&
 		     ElemIsAllCapsHeading(row.text, word_count))) {
 			row.element_type = "heading"; // rule 4 (font size) or 4b (ALL-CAPS)
 		} else if (ElemIsListMarkerLine(first_line_text)) {
@@ -4513,8 +4541,13 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 	int first_0 = opt.first_page > 0 ? opt.first_page - 1 : 0;
 	int last_0 = opt.last_page < 0 ? page_count : MinValue<int>(opt.last_page, page_count);
 
-	std::vector<std::pair<int, std::vector<ElemLine>>> page_lines; // (1-based page, lines)
-	std::map<int, double> page_h;                                  // 1-based page -> crop height
+	struct ElemPageLines {
+		int page_number;
+		std::vector<ElemLine> lines;
+		bool is_ocr;
+	};
+	std::vector<ElemPageLines> page_lines;
+	std::map<int, double> page_h; // 1-based page -> crop height
 	ElemFontHistogram doc_hist;
 	for (int p = first_0; p < last_0; p++) {
 		unique_ptr<poppler::page> page(doc->create_page(p));
@@ -4522,29 +4555,59 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 			continue;
 		}
 		page_h[p + 1] = page->page_rect().height();
+		std::vector<MergedTextBox> boxes;
+		std::vector<OcrWord> ocr_boxes;
+		bool page_is_ocr = LoadWordsForPage(page.get(), opt, boxes, ocr_boxes);
 		std::vector<ElemWord> words;
-		for (auto &b : MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font))) {
-			ElemWord w;
-			w.text = b.text;
-			w.x0 = b.x0;
-			w.y0 = b.y0;
-			w.x1 = b.x1;
-			w.y1 = b.y1;
-			w.has_font = b.has_font;
-			w.font_name = b.has_font ? b.font_name : string();
-			w.font_size = b.has_font ? b.font_size : 0.0;
-			if (w.has_font) {
-				ElemFontTally(doc_hist, w.font_size, w.text.size());
+		if (page_is_ocr) {
+			// OCR has no font metrics; box height is the scale signal, with the
+			// median line height providing the page's body-size baseline.
+			words.reserve(ocr_boxes.size());
+			for (auto &b : ocr_boxes) {
+				ElemWord w;
+				w.text = b.text;
+				w.x0 = b.x0;
+				w.y0 = b.y0;
+				w.x1 = b.x1;
+				w.y1 = b.y1;
+				w.size_signal = b.y1 - b.y0;
+				w.has_size_signal = w.size_signal > 0.0;
+				words.push_back(std::move(w));
 			}
-			words.push_back(std::move(w));
+		} else {
+			words.reserve(boxes.size());
+			for (auto &b : boxes) {
+				ElemWord w;
+				w.text = b.text;
+				w.x0 = b.x0;
+				w.y0 = b.y0;
+				w.x1 = b.x1;
+				w.y1 = b.y1;
+				w.has_font = b.has_font;
+				w.font_name = b.has_font ? b.font_name : string();
+				w.font_size = b.has_font ? b.font_size : 0.0;
+				if (w.has_font) {
+					ElemFontTally(doc_hist, w.font_size, w.text.size());
+				}
+				words.push_back(std::move(w));
+			}
 		}
 		if (!words.empty()) {
-			page_lines.emplace_back(p + 1, ElemBuildLines(std::move(words), page->page_rect().width()));
+			page_lines.push_back({p + 1, ElemBuildLines(std::move(words), page->page_rect().width()), page_is_ocr});
 		}
 	}
 	double body_size = ElemModalFontSize(doc_hist);
 	for (auto &pl : page_lines) {
-		ElemEmitPageBlocks(pl.second, pl.first, body_size, rows);
+		double page_body_size = body_size;
+		if (pl.is_ocr) {
+			std::vector<double> line_heights;
+			line_heights.reserve(pl.lines.size());
+			for (auto &line : pl.lines) {
+				line_heights.push_back(line.y1 - line.y0);
+			}
+			page_body_size = Median(std::move(line_heights));
+		}
+		ElemEmitPageBlocks(pl.lines, pl.page_number, page_body_size, rows);
 	}
 	ElemDemoteRunningHeaders(rows, page_h);
 }
@@ -4568,6 +4631,8 @@ static unique_ptr<FunctionData> ReadPdfElementsBind(ClientContext &context, Tabl
                                                     vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<ReadPdfElementsBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	// Preserve the legacy native-only default; OCR is opt-in for this reader.
+	result->opt.auto_ocr = false;
 	ParseNamed(input.named_parameters, result->opt);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
@@ -4886,6 +4951,8 @@ static unique_ptr<FunctionData> PdfChunksBind(ClientContext &context, TableFunct
                                               vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<PdfChunksBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
+	// Chunks inherit the element reader's legacy native-only default.
+	result->opt.auto_ocr = false;
 	ParseNamed(input.named_parameters, result->opt);
 	int32_t chunk_size = CHUNK_DEFAULT_SIZE;
 	int32_t overlap = CHUNK_DEFAULT_OVERLAP;
@@ -9805,10 +9872,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	read_pdf_lines.named_parameters["layout"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(read_pdf_lines);
 
-	// read_pdf_elements takes only the params it honors (native text layer
-	// only in v1 — no OCR/layout knobs).
+	// read_pdf_elements uses the same OCR/native word source and options as
+	// read_pdf_words; layout-specific knobs are intentionally not advertised.
 	TableFunction read_pdf_elements("read_pdf_elements", {LogicalType::VARCHAR}, ReadPdfElementsScan,
 	                                ReadPdfElementsBind, ReadPdfElementsInit);
+	AddOcrNamedParams(read_pdf_elements);
 	read_pdf_elements.named_parameters["password"] = LogicalType::VARCHAR;
 	read_pdf_elements.named_parameters["first_page"] = LogicalType::INTEGER;
 	read_pdf_elements.named_parameters["last_page"] = LogicalType::INTEGER;
@@ -9818,6 +9886,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// honors the same file handling + page-range/password params as
 	// read_pdf_elements plus its own chunk_size / overlap knobs.
 	TableFunction pdf_chunks("pdf_chunks", {LogicalType::VARCHAR}, PdfChunksScan, PdfChunksBind, PdfChunksInit);
+	AddOcrNamedParams(pdf_chunks);
 	pdf_chunks.named_parameters["chunk_size"] = LogicalType::INTEGER;
 	pdf_chunks.named_parameters["overlap"] = LogicalType::INTEGER;
 	pdf_chunks.named_parameters["password"] = LogicalType::VARCHAR;
