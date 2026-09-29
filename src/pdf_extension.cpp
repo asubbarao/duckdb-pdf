@@ -169,6 +169,18 @@ static string UStringToUtf8(const poppler::ustring &u) {
 	return string(b.begin(), b.end());
 }
 
+// Character measurements count code points: std::string::size() is bytes, which
+// overstates accented, symbol and non-Latin text and shrinks every width ratio.
+static int64_t Utf8CodepointCount(const string &text) {
+	int64_t count = 0;
+	for (unsigned char c : text) {
+		if ((c & 0xC0) != 0x80) {
+			count++;
+		}
+	}
+	return count;
+}
+
 // Direct DataChunk writers — allocate strings in DuckDB's vector heap (no Value intermediate).
 static void OutString(Vector &v, idx_t row, const string &s) {
 	FlatVector::GetData<string_t>(v)[row] = StringVector::AddString(v, s);
@@ -464,7 +476,7 @@ static double LayoutMedianCharWidth(const std::vector<LayoutWord> &words) {
 	widths.reserve(words.size());
 	for (const auto &w : words) {
 		if (!w.text.empty() && w.x1 > w.x0) {
-			widths.push_back((w.x1 - w.x0) / static_cast<double>(w.text.size()));
+			widths.push_back((w.x1 - w.x0) / static_cast<double>(Utf8CodepointCount(w.text)));
 		}
 	}
 	return Median(std::move(widths));
@@ -1779,7 +1791,7 @@ static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord>
 			heights.push_back(h);
 		}
 		double ww = w.xMax - w.xMin;
-		size_t len = w.text.size();
+		size_t len = Utf8CodepointCount(w.text);
 		if (ww > 0 && len > 0) {
 			widths.push_back(ww / static_cast<double>(len));
 		}
@@ -1910,7 +1922,7 @@ ReconstructTableGrids(std::vector<PdfWord> page_words, const RulingLines *rules 
 			heights.push_back(h);
 		}
 		double ww = w.xMax - w.xMin;
-		size_t len = w.text.size();
+		size_t len = Utf8CodepointCount(w.text);
 		if (ww > 0 && len > 0) {
 			widths.push_back(ww / static_cast<double>(len));
 		}
@@ -4409,7 +4421,7 @@ static std::vector<ElemLine> ElemBuildLines(std::vector<ElemWord> words, double 
 			}
 			line.text += w.text;
 			if (w.has_font) {
-				ElemFontTally(line_hist, w.font_size, w.text.size());
+				ElemFontTally(line_hist, w.font_size, Utf8CodepointCount(w.text));
 			}
 			if (w.has_size_signal) {
 				ElemFontTally(line_size_hist, w.size_signal, w.text.size());
@@ -4491,13 +4503,13 @@ static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_numb
 			word_count += line.words.size();
 			for (auto &w : line.words) {
 				if (w.has_font) {
-					ElemFontTally(block_hist, w.font_size, w.text.size());
-					ElemFontTally(block_font_hist, w.font_name, w.text.size(), word_order);
+					ElemFontTally(block_hist, w.font_size, Utf8CodepointCount(w.text));
+					ElemFontTally(block_font_hist, w.font_name, Utf8CodepointCount(w.text), word_order);
 				}
 				if (w.has_size_signal) {
-					ElemFontTally(block_size_hist, w.size_signal, w.text.size());
+					ElemFontTally(block_size_hist, w.size_signal, Utf8CodepointCount(w.text));
 				} else if (w.has_font) {
-					ElemFontTally(block_size_hist, w.font_size, w.text.size());
+					ElemFontTally(block_size_hist, w.font_size, Utf8CodepointCount(w.text));
 				}
 				word_order++;
 			}
@@ -4510,7 +4522,7 @@ static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_numb
 
 		const string &first_line_text = lines[block.front()].text;
 		if ((block_size > 0 && body_size > 0 && block_size >= ELEM_HEADING_SIZE_RATIO * body_size &&
-		     row.text.size() < ELEM_HEADING_MAX_CHARS) ||
+		     Utf8CodepointCount(row.text) < ELEM_HEADING_MAX_CHARS) ||
 		    ((body_size <= 0 || block_size >= ELEM_CAPS_HEADING_MIN_SIZE_RATIO * body_size) &&
 		     ElemIsAllCapsHeading(row.text, word_count))) {
 			row.element_type = "heading"; // rule 4 (font size) or 4b (ALL-CAPS)
@@ -4587,7 +4599,7 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 				w.font_name = b.has_font ? b.font_name : string();
 				w.font_size = b.has_font ? b.font_size : 0.0;
 				if (w.has_font) {
-					ElemFontTally(doc_hist, w.font_size, w.text.size());
+					ElemFontTally(doc_hist, w.font_size, Utf8CodepointCount(w.text));
 				}
 				words.push_back(std::move(w));
 			}
@@ -4767,16 +4779,6 @@ struct ChunkUnit {
 
 static bool ChunkIsAsciiSpace(char c) {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r';
-}
-
-static int64_t Utf8CodepointCount(const string &text) {
-	int64_t count = 0;
-	for (unsigned char c : text) {
-		if ((c & 0xC0) != 0x80) {
-			count++;
-		}
-	}
-	return count;
 }
 
 // C2: split one oversized element text into pieces each <= limit bytes,
