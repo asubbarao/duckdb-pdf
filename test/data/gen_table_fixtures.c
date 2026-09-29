@@ -11,6 +11,7 @@
  * Writes:
  *   test/data/financial_right_aligned.pdf  — borderless, right-aligned amounts
  *   test/data/ruled_lattice.pdf            — fully bordered 3x4 lattice table
+ *   test/data/mixed_prose_table.pdf        — prose around a borderless table
  */
 #include <hpdf.h>
 #include <stdio.h>
@@ -126,6 +127,46 @@ static int make_ruled(const char *path) {
 	return st != HPDF_OK;
 }
 
+/* Mixed prose and a borderless table: the table has one physical continuation
+ * line so the reader must segment the page before reconstructing its grid. */
+static int make_mixed_prose(const char *path) {
+	HPDF_Doc pdf = HPDF_New(NULL, NULL);
+	if (!pdf) {
+		return 1;
+	}
+	HPDF_Page page = HPDF_AddPage(pdf);
+	HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_LETTER, HPDF_PAGE_PORTRAIT);
+	HPDF_Font font = HPDF_GetFont(pdf, "Helvetica", NULL);
+	HPDF_Font bold = HPDF_GetFont(pdf, "Helvetica-Bold", NULL);
+
+	write_left(page, font, 10, 72.0f, 720.0f, "This paragraph explains the report before the data begins.");
+	write_left(page, font, 10, 72.0f, 704.0f, "It is ordinary prose and must not become a table row.");
+	write_left(page, font, 10, 72.0f, 672.0f, "A second paragraph gives context for the examples below.");
+	write_left(page, font, 10, 72.0f, 656.0f, "Its ragged lines are separate from the aligned table columns.");
+
+	const float x[] = {72.0f, 240.0f, 400.0f};
+	const float y[] = {620.0f, 598.0f, 576.0f, 554.0f};
+	const char *cells[4][3] = {
+	    {"Category", "Example", "Considerations"},
+	    {"Agents", "Prospecting agent", "Many inference calls"},
+	    {"Chat", "Customer support chat", "Fast first token"},
+	    {"Voice", "Real-time translation", "End-to-end latency"},
+	};
+	for (int r = 0; r < 4; r++) {
+		for (int c = 0; c < 3; c++) {
+			write_left(page, r == 0 ? bold : font, 10, x[c], y[r], cells[r][c]);
+		}
+	}
+	write_left(page, font, 10, x[2], 538.0f, "for natural conversation");
+
+	write_left(page, font, 10, 72.0f, 506.0f, "This paragraph follows the table and is not tabular data.");
+	write_left(page, font, 10, 72.0f, 490.0f, "The page ends with another ordinary prose line.");
+
+	HPDF_STATUS st = HPDF_SaveToFile(pdf, path);
+	HPDF_Free(pdf);
+	return st != HPDF_OK;
+}
+
 int main(int argc, char **argv) {
 	const char *dir = (argc > 1) ? argv[1] : "test/data";
 	char path[1024];
@@ -139,6 +180,13 @@ int main(int argc, char **argv) {
 
 	snprintf(path, sizeof(path), "%s/ruled_lattice.pdf", dir);
 	if (make_ruled(path)) {
+		fprintf(stderr, "failed to write %s\n", path);
+		return 1;
+	}
+	fprintf(stdout, "wrote %s\n", path);
+
+	snprintf(path, sizeof(path), "%s/mixed_prose_table.pdf", dir);
+	if (make_mixed_prose(path)) {
 		fprintf(stderr, "failed to write %s\n", path);
 		return 1;
 	}

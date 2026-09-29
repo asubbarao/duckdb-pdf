@@ -7,6 +7,12 @@ require pdf
 statement ok
 PRAGMA enable_verification
 
+statement ok
+SELECT write_pdf(
+  'This fixture also uses the native writer for its prose-only control page.',
+  '__TEST_DIR__/prose_only_table_control.pdf'
+);
+
 # ── table.pdf: basic table extraction ────────────────────────────────────
 
 # At least one table row returned
@@ -98,6 +104,50 @@ true
 # Plain text-only PDF should return 0 rows (no tables detected)
 query I
 SELECT COUNT(*) = 0 FROM read_pdf_tables('test/data/two_pages.pdf');
+----
+true
+
+# ── mixed_prose_table.pdf: a table region inside surrounding prose ────────
+
+query I
+SELECT COUNT(DISTINCT table_index) = 1
+FROM read_pdf_tables('test/data/mixed_prose_table.pdf');
+----
+true
+
+query I
+SELECT COUNT(*) = 4
+FROM read_pdf_tables('test/data/mixed_prose_table.pdf');
+----
+true
+
+query I
+SELECT COUNT(*) = 1
+FROM read_pdf_tables('test/data/mixed_prose_table.pdf')
+WHERE list_contains(cells, 'Category')
+  AND list_contains(cells, 'Considerations');
+----
+true
+
+query I
+SELECT COUNT(*) = 1
+FROM read_pdf_tables('test/data/mixed_prose_table.pdf')
+WHERE contains(array_to_string(cells, ' | '), 'for natural conversation');
+----
+true
+
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_tables('test/data/mixed_prose_table.pdf')
+WHERE list_contains(cells, 'This paragraph explains the report before the data begins.')
+   OR list_contains(cells, 'This paragraph follows the table and is not tabular data.');
+----
+true
+
+# A prose-only page is not a table.
+query I
+SELECT COUNT(*) = 0
+FROM read_pdf_tables('__TEST_DIR__/prose_only_table_control.pdf');
 ----
 true
 
