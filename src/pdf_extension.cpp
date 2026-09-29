@@ -368,6 +368,25 @@ static constexpr double LAYOUT_BAND_MIN_CHARS = 20.0;
 // Pages with less text than this are never split.
 static constexpr size_t LAYOUT_MIN_WORDS_TO_SPLIT = 12;
 static constexpr size_t LAYOUT_MAX_BANDS = 8;
+// A fallback edge must recur on three words; the affected paper pages have
+// hundreds of aligned body edges, while figure/table edges are shorter runs.
+static constexpr size_t LAYOUT_MIN_GUTTER_EDGE_SUPPORT = 3;
+// A fallback gutter needs 20 words on each side; the paper has hundreds per
+// body column, while the markdown fixture's right-side table has only ten.
+static constexpr size_t LAYOUT_MIN_GUTTER_SIDE_WORDS = 20;
+// Poppler's repeated column edges vary by less than 1.5pt in the measured
+// paper, so this tolerance ignores that jitter without merging adjacent cells.
+static constexpr double LAYOUT_GUTTER_EDGE_TOLERANCE = 1.5;
+// A fallback gutter may be crossed only by lines that carry little of the page's text:
+// at most this fraction of all words may sit on a line the corridor crosses. Figure
+// labels and titles crossing a real gutter are a handful of words per line, whereas
+// full-width prose above or beside a figure or table is most of the page's words, and
+// cutting there would slice each of those lines in two. Each side also needs this many
+// lines of its own.
+static constexpr double LAYOUT_GUTTER_MAX_CROSSING_WORD_RATIO = 0.2;
+static constexpr size_t LAYOUT_MIN_GUTTER_SIDE_LINES = 8;
+// LayoutLineIds is defined after the band code that calls it.
+static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, const std::vector<int32_t> &bands);
 // Words set this much larger than the body font are display type — titles and
 // banners, which routinely straddle a gutter. They get no vote on where the
 // gutters are, but they are still placed in a band afterwards.
@@ -384,9 +403,8 @@ static double LayoutMedianCharWidth(const std::vector<LayoutWord> &words) {
 	return Median(std::move(widths));
 }
 
-// Vertical whitespace corridors at least `min_width` wide that no word crosses.
-// Sweeping the x-intervals in x0 order is enough: a word that straddled a
-// corridor would have been seen earlier and raised the running maximum.
+// Keep the existing page-wide candidates first; the vertical-run fallback below
+// is only needed when spanning content makes those candidates unusable.
 static std::vector<std::pair<double, double>> LayoutGutters(const std::vector<LayoutWord> &words, double min_width) {
 	std::vector<std::pair<double, double>> spans;
 	spans.reserve(words.size());
@@ -406,6 +424,125 @@ static std::vector<std::pair<double, double>> LayoutGutters(const std::vector<La
 		run_max = MaxValue<double>(run_max, spans[i].second);
 	}
 	return gutters;
+}
+
+// Find edge pairs whose corridor stays clear across the longest vertical run.
+// A spanning word blocks only its own y-range rather than the whole page.
+static std::vector<std::pair<double, double>> LayoutGuttersByVerticalRun(const std::vector<LayoutWord> &words,
+                                                                         double min_width, double page_left,
+                                                                         double page_right, double min_band) {
+	struct EdgeCluster {
+		double position;
+		size_t count;
+	};
+	const double edge_tol = LAYOUT_GUTTER_EDGE_TOLERANCE;
+	auto cluster_edges = [&](bool right_edges) {
+		std::vector<double> positions;
+		positions.reserve(words.size());
+		for (const auto &word : words) {
+			positions.push_back(right_edges ? word.x1 : word.x0);
+		}
+		std::sort(positions.begin(), positions.end());
+		std::vector<EdgeCluster> clusters;
+		for (double position : positions) {
+			if (clusters.empty() || position - clusters.back().position > edge_tol) {
+				clusters.push_back({position, 1});
+			} else {
+				clusters.back().position =
+				    (clusters.back().position * static_cast<double>(clusters.back().count) + position) /
+				    static_cast<double>(clusters.back().count + 1);
+				clusters.back().count++;
+			}
+		}
+		return clusters;
+	};
+	auto left_edges = cluster_edges(true);
+	auto right_edges = cluster_edges(false);
+	struct Candidate {
+		double first;
+		double second;
+		size_t side_lines; // lines that sit wholly on one side of the corridor
+	};
+	std::vector<Candidate> candidates;
+	// Lines are grouped without regard to columns, so a line of two-column text is
+	// one line with words on both sides of the corridor.
+	const auto line_of = LayoutLineIds(words, std::vector<int32_t>(words.size(), 0));
+	int32_t n_lines = 0;
+	for (int32_t l : line_of) {
+		n_lines = MaxValue<int32_t>(n_lines, l);
+	}
+	std::vector<size_t> words_on_line(static_cast<size_t>(n_lines) + 1, 0);
+	for (int32_t l : line_of) {
+		words_on_line[static_cast<size_t>(l)]++;
+	}
+	for (const auto &left : left_edges) {
+		if (left.count < LAYOUT_MIN_GUTTER_EDGE_SUPPORT) {
+			continue;
+		}
+		for (const auto &right : right_edges) {
+			if (right.count < LAYOUT_MIN_GUTTER_EDGE_SUPPORT || right.position - left.position < min_width) {
+				continue;
+			}
+			const double midpoint = 0.5 * (left.position + right.position);
+			if (midpoint - page_left < min_band || page_right - midpoint < min_band) {
+				continue;
+			}
+			size_t left_words = 0;
+			size_t right_words = 0;
+			for (const auto &word : words) {
+				left_words += word.x1 <= left.position + edge_tol;
+				right_words += word.x0 >= right.position - edge_tol;
+			}
+			if (left_words < LAYOUT_MIN_GUTTER_SIDE_WORDS || right_words < LAYOUT_MIN_GUTTER_SIDE_WORDS) {
+				continue;
+			}
+			// A gutter has text on both sides of it, at the same heights, on most lines.
+			// Blank space alone is not evidence: the empty middle of a figure is clear
+			// too, and cutting there would slice every full-width prose line in two.
+			std::vector<char> has_left(static_cast<size_t>(n_lines) + 1, 0);
+			std::vector<char> has_right(static_cast<size_t>(n_lines) + 1, 0);
+			std::vector<char> crosses(static_cast<size_t>(n_lines) + 1, 0);
+			for (size_t i = 0; i < words.size(); i++) {
+				const auto &word = words[i];
+				const size_t l = static_cast<size_t>(line_of[i]);
+				if (word.x1 <= left.position + edge_tol) {
+					has_left[l] = 1;
+				} else if (word.x0 >= right.position - edge_tol) {
+					has_right[l] = 1;
+				} else {
+					crosses[l] = 1;
+				}
+			}
+			size_t crossing_words = 0;
+			size_t left_lines = 0;
+			size_t right_lines = 0;
+			for (size_t l = 1; l <= static_cast<size_t>(n_lines); l++) {
+				if (crosses[l]) {
+					crossing_words += words_on_line[l];
+				} else if (has_left[l] || has_right[l]) {
+					left_lines += has_left[l];
+					right_lines += has_right[l];
+				}
+			}
+			if (static_cast<double>(crossing_words) >
+			        LAYOUT_GUTTER_MAX_CROSSING_WORD_RATIO * static_cast<double>(words.size()) ||
+			    left_lines < LAYOUT_MIN_GUTTER_SIDE_LINES || right_lines < LAYOUT_MIN_GUTTER_SIDE_LINES) {
+				continue;
+			}
+			candidates.push_back({left.position, right.position, left_lines + right_lines});
+		}
+	}
+	if (candidates.empty()) {
+		return {};
+	}
+	Candidate best = candidates.front();
+	for (const auto &candidate : candidates) {
+		if (candidate.side_lines > best.side_lines || (candidate.side_lines == best.side_lines &&
+		                                               candidate.second - candidate.first > best.second - best.first)) {
+			best = candidate;
+		}
+	}
+	return {{best.first, best.second}};
 }
 
 // Split a page into reading columns. Returns a 0-based band id per input word,
@@ -434,10 +571,6 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 	}
 	const double char_width = LayoutMedianCharWidth(body_words);
 	const double min_gutter = MaxValue<double>(LAYOUT_GUTTER_MIN_CHARS * char_width, 1.0);
-	auto gutters = LayoutGutters(body_words, min_gutter);
-	if (gutters.empty()) {
-		return band_of;
-	}
 	double left = body_words.front().x0;
 	double right = body_words.front().x1;
 	for (const auto &w : body_words) {
@@ -450,54 +583,65 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 	// calendar's seven 20.6pt cell gaps sit far enough apart to pass the
 	// band-width test individually, which chops its date grid into four columns.
 	const double width_tol = MaxValue<double>(1.5, 0.25 * char_width);
-	std::vector<double> class_width;             // representative width per class
-	std::vector<std::vector<double>> class_cuts; // gutter midpoints in that class
-	for (const auto &g : gutters) {
-		const double w = g.second - g.first;
-		size_t at = class_width.size();
-		for (size_t i = 0; i < class_width.size(); i++) {
-			if (std::fabs(class_width[i] - w) <= width_tol) {
-				at = i;
-				break;
-			}
-		}
-		if (at == class_width.size()) {
-			class_width.push_back(w);
-			class_cuts.emplace_back();
-		}
-		class_cuts[at].push_back(0.5 * (g.first + g.second));
-	}
-	std::vector<size_t> by_width(class_width.size());
-	for (size_t i = 0; i < by_width.size(); i++) {
-		by_width[i] = i;
-	}
-	std::sort(by_width.begin(), by_width.end(), [&](size_t a, size_t b) { return class_width[a] > class_width[b]; });
-
-	// Widest class first, and take a class only while every column it leaves
-	// behind is still wide enough to be a column rather than a cell.
 	const double min_band =
 	    MaxValue<double>(LAYOUT_BAND_MIN_WIDTH_RATIO * page_width, LAYOUT_BAND_MIN_CHARS * char_width);
-	std::vector<double> cuts;
-	for (size_t ci : by_width) {
-		const auto &members = class_cuts[ci];
-		if (cuts.size() + members.size() + 1 > LAYOUT_MAX_BANDS) {
-			continue;
-		}
-		auto trial = cuts;
-		trial.insert(trial.end(), members.begin(), members.end());
-		std::sort(trial.begin(), trial.end());
-		bool ok = true;
-		double prev = left;
-		for (double c : trial) {
-			if (c - prev < min_band) {
-				ok = false;
-				break;
+	auto choose_cuts = [&](const std::vector<std::pair<double, double>> &candidates) {
+		std::vector<double> class_width;             // representative width per class
+		std::vector<std::vector<double>> class_cuts; // gutter midpoints in that class
+		for (const auto &g : candidates) {
+			const double w = g.second - g.first;
+			size_t at = class_width.size();
+			for (size_t i = 0; i < class_width.size(); i++) {
+				if (std::fabs(class_width[i] - w) <= width_tol) {
+					at = i;
+					break;
+				}
 			}
-			prev = c;
+			if (at == class_width.size()) {
+				class_width.push_back(w);
+				class_cuts.emplace_back();
+			}
+			class_cuts[at].push_back(0.5 * (g.first + g.second));
 		}
-		if (ok && right - prev >= min_band) {
-			cuts = std::move(trial);
+		std::vector<double> cuts;
+		std::vector<size_t> by_width(class_width.size());
+		for (size_t i = 0; i < by_width.size(); i++) {
+			by_width[i] = i;
 		}
+		std::sort(by_width.begin(), by_width.end(),
+		          [&](size_t a, size_t b) { return class_width[a] > class_width[b]; });
+
+		// Widest class first, and take a class only while every column it leaves
+		// behind is still wide enough to be a column rather than a cell.
+		for (size_t ci : by_width) {
+			const auto &members = class_cuts[ci];
+			if (cuts.size() + members.size() + 1 > LAYOUT_MAX_BANDS) {
+				continue;
+			}
+			auto trial = cuts;
+			trial.insert(trial.end(), members.begin(), members.end());
+			std::sort(trial.begin(), trial.end());
+			bool ok = true;
+			double prev = left;
+			for (double c : trial) {
+				if (c - prev < min_band) {
+					ok = false;
+					break;
+				}
+				prev = c;
+			}
+			if (ok && right - prev >= min_band) {
+				cuts = std::move(trial);
+			}
+		}
+		return cuts;
+	};
+
+	// A page-wide sweep can leave only figure/table corridors. Retry with the
+	// longest line-spanning runs before concluding that the page is one column.
+	auto cuts = choose_cuts(LayoutGutters(body_words, min_gutter));
+	if (cuts.empty()) {
+		cuts = choose_cuts(LayoutGuttersByVerticalRun(body_words, min_gutter, left, right, min_band));
 	}
 	if (cuts.empty()) {
 		return band_of;

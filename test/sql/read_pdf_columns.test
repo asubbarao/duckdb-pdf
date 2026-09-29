@@ -173,6 +173,32 @@ GROUP BY page ORDER BY page;
 4	[0, 1]
 5	[0, 1]
 
+# A spanning title, diagram, or figure label must not disable the gutter for
+# the body text that follows it.
+query II
+SELECT page, COUNT(DISTINCT column_index) >= 2
+FROM read_pdf_words('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf',
+                    first_page := 1, last_page := 9)
+WHERE page IN (1, 3, 6, 9)
+GROUP BY page ORDER BY page;
+----
+1	true
+3	true
+6	true
+9	true
+
+query II
+SELECT page, max(line) FILTER (column_index = 0) < min(line) FILTER (column_index = 1)
+FROM read_pdf_words('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf',
+                    first_page := 1, last_page := 9)
+WHERE page IN (1, 3, 6, 9)
+GROUP BY page ORDER BY page;
+----
+1	true
+3	true
+6	true
+9	true
+
 # On the calendar, prose is column 0 and the grid is column 1.
 query I
 SELECT list(DISTINCT column_index) = [0]
