@@ -55,10 +55,49 @@ static int write_single_column_table(const char *path) {
 	return status == HPDF_OK ? 0 : 1;
 }
 
+static int write_full_width_lines(const char *path) {
+	HPDF_Doc pdf = HPDF_New(NULL, NULL);
+	if (!pdf) {
+		return 1;
+	}
+	HPDF_Page page = HPDF_AddPage(pdf);
+	HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_LETTER, HPDF_PAGE_PORTRAIT);
+	HPDF_Font font = HPDF_GetFont(pdf, "Helvetica", NULL);
+	if (!page || !font) {
+		HPDF_Free(pdf);
+		return 1;
+	}
+	write_text(page, font, 18.0f, 150.0f, 760.0f, "Full width title spans both columns");
+	for (int i = 0; i < 10; i++) {
+		char left[96], right[48];
+		float y = 710.0f - 18.0f * (float)i;
+		snprintf(left, sizeof(left), "left-section-one-line-%02d alpha beta gamma delta epsilon", i + 1);
+		snprintf(right, sizeof(right), "right-section-one-line-%02d", i + 1);
+		write_text(page, font, 10.0f, 72.0f, y, left);
+		write_text(page, font, 10.0f, 360.0f, y, right);
+	}
+	write_text(page, font, 12.0f, 160.0f, 520.0f, "Full width line separates column sections");
+	for (int i = 0; i < 10; i++) {
+		char left[96], right[48];
+		float y = 480.0f - 18.0f * (float)i;
+		snprintf(left, sizeof(left), "left-section-two-line-%02d alpha beta gamma delta epsilon", i + 1);
+		snprintf(right, sizeof(right), "right-section-two-line-%02d", i + 1);
+		write_text(page, font, 10.0f, 72.0f, y, left);
+		write_text(page, font, 10.0f, 360.0f, y, right);
+	}
+	HPDF_STATUS status = HPDF_SaveToFile(pdf, path);
+	HPDF_Free(pdf);
+	return status == HPDF_OK ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
 	const char *path = argc > 1 ? argv[1] : "test/data/two_columns_crossing.pdf";
 	const char *table_path = argc > 2 ? argv[2] : "test/data/single_column_table.pdf";
+	const char *spanning_path = argc > 3 ? argv[3] : "test/data/full_width_lines.pdf";
 	if (write_single_column_table(table_path) != 0) {
+		return 1;
+	}
+	if (write_full_width_lines(spanning_path) != 0) {
 		return 1;
 	}
 	HPDF_Doc pdf = HPDF_New(NULL, NULL);

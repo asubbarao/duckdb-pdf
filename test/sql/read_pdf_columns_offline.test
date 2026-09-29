@@ -45,3 +45,33 @@ FROM read_pdf_lines('test/data/single_column_table.pdf')
 WHERE starts_with(text, 'Prose line') AND ends_with(text, 'never stops early.');
 ----
 true
+
+# A spanning line is one reading unit and divides the column runs at its y position.
+query I
+SELECT COUNT(*) = 1
+FROM read_pdf_lines('test/data/full_width_lines.pdf')
+WHERE text = 'Full width title spans both columns';
+----
+true
+
+query I
+SELECT COUNT(*) = 1
+FROM read_pdf_lines('test/data/full_width_lines.pdf')
+WHERE text = 'Full width line separates column sections';
+----
+true
+
+query I
+SELECT min(line) FILTER (text = 'Full width title spans both columns') <
+       min(line) FILTER (starts_with(text, 'left-section-one-line-')) AND
+       max(line) FILTER (starts_with(text, 'left-section-one-line-')) <
+       min(line) FILTER (starts_with(text, 'right-section-one-line-')) AND
+       max(line) FILTER (starts_with(text, 'right-section-one-line-')) <
+       min(line) FILTER (text = 'Full width line separates column sections') AND
+       max(line) FILTER (text = 'Full width line separates column sections') <
+       min(line) FILTER (starts_with(text, 'left-section-two-line-')) AND
+       max(line) FILTER (starts_with(text, 'left-section-two-line-')) <
+       min(line) FILTER (starts_with(text, 'right-section-two-line-'))
+FROM read_pdf_lines('test/data/full_width_lines.pdf');
+----
+true

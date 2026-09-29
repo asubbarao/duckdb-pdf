@@ -450,7 +450,8 @@ static constexpr double LAYOUT_GUTTER_EDGE_TOLERANCE = 1.5;
 static constexpr double LAYOUT_GUTTER_MAX_CROSSING_WORD_RATIO = 0.2;
 static constexpr size_t LAYOUT_MIN_GUTTER_SIDE_LINES = 8;
 // LayoutLineIds is defined after the band code that calls it.
-static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, const std::vector<int32_t> &bands);
+static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, std::vector<int32_t> &bands,
+                                          const std::vector<std::pair<double, double>> &gutters = {});
 // Words set this much larger than the body font are display type — titles and
 // banners, which routinely straddle a gutter. They get no vote on where the
 // gutters are, but they are still placed in a band afterwards.
@@ -530,7 +531,8 @@ static std::vector<std::pair<double, double>> LayoutGuttersByVerticalRun(const s
 	std::vector<Candidate> candidates;
 	// Lines are grouped without regard to columns, so a line of two-column text is
 	// one line with words on both sides of the corridor.
-	const auto line_of = LayoutLineIds(words, std::vector<int32_t>(words.size(), 0));
+	std::vector<int32_t> no_bands(words.size(), 0);
+	const auto line_of = LayoutLineIds(words, no_bands);
 	int32_t n_lines = 0;
 	for (int32_t l : line_of) {
 		n_lines = MaxValue<int32_t>(n_lines, l);
@@ -611,8 +613,12 @@ static std::vector<std::pair<double, double>> LayoutGuttersByVerticalRun(const s
 
 // Split a page into reading columns. Returns a 0-based band id per input word,
 // parallel to `words`; an all-zero result means one column.
-static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &words, double page_width) {
+static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &words, double page_width,
+                                              std::vector<std::pair<double, double>> *accepted_gutters = nullptr) {
 	std::vector<int32_t> band_of(words.size(), 0);
+	if (accepted_gutters) {
+		accepted_gutters->clear();
+	}
 	if (words.size() < LAYOUT_MIN_WORDS_TO_SPLIT || page_width <= 0.0) {
 		return band_of;
 	}
@@ -649,9 +655,9 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 	const double width_tol = MaxValue<double>(1.5, 0.25 * char_width);
 	const double min_band =
 	    MaxValue<double>(LAYOUT_BAND_MIN_WIDTH_RATIO * page_width, LAYOUT_BAND_MIN_CHARS * char_width);
-	auto choose_cuts = [&](const std::vector<std::pair<double, double>> &candidates) {
-		std::vector<double> class_width;             // representative width per class
-		std::vector<std::vector<double>> class_cuts; // gutter midpoints in that class
+	auto choose_gutters = [&](const std::vector<std::pair<double, double>> &candidates) {
+		std::vector<double> class_width; // representative width per class
+		std::vector<std::vector<std::pair<double, double>>> class_gutters;
 		for (const auto &g : candidates) {
 			const double w = g.second - g.first;
 			size_t at = class_width.size();
@@ -663,11 +669,11 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 			}
 			if (at == class_width.size()) {
 				class_width.push_back(w);
-				class_cuts.emplace_back();
+				class_gutters.emplace_back();
 			}
-			class_cuts[at].push_back(0.5 * (g.first + g.second));
+			class_gutters[at].push_back(g);
 		}
-		std::vector<double> cuts;
+		std::vector<std::pair<double, double>> gutters;
 		std::vector<size_t> by_width(class_width.size());
 		for (size_t i = 0; i < by_width.size(); i++) {
 			by_width[i] = i;
@@ -678,16 +684,19 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 		// Widest class first, and take a class only while every column it leaves
 		// behind is still wide enough to be a column rather than a cell.
 		for (size_t ci : by_width) {
-			const auto &members = class_cuts[ci];
-			if (cuts.size() + members.size() + 1 > LAYOUT_MAX_BANDS) {
+			const auto &members = class_gutters[ci];
+			if (gutters.size() + members.size() + 1 > LAYOUT_MAX_BANDS) {
 				continue;
 			}
-			auto trial = cuts;
+			auto trial = gutters;
 			trial.insert(trial.end(), members.begin(), members.end());
-			std::sort(trial.begin(), trial.end());
+			std::sort(trial.begin(), trial.end(), [](const auto &a, const auto &b) {
+				return 0.5 * (a.first + a.second) < 0.5 * (b.first + b.second);
+			});
 			bool ok = true;
 			double prev = left;
-			for (double c : trial) {
+			for (const auto &g : trial) {
+				double c = 0.5 * (g.first + g.second);
 				if (c - prev < min_band) {
 					ok = false;
 					break;
@@ -695,25 +704,29 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 				prev = c;
 			}
 			if (ok && right - prev >= min_band) {
-				cuts = std::move(trial);
+				gutters = std::move(trial);
 			}
 		}
-		return cuts;
+		return gutters;
 	};
 
 	// A page-wide sweep can leave only figure/table corridors. Retry with the
 	// longest line-spanning runs before concluding that the page is one column.
-	auto cuts = choose_cuts(LayoutGutters(body_words, min_gutter));
-	if (cuts.empty()) {
-		cuts = choose_cuts(LayoutGuttersByVerticalRun(body_words, min_gutter, left, right, min_band));
+	auto gutters = choose_gutters(LayoutGutters(body_words, min_gutter));
+	if (gutters.empty()) {
+		gutters = choose_gutters(LayoutGuttersByVerticalRun(body_words, min_gutter, left, right, min_band));
 	}
-	if (cuts.empty()) {
+	if (gutters.empty()) {
 		return band_of;
+	}
+	if (accepted_gutters) {
+		*accepted_gutters = gutters;
 	}
 	for (size_t i = 0; i < words.size(); i++) {
 		const double mid = 0.5 * (words[i].x0 + words[i].x1);
 		int32_t band = 0;
-		for (double c : cuts) {
+		for (const auto &g : gutters) {
+			double c = 0.5 * (g.first + g.second);
 			if (mid > c) {
 				band++;
 			}
@@ -725,11 +738,19 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 
 // 1-based line ids in reading order: columns left to right, lines top to bottom
 // within a column. Parallel to `words`.
-static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, const std::vector<int32_t> &bands) {
+static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, std::vector<int32_t> &bands,
+                                          const std::vector<std::pair<double, double>> &gutters) {
 	std::vector<int32_t> line_of(words.size(), 0);
 	if (words.empty()) {
 		return line_of;
 	}
+	struct LineGroup {
+		std::vector<size_t> members;
+		int32_t band;
+		double y0;
+		double y1;
+		bool spanning;
+	};
 	std::vector<size_t> order(words.size());
 	for (size_t i = 0; i < order.size(); i++) {
 		order[i] = i;
@@ -743,29 +764,165 @@ static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, 
 		}
 		return words[a].x0 < words[b].x0;
 	});
-	int32_t line_no = 0;
-	int32_t cur_band = -1;
-	double cur_y0 = 0.0;
-	double cur_y1 = 0.0;
+	std::vector<LineGroup> fragments;
 	for (size_t idx : order) {
 		const auto &w = words[idx];
-		bool joined = false;
-		if (line_no > 0 && bands[idx] == cur_band) {
-			const double overlap = MinValue<double>(w.y1, cur_y1) - MaxValue<double>(w.y0, cur_y0);
-			const double shorter = MinValue<double>(w.y1 - w.y0, cur_y1 - cur_y0);
-			if (shorter > 0.0 && overlap >= LAYOUT_LINE_OVERLAP_MIN_RATIO * shorter) {
-				cur_y0 = MinValue<double>(cur_y0, w.y0);
-				cur_y1 = MaxValue<double>(cur_y1, w.y1);
-				joined = true;
+		bool joined = !fragments.empty() && bands[idx] == fragments.back().band;
+		if (joined) {
+			const auto &fragment = fragments.back();
+			const double overlap = MinValue<double>(w.y1, fragment.y1) - MaxValue<double>(w.y0, fragment.y0);
+			const double shorter = MinValue<double>(w.y1 - w.y0, fragment.y1 - fragment.y0);
+			joined = shorter > 0.0 && overlap >= LAYOUT_LINE_OVERLAP_MIN_RATIO * shorter;
+		}
+		if (joined) {
+			auto &fragment = fragments.back();
+			fragment.members.push_back(idx);
+			fragment.y0 = MinValue<double>(fragment.y0, w.y0);
+			fragment.y1 = MaxValue<double>(fragment.y1, w.y1);
+		} else {
+			fragments.push_back({{idx}, bands[idx], w.y0, w.y1, false});
+		}
+	}
+	for (auto &fragment : fragments) {
+		for (size_t idx : fragment.members) {
+			for (const auto &gutter : gutters) {
+				if (words[idx].x0 < gutter.second - LAYOUT_GUTTER_EDGE_TOLERANCE &&
+				    words[idx].x1 > gutter.first + LAYOUT_GUTTER_EDGE_TOLERANCE) {
+					fragment.spanning = true;
+					break;
+				}
+			}
+			if (fragment.spanning) {
+				break;
 			}
 		}
-		if (!joined) {
-			line_no++;
-			cur_band = bands[idx];
-			cur_y0 = w.y0;
-			cur_y1 = w.y1;
+	}
+	std::vector<LineGroup> groups;
+	std::vector<bool> consumed(fragments.size(), false);
+	auto overlaps = [](const LineGroup &a, const LineGroup &b) {
+		const double overlap = MinValue<double>(a.y1, b.y1) - MaxValue<double>(a.y0, b.y0);
+		const double shorter = MinValue<double>(a.y1 - a.y0, b.y1 - b.y0);
+		return shorter > 0.0 && overlap >= LAYOUT_LINE_OVERLAP_MIN_RATIO * shorter;
+	};
+	const double max_span_gap = MaxValue<double>(6.0, 1.5 * LayoutMedianCharWidth(words));
+	auto connects = [&](const LineGroup &a, const LineGroup &b) {
+		if (a.band == b.band) {
+			return false;
 		}
-		line_of[idx] = line_no;
+		const auto &left_group = a.band < b.band ? a : b;
+		const auto &right_group = a.band < b.band ? b : a;
+		double left_end = left_group.members.empty() ? 0.0 : words[left_group.members.front()].x1;
+		for (size_t idx : left_group.members) {
+			left_end = MaxValue<double>(left_end, words[idx].x1);
+		}
+		double right_start = right_group.members.empty() ? 0.0 : words[right_group.members.front()].x0;
+		for (size_t idx : right_group.members) {
+			right_start = MinValue<double>(right_start, words[idx].x0);
+		}
+		return right_start - left_end <= max_span_gap;
+	};
+	for (size_t i = 0; i < fragments.size(); i++) {
+		if (consumed[i]) {
+			continue;
+		}
+		bool merge = fragments[i].spanning;
+		if (!merge) {
+			for (size_t j = 0; j < fragments.size(); j++) {
+				if (fragments[j].spanning && overlaps(fragments[i], fragments[j])) {
+					merge = true;
+					break;
+				}
+			}
+		}
+		LineGroup group = fragments[i];
+		consumed[i] = true;
+		if (merge) {
+			bool changed = true;
+			while (changed) {
+				changed = false;
+				for (size_t j = 0; j < fragments.size(); j++) {
+					if (consumed[j] || !overlaps(group, fragments[j]) || !connects(group, fragments[j])) {
+						continue;
+					}
+					group.members.insert(group.members.end(), fragments[j].members.begin(), fragments[j].members.end());
+					group.y0 = MinValue<double>(group.y0, fragments[j].y0);
+					group.y1 = MaxValue<double>(group.y1, fragments[j].y1);
+					consumed[j] = true;
+					changed = true;
+				}
+			}
+			group.spanning = false;
+			for (size_t member : group.members) {
+				if (bands[member] != group.band) {
+					group.spanning = true;
+					break;
+				}
+			}
+		}
+		groups.push_back(std::move(group));
+	}
+	std::vector<size_t> spanning_groups;
+	for (size_t i = 0; i < groups.size(); i++) {
+		if (groups[i].spanning) {
+			spanning_groups.push_back(i);
+		}
+	}
+	std::sort(spanning_groups.begin(), spanning_groups.end(),
+	          [&](size_t a, size_t b) { return groups[a].y0 < groups[b].y0; });
+	auto spanning_rank = [&](size_t group_index) {
+		for (size_t rank = 0; rank < spanning_groups.size(); rank++) {
+			if (spanning_groups[rank] == group_index) {
+				return rank;
+			}
+		}
+		return spanning_groups.size();
+	};
+	std::vector<size_t> group_order(groups.size());
+	for (size_t i = 0; i < group_order.size(); i++) {
+		group_order[i] = i;
+	}
+	std::sort(group_order.begin(), group_order.end(), [&](size_t a, size_t b) {
+		auto section = [&](size_t group_index) {
+			if (groups[group_index].spanning) {
+				return spanning_rank(group_index);
+			}
+			size_t result = 0;
+			for (size_t span : spanning_groups) {
+				result += groups[span].y0 <= groups[group_index].y0;
+			}
+			return result;
+		};
+		const size_t section_a = section(a);
+		const size_t section_b = section(b);
+		if (section_a != section_b) {
+			return section_a < section_b;
+		}
+		if (groups[a].spanning != groups[b].spanning) {
+			return !groups[a].spanning;
+		}
+		if (!groups[a].spanning && groups[a].band != groups[b].band) {
+			return groups[a].band < groups[b].band;
+		}
+		return groups[a].y0 < groups[b].y0;
+	});
+	for (const auto &group : groups) {
+		if (!group.spanning || group.members.empty()) {
+			continue;
+		}
+		int32_t band = bands[group.members.front()];
+		for (size_t idx : group.members) {
+			band = MinValue<int32_t>(band, bands[idx]);
+		}
+		for (size_t idx : group.members) {
+			bands[idx] = band;
+		}
+	}
+	int32_t line_no = 0;
+	for (size_t group_index : group_order) {
+		line_no++;
+		for (size_t idx : groups[group_index].members) {
+			line_of[idx] = line_no;
+		}
 	}
 	return line_of;
 }
@@ -775,8 +932,9 @@ static string LayoutPageText(const std::vector<LayoutWord> &words, double page_w
 	if (words.empty()) {
 		return string();
 	}
-	auto bands = LayoutColumnBands(words, page_width);
-	auto lines = LayoutLineIds(words, bands);
+	std::vector<std::pair<double, double>> gutters;
+	auto bands = LayoutColumnBands(words, page_width, &gutters);
+	auto lines = LayoutLineIds(words, bands, gutters);
 	int32_t max_line = 0;
 	for (int32_t l : lines) {
 		max_line = MaxValue<int32_t>(max_line, l);
@@ -3113,8 +3271,9 @@ static WordGrouping GroupLayoutWords(const std::vector<LayoutWord> &words, const
 	WordGrouping out;
 	out.line.assign(total, 0);
 	out.column.assign(total, 0);
-	auto bands = LayoutColumnBands(words, page_width);
-	auto lines = LayoutLineIds(words, bands);
+	std::vector<std::pair<double, double>> gutters;
+	auto bands = LayoutColumnBands(words, page_width, &gutters);
+	auto lines = LayoutLineIds(words, bands, gutters);
 	for (size_t i = 0; i < origin.size(); i++) {
 		out.line[origin[i]] = lines[i];
 		out.column[origin[i]] = bands[i];
@@ -3793,8 +3952,9 @@ static std::vector<ElemLine> ElemBuildLines(std::vector<ElemWord> words, double 
 		g.text = w.text;
 		geom.push_back(std::move(g));
 	}
-	auto bands = LayoutColumnBands(geom, page_width);
-	auto line_ids = LayoutLineIds(geom, bands);
+	std::vector<std::pair<double, double>> gutters;
+	auto bands = LayoutColumnBands(geom, page_width, &gutters);
+	auto line_ids = LayoutLineIds(geom, bands, gutters);
 	int32_t line_count = 0;
 	for (int32_t l : line_ids) {
 		line_count = MaxValue<int32_t>(line_count, l);
@@ -6281,8 +6441,9 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 			g.text = w.text;
 			geom.push_back(std::move(g));
 		}
-		auto md_bands = LayoutColumnBands(geom, page_widths[p]);
-		auto md_lines = LayoutLineIds(geom, md_bands);
+		std::vector<std::pair<double, double>> md_gutters;
+		auto md_bands = LayoutColumnBands(geom, page_widths[p], &md_gutters);
+		auto md_lines = LayoutLineIds(geom, md_bands, md_gutters);
 		int32_t md_line_count = 0;
 		for (int32_t l : md_lines) {
 			md_line_count = MaxValue<int32_t>(md_line_count, l);
