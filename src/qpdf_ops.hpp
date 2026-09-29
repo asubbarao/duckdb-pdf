@@ -112,6 +112,26 @@ std::vector<Annotation> ReadAnnotations(const std::string &pdf_bytes);
 // zero means that the item's destination could not be resolved.
 std::vector<int> ReadOutlinePages(const std::string &pdf_bytes, const std::string &password);
 
+struct StructureElement {
+	int ord = 0;
+	int depth = 0;
+	int parent_ord = 0; // zero means SQL NULL
+	int page = 0;       // 1-based; zero means SQL NULL
+	std::string tag;
+	std::string role;
+	bool has_alt = false;
+	std::string alt;
+	bool has_actual_text = false;
+	std::string actual_text;
+	bool has_lang = false;
+	std::string lang;
+	std::vector<int> mcids;
+};
+
+// One structure element in depth-first document order. Malformed or cyclic
+// descendants are skipped after the readable prefix has been collected.
+std::vector<StructureElement> ReadStructure(const std::string &pdf_bytes, const std::string &password);
+
 // One axis-aligned-ish ruled line segment collected from a page content stream,
 // used to recover lattice (bordered) tables. Endpoints are in PDF user space
 // (origin bottom-left) as produced by the content-stream path interpreter after

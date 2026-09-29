@@ -2913,6 +2913,117 @@ struct PdfOutlineState : public GlobalTableFunctionState {
 	}
 };
 
+//===--------------------------------------------------------------------===//
+// pdf_structure -> one row per tagged structure element (depth-first)
+//===--------------------------------------------------------------------===//
+struct PdfStructureState : public GlobalTableFunctionState {
+	idx_t file_idx = 0;
+	idx_t row_idx = 0;
+	string current_file;
+	std::vector<pdf_qpdf::StructureElement> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> PdfStructureBind(ClientContext &context, TableFunctionBindInput &input,
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::VARCHAR,
+	                LogicalType::INTEGER,
+	                LogicalType::INTEGER,
+	                LogicalType::INTEGER,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::INTEGER,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::LIST(LogicalType::INTEGER)};
+	names = {"file", "ord", "depth", "parent_ord", "tag", "role", "page", "alt", "actual_text", "lang", "mcids"};
+	return PdfInspectBindCommon(context, input);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfStructureInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfStructureState>();
+}
+
+static void PdfStructureScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	auto &bind = data_p.bind_data->Cast<PdfInspectBindData>();
+	auto &st = data_p.global_state->Cast<PdfStructureState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE) {
+		if (st.row_idx >= st.rows.size()) {
+			if (st.file_idx >= bind.files.size()) {
+				break;
+			}
+			st.rows.clear();
+			st.row_idx = 0;
+			st.current_file = bind.files[st.file_idx++];
+			string bytes;
+			try {
+				ReadAllBytes(context, st.current_file, bytes);
+				st.rows = pdf_qpdf::ReadStructure(bytes, bind.opt.password);
+				int first_page = bind.opt.first_page > 0 ? bind.opt.first_page : 1;
+				int last_page = bind.opt.last_page;
+				if (last_page < 0) {
+					last_page = NumericLimits<int>::Maximum();
+				}
+				st.rows.erase(std::remove_if(st.rows.begin(), st.rows.end(),
+				                             [&](const pdf_qpdf::StructureElement &row) {
+					                             return row.page > 0 && (row.page < first_page || row.page > last_page);
+				                             }),
+				              st.rows.end());
+			} catch (const std::exception &) {
+				if (!bind.opt.ignore_errors) {
+					throw;
+				}
+				continue;
+			}
+			continue;
+		}
+		auto &row = st.rows[st.row_idx];
+		OutString(output.data[0], count, st.current_file);
+		OutInt32(output.data[1], count, row.ord);
+		OutInt32(output.data[2], count, row.depth);
+		if (row.parent_ord > 0) {
+			OutInt32(output.data[3], count, row.parent_ord);
+		} else {
+			OutInt32Null(output.data[3], count);
+		}
+		OutString(output.data[4], count, row.tag);
+		OutString(output.data[5], count, row.role);
+		if (row.page > 0) {
+			OutInt32(output.data[6], count, row.page);
+		} else {
+			OutInt32Null(output.data[6], count);
+		}
+		if (row.has_alt) {
+			OutString(output.data[7], count, row.alt);
+		} else {
+			OutStringNull(output.data[7], count);
+		}
+		if (row.has_actual_text) {
+			OutString(output.data[8], count, row.actual_text);
+		} else {
+			OutStringNull(output.data[8], count);
+		}
+		if (row.has_lang) {
+			OutString(output.data[9], count, row.lang);
+		} else {
+			OutStringNull(output.data[9], count);
+		}
+		vector<Value> mcids;
+		for (auto mcid : row.mcids) {
+			mcids.emplace_back(Value::INTEGER(mcid));
+		}
+		output.SetValue(10, count, Value::LIST(LogicalType::INTEGER, std::move(mcids)));
+		st.row_idx++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
 static unique_ptr<FunctionData> PdfOutlineBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<string> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
@@ -9475,6 +9586,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	pdf_outline.named_parameters["password"] = LogicalType::VARCHAR;
 	pdf_outline.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(pdf_outline);
+
+	TableFunction pdf_structure("pdf_structure", {LogicalType::VARCHAR}, PdfStructureScan, PdfStructureBind,
+	                            PdfStructureInit);
+	pdf_structure.named_parameters["password"] = LogicalType::VARCHAR;
+	pdf_structure.named_parameters["first_page"] = LogicalType::INTEGER;
+	pdf_structure.named_parameters["last_page"] = LogicalType::INTEGER;
+	pdf_structure.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
+	loader.RegisterFunction(pdf_structure);
 
 	TableFunction pdf_attachments("pdf_attachments", {LogicalType::VARCHAR}, PdfAttachmentsScan, PdfAttachmentsBind,
 	                              PdfAttachmentsInit);

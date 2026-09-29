@@ -382,6 +382,206 @@ std::vector<int> ReadOutlinePages(const std::string &pdf_bytes, const std::strin
 
 namespace {
 
+constexpr int STRUCTURE_DEPTH_CAP = 256;
+
+bool IsStandardStructureRole(const std::string &role) {
+	static const std::set<std::string> standard_roles = {
+	    "Document",  "Part",    "Art",       "Sect",     "Div",   "BlockQuote", "Caption", "TOC", "TOCI",    "Index",
+	    "NonStruct", "Private", "P",         "H",        "H1",    "H2",         "H3",      "H4",  "H5",      "H6",
+	    "L",         "LI",      "Lbl",       "LBody",    "Table", "TR",         "TH",      "TD",  "THead",   "TBody",
+	    "TFoot",     "Span",    "Link",      "Annot",    "Ruby",  "RB",         "RT",      "RP",  "Warichu", "WT",
+	    "WP",        "Figure",  "Formula",   "Form",     "Aside", "Title",      "FENote",  "Sub", "Em",      "Strong",
+	    "Quote",     "Note",    "Reference", "BibEntry", "Code",  "Label"};
+	return standard_roles.find(role) != standard_roles.end();
+}
+
+std::string StructureRole(const QPDFObjectHandle &role_map, const std::string &tag) {
+	std::string role = tag;
+	std::set<std::string> seen;
+	while (!IsStandardStructureRole(role) && seen.insert(role).second) {
+		QPDFObjectHandle mapped;
+		try {
+			mapped = role_map.getKey("/" + role);
+		} catch (const std::exception &) {
+			break;
+		}
+		if (!mapped.isName()) {
+			break;
+		}
+		std::string next = mapped.getName();
+		if (!next.empty() && next[0] == '/') {
+			next.erase(0, 1);
+		}
+		if (next == role) {
+			break;
+		}
+		role = next;
+	}
+	return role;
+}
+
+int StructurePage(QPDF &doc, const std::map<QPDFObjGen, int> &page_numbers, const QPDFObjectHandle &page) {
+	if (page.isNull()) {
+		return 0;
+	}
+	auto page_it = page_numbers.find(page.getObjGen());
+	if (page_it != page_numbers.end()) {
+		return page_it->second;
+	}
+	try {
+		return doc.findPage(page) + 1;
+	} catch (const std::exception &) {
+		return 0;
+	}
+}
+
+struct StructureChild {
+	QPDFObjectHandle object;
+	int inherited_page = 0;
+};
+
+// Flatten nested /K arrays while keeping structure children separate from
+// direct marked-content entries. The cap bounds malformed array cycles too.
+void CollectStructureChildren(const QPDFObjectHandle &key, int inherited_page, std::vector<StructureChild> &children,
+                              std::vector<int> &mcids) {
+	struct Pending {
+		QPDFObjectHandle object;
+		int page;
+		int depth;
+	};
+	std::vector<Pending> pending;
+	pending.push_back({key, inherited_page, 0});
+	QPDFObjGen::set seen_arrays;
+	int steps = 0;
+	while (!pending.empty() && steps++ < STRUCTURE_DEPTH_CAP * 4096) {
+		auto item = std::move(pending.back());
+		pending.pop_back();
+		if (item.depth > STRUCTURE_DEPTH_CAP || item.object.isNull()) {
+			continue;
+		}
+		if (item.object.isArray()) {
+			if (!seen_arrays.add(item.object.getObjGen())) {
+				continue;
+			}
+			int n = item.object.getArrayNItems();
+			for (int i = n - 1; i >= 0; i--) {
+				pending.push_back({item.object.getArrayItem(i), item.page, item.depth + 1});
+			}
+			continue;
+		}
+		if (item.object.isInteger()) {
+			mcids.push_back(item.object.getIntValueAsInt());
+			continue;
+		}
+		if (!item.object.isDictionary()) {
+			continue;
+		}
+		auto type = item.object.getKey("/Type");
+		if (item.object.getKey("/S").isName()) {
+			children.push_back({item.object, item.page});
+		} else if (!(type.isName() && type.isNameAndEquals("/OBJR"))) {
+			auto mcid = item.object.getKey("/MCID");
+			if (mcid.isInteger()) {
+				mcids.push_back(mcid.getIntValueAsInt());
+			}
+		}
+	}
+}
+
+} // namespace
+
+std::vector<StructureElement> ReadStructure(const std::string &pdf_bytes, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	OpenQpdfBytes(doc, "pdf_structure", pdf_bytes, password);
+	std::vector<StructureElement> rows;
+	QPDFObjectHandle structure_root = doc.getRoot().getKey("/StructTreeRoot");
+	if (!structure_root.isDictionary()) {
+		return rows;
+	}
+	QPDFObjectHandle role_map = structure_root.getKey("/RoleMap");
+	QPDFPageDocumentHelper doc_pages(doc);
+	std::map<QPDFObjGen, int> page_numbers;
+	auto pages = doc_pages.getAllPages();
+	for (size_t page_idx = 0; page_idx < pages.size(); page_idx++) {
+		page_numbers[pages[page_idx].getObjectHandle().getObjGen()] = static_cast<int>(page_idx + 1);
+	}
+
+	std::vector<StructureChild> root_children;
+	std::vector<int> ignored_mcids;
+	CollectStructureChildren(structure_root.getKey("/K"), 0, root_children, ignored_mcids);
+	struct Pending {
+		QPDFObjectHandle object;
+		int depth;
+		int parent_ord;
+		int inherited_page;
+	};
+	std::vector<Pending> pending;
+	for (auto it = root_children.rbegin(); it != root_children.rend(); ++it) {
+		pending.push_back({it->object, 0, 0, it->inherited_page});
+	}
+	QPDFObjGen::set visited;
+	int steps = 0;
+	while (!pending.empty() && steps++ < STRUCTURE_DEPTH_CAP * 4096) {
+		auto item = std::move(pending.back());
+		pending.pop_back();
+		if (item.depth > STRUCTURE_DEPTH_CAP || !item.object.isDictionary()) {
+			continue;
+		}
+		if (!visited.add(item.object.getObjGen())) {
+			continue;
+		}
+		auto s = item.object.getKey("/S");
+		if (!s.isName()) {
+			continue;
+		}
+		StructureElement row;
+		row.depth = item.depth;
+		row.parent_ord = item.parent_ord;
+		std::string raw_tag = s.getName();
+		row.tag = !raw_tag.empty() && raw_tag[0] == '/' ? raw_tag.substr(1) : raw_tag;
+		row.role = StructureRole(role_map, row.tag);
+		row.page = item.inherited_page;
+		auto page = item.object.getKey("/Pg");
+		if (!page.isNull()) {
+			int page_number = StructurePage(doc, page_numbers, page);
+			if (page_number > 0) {
+				row.page = page_number;
+			}
+		}
+		for (auto field : {std::make_pair("/Alt", &row.has_alt), std::make_pair("/ActualText", &row.has_actual_text),
+		                   std::make_pair("/Lang", &row.has_lang)}) {
+			auto value = item.object.getKey(field.first);
+			if (!value.isString()) {
+				continue;
+			}
+			std::string text = value.getUTF8Value();
+			if (field.second == &row.has_alt) {
+				row.alt = std::move(text);
+			} else if (field.second == &row.has_actual_text) {
+				row.actual_text = std::move(text);
+			} else {
+				row.lang = std::move(text);
+			}
+			*field.second = true;
+		}
+		std::vector<StructureChild> children;
+		CollectStructureChildren(item.object.getKey("/K"), row.page, children, row.mcids);
+		int ord = static_cast<int>(rows.size()) + 1;
+		row.ord = ord;
+		rows.push_back(std::move(row));
+		if (item.depth >= STRUCTURE_DEPTH_CAP) {
+			continue;
+		}
+		for (auto it = children.rbegin(); it != children.rend(); ++it) {
+			pending.push_back({it->object, item.depth + 1, ord, it->inherited_page});
+		}
+	}
+	return rows;
+}
+
+namespace {
+
 // Lightweight content-stream path interpreter: collects axis-aligned stroke
 // segments (and rectangle strokes/fills used as borders). Tracks CTM for `cm`.
 // poppler-cpp has no path API; qpdf's page content parser supplies the tokens.
