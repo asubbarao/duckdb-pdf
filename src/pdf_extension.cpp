@@ -3307,12 +3307,13 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 //                  ELEM_CAPS_HEADING_MAX_WORDS words, at least
 //                  ELEM_CAPS_HEADING_MIN_ALPHA alphabetic (ASCII A-Za-z)
 //                  characters, and at least ELEM_CAPS_HEADING_UPPER_RATIO
-//                  of those alphabetic characters are uppercase —
-//                  REGARDLESS of font size. This catches short shouty
-//                  section headers ("PROFESSIONAL SUMMARY") set at body
-//                  size. Because heading is checked first, an all-caps
-//                  block that also opens with a list marker classifies
-//                  as heading, not list_item.
+//                  of those alphabetic characters are uppercase — and, when
+//                  font info is available, at least ELEM_CAPS_HEADING_MIN_SIZE_RATIO
+//                  x the body size. This catches short shouty section headers
+//                  ("PROFESSIONAL SUMMARY") set at body size while excluding
+//                  smaller running furniture. Because heading is checked first,
+//                  an all-caps block that also opens with a list marker
+//                  classifies as heading, not list_item.
 //  5. list_item  : block's first line starts with a bullet glyph
 //                  (• – ▪ ● ○ ◦ ∙ ‣ ⁃ · ▸, or '-' / '*' followed by a
 //                  space) or a numeric marker: 1-3 digits then '.' or ')'
@@ -3347,9 +3348,10 @@ static constexpr size_t ELEM_MIN_PARAGRAPH_WORDS = 3;
 static constexpr size_t ELEM_CAPS_HEADING_MAX_WORDS = 6;
 // ...at least this many ASCII alphabetic characters (filters "42", "IV")...
 static constexpr size_t ELEM_CAPS_HEADING_MIN_ALPHA = 4;
-// ...where at least this fraction of the alphabetic characters are
-// uppercase is a heading regardless of font size.
+// ...where at least this fraction of the alphabetic characters are uppercase.
 static constexpr double ELEM_CAPS_HEADING_UPPER_RATIO = 0.8;
+// A small tolerance keeps body-size caps headings while excluding smaller furniture.
+static constexpr double ELEM_CAPS_HEADING_MIN_SIZE_RATIO = 0.95;
 // Running-header demotion: a heading whose exact text repeats on this
 // many distinct pages AND sits in the top/bottom band on every hit is
 // a page chrome (even/odd running title), not a section heading.
@@ -3403,7 +3405,7 @@ static double ElemModalFontSize(const ElemFontHistogram &hist) {
 	return best_size;
 }
 
-// Rule 4b: short ALL-CAPS block at any font size (see contract above).
+// Rule 4b: short ALL-CAPS block at or near body size (see contract above).
 // Only ASCII letters are counted — multi-byte UTF-8 letters neither help
 // nor hurt the ratio (documented limitation: "RÉSUMÉ" counts 5 of its 6
 // letters).
@@ -3741,7 +3743,8 @@ static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_numb
 		const string &first_line_text = lines[block.front()].text;
 		if ((row.has_font && body_size > 0 && row.font_size >= ELEM_HEADING_SIZE_RATIO * body_size &&
 		     row.text.size() < ELEM_HEADING_MAX_CHARS) ||
-		    ElemIsAllCapsHeading(row.text, word_count)) {
+		    ((!row.has_font || body_size <= 0 || row.font_size >= ELEM_CAPS_HEADING_MIN_SIZE_RATIO * body_size) &&
+		     ElemIsAllCapsHeading(row.text, word_count))) {
 			row.element_type = "heading"; // rule 4 (font size) or 4b (ALL-CAPS)
 		} else if (ElemIsListMarkerLine(first_line_text)) {
 			row.element_type = "list_item"; // rule 5
