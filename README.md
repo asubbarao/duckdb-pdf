@@ -974,7 +974,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_info(files)` | Table | Full per-file census: metadata, timestamps, dimensions, size, encryption. |
 | `pdf_pages_info(files)` | Table | One row per page: crop/media size, rotation, orientation, label, duration. |
 | `read_pdf_meta(files)` | Table | Legacy per-file metadata (subset of `pdf_info`). |
-| `pdf_outline(files)` | Table | One row per bookmark, depth-first. |
+| `pdf_outline(files)` | Table | One row per bookmark, depth-first: `file`, `ord`, `depth`, `title`, `page`. |
 | `pdf_attachments(files)` | Table | One row per embedded file, bytes as `BLOB`. |
 | `pdf_form_fields(files)` | Table | One row per AcroForm field with type and value. |
 | `pdf_annotations(files)` | Table | One row per annotation; `WHERE subtype = 'Link'` extracts hyperlinks. |
