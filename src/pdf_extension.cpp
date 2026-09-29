@@ -690,9 +690,10 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 			}
 			auto trial = gutters;
 			trial.insert(trial.end(), members.begin(), members.end());
-			std::sort(trial.begin(), trial.end(), [](const auto &a, const auto &b) {
-				return 0.5 * (a.first + a.second) < 0.5 * (b.first + b.second);
-			});
+			std::sort(trial.begin(), trial.end(),
+			          [](const std::pair<double, double> &a, const std::pair<double, double> &b) {
+				          return 0.5 * (a.first + a.second) < 0.5 * (b.first + b.second);
+			          });
 			bool ok = true;
 			double prev = left;
 			for (const auto &g : trial) {
