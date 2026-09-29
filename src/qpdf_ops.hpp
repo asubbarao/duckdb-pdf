@@ -32,6 +32,9 @@ namespace pdf_qpdf {
 // as well as local paths. Writers take paths, because qpdf streams the source
 // lazily into the output file it writes.
 
+// Reports whether the document catalog contains a /PageLabels entry.
+bool HasPageLabels(const std::string &pdf_bytes, const std::string &password);
+
 // Concatenates the inputs' pages in list order into `output`.
 // The caller validates that inputs exist and the output directory exists.
 void Merge(const std::vector<std::string> &inputs, const std::string &output);

@@ -79,6 +79,19 @@ static void OpenQpdfBytes(QPDF &doc, const char *name, const std::string &pdf_by
 	doc.processMemoryFile(name, pdf_bytes.data(), pdf_bytes.size(), password.empty() ? nullptr : password.c_str());
 }
 
+bool HasPageLabels(const std::string &pdf_bytes, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	try {
+		QPDF doc;
+		doc.setSuppressWarnings(true);
+		OpenQpdfBytes(doc, "page-labels", pdf_bytes, password);
+		auto root = doc.getRoot();
+		return root.isDictionary() && root.getKey("/PageLabels").isDictionary();
+	} catch (const std::exception &) {
+		return false;
+	}
+}
+
 void Merge(const std::vector<std::string> &inputs, const std::string &output) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	QPDF merged;

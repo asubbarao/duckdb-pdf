@@ -92,7 +92,7 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 
 ### `read_pdf` — one row per page
 
-Columns: `filename`, `page`, `page_count`, `text`, `width`, `height` (page size in PDF points), `has_text_layer` (native embedded text is non-blank), `used_ocr` (Tesseract produced the returned text), `ocr_confidence` (Tess MeanTextConf 0–100 when `used_ocr`, else NULL).
+Columns: `filename`, `page`, `page_count`, `text`, `width`, `height` (page size in PDF points), `has_text_layer` (native embedded text is non-blank), `used_ocr` (Tesseract produced the returned text), `ocr_confidence` (Tess MeanTextConf 0–100 when `used_ocr`, else NULL), `label` (printed page label, or NULL).
 
 `has_text_layer` describes the PDF itself (true even when `ocr:=true` forced a re-OCR of a text page). `used_ocr` is true when the page had no extractable text and auto-OCR ran, or when `ocr:=true` forced OCR and the engine returned text. Together they make image-only vs embedded-text detection first-class:
 
@@ -134,7 +134,7 @@ GROUP BY filename;
 
 ### `read_pdf_lines` — one row per line
 
-Columns: `filename`, `page`, `line` (1-based, reset per page), `text`. A PDF-aware analog of `read_lines`: grep a PDF the way you'd grep a text file, keeping page + line context.
+Columns: `filename`, `page`, `line` (1-based, reset per page), `text`, `label` (printed page label, or NULL). A PDF-aware analog of `read_lines`: grep a PDF the way you'd grep a text file, keeping page + line context.
 
 ```sql
 SELECT page, line, text
@@ -149,7 +149,7 @@ WHERE text ILIKE '%total due%';
 
 ### `read_pdf_words` — one row per word, with bounding boxes
 
-Columns: `filename`, `page`, `word`, `x0`, `y0`, `x1`, `y1` (PDF points; poppler-cpp `text_list` y is top-down on typical pages — smaller `y0` is higher on the page), `font_name`, `font_size`, `source`, `confidence`, **`line`** (1-based geometric line id within the page), **`page_width`** / **`page_height`** (crop-box size in points for that page — same numbers as `read_pdf.width` / `height`).
+Columns: `filename`, `page`, `word`, `x0`, `y0`, `x1`, `y1` (PDF points; poppler-cpp `text_list` y is top-down on typical pages — smaller `y0` is higher on the page), `font_name`, `font_size`, `source`, `confidence`, **`line`** (1-based geometric line id within the page), **`page_width`** / **`page_height`** (crop-box size in points for that page — same numbers as `read_pdf.width` / `height`), `label` (printed page label, or NULL).
 
 `line` clusters words with the same vertical-overlap rule as `read_pdf_elements` (≥ 50% of the shorter word height). Use it to equi-join marks to line context or rebuild lines in one Poppler walk:
 
@@ -965,9 +965,9 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 
 | Function | Type | Description |
 |---|---|---|
-| `read_pdf(files)` | Table | One row per page: text, dimensions, `has_text_layer`, `used_ocr`, **`ocr_confidence`** (NULL if no OCR). Parallel multi-file scan; `ignore_errors` skips bad files. Named OCR knobs include `ocr_vars` MAP + `ocr_config`. |
-| `read_pdf_lines(files)` | Table | One row per layout-preserving line. |
-| `read_pdf_words(files)` / `read_pdf_layout` | Table | One row per word: bbox, font, OCR source/confidence, geometric `line`, `page_width`/`page_height`. |
+| `read_pdf(files)` | Table | One row per page: text, dimensions, printed page `label`, `has_text_layer`, `used_ocr`, **`ocr_confidence`** (NULL if no OCR). Parallel multi-file scan; `ignore_errors` skips bad files. Named OCR knobs include `ocr_vars` MAP + `ocr_config`. |
+| `read_pdf_lines(files)` | Table | One row per layout-preserving line with the printed page `label`. |
+| `read_pdf_words(files)` / `read_pdf_layout` | Table | One row per word: bbox, font, OCR source/confidence, geometric `line`, `page_width`/`page_height`, and printed page `label` on `read_pdf_words`. |
 | `read_pdf_tables(files)` | Table | One row per detected table row; cells as `VARCHAR[]`. |
 | `read_pdf_elements(files)` | Table | One row per layout element (`heading`/`paragraph`/`list_item`/`other`) with bbox and dominant font name. |
 | `pdf_chunks(files)` | Table | Retrieval-ready chunks with section headings; `chunk_size`/`overlap` knobs. |

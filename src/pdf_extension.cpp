@@ -2155,8 +2155,9 @@ struct ReadPdfFileSlot {
 	string path;
 	string bytes; // immutable after load_done; shared by all workers on this file
 	int page_count = 0;
-	int first_page_0 = 0;           // inclusive
-	int last_page_0 = 0;            // exclusive
+	int first_page_0 = 0; // inclusive
+	int last_page_0 = 0;  // exclusive
+	bool has_page_labels = false;
 	std::atomic<int> next_page {0}; // next 0-based page to claim
 	std::atomic<bool> load_done {false};
 	std::atomic<bool> load_failed {false};
@@ -2195,11 +2196,11 @@ static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctio
 	// ocr_confidence: Tess MeanTextConf 0..100 when used_ocr, else NULL.
 	// Together they make image-only vs embedded-text detection first-class without
 	// a second pass over the file.
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
-	                LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::DOUBLE,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::DOUBLE};
-	names = {"filename", "page",           "page_count", "text",          "width",
-	         "height",   "has_text_layer", "used_ocr",   "ocr_confidence"};
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::DOUBLE,  LogicalType::VARCHAR};
+	names = {"filename", "page",           "page_count", "text",           "width",
+	         "height",   "has_text_layer", "used_ocr",   "ocr_confidence", "label"};
 	return std::move(result);
 }
 
@@ -2218,6 +2219,7 @@ static bool EnsureFileSlotLoaded(ClientContext &context, const ReadPdfBindData &
 		// Open solely to learn page_count / validate; discard doc — workers open their own.
 		auto probe = LoadDoc(slot.bytes, bind.opt.password, slot.path);
 		slot.page_count = probe->pages();
+		slot.has_page_labels = pdf_qpdf::HasPageLabels(slot.bytes, bind.opt.password);
 		slot.first_page_0 = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
 		slot.last_page_0 =
 		    bind.opt.last_page < 0 ? slot.page_count : MinValue<int>(bind.opt.last_page, slot.page_count);
@@ -2321,6 +2323,7 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 		string text;
 		double width = 0.0;
 		double height = 0.0;
+		string page_label;
 		bool has_text_layer = false;
 		bool used_ocr = false;
 		double ocr_confidence = 0.0;
@@ -2336,9 +2339,13 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 			PopplerDocGuard poppler_guard;
 			page.reset(l.doc->create_page(l.page_idx));
 			if (page) {
+				auto poppler_label = UStringToUtf8(page->label());
 				auto rect = page->page_rect();
 				width = rect.width();
 				height = rect.height();
+				if (g.slots[l.file_idx]->has_page_labels) {
+					page_label = std::move(poppler_label);
+				}
 				// Probe the native text layer even under force_ocr so the
 				// has_text_layer flag always reflects the PDF itself, not the
 				// extraction path chosen by the caller.
@@ -2383,6 +2390,7 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 		} else {
 			OutDoubleNull(output.data[8], count);
 		}
+		OutStringOrNull(output.data[9], count, page_label);
 		count++;
 	}
 	output.SetCardinality(count);
@@ -3225,9 +3233,9 @@ static unique_ptr<FunctionData> ReadPdfWordsBind(ClientContext &context, TableFu
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::DOUBLE,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR,
 	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::INTEGER,
-	                LogicalType::INTEGER, LogicalType::DOUBLE,  LogicalType::DOUBLE};
-	names = {"filename",  "page",   "word",       "x0",   "y0",           "x1",         "y1",         "font_name",
-	         "font_size", "source", "confidence", "line", "column_index", "page_width", "page_height"};
+	                LogicalType::INTEGER, LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR};
+	names = {"filename",  "page",   "word",       "x0",   "y0",           "x1",         "y1",          "font_name",
+	         "font_size", "source", "confidence", "line", "column_index", "page_width", "page_height", "label"};
 	return std::move(result);
 }
 
@@ -3246,6 +3254,8 @@ struct ReadPdfWordsState : public GlobalTableFunctionState {
 	std::vector<int32_t> column_ids;
 	double page_width = 0.0;
 	double page_height = 0.0;
+	string page_label;
+	bool has_page_labels = false;
 	bool page_is_ocr = false;
 	string current_file;
 	idx_t MaxThreads() const override {
@@ -3328,6 +3338,7 @@ static void WordsOpenFile(ClientContext &context, const ReadPdfWordsBindData &bi
 	g.current_file = bind.files[g.file_idx];
 	ReadAllBytes(context, g.current_file, g.file_bytes);
 	g.doc = LoadDoc(g.file_bytes, bind.opt.password, g.current_file);
+	g.has_page_labels = pdf_qpdf::HasPageLabels(g.file_bytes, bind.opt.password);
 	g.page_count = g.doc->pages();
 	g.page_idx = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
 	g.last_page_0 = bind.opt.last_page < 0 ? g.page_count : MinValue<int>(bind.opt.last_page, g.page_count);
@@ -3337,6 +3348,7 @@ static void WordsOpenFile(ClientContext &context, const ReadPdfWordsBindData &bi
 	g.column_ids.clear();
 	g.page_width = 0.0;
 	g.page_height = 0.0;
+	g.page_label.clear();
 	g.page_is_ocr = false;
 	g.word_idx = 0;
 }
@@ -3349,6 +3361,7 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 	g.column_ids.clear();
 	g.page_width = 0.0;
 	g.page_height = 0.0;
+	g.page_label.clear();
 	g.page_is_ocr = false;
 	g.word_idx = 0;
 	if (g.page_idx >= g.last_page_0) {
@@ -3356,10 +3369,14 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 	}
 	unique_ptr<poppler::page> page(g.doc->create_page(g.page_idx));
 	if (page) {
+		auto poppler_label = UStringToUtf8(page->label());
 		// Crop-box size in points — same default as read_pdf width/height.
 		auto rect = page->page_rect();
 		g.page_width = rect.width();
 		g.page_height = rect.height();
+		if (g.has_page_labels) {
+			g.page_label = std::move(poppler_label);
+		}
 		if (opt.force_ocr) {
 			// Prefer OCR; fall back to native words when the raster is blank
 			// (e.g. missing display fonts on a text-only PDF under vcpkg poppler).
@@ -3463,6 +3480,7 @@ static void ReadPdfWordsScan(ClientContext &context, TableFunctionInput &data_p,
 		OutInt32(output.data[12], count, column_no);
 		OutDouble(output.data[13], count, g.page_width);
 		OutDouble(output.data[14], count, g.page_height);
+		OutStringOrNull(output.data[15], count, g.page_label);
 		g.word_idx++;
 		count++;
 	}
@@ -3484,8 +3502,9 @@ static unique_ptr<FunctionData> ReadPdfLinesBind(ClientContext &context, TableFu
 	auto result = make_uniq<ReadPdfLinesBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR};
-	names = {"filename", "page", "line", "text"};
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR};
+	names = {"filename", "page", "line", "text", "label"};
 	return std::move(result);
 }
 
@@ -3499,6 +3518,8 @@ struct ReadPdfLinesState : public GlobalTableFunctionState {
 	unique_ptr<poppler::document> doc;
 	vector<string> lines;
 	string current_file;
+	string page_label;
+	bool has_page_labels = false;
 	idx_t MaxThreads() const override {
 		return 1;
 	}
@@ -3509,17 +3530,20 @@ static void LinesOpenFile(ClientContext &context, const ReadPdfLinesBindData &bi
 	g.current_file = bind.files[g.file_idx];
 	ReadAllBytes(context, g.current_file, g.file_bytes);
 	g.doc = LoadDoc(g.file_bytes, bind.opt.password, g.current_file);
+	g.has_page_labels = pdf_qpdf::HasPageLabels(g.file_bytes, bind.opt.password);
 	g.page_count = g.doc->pages();
 	g.page_idx = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
 	g.last_page_0 = bind.opt.last_page < 0 ? g.page_count : MinValue<int>(bind.opt.last_page, g.page_count);
 	g.lines.clear();
 	g.line_idx = 0;
+	g.page_label.clear();
 }
 
 static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	g.lines.clear();
 	g.line_idx = 0;
+	g.page_label.clear();
 	if (g.page_idx >= g.last_page_0) {
 		return false;
 	}
@@ -3527,6 +3551,10 @@ static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 	auto layout = LayoutFromString(opt.layout, false);
 	unique_ptr<poppler::page> page(g.doc->create_page(g.page_idx));
 	if (page) {
+		auto poppler_label = UStringToUtf8(page->label());
+		if (g.has_page_labels) {
+			g.page_label = std::move(poppler_label);
+		}
 		// 'auto' takes the geometry engine, so a line here is the same object a
 		// read_pdf_words `line` id names. The poppler modes still split rendered
 		// page text on newlines, which is why their line numbers can disagree on
@@ -3589,6 +3617,7 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 		OutInt32(output.data[1], count, g.page_idx + 1);
 		OutInt32(output.data[2], count, (int32_t)g.line_idx + 1);
 		OutString(output.data[3], count, g.lines[g.line_idx]);
+		OutStringOrNull(output.data[4], count, g.page_label);
 		g.line_idx++;
 		count++;
 	}
@@ -8359,6 +8388,7 @@ struct PdfPagesInfoState : public GlobalTableFunctionState {
 	idx_t row_idx = 0;
 	string current_file;
 	int page_count = 0;
+	bool has_page_labels = false;
 	std::vector<PdfPagesInfoRow> rows;
 	idx_t MaxThreads() const override {
 		return 1;
@@ -8396,6 +8426,7 @@ static void PdfPagesInfoScan(ClientContext &context, TableFunctionInput &data_p,
 			string bytes;
 			ReadAllBytes(context, st.current_file, bytes);
 			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+			st.has_page_labels = pdf_qpdf::HasPageLabels(bytes, bind.opt.password);
 			st.page_count = doc->pages();
 			for (int i = 0; i < st.page_count; i++) {
 				unique_ptr<poppler::page> page(doc->create_page(i));
@@ -8415,7 +8446,10 @@ static void PdfPagesInfoScan(ClientContext &context, TableFunctionInput &data_p,
 				auto ori = page->orientation();
 				row.orientation = OrientationName(ori);
 				row.rotation = OrientationDegrees(ori);
-				row.label = UStringToUtf8(page->label());
+				auto poppler_label = UStringToUtf8(page->label());
+				if (st.has_page_labels) {
+					row.label = std::move(poppler_label);
+				}
 				row.duration = page->duration();
 				st.rows.push_back(std::move(row));
 			}
