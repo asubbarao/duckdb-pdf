@@ -28,6 +28,7 @@
 #include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFPageDocumentHelper.hh>
 #include <qpdf/QPDFPageObjectHelper.hh>
+#include <qpdf/QPDFOutlineDocumentHelper.hh>
 #include <qpdf/QPDFWriter.hh>
 #include <qpdf/QPDFXRefEntry.hh>
 #include <qpdf/QUtil.hh>
@@ -325,6 +326,45 @@ std::vector<Annotation> ReadAnnotations(const std::string &pdf_bytes) {
 		}
 	}
 	return annotations;
+}
+
+namespace {
+
+static void CollectOutlinePages(QPDFOutlineObjectHelper &item, const std::map<QPDFObjGen, int> &page_numbers,
+                                std::vector<int> &pages) {
+	auto dest_page = item.getDestPage();
+	int page_number = 0;
+	if (!dest_page.isNull()) {
+		auto page_it = page_numbers.find(dest_page.getObjGen());
+		if (page_it != page_numbers.end()) {
+			page_number = page_it->second;
+		}
+	}
+	pages.push_back(page_number);
+	for (auto &child : item.getKids()) {
+		CollectOutlinePages(child, page_numbers, pages);
+	}
+}
+
+} // namespace
+
+std::vector<int> ReadOutlinePages(const std::string &pdf_bytes, const std::string &password) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	OpenQpdfBytes(doc, "pdf_outline", pdf_bytes, password);
+	QPDFPageDocumentHelper doc_pages(doc);
+	std::map<QPDFObjGen, int> page_numbers;
+	auto pages = doc_pages.getAllPages();
+	for (size_t page_idx = 0; page_idx < pages.size(); page_idx++) {
+		page_numbers[pages[page_idx].getObjectHandle().getObjGen()] = static_cast<int>(page_idx + 1);
+	}
+
+	std::vector<int> outline_pages;
+	QPDFOutlineDocumentHelper outlines(doc);
+	for (auto &item : outlines.getTopLevelOutlines()) {
+		CollectOutlinePages(item, page_numbers, outline_pages);
+	}
+	return outline_pages;
 }
 
 namespace {

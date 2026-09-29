@@ -2351,6 +2351,7 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 struct PdfOutlineRow {
 	int ord = 0;   // 1-based, depth-first document order
 	int depth = 0; // 1 = top level
+	int page = 0;  // 1-based physical page; zero is SQL NULL
 	string title;
 };
 
@@ -2379,8 +2380,9 @@ struct PdfOutlineState : public GlobalTableFunctionState {
 
 static unique_ptr<FunctionData> PdfOutlineBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<string> &names) {
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR};
-	names = {"file", "ord", "depth", "title"};
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::INTEGER};
+	names = {"file", "ord", "depth", "title", "page"};
 	return PdfInspectBindCommon(context, input);
 }
 
@@ -2403,12 +2405,29 @@ static void PdfOutlineScan(ClientContext &context, TableFunctionInput &data_p, D
 			st.row_idx = 0;
 			st.current_file = bind.files[st.file_idx++];
 			string bytes;
-			ReadAllBytes(context, st.current_file, bytes);
-			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
-			unique_ptr<poppler::toc> toc(doc->create_toc());
-			if (toc && toc->root()) {
-				int ord = 0;
-				OutlineWalk(toc->root(), 1, ord, st.rows);
+			try {
+				ReadAllBytes(context, st.current_file, bytes);
+				auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+				unique_ptr<poppler::toc> toc(doc->create_toc());
+				if (toc && toc->root()) {
+					int ord = 0;
+					OutlineWalk(toc->root(), 1, ord, st.rows);
+				}
+				try {
+					auto pages = pdf_qpdf::ReadOutlinePages(bytes, bind.opt.password);
+					if (pages.size() == st.rows.size()) {
+						for (idx_t i = 0; i < st.rows.size(); i++) {
+							st.rows[i].page = pages[i];
+						}
+					}
+				} catch (const std::exception &) {
+					// Poppler remains authoritative for rows; an unresolved qpdf pass means NULL pages.
+				}
+			} catch (const std::exception &) {
+				if (!bind.opt.ignore_errors) {
+					throw;
+				}
+				continue;
 			}
 			continue;
 		}
@@ -2417,6 +2436,11 @@ static void PdfOutlineScan(ClientContext &context, TableFunctionInput &data_p, D
 		OutInt32(output.data[1], count, row.ord);
 		OutInt32(output.data[2], count, row.depth);
 		OutString(output.data[3], count, row.title);
+		if (row.page > 0) {
+			OutInt32(output.data[4], count, row.page);
+		} else {
+			OutInt32Null(output.data[4], count);
+		}
 		st.row_idx++;
 		count++;
 	}
@@ -8831,6 +8855,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	TableFunction pdf_outline("pdf_outline", {LogicalType::VARCHAR}, PdfOutlineScan, PdfOutlineBind, PdfOutlineInit);
 	pdf_outline.named_parameters["password"] = LogicalType::VARCHAR;
+	pdf_outline.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(pdf_outline);
 
 	TableFunction pdf_attachments("pdf_attachments", {LogicalType::VARCHAR}, PdfAttachmentsScan, PdfAttachmentsBind,
