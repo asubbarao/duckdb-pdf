@@ -58,6 +58,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -7486,6 +7487,184 @@ static void PdfSplitBlankScan(ClientContext &context, TableFunctionInput &data_p
 // during write, and the whole operation runs under QpdfMutex (in qpdf_ops.cpp).
 //===--------------------------------------------------------------------===//
 
+static void PdfOpsCheckInOut(const char *fn, const string &input, const string &output);
+
+struct PdfOcrRow {
+	int page = 0;
+	bool had_text_layer = false;
+	bool ocr_applied = false;
+	int words = 0;
+	bool has_confidence = false;
+	double mean_confidence = 0;
+	double seconds = 0;
+};
+
+struct PdfOcrBindData : public TableFunctionData {
+	string input;
+	string output;
+	PdfOptions opt;
+	bool force = false;
+};
+
+struct PdfOcrState : public GlobalTableFunctionState {
+	bool executed = false;
+	idx_t emit_idx = 0;
+	std::vector<PdfOcrRow> rows;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static string PdfOcrTempBase(int page, int pass) {
+#ifdef _WIN32
+	const char sep = '\\';
+#else
+	const char sep = '/';
+#endif
+	return TempDir() + sep + "pdf_ocr_" + BaseUUID::ToString(UUID::GenerateRandomUUID()) + "_p" + std::to_string(page) +
+	       "_pass" + std::to_string(pass);
+}
+
+static pdf_ocr::PdfResult RenderOcrLayer(poppler::page *page, const PdfOptions &po, int dpi, const string &base) {
+	auto opt = MakeOcrOptions(po, false);
+	opt.dpi = dpi;
+	poppler::image image = RenderPageForOcr(page, dpi);
+	if (!image.is_valid()) {
+		throw IOException("pdf_ocr: failed to render page");
+	}
+	try {
+		return pdf_ocr::RenderSearchablePdf(reinterpret_cast<const unsigned char *>(image.const_data()), image.width(),
+		                                    image.height(), image.bytes_per_row(), PopplerFormatToOcr(image.format()),
+		                                    base, opt);
+	} catch (const std::exception &e) {
+		throw IOException("pdf_ocr: %s", string(e.what()));
+	}
+}
+
+static void PdfOcrExecute(ClientContext &context, const string &input, const string &output, const PdfOptions &po,
+                          bool force, std::vector<PdfOcrRow> &rows) {
+	PdfOpsCheckInOut("pdf_ocr", input, output);
+	string bytes;
+	ReadPdfInput(context, "pdf_ocr", input, bytes);
+	auto doc = LoadDoc(bytes, po.password, input);
+	if (StringUtil::Lower(po.ocr_backend) != "tesseract") {
+		throw InvalidInputException("pdf_ocr: the searchable-PDF renderer requires ocr_backend := 'tesseract'");
+	}
+
+	std::vector<string> layers(static_cast<size_t>(doc->pages()));
+	std::vector<TempFileGuard> temp_files;
+	rows.reserve(static_cast<size_t>(doc->pages()));
+	for (int page_idx = 0; page_idx < doc->pages(); page_idx++) {
+		unique_ptr<poppler::page> page;
+		double width = 0;
+		bool had_text_layer = false;
+		int native_words = 0;
+		{
+			PopplerDocGuard poppler_guard;
+			page.reset(doc->create_page(page_idx));
+			if (!page) {
+				throw IOException("pdf_ocr: could not read page %d", page_idx + 1);
+			}
+			width = page->page_rect().width();
+			auto layout_words =
+			    LayoutWordsFromBoxes(MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font)));
+			for (const auto &word : layout_words) {
+				if (pdf_ocr::HasGlyphs(word.text)) {
+					native_words++;
+				}
+			}
+			had_text_layer = pdf_ocr::HasGlyphs(LayoutPageText(layout_words, width));
+		}
+
+		PdfOcrRow row;
+		row.page = page_idx + 1;
+		row.had_text_layer = had_text_layer;
+		row.words = native_words;
+		if (had_text_layer && !force) {
+			rows.push_back(row);
+			continue;
+		}
+
+		const auto started = std::chrono::steady_clock::now();
+		const string first_base = PdfOcrTempBase(row.page, 1);
+		const string first_path = first_base + ".pdf";
+		temp_files.emplace_back(first_path);
+		auto first = RenderOcrLayer(page.get(), po, po.ocr_dpi, first_base);
+		string chosen_path = first_path;
+		pdf_ocr::PdfResult chosen = first;
+		if (po.ocr_retry && first.confidence < 55 && po.ocr_dpi < 400) {
+			const string second_base = PdfOcrTempBase(row.page, 2);
+			const string second_path = second_base + ".pdf";
+			temp_files.emplace_back(second_path);
+			auto second = RenderOcrLayer(page.get(), po, po.ocr_dpi * 2, second_base);
+			if (second.confidence > chosen.confidence) {
+				chosen_path = second_path;
+				chosen = second;
+			}
+		}
+		row.ocr_applied = true;
+		row.words = chosen.words;
+		row.mean_confidence = chosen.confidence;
+		row.has_confidence = true;
+		row.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+		layers[static_cast<size_t>(page_idx)] = chosen_path;
+		rows.push_back(row);
+	}
+
+	try {
+		pdf_qpdf::AddTextLayers(input, output, layers);
+	} catch (const std::exception &e) {
+		throw InvalidInputException("pdf_ocr: %s", string(e.what()));
+	}
+}
+
+static unique_ptr<FunctionData> PdfOcrBind(ClientContext &, TableFunctionBindInput &input,
+                                           vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PdfOcrBindData>();
+	result->input = StringValue::Get(input.inputs[0]);
+	result->output = StringValue::Get(input.inputs[1]);
+	ParseNamed(input.named_parameters, result->opt);
+	for (auto &kv : input.named_parameters) {
+		if (StringUtil::Lower(kv.first) == "force") {
+			result->force = BooleanValue::Get(kv.second);
+		}
+	}
+	return_types = {LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::INTEGER,
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR};
+	names = {"page", "had_text_layer", "ocr_applied", "words", "mean_confidence", "seconds", "out_path"};
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PdfOcrInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<PdfOcrState>();
+}
+
+static void PdfOcrScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<PdfOcrBindData>();
+	auto &state = data_p.global_state->Cast<PdfOcrState>();
+	if (!state.executed) {
+		PdfOcrExecute(context, bind.input, bind.output, bind.opt, bind.force, state.rows);
+		state.executed = true;
+	}
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && state.emit_idx < state.rows.size()) {
+		auto &row = state.rows[state.emit_idx++];
+		OutInt32(output.data[0], count, row.page);
+		OutBool(output.data[1], count, row.had_text_layer);
+		OutBool(output.data[2], count, row.ocr_applied);
+		OutInt32(output.data[3], count, row.words);
+		if (row.has_confidence) {
+			OutDouble(output.data[4], count, row.mean_confidence);
+		} else {
+			OutDoubleNull(output.data[4], count);
+		}
+		OutDouble(output.data[5], count, row.seconds);
+		OutString(output.data[6], count, bind.output);
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
 // Shared preamble for the single-input scalar ops.
 static void PdfOpsCheckInOut(const char *fn, const string &input, const string &output) {
 	PdfOpsCheckInputExists(fn, input);
@@ -9875,6 +10054,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                 nullptr, PdfRedactLateralBind, nullptr, PdfRedactLateralLocalInit);
 	pdf_redact_lateral.in_out_function = PdfRedactLateralInOut;
 	loader.RegisterFunction(pdf_redact_lateral);
+
+	// pdf_ocr: persist Tesseract's invisible text layer, then splice it into the
+	// original document so pages without OCR remain structurally untouched.
+	TableFunction pdf_ocr("pdf_ocr", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfOcrScan, PdfOcrBind, PdfOcrInit);
+	AddCommonNamedParams(pdf_ocr);
+	pdf_ocr.named_parameters["force"] = LogicalType::BOOLEAN;
+	loader.RegisterFunction(pdf_ocr);
 
 	// Comprehensive poppler / qpdf surface
 	TableFunction pdf_pages_info("pdf_pages_info", {LogicalType::VARCHAR}, PdfPagesInfoScan, PdfPagesInfoBind,

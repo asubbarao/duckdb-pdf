@@ -9,6 +9,7 @@
 
 #include <tesseract/baseapi.h>
 #include <tesseract/resultiterator.h>
+#include <tesseract/renderer.h>
 
 #include <leptonica/allheaders.h>
 
@@ -782,6 +783,50 @@ WordsResult RecognizeWords(const unsigned char *data, int width, int height, int
 		return wr;
 	}
 	return RecognizeTesseractWords(data, width, height, bytes_per_row, format, opt);
+}
+
+PdfResult RenderSearchablePdf(const unsigned char *data, int width, int height, int bytes_per_row, ImageFormat format,
+                              const std::string &output_base, const Options &opt) {
+	PdfResult out;
+	if (!data || width <= 0 || height <= 0) {
+		return out;
+	}
+	if (!EnsureTesseract(opt)) {
+		return out;
+	}
+	const std::string datadir = ResolveTessdataDir(opt.language, opt.tessdata_dir);
+	std::ifstream pdf_font((datadir + "/pdf.ttf").c_str());
+	const bool has_pdf_font = pdf_font.good();
+
+	auto &api = TlsTess().api;
+	Pix *base = nullptr;
+	Pix *processed = nullptr;
+	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed);
+	tesseract::TessPDFRenderer renderer(output_base.c_str(), datadir.c_str(), true /* textonly */);
+	const bool begun = renderer.BeginDocument("DuckDB PDF OCR");
+	const bool recognized = begun && api.Recognize(0) == 0;
+	const bool added = recognized && renderer.AddImage(&api);
+	const bool rendered = added && renderer.EndDocument();
+	if (!rendered || !renderer.happy()) {
+		api.Clear();
+		DestroyPixPair(processed, base);
+		std::string message = "pdf_ocr: Tesseract's PDF renderer could not write the text layer";
+		if (!has_pdf_font) {
+			message += "; pdf.ttf is missing from tessdata ('" + datadir + "')";
+		}
+		throw std::runtime_error(message);
+	}
+	out.confidence = api.MeanTextConf();
+	if (auto *ri = api.GetIterator()) {
+		do {
+			if (!ri->Empty(tesseract::RIL_WORD)) {
+				out.words++;
+			}
+		} while (ri->Next(tesseract::RIL_WORD));
+	}
+	api.Clear();
+	DestroyPixPair(processed, base);
+	return out;
 }
 
 TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Options &opt) {

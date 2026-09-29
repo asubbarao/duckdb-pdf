@@ -24,6 +24,9 @@ FROM pdf_info('docs/*.pdf');
 CREATE TABLE chunks AS FROM pdf_chunks('docs/*.pdf');
 ```
 
+For scans, OCR once with `pdf_ocr`, then read the searchable output with the
+ordinary PDF readers.
+
 > **See [COOKBOOK.md](COOKBOOK.md) for task-oriented recipes** — RAG ingestion,
 > full-text search, scanned-invoice OCR, quarantining broken files, signature
 > forensics, bulk document surgery, thumbnails, and reporting. This README is the
@@ -990,6 +993,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_split(file, dir)` | Table | One single-page PDF per page; one row per emitted file. |
 | `pdf_split_blank(file, dir[, blank_threshold])` | Table | Splits on blank-page separators (mailroom batches); one row per emitted document. |
 | `pdf_redact(in, out, boxes [, dpi, password])` | Table | True raster redaction: replace boxed pages with image-only pages (text removed, not covered); one row per output page. |
+| `pdf_ocr(src, dst [, force, OCR knobs])` | Table | Persist an invisible Tesseract text layer; one receipt row per page. |
 | `pdf_redact_lateral(in, out, boxes)` | Table (in-out) | Column-ref / dependent-join form of `pdf_redact` (positional only; dpi=200, password=''). |
 | `pdf_to_text(src [, layout])` | Scalar | Whole document as plain text. Path or `BLOB`. |
 | `pdf_to_markdown(path)` | Scalar | Whole document as GitHub-flavoured Markdown. |

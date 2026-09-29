@@ -137,6 +137,11 @@ struct WordsResult {
 	Backend backend_used = Backend::Tesseract;
 };
 
+struct PdfResult {
+	int words = 0;
+	int confidence = 0;
+};
+
 // Single-pass OCR of a rendered page bitmap. `bytes_per_row` is the stride.
 // Confidence-based 2x-DPI retry lives in the caller (only the caller can
 // re-render via poppler). Dispatches on opt.backend.
@@ -145,6 +150,11 @@ TextResult RecognizeText(const unsigned char *data, int width, int height, int b
 
 WordsResult RecognizeWords(const unsigned char *data, int width, int height, int bytes_per_row, ImageFormat format,
                            const Options &opt);
+
+// Render the current page image as a text-only searchable PDF using Tesseract's
+// own PDF renderer. `output_base` excludes the `.pdf` suffix.
+PdfResult RenderSearchablePdf(const unsigned char *data, int width, int height, int bytes_per_row, ImageFormat format,
+                              const std::string &output_base, const Options &opt);
 
 // OCR an encoded image BLOB (PNG/JPEG/etc. that leptonica pixReadMem accepts).
 // Uses the same thread_local TessBaseAPI path as RecognizeText. Throws

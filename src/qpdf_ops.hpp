@@ -56,6 +56,10 @@ void Split(const std::string &input, const std::string &output_dir, const std::s
 // linearization ("fast web view"). Image data is carried over as-is.
 void Compress(const std::string &input, const std::string &output);
 
+// Appends each non-empty text-only PDF page in `layers` to the corresponding
+// source page, copying its font resources into the source document.
+void AddTextLayers(const std::string &input, const std::string &output, const std::vector<std::string> &layers);
+
 // AES-256 (R6) with all permissions allowed; the caller has already resolved
 // an empty owner password to the user password.
 void Encrypt(const std::string &input, const std::string &output, const std::string &user_password,

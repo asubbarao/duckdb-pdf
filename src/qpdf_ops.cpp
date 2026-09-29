@@ -210,6 +210,77 @@ void Compress(const std::string &input, const std::string &output) {
 	writer.write();
 }
 
+namespace {
+
+void MergeLayerResources(QPDF &doc, QPDFPageObjectHelper &page, QPDFPageObjectHelper &layer) {
+	QPDFObjectHandle resources = QPDFObjectHandle::newDictionary();
+	QPDFObjectHandle original = page.getAttribute("/Resources", false);
+	if (original.isDictionary()) {
+		for (const auto &entry : original.getDictAsMap()) {
+			resources.replaceKey(entry.first, entry.second);
+		}
+	}
+	QPDFObjectHandle layer_resources = layer.getAttribute("/Resources", false);
+	if (!layer_resources.isDictionary()) {
+		page.getObjectHandle().replaceKey("/Resources", resources);
+		return;
+	}
+	for (const char *category : {"/ExtGState", "/ColorSpace", "/Pattern", "/Shading", "/XObject", "/Font"}) {
+		QPDFObjectHandle layer_dict = layer_resources.getKeyIfDict(category);
+		if (!layer_dict.isDictionary()) {
+			continue;
+		}
+		QPDFObjectHandle merged = QPDFObjectHandle::newDictionary();
+		QPDFObjectHandle original_dict = resources.getKeyIfDict(category);
+		if (original_dict.isDictionary()) {
+			for (const auto &entry : original_dict.getDictAsMap()) {
+				merged.replaceKey(entry.first, entry.second);
+			}
+		}
+		for (const auto &entry : layer_dict.getDictAsMap()) {
+			merged.replaceKey(entry.first, doc.copyForeignObject(entry.second));
+		}
+		resources.replaceKey(category, merged);
+	}
+	page.getObjectHandle().replaceKey("/Resources", resources);
+}
+
+} // namespace
+
+void AddTextLayers(const std::string &input, const std::string &output, const std::vector<std::string> &layers) {
+	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
+	QPDF doc;
+	doc.processFile(input.c_str());
+	QPDFPageDocumentHelper doc_pages(doc);
+	auto pages = doc_pages.getAllPages();
+	if (pages.size() != layers.size()) {
+		throw std::runtime_error("pdf_ocr: internal page-count mismatch (" + std::to_string(pages.size()) +
+		                         " document pages vs " + std::to_string(layers.size()) + " OCR layers)");
+	}
+	std::vector<std::unique_ptr<QPDF>> layer_docs;
+	layer_docs.reserve(layers.size());
+	for (size_t i = 0; i < pages.size(); i++) {
+		if (layers[i].empty()) {
+			continue;
+		}
+		auto layer_doc = std::make_unique<QPDF>();
+		layer_doc->processFile(layers[i].c_str());
+		QPDFPageDocumentHelper layer_pages(*layer_doc);
+		auto rendered_pages = layer_pages.getAllPages();
+		if (rendered_pages.size() != 1) {
+			throw std::runtime_error("pdf_ocr: Tesseract returned a text layer with an unexpected page count");
+		}
+		QPDFPageObjectHelper layer_page = rendered_pages[0];
+		MergeLayerResources(doc, pages[i], layer_page);
+		for (auto &contents : layer_page.getPageContents()) {
+			pages[i].addPageContents(doc.copyForeignObject(contents), false);
+		}
+		layer_docs.push_back(std::move(layer_doc));
+	}
+	QPDFWriter writer(doc, output.c_str());
+	writer.write();
+}
+
 void Encrypt(const std::string &input, const std::string &output, const std::string &user_password,
              const std::string &owner_password) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
