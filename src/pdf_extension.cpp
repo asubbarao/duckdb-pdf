@@ -949,7 +949,7 @@ static size_t AssignCellToColumn(const ProvCell &c, const std::vector<double> &c
 }
 
 // Merge sparse multi-line continuation rows into the previous row.
-static void MergeContinuationRows(std::vector<std::vector<string>> &grid) {
+static void MergeContinuationRows(std::vector<std::vector<string>> &grid, bool allow_dense_continuation = false) {
 	if (grid.size() < 2) {
 		return;
 	}
@@ -985,8 +985,10 @@ static void MergeContinuationRows(std::vector<std::vector<string>> &grid) {
 		// Continuation: sparse row whose non-empty cells continue columns that
 		// already have text in the previous row (wrapped multi-line cell), and
 		// that does not introduce many brand-new columns.
+		bool sparse_enough =
+		    allow_dense_continuation ? filled_cur < filled_prev : filled_cur <= std::max(1, filled_prev / 2);
 		bool is_cont = filled_cur > 0 && filled_cur < filled_prev && shared_nonempty >= filled_cur && only_cur == 0 &&
-		               filled_cur <= std::max(1, filled_prev / 2);
+		               sparse_enough;
 		if (is_cont) {
 			for (size_t c = 0; c < cur.size(); ++c) {
 				if (cur[c].empty()) {
@@ -1155,11 +1157,75 @@ static std::vector<std::vector<string>> ReconstructLatticeGrid(const std::vector
 	return grid;
 }
 
+// Reconstruct one whitespace-region grid from already clustered provisional cells.
+static std::vector<std::vector<string>> ReconstructWhitespaceGrid(const std::vector<std::vector<ProvCell>> &row_cells,
+                                                                  double col_tol,
+                                                                  bool allow_dense_continuation = false) {
+	std::vector<std::vector<string>> grid;
+	if (row_cells.empty()) {
+		return grid;
+	}
+
+	std::vector<double> col_centers = DetectColumnsGlobal(row_cells, col_tol);
+	if (col_centers.size() < 2) {
+		return grid;
+	}
+
+	const size_t ncols = col_centers.size();
+	for (const auto &source_cells : row_cells) {
+		std::vector<ProvCell> cells = source_cells;
+		std::vector<string> line(ncols);
+		// Assign L→R so same-row cells never collide on one column when possible
+		std::sort(cells.begin(), cells.end(), [](const ProvCell &a, const ProvCell &b) { return a.xMin < b.xMin; });
+		std::vector<bool> used(ncols, false);
+		for (auto &c : cells) {
+			size_t best = 0;
+			double best_score = 1e300;
+			for (size_t k = 0; k < ncols; ++k) {
+				if (used[k]) {
+					continue;
+				}
+				// temporary un-mark: score as if free
+				ProvCell tmp = c;
+				// reuse AssignCellToColumn logic inline with used mask
+				double mid = 0.5 * (c.xMin + c.xMax);
+				double center = col_centers[k];
+				double d = std::min({std::fabs(c.xMin - center), std::fabs(c.xMax - center), std::fabs(mid - center)});
+				if (c.xMin - col_tol <= center && center <= c.xMax + col_tol) {
+					d = std::min(d, 0.25 * std::fabs(mid - center));
+				}
+				if (d < best_score) {
+					best_score = d;
+					best = k;
+				}
+				(void)tmp;
+			}
+			// If all columns used, fall back to absolute best including collisions
+			if (used[best] || best_score > col_tol * 8) {
+				best = AssignCellToColumn(c, col_centers, col_tol);
+			}
+			used[best] = true;
+			if (!line[best].empty()) {
+				line[best].push_back(' ');
+			}
+			line[best] += c.text;
+		}
+		grid.push_back(std::move(line));
+	}
+
+	MergeContinuationRows(grid, allow_dense_continuation);
+	if (!PassesTabularGate(grid, /*lattice=*/false)) {
+		grid.clear();
+	}
+	return grid;
+}
+
 // Reconstruct one page's words into a grid of text cells. Returns an empty grid
 // for non-tabular pages (prose, single column/row, irregular cell counts).
 // When `rules` is non-null and usable, lattice separators are authoritative.
 static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord> page_words,
-                                                            const RulingLines *rules = nullptr) {
+                                                            const RulingLines *rules = nullptr,
+                                                            bool allow_dense_continuation = false) {
 	std::vector<std::vector<string>> grid;
 	if (page_words.size() < 2) {
 		return grid;
@@ -1244,59 +1310,168 @@ static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord>
 		row_cells.push_back(GroupRowIntoCells(std::move(rows[r]), cell_gap_tol, r));
 	}
 
-	// --- global column model (left + right alignment recurrence) ---
-	std::vector<double> col_centers = DetectColumnsGlobal(row_cells, col_tol);
-	if (col_centers.size() < 2) {
-		return grid;
-	}
+	return ReconstructWhitespaceGrid(row_cells, col_tol, allow_dense_continuation);
+}
 
-	const size_t ncols = col_centers.size();
-	for (auto &cells : row_cells) {
-		std::vector<string> line(ncols);
-		// Assign L→R so same-row cells never collide on one column when possible
-		std::sort(cells.begin(), cells.end(), [](const ProvCell &a, const ProvCell &b) { return a.xMin < b.xMin; });
-		std::vector<bool> used(ncols, false);
-		for (auto &c : cells) {
-			size_t best = 0;
-			double best_score = 1e300;
-			for (size_t k = 0; k < ncols; ++k) {
-				if (used[k]) {
-					continue;
-				}
-				// temporary un-mark: score as if free
-				ProvCell tmp = c;
-				// reuse AssignCellToColumn logic inline with used mask
-				double mid = 0.5 * (c.xMin + c.xMax);
-				double center = col_centers[k];
-				double d = std::min({std::fabs(c.xMin - center), std::fabs(c.xMax - center), std::fabs(mid - center)});
-				if (c.xMin - col_tol <= center && center <= c.xMax + col_tol) {
-					d = std::min(d, 0.25 * std::fabs(mid - center));
-				}
-				if (d < best_score) {
-					best_score = d;
-					best = k;
-				}
-				(void)tmp;
-			}
-			// If all columns used, fall back to absolute best including collisions
-			if (used[best] || best_score > col_tol * 8) {
-				best = AssignCellToColumn(c, col_centers, col_tol);
-			}
-			used[best] = true;
-			if (!line[best].empty()) {
-				line[best].push_back(' ');
-			}
-			line[best] += c.text;
+static bool IsTabularRow(const std::vector<ProvCell> &row, double clear_gap_tol) {
+	if (row.size() < 2) {
+		return false;
+	}
+	double largest_gap = 0.0;
+	for (size_t c = 1; c < row.size(); ++c) {
+		largest_gap = std::max(largest_gap, row[c].xMin - row[c - 1].xMax);
+	}
+	return largest_gap >= clear_gap_tol;
+}
+
+static bool IsTableContinuationRow(const std::vector<ProvCell> &row, const std::vector<std::vector<ProvCell>> &rows,
+                                   size_t region_start, size_t row_idx, double col_tol, double clear_gap_tol) {
+	if (row.empty() || IsTabularRow(row, clear_gap_tol) || row_idx == region_start) {
+		return false;
+	}
+	const auto &cell = row.front();
+	bool matches_nonfirst_column = false;
+	size_t tabular_rows = 0;
+	for (size_t r = region_start; r < row_idx; ++r) {
+		if (!IsTabularRow(rows[r], clear_gap_tol)) {
+			continue;
 		}
-		grid.push_back(std::move(line));
+		tabular_rows++;
+		if (tabular_rows < 2) {
+			continue;
+		}
+		for (size_t c = 1; c < rows[r].size(); ++c) {
+			const auto &table_cell = rows[r][c];
+			if (std::fabs(cell.xMin - table_cell.xMin) <= col_tol * 2.0) {
+				matches_nonfirst_column = true;
+				break;
+			}
+		}
+		if (matches_nonfirst_column) {
+			break;
+		}
+	}
+	if (matches_nonfirst_column) {
+		return true;
+	}
+	// A sparse line between two full rows can wrap the first column as well.
+	return row_idx + 1 < rows.size() && IsTabularRow(rows[row_idx - 1], clear_gap_tol) &&
+	       IsTabularRow(rows[row_idx + 1], clear_gap_tol);
+}
+
+// Find independent whitespace tables on a page. Ruled pages stay on the
+// existing lattice path; only the borderless path is segmented here.
+static std::vector<std::vector<std::vector<string>>> ReconstructTableGrids(std::vector<PdfWord> page_words,
+                                                                           const RulingLines *rules = nullptr) {
+	std::vector<std::vector<std::vector<string>>> grids;
+	if (rules && rules->Usable()) {
+		auto grid = ReconstructPageGrid(page_words, rules);
+		if (!grid.empty()) {
+			grids.push_back(std::move(grid));
+			return grids;
+		}
+	}
+	if (page_words.size() < 2) {
+		return grids;
 	}
 
-	// --- multi-line cell merge + regularity gate ---
-	MergeContinuationRows(grid);
-	if (!PassesTabularGate(grid, /*lattice=*/false)) {
-		grid.clear();
+	std::vector<double> heights;
+	std::vector<double> widths;
+	heights.reserve(page_words.size());
+	widths.reserve(page_words.size());
+	for (const auto &w : page_words) {
+		double h = w.yMax - w.yMin;
+		if (h > 0) {
+			heights.push_back(h);
+		}
+		double ww = w.xMax - w.xMin;
+		size_t len = w.text.size();
+		if (ww > 0 && len > 0) {
+			widths.push_back(ww / static_cast<double>(len));
+		}
 	}
-	return grid;
+	double med_h = Median(heights);
+	if (med_h <= 0) {
+		med_h = 10.0;
+	}
+	double char_w = Median(widths);
+	if (char_w <= 0) {
+		char_w = med_h * 0.5;
+	}
+	double row_tol = med_h * 0.5;
+	double col_tol = char_w * 1.5;
+	double cell_gap_tol = char_w * 1.8;
+	double clear_gap_tol = std::max(10.0, cell_gap_tol * 1.5);
+
+	std::sort(page_words.begin(), page_words.end(), [](const PdfWord &a, const PdfWord &b) { return a.yMin < b.yMin; });
+	std::vector<std::vector<PdfWord>> word_rows;
+	std::vector<PdfWord> current;
+	double row_anchor = page_words.front().yMin;
+	for (auto &w : page_words) {
+		if (current.empty()) {
+			current.push_back(w);
+			row_anchor = w.yMin;
+		} else if (std::fabs(w.yMin - row_anchor) <= row_tol) {
+			current.push_back(w);
+		} else {
+			word_rows.push_back(std::move(current));
+			current.clear();
+			current.push_back(w);
+			row_anchor = w.yMin;
+		}
+	}
+	if (!current.empty()) {
+		word_rows.push_back(std::move(current));
+	}
+
+	std::vector<std::vector<ProvCell>> row_cells;
+	row_cells.reserve(word_rows.size());
+	for (size_t r = 0; r < word_rows.size(); ++r) {
+		row_cells.push_back(GroupRowIntoCells(word_rows[r], cell_gap_tol, r));
+	}
+
+	for (size_t start = 0; start < row_cells.size();) {
+		if (!IsTabularRow(row_cells[start], clear_gap_tol)) {
+			start++;
+			continue;
+		}
+		// A section heading can have a large gap but is narrower than the table
+		// header immediately below it; do not let it seed the table region.
+		if (start + 1 < row_cells.size() && row_cells[start + 1].size() >= row_cells[start].size() + 2) {
+			start++;
+			continue;
+		}
+		size_t end = start + 1;
+		while (end < row_cells.size()) {
+			if (IsTabularRow(row_cells[end], clear_gap_tol) ||
+			    IsTableContinuationRow(row_cells[end], row_cells, start, end, col_tol, clear_gap_tol)) {
+				end++;
+				continue;
+			}
+			break;
+		}
+		if (end - start >= 3) {
+			std::vector<PdfWord> region_words;
+			for (size_t r = start; r < end; ++r) {
+				region_words.insert(region_words.end(), word_rows[r].begin(), word_rows[r].end());
+			}
+			auto grid = ReconstructPageGrid(std::move(region_words), nullptr, true);
+			if (!grid.empty()) {
+				grids.push_back(std::move(grid));
+			}
+		}
+		start = end;
+	}
+	// A page whose whole layout is one table (a calendar month) has no prose to
+	// separate it from, so region segmentation can miss it; keep the whole-page
+	// reading as a floor so segmentation only ever adds tables.
+	if (grids.empty()) {
+		auto grid = ReconstructPageGrid(std::move(page_words), nullptr);
+		if (!grid.empty()) {
+			grids.push_back(std::move(grid));
+		}
+	}
+	return grids;
 }
 
 //===--------------------------------------------------------------------===//
@@ -4103,8 +4278,7 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 		} catch (...) {
 			ruling_segments.clear();
 		}
-		// table_index is a running counter over the tabular pages of this document
-		// (each tabular page yields one reconstructed grid).
+		// table_index is a running counter over reconstructed tables in this document.
 		int table_index = 0;
 		for (int p = first0; p < last0; p++) {
 			unique_ptr<poppler::page> page(doc->create_page(p));
@@ -4161,14 +4335,16 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 			// Lattice first when the page content stream has ruling lines (qpdf);
 			// ReconstructPageGrid falls back to the whitespace/stream model.
 			RulingLines rules = RulesForPage(ruling_segments, p);
-			auto grid = ReconstructPageGrid(std::move(words), &rules);
-			if (grid.size() < 2 || grid.front().size() < 2) {
-				continue;
+			auto grids = ReconstructTableGrids(std::move(words), &rules);
+			for (auto &grid : grids) {
+				if (grid.size() < 2 || grid.front().size() < 2) {
+					continue;
+				}
+				for (idx_t r = 0; r < grid.size(); r++) {
+					st->rows.push_back(TableRowOut {f, p + 1, table_index, (int)r, grid[r]});
+				}
+				table_index++;
 			}
-			for (idx_t r = 0; r < grid.size(); r++) {
-				st->rows.push_back(TableRowOut {f, p + 1, table_index, (int)r, grid[r]});
-			}
-			table_index++;
 		}
 	}
 	return std::move(st);
