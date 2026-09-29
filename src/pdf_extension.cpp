@@ -346,9 +346,73 @@ struct LayoutWord {
 	string text;
 };
 
+struct MergedTextBox {
+	double x0 = 0.0;
+	double y0 = 0.0;
+	double x1 = 0.0;
+	double y1 = 0.0;
+	string text;
+	string font_name;
+	double font_size = 0.0;
+	bool has_font = false;
+	bool has_space_after = true;
+};
+
 // A word joins a line when it overlaps that line vertically by at least this
 // fraction of the shorter of the two heights.
 static constexpr double LAYOUT_LINE_OVERLAP_MIN_RATIO = 0.5;
+
+// Two boxes on one line that touch within this fraction of the shorter box height
+// are one word when poppler says no space follows the first. A ligature run and the
+// rest of its word overlap by a small fraction of the type size (0.2pt at 12.75pt),
+// while a real word space is about a quarter of it; scaling by height keeps the
+// test the same from footnote to display type, including boxes with no font info.
+static constexpr double LAYOUT_JOIN_MAX_GAP_RATIO = 0.1;
+
+// Poppler reports a ligature run, or a superscript such as "26" + "th", as separate
+// boxes and the extension would join them with a space. Merge them back into one word.
+static std::vector<MergedTextBox> MergeSpacelessBoxes(std::vector<poppler::text_box> boxes) {
+	std::vector<MergedTextBox> merged;
+	merged.reserve(boxes.size());
+	for (auto &box : boxes) {
+		string text = UStringToUtf8(box.text());
+		if (!pdf_ocr::HasGlyphs(text)) {
+			continue;
+		}
+		auto r = box.bbox();
+		MergedTextBox current;
+		current.x0 = r.x();
+		current.y0 = r.y();
+		current.x1 = r.x() + r.width();
+		current.y1 = r.y() + r.height();
+		current.text = std::move(text);
+		current.has_font = box.has_font_info();
+		if (current.has_font) {
+			current.font_name = box.get_font_name();
+			current.font_size = box.get_font_size();
+		}
+		current.has_space_after = box.has_space_after();
+		if (!merged.empty()) {
+			auto &previous = merged.back();
+			double gap = current.x0 - previous.x1;
+			double overlap = MinValue<double>(current.y1, previous.y1) - MaxValue<double>(current.y0, previous.y0);
+			double shorter = MinValue<double>(current.y1 - current.y0, previous.y1 - previous.y0);
+			bool same_line = shorter > 0.0 && overlap >= LAYOUT_LINE_OVERLAP_MIN_RATIO * shorter;
+			if (!previous.has_space_after && same_line && std::fabs(gap) < LAYOUT_JOIN_MAX_GAP_RATIO * shorter) {
+				previous.text += current.text;
+				previous.x0 = MinValue<double>(previous.x0, current.x0);
+				previous.y0 = MinValue<double>(previous.y0, current.y0);
+				previous.x1 = MaxValue<double>(previous.x1, current.x1);
+				previous.y1 = MaxValue<double>(previous.y1, current.y1);
+				previous.has_space_after = current.has_space_after; // a word of three runs keeps merging
+				continue;
+			}
+		}
+		merged.push_back(std::move(current));
+	}
+	return merged;
+}
+
 // A candidate gutter must be this many median character widths wide, measured
 // in the units the page itself chose rather than in absolute points.
 static constexpr double LAYOUT_GUTTER_MIN_CHARS = 3.0;
@@ -600,34 +664,20 @@ static string LayoutPageText(const std::vector<LayoutWord> &words, double page_w
 
 // poppler text_list() -> the layout engine's word grain. Boxes that carry no
 // glyphs are dropped so they cannot anchor a phantom line.
-static std::vector<LayoutWord> LayoutWordsFromBoxes(const std::vector<poppler::text_box> &boxes) {
+static std::vector<LayoutWord> LayoutWordsFromBoxes(const std::vector<MergedTextBox> &boxes) {
 	std::vector<LayoutWord> words;
 	words.reserve(boxes.size());
 	for (const auto &b : boxes) {
-		string text = UStringToUtf8(b.text());
-		if (!pdf_ocr::HasGlyphs(text)) {
-			continue;
-		}
-		auto r = b.bbox();
 		LayoutWord w;
-		w.x0 = r.x();
-		w.y0 = r.y();
-		w.x1 = r.x() + r.width();
-		w.y1 = r.y() + r.height();
-		w.font_size = b.has_font_info() ? b.get_font_size() : 0.0;
-		w.text = std::move(text);
+		w.x0 = b.x0;
+		w.y0 = b.y0;
+		w.x1 = b.x1;
+		w.y1 = b.y1;
+		w.font_size = b.has_font ? b.font_size : 0.0;
+		w.text = b.text;
 		words.push_back(std::move(w));
 	}
 	return words;
-}
-
-// The same drop, applied to the box list itself. A page left with no boxes has
-// no text layer, which is the word-grain spelling of read_pdf's has_text_layer —
-// so both grains route the same pages to OCR and report the same used_ocr.
-static void DropGlyphlessBoxes(std::vector<poppler::text_box> &boxes) {
-	boxes.erase(std::remove_if(boxes.begin(), boxes.end(),
-	                           [](const poppler::text_box &b) { return !pdf_ocr::HasGlyphs(UStringToUtf8(b.text())); }),
-	            boxes.end());
 }
 
 // Geometry consumer for the qpdf-collected ruling segments — no qpdf here.
@@ -1814,11 +1864,10 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 				// Probe the native text layer even under force_ocr so the
 				// has_text_layer flag always reflects the PDF itself, not the
 				// extraction path chosen by the caller.
-				string native =
-				    auto_layout
-				        ? LayoutPageText(LayoutWordsFromBoxes(page->text_list(poppler::page::text_list_include_font)),
-				                         width)
-				        : UStringToUtf8(page->text(poppler::rectf(), layout));
+				string native = auto_layout ? LayoutPageText(LayoutWordsFromBoxes(MergeSpacelessBoxes(page->text_list(
+				                                                 poppler::page::text_list_include_font))),
+				                                             width)
+				                            : UStringToUtf8(page->text(poppler::rectf(), layout));
 				has_text_layer = pdf_ocr::HasGlyphs(native);
 				text = native;
 				want_ocr = bind.opt.force_ocr || (bind.opt.auto_ocr && !has_text_layer);
@@ -2688,7 +2737,7 @@ struct ReadPdfWordsState : public GlobalTableFunctionState {
 	idx_t word_idx = 0;
 	string file_bytes;
 	unique_ptr<poppler::document> doc;
-	std::vector<poppler::text_box> boxes;
+	std::vector<MergedTextBox> boxes;
 	std::vector<OcrWord> ocr_boxes;
 	// Parallel to boxes / ocr_boxes (whichever is active for the page).
 	std::vector<int32_t> line_ids;
@@ -2730,24 +2779,19 @@ static WordGrouping GroupLayoutWords(const std::vector<LayoutWord> &words, const
 	return out;
 }
 
-static WordGrouping GroupWordsNative(const std::vector<poppler::text_box> &boxes, double page_width) {
+static WordGrouping GroupWordsNative(const std::vector<MergedTextBox> &boxes, double page_width) {
 	std::vector<LayoutWord> words;
 	std::vector<size_t> origin;
 	words.reserve(boxes.size());
 	origin.reserve(boxes.size());
 	for (size_t i = 0; i < boxes.size(); i++) {
-		string text = UStringToUtf8(boxes[i].text());
-		if (!pdf_ocr::HasGlyphs(text)) {
-			continue;
-		}
-		auto r = boxes[i].bbox();
 		LayoutWord w;
-		w.x0 = r.x();
-		w.y0 = r.y();
-		w.x1 = r.x() + r.width();
-		w.y1 = r.y() + r.height();
-		w.font_size = boxes[i].has_font_info() ? boxes[i].get_font_size() : 0.0;
-		w.text = std::move(text);
+		w.x0 = boxes[i].x0;
+		w.y0 = boxes[i].y0;
+		w.x1 = boxes[i].x1;
+		w.y1 = boxes[i].y1;
+		w.font_size = boxes[i].has_font ? boxes[i].font_size : 0.0;
+		w.text = boxes[i].text;
 		words.push_back(std::move(w));
 		origin.push_back(i);
 	}
@@ -2818,8 +2862,7 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 			// (e.g. missing display fonts on a text-only PDF under vcpkg poppler).
 			// Probe native first so best_effort can stay false on image-only pages
 			// (loud missing-model error under explicit ocr:=true).
-			g.boxes = page->text_list(poppler::page::text_list_include_font);
-			DropGlyphlessBoxes(g.boxes);
+			g.boxes = MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font));
 			const bool has_native = !g.boxes.empty();
 			g.ocr_boxes = OcrPageWords(page.get(), opt, /*best_effort=*/has_native);
 			if (!g.ocr_boxes.empty()) {
@@ -2829,8 +2872,7 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 				g.page_is_ocr = false;
 			}
 		} else {
-			g.boxes = page->text_list(poppler::page::text_list_include_font);
-			DropGlyphlessBoxes(g.boxes);
+			g.boxes = MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font));
 			if (!g.boxes.empty()) {
 				g.page_is_ocr = false;
 			} else if (opt.auto_ocr) {
@@ -2896,15 +2938,14 @@ static void ReadPdfWordsScan(ClientContext &context, TableFunctionInput &data_p,
 			OutDouble(output.data[10], count, w.confidence);
 		} else {
 			auto &b = g.boxes[g.word_idx];
-			auto r = b.bbox();
-			OutString(output.data[2], count, UStringToUtf8(b.text()));
-			OutDouble(output.data[3], count, r.x());
-			OutDouble(output.data[4], count, r.y());
-			OutDouble(output.data[5], count, r.x() + r.width());
-			OutDouble(output.data[6], count, r.y() + r.height());
-			if (b.has_font_info()) {
-				OutString(output.data[7], count, b.get_font_name());
-				OutDouble(output.data[8], count, b.get_font_size());
+			OutString(output.data[2], count, b.text);
+			OutDouble(output.data[3], count, b.x0);
+			OutDouble(output.data[4], count, b.y0);
+			OutDouble(output.data[5], count, b.x1);
+			OutDouble(output.data[6], count, b.y1);
+			if (b.has_font) {
+				OutString(output.data[7], count, b.font_name);
+				OutDouble(output.data[8], count, b.font_size);
 			} else {
 				OutStringNull(output.data[7], count);
 				OutDoubleNull(output.data[8], count);
@@ -2987,10 +3028,10 @@ static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 		// read_pdf_words `line` id names. The poppler modes still split rendered
 		// page text on newlines, which is why their line numbers can disagree on
 		// a multi-column page.
-		string text = auto_layout
-		                  ? LayoutPageText(LayoutWordsFromBoxes(page->text_list(poppler::page::text_list_include_font)),
-		                                   page->page_rect().width())
-		                  : UStringToUtf8(page->text(poppler::rectf(), layout));
+		string text = auto_layout ? LayoutPageText(LayoutWordsFromBoxes(MergeSpacelessBoxes(
+		                                               page->text_list(poppler::page::text_list_include_font))),
+		                                           page->page_rect().width())
+		                          : UStringToUtf8(page->text(poppler::rectf(), layout));
 		size_t start = 0;
 		while (start <= text.size()) {
 			size_t nl = text.find('\n', start);
@@ -3564,19 +3605,15 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 		}
 		page_h[p + 1] = page->page_rect().height();
 		std::vector<ElemWord> words;
-		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
+		for (auto &b : MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font))) {
 			ElemWord w;
-			w.text = UStringToUtf8(b.text());
-			if (!pdf_ocr::HasGlyphs(w.text)) {
-				continue;
-			}
-			auto r = b.bbox();
-			w.x0 = r.x();
-			w.y0 = r.y();
-			w.x1 = r.x() + r.width();
-			w.y1 = r.y() + r.height();
-			w.has_font = b.has_font_info();
-			w.font_size = w.has_font ? b.get_font_size() : 0.0;
+			w.text = b.text;
+			w.x0 = b.x0;
+			w.y0 = b.y0;
+			w.x1 = b.x1;
+			w.y1 = b.y1;
+			w.has_font = b.has_font;
+			w.font_size = b.has_font ? b.font_size : 0.0;
 			if (w.has_font) {
 				ElemFontTally(doc_hist, w.font_size, w.text.size());
 			}
@@ -4088,26 +4125,24 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 					words.push_back(std::move(w));
 				}
 				if (words.empty()) {
-					for (auto &b : page->text_list()) {
-						auto r = b.bbox();
+					for (auto &b : MergeSpacelessBoxes(page->text_list())) {
 						PdfWord w;
-						w.xMin = r.x();
-						w.yMin = r.y();
-						w.xMax = r.x() + r.width();
-						w.yMax = r.y() + r.height();
-						w.text = UStringToUtf8(b.text());
+						w.xMin = b.x0;
+						w.yMin = b.y0;
+						w.xMax = b.x1;
+						w.yMax = b.y1;
+						w.text = b.text;
 						words.push_back(std::move(w));
 					}
 				}
 			} else {
-				for (auto &b : page->text_list()) {
-					auto r = b.bbox();
+				for (auto &b : MergeSpacelessBoxes(page->text_list())) {
 					PdfWord w;
-					w.xMin = r.x();
-					w.yMin = r.y();
-					w.xMax = r.x() + r.width();
-					w.yMax = r.y() + r.height();
-					w.text = UStringToUtf8(b.text());
+					w.xMin = b.x0;
+					w.yMin = b.y0;
+					w.xMax = b.x1;
+					w.yMax = b.y1;
+					w.text = b.text;
 					words.push_back(std::move(w));
 				}
 				if (words.empty() && bind.opt.auto_ocr) {
@@ -4357,11 +4392,10 @@ static string DocToXml(poppler::document &doc) {
 		auto rect = page->page_rect();
 		out += "  <page number=\"" + std::to_string(p + 1) + "\" width=\"" + FmtCoord(rect.width()) + "\" height=\"" +
 		       FmtCoord(rect.height()) + "\">\n";
-		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
-			auto r = b.bbox();
-			out += "    <word xMin=\"" + FmtCoord(r.x()) + "\" yMin=\"" + FmtCoord(r.y()) + "\" xMax=\"" +
-			       FmtCoord(r.x() + r.width()) + "\" yMax=\"" + FmtCoord(r.y() + r.height()) + "\">";
-			AppendXmlEscaped(out, UStringToUtf8(b.text()));
+		for (auto &b : MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font))) {
+			out += "    <word xMin=\"" + FmtCoord(b.x0) + "\" yMin=\"" + FmtCoord(b.y0) + "\" xMax=\"" +
+			       FmtCoord(b.x1) + "\" yMax=\"" + FmtCoord(b.y1) + "\">";
+			AppendXmlEscaped(out, b.text);
 			out += "</word>\n";
 		}
 		out += "  </page>\n";
@@ -4400,12 +4434,11 @@ static string DocToHtml(poppler::document &doc) {
 		auto rect = page->page_rect();
 		out += "<div class=\"page\" id=\"page" + std::to_string(p + 1) + "\" style=\"width:" + FmtCoord(rect.width()) +
 		       "px;height:" + FmtCoord(rect.height()) + "px;\">\n";
-		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
-			auto r = b.bbox();
-			double fs = b.has_font_info() ? b.get_font_size() : (r.height() > 0 ? r.height() : 10.0);
-			out += "<span style=\"left:" + FmtCoord(r.x()) + "px;top:" + FmtCoord(r.y()) +
+		for (auto &b : MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font))) {
+			double fs = b.has_font ? b.font_size : (b.y1 - b.y0 > 0 ? b.y1 - b.y0 : 10.0);
+			out += "<span style=\"left:" + FmtCoord(b.x0) + "px;top:" + FmtCoord(b.y0) +
 			       "px;font-size:" + FmtCoord(fs) + "px;\">";
-			AppendXmlEscaped(out, UStringToUtf8(b.text()));
+			AppendXmlEscaped(out, b.text);
 			out += "</span>\n";
 		}
 		out += "</div>\n";
@@ -5724,19 +5757,18 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 		}
 		page_widths[p] = page->page_rect().width();
 		std::vector<MdWord> page_words;
-		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
-			auto r = b.bbox();
+		for (auto &b : MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font))) {
 			MdWord w;
-			w.xMin = r.x();
-			w.yMin = r.y();
-			w.xMax = r.x() + r.width();
-			w.yMax = r.y() + r.height();
-			w.text = UStringToUtf8(b.text());
-			if (b.has_font_info()) {
-				w.font_name = b.get_font_name();
-				w.font_size = b.get_font_size();
+			w.xMin = b.x0;
+			w.yMin = b.y0;
+			w.xMax = b.x1;
+			w.yMax = b.y1;
+			w.text = b.text;
+			if (b.has_font) {
+				w.font_name = b.font_name;
+				w.font_size = b.font_size;
 			} else {
-				w.font_size = (r.height() > 0 ? r.height() : 10.0);
+				w.font_size = (b.y1 - b.y0 > 0 ? b.y1 - b.y0 : 10.0);
 			}
 			if (w.font_size > 0) {
 				all_font_sizes.push_back(w.font_size);
