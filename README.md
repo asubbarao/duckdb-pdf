@@ -76,6 +76,7 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 | `first_page` / `last_page` | INTEGER | full document | 1-based inclusive page range. |
 | `layout` | VARCHAR | `'reading'` | Text extraction order: `'reading'`, `'physical'` (preserves column alignment), or `'raw'` (content-stream order). |
 | `parse_tables` | BOOLEAN | false | Force physical layout (column-preserving) extraction. |
+| `force` | BOOLEAN | false | `read_pdf_tables` only: return whitespace grids that fail its confidence gate. |
 | `ocr` | BOOLEAN | false | Force OCR on every page, even pages with a text layer. |
 | `auto_ocr` | BOOLEAN | true | OCR pages that have no extractable text layer. |
 | `ocr_language` | VARCHAR | `'eng'` | Tesseract language model. |
@@ -195,6 +196,8 @@ Two detectors run per page:
 
 - **Lattice (ruled) tables** — horizontal/vertical rule segments are collected from the page content streams and, when they form a usable grid, used as authoritative cell separators. Bordered tables are cut exactly along their lines, including cells whose text alignment alone would mis-cluster.
 - **Unruled tables** — a precision-first geometric heuristic (word bounding-box column clustering with a regularity gate, plus document-wide column-edge voting so **right-aligned numeric columns** cluster correctly). It favors not emitting spurious tables from prose over catching every table.
+
+By default, `read_pdf_tables` emits only whitespace grids that pass the confidence gate. Pass `force := true` to return the best-effort grid for an ambiguous page as well.
 
 Merged cells and borderless/sparse tables remain out of scope — see [Scope](#scope).
 

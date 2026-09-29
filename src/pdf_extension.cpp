@@ -276,6 +276,7 @@ struct PdfWord {
 	double yMin = 0.0;
 	double xMax = 0.0;
 	double yMax = 0.0;
+	double font_size = 0.0;
 	string text;
 };
 
@@ -1021,9 +1022,28 @@ static RulingLines RulesForPage(const std::vector<pdf_qpdf::RuledSegment> &segme
 
 struct ProvCell {
 	double xMin = 0, xMax = 0, yMin = 0, yMax = 0;
+	double baseline = 0;
+	double font_size = 0;
 	string text;
 	size_t row = 0;
+	size_t baseline_count = 0;
+	size_t font_count = 0;
+	bool starts_with_bullet = false;
 };
+
+static bool ElemIsListMarkerLine(const string &line_text);
+
+// Dotted leaders are navigation typography, not repeated table cell content.
+static bool HasDottedLeader(const string &text) {
+	int run = 0;
+	for (char c : text) {
+		run = c == '.' ? run + 1 : 0;
+		if (run >= 5) {
+			return true;
+		}
+	}
+	return false;
+}
 
 // Group words of one geometric row into provisional cells by small x-gaps.
 static std::vector<ProvCell> GroupRowIntoCells(std::vector<PdfWord> row, double gap_tol, size_t row_idx) {
@@ -1037,6 +1057,12 @@ static std::vector<ProvCell> GroupRowIntoCells(std::vector<PdfWord> row, double 
 	cur.xMax = row[0].xMax;
 	cur.yMin = row[0].yMin;
 	cur.yMax = row[0].yMax;
+	cur.baseline = row[0].yMax;
+	cur.baseline_count = 1;
+	if (row[0].font_size > 0) {
+		cur.font_size = row[0].font_size;
+		cur.font_count = 1;
+	}
 	cur.text = row[0].text;
 	cur.row = row_idx;
 	for (size_t i = 1; i < row.size(); ++i) {
@@ -1050,17 +1076,33 @@ static std::vector<ProvCell> GroupRowIntoCells(std::vector<PdfWord> row, double 
 			cur.xMin = std::min(cur.xMin, row[i].xMin);
 			cur.yMin = std::min(cur.yMin, row[i].yMin);
 			cur.yMax = std::max(cur.yMax, row[i].yMax);
+			cur.baseline = (cur.baseline * static_cast<double>(cur.baseline_count) + row[i].yMax) /
+			               static_cast<double>(cur.baseline_count + 1);
+			cur.baseline_count++;
+			if (row[i].font_size > 0) {
+				cur.font_size = (cur.font_size * static_cast<double>(cur.font_count) + row[i].font_size) /
+				                static_cast<double>(cur.font_count + 1);
+				cur.font_count++;
+			}
 		} else {
+			cur.starts_with_bullet = ElemIsListMarkerLine(cur.text);
 			cells.push_back(std::move(cur));
 			cur = ProvCell {};
 			cur.xMin = row[i].xMin;
 			cur.xMax = row[i].xMax;
 			cur.yMin = row[i].yMin;
 			cur.yMax = row[i].yMax;
+			cur.baseline = row[i].yMax;
+			cur.baseline_count = 1;
+			if (row[i].font_size > 0) {
+				cur.font_size = row[i].font_size;
+				cur.font_count = 1;
+			}
 			cur.text = row[i].text;
 			cur.row = row_idx;
 		}
 	}
+	cur.starts_with_bullet = ElemIsListMarkerLine(cur.text);
 	cells.push_back(std::move(cur));
 	return cells;
 }
@@ -1309,9 +1351,61 @@ static void MergeContinuationRows(std::vector<std::vector<string>> &grid, bool a
 	grid = std::move(out);
 }
 
-// Regularity gate: keep precision against prose while allowing sparse/merged cells.
-// Returns true if the grid looks tabular.
-static bool PassesTabularGate(const std::vector<std::vector<string>> &grid, bool lattice) {
+static void MergeContinuationCells(std::vector<std::vector<ProvCell>> &grid, bool allow_dense_continuation = false) {
+	if (grid.size() < 2) {
+		return;
+	}
+	std::vector<std::vector<ProvCell>> out;
+	out.reserve(grid.size());
+	out.push_back(grid[0]);
+	for (size_t i = 1; i < grid.size(); ++i) {
+		const auto &prev = out.back();
+		const auto &cur = grid[i];
+		if (prev.size() != cur.size() || cur.empty()) {
+			out.push_back(cur);
+			continue;
+		}
+		int filled_cur = 0, filled_prev = 0;
+		int shared_nonempty = 0;
+		int only_cur = 0;
+		for (size_t c = 0; c < cur.size(); ++c) {
+			bool pc = !prev[c].text.empty();
+			bool cc = !cur[c].text.empty();
+			filled_prev += pc;
+			filled_cur += cc;
+			shared_nonempty += pc && cc;
+			only_cur += !pc && cc;
+		}
+		bool sparse_enough =
+		    allow_dense_continuation ? filled_cur < filled_prev : filled_cur <= std::max(1, filled_prev / 2);
+		bool is_cont = filled_cur > 0 && filled_cur < filled_prev && shared_nonempty >= filled_cur && only_cur == 0 &&
+		               sparse_enough;
+		if (!is_cont) {
+			out.push_back(cur);
+			continue;
+		}
+		for (size_t c = 0; c < cur.size(); ++c) {
+			if (cur[c].text.empty()) {
+				continue;
+			}
+			if (!out.back()[c].text.empty()) {
+				out.back()[c].text.push_back(' ');
+			}
+			out.back()[c].text += cur[c].text;
+			out.back()[c].xMin = std::min(out.back()[c].xMin, cur[c].xMin);
+			out.back()[c].xMax = std::max(out.back()[c].xMax, cur[c].xMax);
+			out.back()[c].yMin = std::min(out.back()[c].yMin, cur[c].yMin);
+			out.back()[c].yMax = std::max(out.back()[c].yMax, cur[c].yMax);
+			out.back()[c].starts_with_bullet = out.back()[c].starts_with_bullet || cur[c].starts_with_bullet;
+		}
+	}
+	grid = std::move(out);
+}
+
+// A stream table repeats geometry and typography across rows; cards repeat those
+// properties only inside each independent stack, so their assembled rows diverge.
+static bool PassesTabularGate(const std::vector<std::vector<string>> &grid,
+                              const std::vector<std::vector<ProvCell>> *evidence, double edge_tol, bool lattice) {
 	if (grid.size() < 3) {
 		return false;
 	}
@@ -1360,17 +1454,130 @@ static bool PassesTabularGate(const std::vector<std::vector<string>> &grid, bool
 		// Rules already prove structure; only reject nearly empty grids.
 		return modal_filled >= 1 && density >= 0.15 && grid.size() >= 2;
 	}
-	// Whitespace path: still precision-first — reject prose (one long column of
-	// sentences rarely has modal_filled >= 2 with near_fraction high).
-	if (modal_filled < 2) {
+	if (!evidence || evidence->size() != grid.size() || modal_filled < 2) {
 		return false;
 	}
-	// Old gate was modal_fraction >= 0.6 exact match. Allow near-modal majority
-	// so multi-line / lightly sparse rows do not discard the whole table.
-	if (modal_fraction >= 0.45 || near_fraction >= 0.55) {
-		return density >= 0.25;
+	// Real tables keep a stable number of populated cells, with only a minority
+	// of rows needing the one-cell tolerance for sparse continuations.
+	if (density < 0.25) {
+		return false;
 	}
-	return false;
+
+	std::vector<double> cell_heights;
+	std::vector<double> font_sizes;
+	for (const auto &row : *evidence) {
+		for (const auto &cell : row) {
+			if (cell.text.empty()) {
+				continue;
+			}
+			cell_heights.push_back(cell.yMax - cell.yMin);
+			if (cell.font_count > 0) {
+				font_sizes.push_back(cell.font_size);
+			}
+			if (cell.starts_with_bullet || HasDottedLeader(cell.text)) {
+				return false;
+			}
+		}
+	}
+	// 0.35 of the type size covers Poppler baseline jitter while separating card pitches.
+	const double baseline_tol = std::max(2.0, 0.35 * (font_sizes.empty() ? Median(cell_heights) : Median(font_sizes)));
+	int baseline_rows = 0;
+	int baseline_matches = 0;
+	for (const auto &row : *evidence) {
+		std::vector<double> baselines;
+		for (const auto &cell : row) {
+			if (!cell.text.empty()) {
+				baselines.push_back(cell.baseline);
+			}
+		}
+		if (baselines.size() < 2) {
+			continue;
+		}
+		baseline_rows++;
+		if (*std::max_element(baselines.begin(), baselines.end()) -
+		        *std::min_element(baselines.begin(), baselines.end()) <=
+		    baseline_tol) {
+			baseline_matches++;
+		}
+	}
+	// Three rows and 75% agreement distinguish a repeated table baseline from coincidental overlaps.
+	bool baseline_bad = baseline_rows < 3 || baseline_matches * 4 < baseline_rows * 3;
+
+	// At least three rows must support a repeated left or right edge for each
+	// column; this excludes accidental columns assembled from unrelated blocks.
+	// 40% support keeps sparse month columns while requiring repeated geometry in ordinary tables.
+	const int min_edge_support = std::max(2, static_cast<int>(std::ceil(0.4 * grid.size())));
+	int recurring_columns = 0;
+	int center_recurring_columns = 0;
+	for (size_t c = 0; c < grid.front().size(); ++c) {
+		std::vector<double> left_edges, right_edges, centers;
+		for (const auto &row : *evidence) {
+			if (!row[c].text.empty()) {
+				left_edges.push_back(row[c].xMin);
+				right_edges.push_back(row[c].xMax);
+				centers.push_back(0.5 * (row[c].xMin + row[c].xMax));
+			}
+		}
+		if (static_cast<int>(left_edges.size()) < min_edge_support) {
+			continue;
+		}
+		auto recurring = [&](const std::vector<double> &edges) {
+			double anchor = Median(edges);
+			int matches = 0;
+			for (double edge : edges) {
+				matches += std::fabs(edge - anchor) <= edge_tol;
+			}
+			// 70% recurrence tolerates a wrapped or sparse cell without accepting random edges.
+			return matches >= static_cast<int>(std::ceil(0.7 * static_cast<double>(edges.size())));
+		};
+		bool left_recurring = recurring(left_edges);
+		bool right_recurring = recurring(right_edges);
+		bool center_recurring = recurring(centers);
+		if (left_recurring || right_recurring || center_recurring) {
+			recurring_columns++;
+		}
+		center_recurring_columns += center_recurring;
+	}
+	// A majority of recurring columns is enough when one column is a spanning label.
+	if (recurring_columns < std::max(2, static_cast<int>(std::ceil(0.6 * grid.front().size()))) &&
+	    center_recurring_columns < std::max(2, static_cast<int>(std::ceil(0.4 * grid.front().size())))) {
+		return false;
+	}
+	// Centered month cells need only two stable lanes because adjacent prose occupies one lane.
+	bool centered_grid =
+	    center_recurring_columns >= std::max(2, static_cast<int>(std::ceil(0.4 * grid.front().size())));
+	if (baseline_bad && !centered_grid) {
+		return false;
+	}
+	// 60% exact or 80% near-modal rows reject irregular assembled stacks.
+	if (!centered_grid && modal_fraction < 0.6 && near_fraction < 0.8) {
+		return false;
+	}
+
+	// A header may differ from the body by row, but cells in one row should
+	// share a type size; 14pt card headings beside 10pt bullets must fail.
+	int font_rows = 0;
+	int uniform_font_rows = 0;
+	for (const auto &row : *evidence) {
+		std::vector<double> row_fonts;
+		for (const auto &cell : row) {
+			if (!cell.text.empty() && cell.font_count > 0) {
+				row_fonts.push_back(cell.font_size);
+			}
+		}
+		if (row_fonts.size() < 2) {
+			continue;
+		}
+		font_rows++;
+		double min_font = *std::min_element(row_fonts.begin(), row_fonts.end());
+		double max_font = *std::max_element(row_fonts.begin(), row_fonts.end());
+		uniform_font_rows += min_font > 0 && max_font / min_font <= 1.2;
+	}
+	// 20% size spread and 75% row agreement separate 14pt card headings from 10pt bullets.
+	if (font_rows > 0 && uniform_font_rows * 4 < font_rows * 3 && !centered_grid) {
+		return false;
+	}
+	return true;
 }
 
 // Lattice reconstruction: rules define row/column bands.
@@ -1462,8 +1669,8 @@ static std::vector<std::vector<string>> ReconstructLatticeGrid(const std::vector
 
 // Reconstruct one whitespace-region grid from already clustered provisional cells.
 static std::vector<std::vector<string>> ReconstructWhitespaceGrid(const std::vector<std::vector<ProvCell>> &row_cells,
-                                                                  double col_tol,
-                                                                  bool allow_dense_continuation = false) {
+                                                                  double col_tol, bool allow_dense_continuation = false,
+                                                                  bool force = false) {
 	std::vector<std::vector<string>> grid;
 	if (row_cells.empty()) {
 		return grid;
@@ -1475,9 +1682,11 @@ static std::vector<std::vector<string>> ReconstructWhitespaceGrid(const std::vec
 	}
 
 	const size_t ncols = col_centers.size();
+	std::vector<std::vector<ProvCell>> cell_grid;
+	cell_grid.reserve(row_cells.size());
 	for (const auto &source_cells : row_cells) {
 		std::vector<ProvCell> cells = source_cells;
-		std::vector<string> line(ncols);
+		std::vector<ProvCell> line(ncols);
 		// Assign L→R so same-row cells never collide on one column when possible
 		std::sort(cells.begin(), cells.end(), [](const ProvCell &a, const ProvCell &b) { return a.xMin < b.xMin; });
 		std::vector<bool> used(ncols, false);
@@ -1488,8 +1697,6 @@ static std::vector<std::vector<string>> ReconstructWhitespaceGrid(const std::vec
 				if (used[k]) {
 					continue;
 				}
-				// temporary un-mark: score as if free
-				ProvCell tmp = c;
 				// reuse AssignCellToColumn logic inline with used mask
 				double mid = 0.5 * (c.xMin + c.xMax);
 				double center = col_centers[k];
@@ -1501,23 +1708,37 @@ static std::vector<std::vector<string>> ReconstructWhitespaceGrid(const std::vec
 					best_score = d;
 					best = k;
 				}
-				(void)tmp;
 			}
 			// If all columns used, fall back to absolute best including collisions
 			if (used[best] || best_score > col_tol * 8) {
 				best = AssignCellToColumn(c, col_centers, col_tol);
 			}
 			used[best] = true;
-			if (!line[best].empty()) {
-				line[best].push_back(' ');
+			if (!line[best].text.empty()) {
+				line[best].text.push_back(' ');
+				line[best].text += c.text;
+				line[best].xMin = std::min(line[best].xMin, c.xMin);
+				line[best].xMax = std::max(line[best].xMax, c.xMax);
+				line[best].yMin = std::min(line[best].yMin, c.yMin);
+				line[best].yMax = std::max(line[best].yMax, c.yMax);
+				line[best].starts_with_bullet = line[best].starts_with_bullet || c.starts_with_bullet;
+			} else {
+				line[best] = c;
 			}
-			line[best] += c.text;
+		}
+		cell_grid.push_back(std::move(line));
+	}
+
+	MergeContinuationCells(cell_grid, allow_dense_continuation);
+	for (const auto &cells : cell_grid) {
+		std::vector<string> line;
+		line.reserve(cells.size());
+		for (const auto &cell : cells) {
+			line.push_back(cell.text);
 		}
 		grid.push_back(std::move(line));
 	}
-
-	MergeContinuationRows(grid, allow_dense_continuation);
-	if (!PassesTabularGate(grid, /*lattice=*/false)) {
+	if (!force && !PassesTabularGate(grid, &cell_grid, col_tol * 1.5, /*lattice=*/false)) {
 		grid.clear();
 	}
 	return grid;
@@ -1528,7 +1749,7 @@ static std::vector<std::vector<string>> ReconstructWhitespaceGrid(const std::vec
 // When `rules` is non-null and usable, lattice separators are authoritative.
 static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord> page_words,
                                                             const RulingLines *rules = nullptr,
-                                                            bool allow_dense_continuation = false) {
+                                                            bool allow_dense_continuation = false, bool force = false) {
 	std::vector<std::vector<string>> grid;
 	if (page_words.size() < 2) {
 		return grid;
@@ -1538,7 +1759,7 @@ static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord>
 	if (rules && rules->Usable()) {
 		grid = ReconstructLatticeGrid(page_words, *rules);
 		MergeContinuationRows(grid);
-		if (!PassesTabularGate(grid, /*lattice=*/true)) {
+		if (!PassesTabularGate(grid, nullptr, 0.0, /*lattice=*/true)) {
 			grid.clear();
 		}
 		if (!grid.empty()) {
@@ -1613,7 +1834,7 @@ static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord>
 		row_cells.push_back(GroupRowIntoCells(std::move(rows[r]), cell_gap_tol, r));
 	}
 
-	return ReconstructWhitespaceGrid(row_cells, col_tol, allow_dense_continuation);
+	return ReconstructWhitespaceGrid(row_cells, col_tol, allow_dense_continuation, force);
 }
 
 static bool IsTabularRow(const std::vector<ProvCell> &row, double clear_gap_tol) {
@@ -1664,11 +1885,11 @@ static bool IsTableContinuationRow(const std::vector<ProvCell> &row, const std::
 
 // Find independent whitespace tables on a page. Ruled pages stay on the
 // existing lattice path; only the borderless path is segmented here.
-static std::vector<std::vector<std::vector<string>>> ReconstructTableGrids(std::vector<PdfWord> page_words,
-                                                                           const RulingLines *rules = nullptr) {
+static std::vector<std::vector<std::vector<string>>>
+ReconstructTableGrids(std::vector<PdfWord> page_words, const RulingLines *rules = nullptr, bool force = false) {
 	std::vector<std::vector<std::vector<string>>> grids;
 	if (rules && rules->Usable()) {
-		auto grid = ReconstructPageGrid(page_words, rules);
+		auto grid = ReconstructPageGrid(page_words, rules, false, force);
 		if (!grid.empty()) {
 			grids.push_back(std::move(grid));
 			return grids;
@@ -1758,7 +1979,7 @@ static std::vector<std::vector<std::vector<string>>> ReconstructTableGrids(std::
 			for (size_t r = start; r < end; ++r) {
 				region_words.insert(region_words.end(), word_rows[r].begin(), word_rows[r].end());
 			}
-			auto grid = ReconstructPageGrid(std::move(region_words), nullptr, true);
+			auto grid = ReconstructPageGrid(std::move(region_words), nullptr, true, force);
 			if (!grid.empty()) {
 				grids.push_back(std::move(grid));
 			}
@@ -1769,7 +1990,7 @@ static std::vector<std::vector<std::vector<string>>> ReconstructTableGrids(std::
 	// separate it from, so region segmentation can miss it; keep the whole-page
 	// reading as a floor so segmentation only ever adds tables.
 	if (grids.empty()) {
-		auto grid = ReconstructPageGrid(std::move(page_words), nullptr);
+		auto grid = ReconstructPageGrid(std::move(page_words), nullptr, false, force);
 		if (!grid.empty()) {
 			grids.push_back(std::move(grid));
 		}
@@ -1807,6 +2028,7 @@ struct PdfOptions {
 	string ocr_config;
 	string layout = "auto"; // geometry engine; see ValidateLayout for the alternatives
 	bool parse_tables = false;
+	bool force_tables = false;
 	string password;
 	int32_t first_page = 1;
 	int32_t last_page = -1; // -1 => through end
@@ -1996,6 +2218,8 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 			o.layout = StringValue::Get(kv.second);
 		} else if (key == "parse_tables") {
 			o.parse_tables = BooleanValue::Get(kv.second);
+		} else if (key == "force") {
+			o.force_tables = BooleanValue::Get(kv.second);
 		} else if (key == "password") {
 			o.password = StringValue::Get(kv.second);
 		} else if (key == "first_page") {
@@ -4712,23 +4936,25 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 					words.push_back(std::move(w));
 				}
 				if (words.empty()) {
-					for (auto &b : MergeSpacelessBoxes(page->text_list())) {
+					for (auto &b : MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font))) {
 						PdfWord w;
 						w.xMin = b.x0;
 						w.yMin = b.y0;
 						w.xMax = b.x1;
 						w.yMax = b.y1;
+						w.font_size = b.has_font ? b.font_size : 0.0;
 						w.text = b.text;
 						words.push_back(std::move(w));
 					}
 				}
 			} else {
-				for (auto &b : MergeSpacelessBoxes(page->text_list())) {
+				for (auto &b : MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font))) {
 					PdfWord w;
 					w.xMin = b.x0;
 					w.yMin = b.y0;
 					w.xMax = b.x1;
 					w.yMax = b.y1;
+					w.font_size = b.has_font ? b.font_size : 0.0;
 					w.text = b.text;
 					words.push_back(std::move(w));
 				}
@@ -4748,7 +4974,7 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 			// Lattice first when the page content stream has ruling lines (qpdf);
 			// ReconstructPageGrid falls back to the whitespace/stream model.
 			RulingLines rules = RulesForPage(ruling_segments, p);
-			auto grids = ReconstructTableGrids(std::move(words), &rules);
+			auto grids = ReconstructTableGrids(std::move(words), &rules, bind.opt.force_tables);
 			for (auto &grid : grids) {
 				if (grid.size() < 2 || grid.front().size() < 2) {
 					continue;
@@ -9304,6 +9530,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction read_pdf_tables("read_pdf_tables", {LogicalType::VARCHAR}, ReadPdfTablesScan, ReadPdfTablesBind,
 	                              ReadPdfTablesInit);
 	AddCommonNamedParams(read_pdf_tables);
+	read_pdf_tables.named_parameters["force"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(read_pdf_tables);
 
 	ScalarFunctionSet pdf_to_text_set("pdf_to_text");
