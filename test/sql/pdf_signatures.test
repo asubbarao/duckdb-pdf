@@ -57,6 +57,17 @@ FROM pdf_signatures('test/data/signed_tampered.pdf');
 ----
 false	true
 
+# ── a CMS blob whose last byte is 0x00 ──
+# The blob ends with the RSA signature value, so one signature in 256 ends in
+# 0x00 — the same byte as the padding after it in the /Contents hole. This file
+# is pdf_sign over hello.pdf with sign_key.pem, picked because it is one of those.
+
+query II
+SELECT covers_whole_file, verified
+FROM pdf_signatures('test/data/sig_der_trailing_nul.pdf');
+----
+true	true
+
 # ── glob: both fixtures, one row each ──
 
 query I

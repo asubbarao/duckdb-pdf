@@ -27,6 +27,11 @@
 
 namespace pdf_qpdf {
 
+// Readers take the document's bytes, not a path: the caller owns file access and
+// reads through DuckDB's filesystem, so every reader works on https:// and s3://
+// as well as local paths. Writers take paths, because qpdf streams the source
+// lazily into the output file it writes.
+
 // Concatenates the inputs' pages in list order into `output`.
 // The caller validates that inputs exist and the output directory exists.
 void Merge(const std::vector<std::string> &inputs, const std::string &output);
@@ -85,7 +90,7 @@ struct FormField {
 	std::string value;
 	bool is_required = false;
 };
-std::vector<FormField> ReadFormFields(const std::string &path);
+std::vector<FormField> ReadFormFields(const std::string &pdf_bytes);
 
 // One entry per page annotation. `subtype` is qpdf's raw name ('/Link', ...);
 // uri is populated for Link annotations with an /A /URI action.
@@ -98,7 +103,7 @@ struct Annotation {
 	std::string uri;
 	double rect_x0 = 0, rect_y0 = 0, rect_x1 = 0, rect_y1 = 0;
 };
-std::vector<Annotation> ReadAnnotations(const std::string &path);
+std::vector<Annotation> ReadAnnotations(const std::string &pdf_bytes);
 
 // One axis-aligned-ish ruled line segment collected from a page content stream,
 // used to recover lattice (bordered) tables. Endpoints are in PDF user space
@@ -144,10 +149,9 @@ struct SignatureInfo {
 	bool has_verified = false;      // false = no /Contents → verified is NULL
 	bool verified = false;          // CMS_verify result when has_verified
 };
-// `password` may be empty (unencrypted / owner-open). The caller validates the
-// path exists; a wrong password or unreadable file surfaces via the error
-// contract (thrown std::exception).
-std::vector<SignatureInfo> ReadSignatures(const std::string &path, const std::string &password);
+// `password` may be empty (unencrypted / owner-open). A wrong password or
+// unreadable document surfaces via the error contract (thrown std::exception).
+std::vector<SignatureInfo> ReadSignatures(const std::string &pdf_bytes, const std::string &password);
 
 // One entry per embedded image XObject per page (the actual stored raster, not a
 // page render). `image_index` is 1-based within its page; `name` is the resource
@@ -177,11 +181,11 @@ struct EmbeddedImage {
 	std::string format;     // 'jpeg' | 'jp2' | 'ccitt' | 'png' | 'raw'
 	std::string data;       // encoded/wrapped bytes per `format`
 };
-// `password` may be empty (unencrypted / owner-open). The caller validates the
-// path exists; a wrong password or unreadable file surfaces via the error
-// contract (thrown std::exception). A single image whose stream data cannot be
-// extracted is skipped rather than aborting the whole document.
-std::vector<EmbeddedImage> ReadImages(const std::string &path, const std::string &password);
+// `password` may be empty (unencrypted / owner-open). A wrong password or
+// unreadable document surfaces via the error contract (thrown std::exception).
+// A single image whose stream data cannot be extracted is skipped rather than
+// aborting the whole document.
+std::vector<EmbeddedImage> ReadImages(const std::string &pdf_bytes, const std::string &password);
 
 // Stamps `text` as a large diagonal (45°) gray watermark centered on every
 // page, on TOP of existing content (a fresh Helvetica text run appended to each
@@ -297,15 +301,15 @@ struct DocumentStats {
 	int64_t warning_count = 0;
 };
 
-// Opens `path` with optional password and returns the structure census above.
-// Wrong password / unreadable file throws via the error contract.
-DocumentStats InspectDocument(const std::string &path, const std::string &password);
+// Opens the document with an optional password and returns the census above.
+// Wrong password / unreadable document throws via the error contract.
+DocumentStats InspectDocument(const std::string &pdf_bytes, const std::string &password);
 
 // Dumps the document as qpdf JSON (version 2 by default). Stream *payloads* are
 // omitted (qpdf_sj_none) so the result is a structural map suitable for SQL
 // inspection, not a multi-megabyte re-encoding of every image. `password` may
 // be empty. Throws on open/write failure.
-std::string WriteJson(const std::string &path, const std::string &password, int json_version = 2);
+std::string WriteJson(const std::string &pdf_bytes, const std::string &password, int json_version = 2);
 
 // Best-effort structural repair: fix dangling references, content-stream
 // normalization, stream recompression. Writes a new file at `output`. Does not

@@ -88,14 +88,18 @@ FROM read_pdf('__TEST_DIR__/copy_opts_hf2.pdf', auto_ocr := false);
 ----
 true
 
-# --- {page} placeholder in footer (poppler text extraction drops the space: assert 'p1'/'p2') ---
+# --- {page} placeholder in footer ---
+# The footer is authored as 'p {page}', and the geometry engine reports the space
+# that was written. Poppler's own 'reading' mode drops it and yields 'p1', which
+# is what this used to assert.
 statement ok
 COPY (SELECT repeat('pagination filler for the page placeholder test. ', 200) AS c)
 TO '__TEST_DIR__/copy_opts_pageno.pdf' (FORMAT pdf, FOOTER 'p {page}', USE_TMP_FILE false);
 
 query I
-SELECT contains((SELECT text FROM read_pdf('__TEST_DIR__/copy_opts_pageno.pdf', auto_ocr := false) WHERE page = 1), 'p1')
-   AND contains((SELECT text FROM read_pdf('__TEST_DIR__/copy_opts_pageno.pdf', auto_ocr := false) WHERE page = 2), 'p2');
+SELECT contains((SELECT text FROM read_pdf('__TEST_DIR__/copy_opts_pageno.pdf', auto_ocr := false) WHERE page = 1), 'p 1')
+   AND contains((SELECT text FROM read_pdf('__TEST_DIR__/copy_opts_pageno.pdf', auto_ocr := false) WHERE page = 2), 'p 2')
+   AND contains(pdf_to_text('__TEST_DIR__/copy_opts_pageno.pdf', 'reading'), 'p1');
 ----
 true
 

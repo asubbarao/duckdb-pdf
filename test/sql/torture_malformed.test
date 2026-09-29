@@ -57,6 +57,11 @@ SELECT pdf_to_svg('__TEST_DIR__/zero.pdf', 1);
 could not open
 
 # ── text file renamed .pdf (committed fixture) ──────────────────────────────
+#
+# The three committed fixtures below stay synthetic on purpose: no published
+# document is a broken one. A file that is not a PDF, a PDF cut off mid-xref,
+# and bytes that only start with %PDF- are what the reader must refuse, and
+# nobody publishes those on purpose.
 
 statement error
 SELECT * FROM read_pdf('test/data/text_as_pdf.pdf');
