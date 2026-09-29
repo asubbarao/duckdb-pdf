@@ -104,6 +104,13 @@ WHERE font_size IS NULL OR font_size < 9 OR font_size > 11;
 ----
 true
 
+# Native text layer: one-font elements report their font name
+query I
+SELECT font_name FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+WHERE text = 'Markdown Fixture Title';
+----
+Helvetica-Bold
+
 # ── multi-font fixture: heading detection ─────────────────────────────────────
 # markdown_fixture.pdf: 24pt title, 14pt subheading, 10pt body/list/table.
 
@@ -125,6 +132,13 @@ SELECT element_type FROM read_pdf_elements('test/data/markdown_fixture.pdf')
 WHERE text = 'Introduction Section';
 ----
 heading
+
+# Mixed-font elements report the font carrying the most characters
+query I
+SELECT font_name FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+WHERE text = 'The word important is bold here.';
+----
+Helvetica
 
 # The title is the first element in reading order
 query I

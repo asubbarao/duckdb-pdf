@@ -3598,7 +3598,7 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 //===--------------------------------------------------------------------===//
 // read_pdf_elements -> one row per layout element
 //   (file, page_number, element_idx, element_type, text, font_size,
-//    bbox_x0, bbox_y0, bbox_x1, bbox_y1)
+//    bbox_x0, bbox_y0, bbox_x1, bbox_y1, font_name)
 //
 // Deterministic geometry over poppler-cpp's positioned word list
 // (page::text_list with font info). No OCR path in v1: pages without a
@@ -3690,6 +3690,7 @@ static constexpr double ELEM_RUNNING_BAND_FRAC = 0.12;
 struct ElemWord {
 	double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
 	string text;
+	string font_name;
 	double font_size = 0.0;
 	bool has_font = false;
 };
@@ -3708,6 +3709,8 @@ struct PdfElementRow {
 	string text;
 	double font_size = 0.0;
 	bool has_font = false;
+	string font_name;
+	bool has_font_name = false;
 	double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
 };
 
@@ -3717,6 +3720,25 @@ using ElemFontHistogram = std::map<long long, size_t>;
 
 static void ElemFontTally(ElemFontHistogram &hist, double font_size, size_t chars) {
 	hist[(long long)std::llround(font_size * 100.0)] += chars;
+}
+
+struct ElemFontNameTally {
+	size_t chars;
+	size_t first_word;
+};
+
+using ElemFontNameHistogram = std::map<string, ElemFontNameTally>;
+
+static void ElemFontTally(ElemFontNameHistogram &hist, const string &font_name, size_t chars, size_t word_index) {
+	auto entry = hist.find(font_name);
+	if (entry == hist.end()) {
+		ElemFontNameTally tally;
+		tally.chars = chars;
+		tally.first_word = word_index;
+		hist.emplace(font_name, tally);
+	} else {
+		entry->second.chars += chars;
+	}
 }
 
 // Modal font size (rule 3): most characters wins; ties -> smaller size
@@ -3731,6 +3753,24 @@ static double ElemModalFontSize(const ElemFontHistogram &hist) {
 		}
 	}
 	return best_size;
+}
+
+// Modal font name: most characters wins; ties go to the first word in reading order.
+static string ElemModalFontName(const ElemFontNameHistogram &hist) {
+	string best_name;
+	size_t best_chars = 0;
+	size_t best_word = 0;
+	bool found = false;
+	for (auto &entry : hist) {
+		if (!found || entry.second.chars > best_chars ||
+		    (entry.second.chars == best_chars && entry.second.first_word < best_word)) {
+			best_name = entry.first;
+			best_chars = entry.second.chars;
+			best_word = entry.second.first_word;
+			found = true;
+		}
+	}
+	return best_name;
 }
 
 // Rule 4b: short ALL-CAPS block at or near body size (see contract above).
@@ -4041,7 +4081,9 @@ static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_numb
 		row.page_number = page_number;
 		row.element_idx = ++element_idx;
 		ElemFontHistogram block_hist;
+		ElemFontNameHistogram block_font_hist;
 		size_t word_count = 0;
+		size_t word_order = 0;
 		bool first = true;
 		for (auto li : block) {
 			const auto &line = lines[li];
@@ -4063,11 +4105,15 @@ static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_numb
 			for (auto &w : line.words) {
 				if (w.has_font) {
 					ElemFontTally(block_hist, w.font_size, w.text.size());
+					ElemFontTally(block_font_hist, w.font_name, w.text.size(), word_order);
 				}
+				word_order++;
 			}
 		}
 		row.font_size = ElemModalFontSize(block_hist);
 		row.has_font = row.font_size > 0;
+		row.font_name = ElemModalFontName(block_font_hist);
+		row.has_font_name = !block_font_hist.empty();
 
 		const string &first_line_text = lines[block.front()].text;
 		if ((row.has_font && body_size > 0 && row.font_size >= ELEM_HEADING_SIZE_RATIO * body_size &&
@@ -4120,6 +4166,7 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 			w.x1 = b.x1;
 			w.y1 = b.y1;
 			w.has_font = b.has_font;
+			w.font_name = b.has_font ? b.font_name : string();
 			w.font_size = b.has_font ? b.font_size : 0.0;
 			if (w.has_font) {
 				ElemFontTally(doc_hist, w.font_size, w.text.size());
@@ -4159,9 +4206,9 @@ static unique_ptr<FunctionData> ReadPdfElementsBind(ClientContext &context, Tabl
 	ParseNamed(input.named_parameters, result->opt);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
-	                LogicalType::DOUBLE,  LogicalType::DOUBLE};
-	names = {"file",      "page_number", "element_idx", "element_type", "text",
-	         "font_size", "bbox_x0",     "bbox_y0",     "bbox_x1",      "bbox_y1"};
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR};
+	names = {"file",    "page_number", "element_idx", "element_type", "text",     "font_size",
+	         "bbox_x0", "bbox_y0",     "bbox_x1",     "bbox_y1",      "font_name"};
 	return std::move(result);
 }
 
@@ -4211,6 +4258,11 @@ static void ReadPdfElementsScan(ClientContext &context, TableFunctionInput &data
 		OutDouble(output.data[7], count, row.y0);
 		OutDouble(output.data[8], count, row.x1);
 		OutDouble(output.data[9], count, row.y1);
+		if (row.has_font_name) {
+			OutString(output.data[10], count, row.font_name);
+		} else {
+			OutStringNull(output.data[10], count);
+		}
 		g.row_idx++;
 		count++;
 	}

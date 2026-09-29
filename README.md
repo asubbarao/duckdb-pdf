@@ -969,7 +969,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `read_pdf_lines(files)` | Table | One row per layout-preserving line. |
 | `read_pdf_words(files)` / `read_pdf_layout` | Table | One row per word: bbox, font, OCR source/confidence, geometric `line`, `page_width`/`page_height`. |
 | `read_pdf_tables(files)` | Table | One row per detected table row; cells as `VARCHAR[]`. |
-| `read_pdf_elements(files)` | Table | One row per layout element (`heading`/`paragraph`/`list_item`/`other`) with bbox. |
+| `read_pdf_elements(files)` | Table | One row per layout element (`heading`/`paragraph`/`list_item`/`other`) with bbox and dominant font name. |
 | `pdf_chunks(files)` | Table | Retrieval-ready chunks with section headings; `chunk_size`/`overlap` knobs. |
 | `pdf_info(files)` | Table | Full per-file census: metadata, timestamps, dimensions, size, encryption. |
 | `pdf_pages_info(files)` | Table | One row per page: crop/media size, rotation, orientation, label, duration. |
