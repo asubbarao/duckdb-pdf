@@ -464,8 +464,11 @@ static constexpr double LAYOUT_GUTTER_EDGE_TOLERANCE = 1.5;
 static constexpr double LAYOUT_GUTTER_MAX_CROSSING_WORD_RATIO = 0.2;
 static constexpr size_t LAYOUT_MIN_GUTTER_SIDE_LINES = 8;
 // LayoutLineIds is defined after the band code that calls it.
+// `spanning_lines`, when given, receives one flag per line id (index id - 1):
+// whether that line crosses a column gutter.
 static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, std::vector<int32_t> &bands,
-                                          const std::vector<std::pair<double, double>> &gutters = {});
+                                          const std::vector<std::pair<double, double>> &gutters = {},
+                                          std::vector<bool> *spanning_lines = nullptr);
 // Words set this much larger than the body font are display type — titles and
 // banners, which routinely straddle a gutter. They get no vote on where the
 // gutters are, but they are still placed in a band afterwards.
@@ -754,7 +757,8 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 // 1-based line ids in reading order: columns left to right, lines top to bottom
 // within a column. Parallel to `words`.
 static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, std::vector<int32_t> &bands,
-                                          const std::vector<std::pair<double, double>> &gutters) {
+                                          const std::vector<std::pair<double, double>> &gutters,
+                                          std::vector<bool> *spanning_lines) {
 	std::vector<int32_t> line_of(words.size(), 0);
 	if (words.empty()) {
 		return line_of;
@@ -938,18 +942,38 @@ static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, 
 		for (size_t idx : groups[group_index].members) {
 			line_of[idx] = line_no;
 		}
+		if (spanning_lines) {
+			spanning_lines->push_back(groups[group_index].spanning);
+		}
 	}
 	return line_of;
 }
 
+// Byte length of an end-of-line hyphen that poppler's 'reading' text removes
+// when the line continues: the soft hyphen, and the characters its default
+// EndOfLineHyphenMode::RemoveAll treats as hyphens (TextOutputDev isHyphenChar).
+static size_t TrailingLineHyphenBytes(const string &line) {
+	static const char *const HYPHENS[] = {"-", "\xC2\xAD", "\xE2\x80\x90", "\xEF\xB9\xA3", "\xEF\xBC\x8D"};
+	for (const char *hyphen : HYPHENS) {
+		if (StringUtil::EndsWith(line, hyphen)) {
+			return strlen(hyphen);
+		}
+	}
+	return 0;
+}
+
 // The page as text, one line per geometric line, columns in reading order.
+// A line ending in a hyphen is joined to the next line of the same column with
+// the hyphen dropped, as poppler does within a text flow; the last line of a
+// column or of the page keeps its hyphen, as there. read_pdf_words is untouched.
 static string LayoutPageText(const std::vector<LayoutWord> &words, double page_width) {
 	if (words.empty()) {
 		return string();
 	}
 	std::vector<std::pair<double, double>> gutters;
 	auto bands = LayoutColumnBands(words, page_width, &gutters);
-	auto lines = LayoutLineIds(words, bands, gutters);
+	std::vector<bool> spanning;
+	auto lines = LayoutLineIds(words, bands, gutters, &spanning);
 	int32_t max_line = 0;
 	for (int32_t l : lines) {
 		max_line = MaxValue<int32_t>(max_line, l);
@@ -964,17 +988,28 @@ static string LayoutPageText(const std::vector<LayoutWord> &words, double page_w
 		}
 	}
 	string out;
-	for (auto &idxs : by_line) {
+	bool continues = false;
+	for (size_t l = 0; l < by_line.size(); l++) {
+		auto &idxs = by_line[l];
 		std::sort(idxs.begin(), idxs.end(), [&](size_t a, size_t b) { return words[a].x0 < words[b].x0; });
-		if (!out.empty()) {
+		if (!out.empty() && !continues) {
 			out += "\n";
 		}
+		string line;
 		for (size_t k = 0; k < idxs.size(); k++) {
 			if (k > 0) {
-				out += " ";
+				line += " ";
 			}
-			out += words[idxs[k]].text;
+			line += words[idxs[k]].text;
 		}
+		// Every line id has at least one word, so its band is that of any member;
+		// spanning lines share one band and form their own flow.
+		const bool same_flow = l + 1 < by_line.size() && !idxs.empty() && !by_line[l + 1].empty() &&
+		                       spanning[l] == spanning[l + 1] && bands[idxs.front()] == bands[by_line[l + 1].front()];
+		const size_t hyphen = same_flow ? TrailingLineHyphenBytes(line) : 0;
+		continues = hyphen > 0;
+		line.resize(line.size() - hyphen);
+		out += line;
 	}
 	return out;
 }
@@ -3916,7 +3951,8 @@ static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 			g.page_label = std::move(poppler_label);
 		}
 		// 'auto' takes the geometry engine, so a line here is the same object a
-		// read_pdf_words `line` id names. The poppler modes still split rendered
+		// read_pdf_words `line` id names, except that a line ending in a hyphen is
+		// joined to the next line of its column. The poppler modes still split rendered
 		// page text on newlines, which is why their line numbers can disagree on
 		// a multi-column page.
 		string text = auto_layout ? LayoutPageText(LayoutWordsFromBoxes(MergeSpacelessBoxes(
