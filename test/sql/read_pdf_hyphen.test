@@ -56,3 +56,10 @@ ORDER BY line;
 contin-	1
 ues	2
 well-	5
+
+# poppler ends lines with CRLF on Windows; a line never carries the CR.
+query I
+SELECT bool_and(NOT contains(text, chr(13)))
+FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'reading', auto_ocr := false);
+----
+true

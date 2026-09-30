@@ -949,11 +949,16 @@ static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, 
 	return line_of;
 }
 
-// Byte length of an end-of-line hyphen that poppler's 'reading' text removes
-// when the line continues: the soft hyphen, and the characters its default
+// Byte length of an end-of-line hyphen that the linked poppler's 'reading' text
+// removes when the line continues. Before 26.05 that is '-' alone; from 26.05 it
+// is also the soft hyphen and the characters its default
 // EndOfLineHyphenMode::RemoveAll treats as hyphens (TextOutputDev isHyphenChar).
 static size_t TrailingLineHyphenBytes(const string &line) {
+#if POPPLER_VERSION_MAJOR > 26 || (POPPLER_VERSION_MAJOR == 26 && POPPLER_VERSION_MINOR >= 5)
 	static const char *const HYPHENS[] = {"-", "\xC2\xAD", "\xE2\x80\x90", "\xEF\xB9\xA3", "\xEF\xBC\x8D"};
+#else
+	static const char *const HYPHENS[] = {"-"};
+#endif
 	for (const char *hyphen : HYPHENS) {
 		if (StringUtil::EndsWith(line, hyphen)) {
 			return strlen(hyphen);
@@ -3966,7 +3971,9 @@ static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 				g.lines.push_back(text.substr(start));
 				break;
 			}
-			g.lines.push_back(text.substr(start, nl - start));
+			// poppler ends lines with "\r\n" on Windows (TextOutputDev::defaultEndOfLine).
+			const size_t end = nl > start && text[nl - 1] == '\r' ? nl - 1 : nl;
+			g.lines.push_back(text.substr(start, end - start));
 			start = nl + 1;
 		}
 		// Drop trailing empty/whitespace-only lines so a page does not emit a
