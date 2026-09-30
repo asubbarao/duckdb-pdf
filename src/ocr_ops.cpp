@@ -6,10 +6,10 @@
 // the host needs without ODR-colliding with libduckdb_static.
 //===--------------------------------------------------------------------===//
 #include "ocr_ops.hpp"
+#include "ocr_renderer.hpp"
 
 #include <tesseract/baseapi.h>
 #include <tesseract/resultiterator.h>
-#include <tesseract/renderer.h>
 
 #include <leptonica/allheaders.h>
 
@@ -802,12 +802,8 @@ PdfResult RenderSearchablePdf(const unsigned char *data, int width, int height, 
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
 	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed);
-	tesseract::TessPDFRenderer renderer(output_base.c_str(), datadir.c_str(), true /* textonly */);
-	const bool begun = renderer.BeginDocument("DuckDB PDF OCR");
-	const bool recognized = begun && api.Recognize(0) == 0;
-	const bool added = recognized && renderer.AddImage(&api);
-	const bool rendered = added && renderer.EndDocument();
-	if (!rendered || !renderer.happy()) {
+	const bool rendered = RenderTesseractPdf(api, output_base, datadir);
+	if (!rendered) {
 		api.Clear();
 		DestroyPixPair(processed, base);
 		std::string message = "pdf_ocr: Tesseract's PDF renderer could not write the text layer";
