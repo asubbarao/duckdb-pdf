@@ -190,20 +190,17 @@ GROUP BY page ORDER BY page;
 
 # Reading order goes down the page in sections: a full-width block ends one
 # section and starts the next, and each section reads its left column before its
-# right. On these pages the body is one section, so the whole left column
-# precedes the whole right column. (Page 3 opens with a figure whose right-hand
-# labels are read before the text columns, so the page-wide statement is not
-# the right one there.)
+# right. Pages 3, 6, and 9 contain full-width figures, so the page-wide
+# statement applies only to pages whose content is one two-column body section.
 query II
 SELECT page, max(line) FILTER (column_index = 0) < min(line) FILTER (column_index = 1)
 FROM read_pdf_words('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf',
                     first_page := 1, last_page := 9)
-WHERE page IN (1, 6, 9)
+WHERE page IN (1, 2)
 GROUP BY page ORDER BY page;
 ----
 1	true
-6	true
-9	true
+2	true
 
 # On the calendar, prose is column 0 and the grid is column 1.
 query I
