@@ -1,0 +1,508 @@
+%PDF-1.3
+%·¾­ª
+1 0 obj
+<<
+/Type /Catalog
+/Pages 2 0 R
+>>
+endobj
+2 0 obj
+<<
+/Type /Pages
+/Kids [ 4 0 R ]
+/Count 1
+>>
+endobj
+3 0 obj
+<<
+/Producer (Haru Free PDF Library 2.4.6)
+>>
+endobj
+4 0 obj
+<<
+/Type /Page
+/MediaBox [ 0 0 792 612 ]
+/Contents 5 0 R
+/Resources <<
+/ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]
+/Font <<
+/F1 9 0 R
+/F2 8 0 R
+/F3 7 0 R
+>>
+>>
+/Parent 2 0 R
+>>
+endobj
+5 0 obj
+<<
+/Length 6 0 R
+>>
+stream
+0.93 0.95 0.98 rg
+42 500 m
+38 500 36 502 36 506 c
+36 556 38 558 42 558 c
+176 558 178 556 178 552 c
+178 502 176 500 42 500 c
+f
+/F1 14 Tf
+BT
+44 538 Td
+(Alpha) Tj
+ET
+0.5 w
+44 536 m
+82.89199 536 l
+S
+/F2 10 Tf
+BT
+44 522 Td
+(property: one) Tj
+ET
+/F3 10 Tf
+BT
+44 507 Td
+(* first detail) Tj
+ET
+0.93 0.95 0.98 rg
+42 432 m
+38 432 36 434 36 438 c
+36 488 38 490 42 490 c
+176 490 178 488 178 484 c
+178 434 176 432 42 432 c
+f
+/F1 14 Tf
+BT
+44 470 Td
+(Beta) Tj
+ET
+0.5 w
+44 468 m
+74.33799 468 l
+S
+/F2 10 Tf
+BT
+44 454 Td
+(property: two) Tj
+ET
+/F3 10 Tf
+BT
+44 439 Td
+(* second detail) Tj
+ET
+0.93 0.95 0.98 rg
+42 364 m
+38 364 36 366 36 370 c
+36 420 38 422 42 422 c
+176 422 178 420 178 416 c
+178 366 176 364 42 364 c
+f
+/F1 14 Tf
+BT
+44 402 Td
+(Gamma) Tj
+ET
+0.5 w
+44 400 m
+95.352 400 l
+S
+/F2 10 Tf
+BT
+44 386 Td
+(property: three) Tj
+ET
+/F3 10 Tf
+BT
+44 371 Td
+(* third detail) Tj
+ET
+0.93 0.95 0.98 rg
+42 296 m
+38 296 36 298 36 302 c
+36 352 38 354 42 354 c
+176 354 178 352 178 348 c
+178 298 176 296 42 296 c
+f
+/F1 14 Tf
+BT
+44 334 Td
+(Delta) Tj
+ET
+0.5 w
+44 332 m
+78.22999 332 l
+S
+/F2 10 Tf
+BT
+44 318 Td
+(property: four) Tj
+ET
+/F3 10 Tf
+BT
+44 303 Td
+(* fourth detail) Tj
+ET
+0.93 0.95 0.98 rg
+42 228 m
+38 228 36 230 36 234 c
+36 284 38 286 42 286 c
+176 286 178 284 178 280 c
+178 230 176 228 42 228 c
+f
+/F1 14 Tf
+BT
+44 266 Td
+(Epsilon) Tj
+ET
+0.5 w
+44 264 m
+94.568 264 l
+S
+/F2 10 Tf
+BT
+44 250 Td
+(property: one) Tj
+ET
+/F3 10 Tf
+BT
+44 235 Td
+(* fifth detail) Tj
+ET
+0.93 0.95 0.98 rg
+42 160 m
+38 160 36 162 36 166 c
+36 216 38 218 42 218 c
+176 218 178 216 178 212 c
+178 162 176 160 42 160 c
+f
+/F1 14 Tf
+BT
+44 198 Td
+(Zeta) Tj
+ET
+0.5 w
+44 196 m
+72.78399 196 l
+S
+/F2 10 Tf
+BT
+44 182 Td
+(property: two) Tj
+ET
+/F3 10 Tf
+BT
+44 167 Td
+(* sixth detail) Tj
+ET
+0.93 0.95 0.98 rg
+232 526 m
+228 526 226 528 226 532 c
+226 582 228 584 232 584 c
+366 584 368 582 368 578 c
+368 528 366 526 232 526 c
+f
+/F1 14 Tf
+BT
+234 564 Td
+(Alpha) Tj
+ET
+0.5 w
+234 562 m
+272.89199 562 l
+S
+/F2 10 Tf
+BT
+234 548 Td
+(property: one) Tj
+ET
+/F3 10 Tf
+BT
+234 533 Td
+(* first detail) Tj
+ET
+0.93 0.95 0.98 rg
+232 465 m
+228 465 226 467 226 471 c
+226 521 228 523 232 523 c
+366 523 368 521 368 517 c
+368 467 366 465 232 465 c
+f
+/F1 14 Tf
+BT
+234 503 Td
+(Beta) Tj
+ET
+0.5 w
+234 501 m
+264.33801 501 l
+S
+/F2 10 Tf
+BT
+234 487 Td
+(property: two) Tj
+ET
+/F3 10 Tf
+BT
+234 472 Td
+(* second detail) Tj
+ET
+0.93 0.95 0.98 rg
+232 404 m
+228 404 226 406 226 410 c
+226 460 228 462 232 462 c
+366 462 368 460 368 456 c
+368 406 366 404 232 404 c
+f
+/F1 14 Tf
+BT
+234 442 Td
+(Gamma) Tj
+ET
+0.5 w
+234 440 m
+285.35198 440 l
+S
+/F2 10 Tf
+BT
+234 426 Td
+(property: three) Tj
+ET
+/F3 10 Tf
+BT
+234 411 Td
+(* third detail) Tj
+ET
+0.93 0.95 0.98 rg
+232 343 m
+228 343 226 345 226 349 c
+226 399 228 401 232 401 c
+366 401 368 399 368 395 c
+368 345 366 343 232 343 c
+f
+/F1 14 Tf
+BT
+234 381 Td
+(Delta) Tj
+ET
+0.5 w
+234 379 m
+268.23001 379 l
+S
+/F2 10 Tf
+BT
+234 365 Td
+(property: four) Tj
+ET
+/F3 10 Tf
+BT
+234 350 Td
+(* fourth detail) Tj
+ET
+0.93 0.95 0.98 rg
+232 282 m
+228 282 226 284 226 288 c
+226 338 228 340 232 340 c
+366 340 368 338 368 334 c
+368 284 366 282 232 282 c
+f
+/F1 14 Tf
+BT
+234 320 Td
+(Epsilon) Tj
+ET
+0.5 w
+234 318 m
+284.56799 318 l
+S
+/F2 10 Tf
+BT
+234 304 Td
+(property: one) Tj
+ET
+/F3 10 Tf
+BT
+234 289 Td
+(* fifth detail) Tj
+ET
+0.93 0.95 0.98 rg
+232 221 m
+228 221 226 223 226 227 c
+226 277 228 279 232 279 c
+366 279 368 277 368 273 c
+368 223 366 221 232 221 c
+f
+/F1 14 Tf
+BT
+234 259 Td
+(Zeta) Tj
+ET
+0.5 w
+234 257 m
+262.78399 257 l
+S
+/F2 10 Tf
+BT
+234 243 Td
+(property: two) Tj
+ET
+/F3 10 Tf
+BT
+234 228 Td
+(* sixth detail) Tj
+ET
+0.93 0.95 0.98 rg
+422 488 m
+418 488 416 490 416 494 c
+416 544 418 546 422 546 c
+556 546 558 544 558 540 c
+558 490 556 488 422 488 c
+f
+/F1 14 Tf
+BT
+424 526 Td
+(Alpha) Tj
+ET
+0.5 w
+424 524 m
+462.89199 524 l
+S
+/F2 10 Tf
+BT
+424 510 Td
+(property: one) Tj
+ET
+/F3 10 Tf
+BT
+424 495 Td
+(* first detail) Tj
+ET
+0.93 0.95 0.98 rg
+422 405 m
+418 405 416 407 416 411 c
+416 461 418 463 422 463 c
+556 463 558 461 558 457 c
+558 407 556 405 422 405 c
+f
+/F1 14 Tf
+BT
+424 443 Td
+(Beta) Tj
+ET
+0.5 w
+424 441 m
+454.33801 441 l
+S
+/F2 10 Tf
+BT
+424 427 Td
+(property: two) Tj
+ET
+/F3 10 Tf
+BT
+424 412 Td
+(* second detail) Tj
+ET
+0.93 0.95 0.98 rg
+422 322 m
+418 322 416 324 416 328 c
+416 378 418 380 422 380 c
+556 380 558 378 558 374 c
+558 324 556 322 422 322 c
+f
+/F1 14 Tf
+BT
+424 360 Td
+(Gamma) Tj
+ET
+0.5 w
+424 358 m
+475.35198 358 l
+S
+/F2 10 Tf
+BT
+424 344 Td
+(property: three) Tj
+ET
+/F3 10 Tf
+BT
+424 329 Td
+(* third detail) Tj
+ET
+0.93 0.95 0.98 rg
+422 239 m
+418 239 416 241 416 245 c
+416 295 418 297 422 297 c
+556 297 558 295 558 291 c
+558 241 556 239 422 239 c
+f
+/F1 14 Tf
+BT
+424 277 Td
+(Delta) Tj
+ET
+0.5 w
+424 275 m
+458.23001 275 l
+S
+/F2 10 Tf
+BT
+424 261 Td
+(property: four) Tj
+ET
+/F3 10 Tf
+BT
+424 246 Td
+(* fourth detail) Tj
+ET
+
+endstream
+endobj
+6 0 obj
+4716
+endobj
+7 0 obj
+<<
+/Type /Font
+/BaseFont /Helvetica
+/Subtype /Type1
+/Encoding /StandardEncoding
+>>
+endobj
+8 0 obj
+<<
+/Type /Font
+/BaseFont /Helvetica-Oblique
+/Subtype /Type1
+/Encoding /StandardEncoding
+>>
+endobj
+9 0 obj
+<<
+/Type /Font
+/BaseFont /Helvetica-Bold
+/Subtype /Type1
+/Encoding /StandardEncoding
+>>
+endobj
+xref
+0 10
+0000000000 65535 f
+0000000015 00000 n
+0000000064 00000 n
+0000000123 00000 n
+0000000184 00000 n
+0000000380 00000 n
+0000005150 00000 n
+0000005170 00000 n
+0000005268 00000 n
+0000005374 00000 n
+trailer
+<<
+/Root 1 0 R
+/Info 3 0 R
+/Size 10
+>>
+startxref
+5477
+%%EOF

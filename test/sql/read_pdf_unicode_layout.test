@@ -1,0 +1,17 @@
+# name: test/sql/read_pdf_unicode_layout.test
+# description: UTF-8 code points, not bytes, drive layout thresholds
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# The 13.5pt internal gap is below the code-point threshold but above the
+# byte-count threshold for equal-width "café" / "cafe" words.
+query I
+SELECT len(list(DISTINCT column_index)) = 1
+FROM read_pdf_words('test/data/unicode_columns.pdf')
+GROUP BY page;
+----
+true

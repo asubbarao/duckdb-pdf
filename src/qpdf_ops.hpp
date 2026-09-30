@@ -32,6 +32,9 @@ namespace pdf_qpdf {
 // as well as local paths. Writers take paths, because qpdf streams the source
 // lazily into the output file it writes.
 
+// Reports whether the document catalog contains a /PageLabels entry.
+bool HasPageLabels(const std::string &pdf_bytes, const std::string &password);
+
 // Concatenates the inputs' pages in list order into `output`.
 // The caller validates that inputs exist and the output directory exists.
 void Merge(const std::vector<std::string> &inputs, const std::string &output);
@@ -52,6 +55,10 @@ void Split(const std::string &input, const std::string &output_dir, const std::s
 // Structural optimization only: object streams, stream recompression, and
 // linearization ("fast web view"). Image data is carried over as-is.
 void Compress(const std::string &input, const std::string &output);
+
+// Appends each non-empty text-only PDF page in `layers` to the corresponding
+// source page, copying its font resources into the source document.
+void AddTextLayers(const std::string &input, const std::string &output, const std::vector<std::string> &layers);
 
 // AES-256 (R6) with all permissions allowed; the caller has already resolved
 // an empty owner password to the user password.
@@ -108,6 +115,26 @@ std::vector<Annotation> ReadAnnotations(const std::string &pdf_bytes);
 // One 1-based physical page per outline item in qpdf's depth-first order;
 // zero means that the item's destination could not be resolved.
 std::vector<int> ReadOutlinePages(const std::string &pdf_bytes, const std::string &password);
+
+struct StructureElement {
+	int ord = 0;
+	int depth = 0;
+	int parent_ord = 0; // zero means SQL NULL
+	int page = 0;       // 1-based; zero means SQL NULL
+	std::string tag;
+	std::string role;
+	bool has_alt = false;
+	std::string alt;
+	bool has_actual_text = false;
+	std::string actual_text;
+	bool has_lang = false;
+	std::string lang;
+	std::vector<int> mcids;
+};
+
+// One structure element in depth-first document order. Malformed or cyclic
+// descendants are skipped after the readable prefix has been collected.
+std::vector<StructureElement> ReadStructure(const std::string &pdf_bytes, const std::string &password);
 
 // One axis-aligned-ish ruled line segment collected from a page content stream,
 // used to recover lattice (bordered) tables. Endpoints are in PDF user space

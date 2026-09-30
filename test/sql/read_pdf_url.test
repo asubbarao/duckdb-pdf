@@ -289,6 +289,32 @@ SELECT (SELECT count(*) FROM pdf_form_fields('https://blobs.duckdb.org/events/du
 ----
 0	1	0
 
+# Tagged structure counts measured from the local copies are stable properties
+# for these published URLs: Floyd has 240 rows (P=48, Sect=51), and State of
+# the Duck has 499 rows (P=76, H1=122). Sect is included as a section-heading
+# role because the Floyd document uses it instead of H/H1-H6.
+query I
+SELECT count(*) > 0
+   AND count(*) FILTER (WHERE role = 'P') > 0
+   AND count(*) FILTER (WHERE role = 'Sect') > 0
+FROM pdf_structure('https://blobs.duckdb.org/events/duckcon7/floyd-berndsen-ducklake-on-hetzner.pdf');
+----
+true
+
+query I
+SELECT count(*) > 0
+   AND count(*) FILTER (WHERE role = 'P') > 0
+   AND count(*) FILTER (WHERE role = 'H1') > 0
+FROM pdf_structure('https://blobs.duckdb.org/events/duckcon7/hannes-muehleisen-mark-raasveldt-duckcon7-state-of-the-duck.pdf');
+----
+true
+
+query I
+SELECT count(*) = 0
+FROM pdf_structure('https://blobs.duckdb.org/docs/ducklake-docs.pdf');
+----
+true
+
 # A URL that does not exist fails as an HTTP error, not as a parse error.
 statement error
 SELECT * FROM read_pdf('https://blobs.duckdb.org/merch/no-such-calendar.pdf');

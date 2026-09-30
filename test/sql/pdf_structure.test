@@ -1,0 +1,75 @@
+# name: test/sql/pdf_structure.test
+# description: Tagged PDF structure tree inspection
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+query IIII
+SELECT tag, role, depth, parent_ord
+FROM pdf_structure('test/data/structure.pdf')
+ORDER BY ord;
+----
+Document	Document	0	NULL
+H1	H1	1	1
+P	P	1	1
+L	L	1	1
+LI	LI	2	4
+Lbl	Lbl	3	5
+LBody	LBody	3	5
+Table	Table	1	1
+TR	TR	2	8
+TD	TD	3	9
+Figure	Figure	1	1
+Span	Span	2	11
+CustomP	P	1	1
+
+query IIII
+SELECT page, alt, actual_text, lang
+FROM pdf_structure('test/data/structure.pdf')
+WHERE tag IN ('Figure', 'P', 'Document')
+ORDER BY ord;
+----
+NULL	NULL	NULL	en-US
+1	NULL	actual paragraph	NULL
+2	A diagram	NULL	NULL
+
+query I
+SELECT mcids
+FROM pdf_structure('test/data/structure.pdf')
+ORDER BY ord;
+----
+[]
+[0]
+[1, 2]
+[]
+[]
+[3]
+[4]
+[]
+[]
+[5]
+[]
+[6]
+[7]
+
+query I
+SELECT count(*)
+FROM pdf_structure('test/data/structure.pdf', first_page := 2, last_page := 2)
+WHERE page = 2;
+----
+6
+
+query I
+SELECT count(*)
+FROM pdf_structure('test/data/hello.pdf');
+----
+0
+
+query I
+SELECT count(*) = 1 AND min(tag) = 'Document'
+FROM pdf_structure('test/data/structure_cycle.pdf');
+----
+true

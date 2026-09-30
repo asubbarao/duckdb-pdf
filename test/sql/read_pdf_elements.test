@@ -96,6 +96,83 @@ WHERE NOT (bbox_x0 < bbox_x1 AND bbox_y0 < bbox_y1);
 ----
 true
 
+# ── OCR word source ─────────────────────────────────────────────────────────
+# The bundled English model keeps these tests independent of host tessdata.
+# OCR words are ordered by the shared geometric line ids, not Tesseract's raw
+# result order, so element text must be a lossless grouping of those words.
+
+query I
+SELECT count() = 0
+FROM read_pdf_elements('test/data/scanned.pdf');
+----
+true
+
+query I
+SELECT count() = 0
+FROM read_pdf_elements('test/data/skewed_scan.pdf');
+----
+true
+
+query I
+SELECT count() > 0
+FROM read_pdf_elements('test/data/scanned.pdf', auto_ocr := true);
+----
+true
+
+query I
+SELECT count() = 0
+FROM read_pdf_elements('test/data/scanned.pdf', auto_ocr := false);
+----
+true
+
+query I
+WITH words AS (
+  SELECT page, string_agg(word, ' ' ORDER BY line, column_index, x0) AS text
+  FROM read_pdf_words('test/data/scanned.pdf', ocr := true)
+  GROUP BY page
+), elements AS (
+  SELECT page_number AS page, string_agg(text, ' ' ORDER BY element_idx) AS text,
+         bool_and(font_size IS NULL AND font_name IS NULL) AS null_fonts
+  FROM read_pdf_elements('test/data/scanned.pdf', ocr := true)
+  GROUP BY page_number
+)
+SELECT count() > 0 AND bool_and(words.text = elements.text AND elements.null_fonts)
+FROM words
+JOIN elements USING (page);
+----
+true
+
+query I
+SELECT count() > 0
+FROM read_pdf_elements('test/data/scanned.pdf', ocr := true)
+WHERE element_type = 'paragraph';
+----
+true
+
+query I
+WITH words AS (
+  SELECT page, string_agg(word, ' ' ORDER BY line, column_index, x0) AS text
+  FROM read_pdf_words('test/data/skewed_scan.pdf', ocr := true)
+  GROUP BY page
+), elements AS (
+  SELECT page_number AS page, string_agg(text, ' ' ORDER BY element_idx) AS text,
+         bool_and(font_size IS NULL AND font_name IS NULL) AS null_fonts
+  FROM read_pdf_elements('test/data/skewed_scan.pdf', ocr := true)
+  GROUP BY page_number
+)
+SELECT count() > 0 AND bool_and(words.text = elements.text AND elements.null_fonts)
+FROM words
+JOIN elements USING (page);
+----
+true
+
+query I
+SELECT count() > 0
+FROM read_pdf_elements('test/data/skewed_scan.pdf', ocr := true)
+WHERE element_type = 'paragraph';
+----
+true
+
 # Native text layer: font_size present and near the writer's 10pt default
 query I
 SELECT COUNT(*) = 0
@@ -103,6 +180,13 @@ FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
 WHERE font_size IS NULL OR font_size < 9 OR font_size > 11;
 ----
 true
+
+# Native text layer: one-font elements report their font name
+query I
+SELECT font_name FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+WHERE text = 'Markdown Fixture Title';
+----
+Helvetica-Bold
 
 # ── multi-font fixture: heading detection ─────────────────────────────────────
 # markdown_fixture.pdf: 24pt title, 14pt subheading, 10pt body/list/table.
@@ -125,6 +209,13 @@ SELECT element_type FROM read_pdf_elements('test/data/markdown_fixture.pdf')
 WHERE text = 'Introduction Section';
 ----
 heading
+
+# Mixed-font elements report the font carrying the most characters
+query I
+SELECT font_name FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+WHERE text = 'The word important is bold here.';
+----
+Helvetica
 
 # The title is the first element in reading order
 query I

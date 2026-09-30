@@ -481,3 +481,111 @@ functions (`read_pdf`, `pdf_chunks`, `read_pdf_tables`, ...) and the qpdf writer
 take a **path or glob, not a BLOB** — for those, give the URL as the path (they
 route through the VFS) rather than piping bytes. The qpdf writers additionally
 require a **local** output path.
+
+---
+
+## 10. Digest a long document: its contents, section by section
+
+**Goal:** before reading a 100-page manual, see its shape: every section in
+order, where it starts, how big it is, and how it opens. One statement, built
+from the word grain and the bookmarks.
+
+```sql
+WITH words AS (
+  FROM read_pdf_words('https://blobs.duckdb.org/docs/ducklake-docs.pdf')
+), lines AS (       -- read_pdf_words numbers lines per page, already in column order
+  SELECT page, line, string_agg(word, ' ' ORDER BY x0) AS text,
+         len(list(DISTINCT page) OVER ()) AS n_pages
+  FROM words GROUP BY page, line
+), furniture AS (   -- running headers and footers: the same text on over half the pages
+  SELECT text FROM lines GROUP BY text, n_pages HAVING len(list(DISTINCT page)) > n_pages / 2
+), body AS (
+  SELECT page, line, text FROM lines ANTI JOIN furniture USING (text)
+), anchors AS (     -- a bookmark starts at the line on its page that prints its title
+  SELECT o.ord, o.depth, o.title, o.page, coalesce(min(b.line), 0) AS line
+  FROM pdf_outline('https://blobs.duckdb.org/docs/ducklake-docs.pdf') o
+  LEFT JOIN body b ON b.page = o.page AND b.text = o.title
+  GROUP BY o.ord, o.depth, o.title, o.page
+), sections AS (    -- each line belongs to the deepest bookmark at or before it
+  SELECT a.ord, a.depth, a.title, a.page, b.page AS at_page, b.line, b.text
+  FROM body b ASOF JOIN anchors a
+    ON (b.page, b.line, 2147483647) >= (a.page, a.line, a.ord)
+)
+SELECT repeat('  ', depth) || title AS contents, page,
+       len(list(text)) AS lines, sum(length(text)) AS chars,
+       list(text ORDER BY at_page, line) FILTER (WHERE length(text) > 40)[1] AS opening
+FROM sections GROUP BY ord, depth, title, page ORDER BY ord;
+```
+
+```
+contents                          page  lines  chars  opening
+  Summary                            6      9    467  This document contains DuckLake's documentation in a single-file …
+    Introduction                     9     18    900  This page contains the specification for the DuckLake format, version 1.0.
+    Data Types                      10    272  10942  DuckLake specifies multiple different data types for field values, …
+    Queries                         17    404  16284  This page explains the queries issued to the DuckLake catalog database …
+      ducklake_column_mapping       30     13    587  Mappings contain the information used to map Parquet fields to column ids …
+```
+
+`pdf_outline.page` is the page each bookmark points at, so the contents join
+straight onto the text. Anchoring a bookmark to the line that prints its title,
+not just its page, keeps two sections that share a page apart. Keying the ASOF
+join on `ord` as well gives a shared line to the deeper bookmark.
+
+**Gotcha:** a document without bookmarks returns no rows from `pdf_outline`.
+Take the anchors from `read_pdf_elements` instead
+(`WHERE element_type = 'heading'`, with `page_number` and the element's text).
+For the printed page number rather than the physical index, join
+`pdf_pages_info(file)` on `page` and use its `label`.
+The runnable script is [`examples/digest_long_document.sql`](examples/digest_long_document.sql).
+
+---
+
+## 11. Scanned documents: OCR once, then read the result natively
+
+**Goal:** turn a scan into a PDF with a real text layer, so every reader works on it
+quickly and no query pays for OCR twice.
+
+```sql
+-- pdf_ocr(src, dst, force := false, <the OCR options the readers take>)
+-- One row per page: page, had_text_layer, ocr_applied, words, mean_confidence, seconds, out_path
+FROM pdf_ocr('scans/invoice.pdf', 'scans/invoice.searchable.pdf');
+
+-- The copy is an ordinary text PDF: no OCR option needed from here on.
+SELECT page_number, element_type, text FROM read_pdf_elements('scans/invoice.searchable.pdf');
+SELECT chunk_idx, page_start, n_chars    FROM pdf_chunks('scans/invoice.searchable.pdf');
+```
+
+Pages that already have a text layer are copied untouched (`ocr_applied = false`); `force := true`
+OCRs every page. OCR runs through Tesseract and the text layer is Tesseract's own invisible one,
+spliced into the original with qpdf, so links, outline and metadata survive.
+
+**Gotcha:** this is best-effort OCR for clean printed text. On the repository's scanned invoice
+fixture the run takes about a quarter of a second and reads every row, but "Item" comes back as
+"ltem": check `mean_confidence` and do not treat the output as authoritative for handwriting or
+anything where a misread is costly. For a one-off look without writing a file,
+`read_pdf_words(..., ocr := true)` still works, and `read_pdf_elements` takes the same OCR options.
+
+---
+
+## 12. Tagged PDFs: read the author's own structure instead of guessing it
+
+**Goal:** many PDFs (PowerPoint and Word exports, anything PDF/UA) carry a structure tree that
+says what each piece is: heading, paragraph, list item, table cell, figure. `read_pdf_elements`
+infers those from font size and position; `pdf_structure` reads what the file declares.
+
+```sql
+-- pdf_structure(files, password, first_page, last_page, ignore_errors)
+-- One row per structure element, depth-first: file, ord, depth, parent_ord, tag, role, page,
+--   alt, actual_text, lang, mcids INTEGER[]   (role = tag after the document's /RoleMap)
+SELECT role, len(list(ord)) AS n
+FROM pdf_structure('https://blobs.duckdb.org/events/duckcon7/floyd-berndsen-ducklake-on-hetzner.pdf')
+GROUP BY role ORDER BY n DESC;
+```
+
+An untagged file returns no rows, so the same query tells you which documents have a tree. Where
+one exists it is exact: on a tagged conference deck the tree has far more headings (`H1`) per page
+than the geometric guess finds, because a slide title is often no larger than the type around it.
+
+**Gotcha:** `pdf_structure` returns the structure, not its text. `mcids` are the marked-content
+ids that belong to each element, which is what a later step needs to attach text; until then, join
+the tags to `read_pdf_elements` by page. Compare the two on your own documents before choosing one.

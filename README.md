@@ -24,6 +24,9 @@ FROM pdf_info('docs/*.pdf');
 CREATE TABLE chunks AS FROM pdf_chunks('docs/*.pdf');
 ```
 
+For scans, OCR once with `pdf_ocr`, then read the searchable output with the
+ordinary PDF readers.
+
 > **See [COOKBOOK.md](COOKBOOK.md) for task-oriented recipes** — RAG ingestion,
 > full-text search, scanned-invoice OCR, quarantining broken files, signature
 > forensics, bulk document surgery, thumbnails, and reporting. This README is the
@@ -76,6 +79,7 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 | `first_page` / `last_page` | INTEGER | full document | 1-based inclusive page range. |
 | `layout` | VARCHAR | `'reading'` | Text extraction order: `'reading'`, `'physical'` (preserves column alignment), or `'raw'` (content-stream order). |
 | `parse_tables` | BOOLEAN | false | Force physical layout (column-preserving) extraction. |
+| `force` | BOOLEAN | false | `read_pdf_tables` only: return whitespace grids that fail its confidence gate. |
 | `ocr` | BOOLEAN | false | Force OCR on every page, even pages with a text layer. |
 | `auto_ocr` | BOOLEAN | true | OCR pages that have no extractable text layer. |
 | `ocr_language` | VARCHAR | `'eng'` | Tesseract language model. |
@@ -88,11 +92,11 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 | `ocr_config` | VARCHAR | — | Path or tessdata config name for `ReadConfigFile` (applied after Init, before `ocr_vars`). |
 | `ignore_errors` | BOOLEAN | false | `read_pdf` / `read_pdf_meta` only: skip unopenable files in a multi-file scan instead of aborting it. |
 
-`read_pdf_elements` and `pdf_chunks` accept only `password`, `first_page`, `last_page` (plus `pdf_chunks`' own `chunk_size` / `overlap`) — they read the native text layer only.
+`read_pdf_elements` and `pdf_chunks` accept the OCR options above, plus `password`, `first_page`, and `last_page` (`pdf_chunks` also has `chunk_size` / `overlap`). Their legacy default remains native-only; set `auto_ocr := true` or `ocr := true` to include OCR words.
 
 ### `read_pdf` — one row per page
 
-Columns: `filename`, `page`, `page_count`, `text`, `width`, `height` (page size in PDF points), `has_text_layer` (native embedded text is non-blank), `used_ocr` (Tesseract produced the returned text), `ocr_confidence` (Tess MeanTextConf 0–100 when `used_ocr`, else NULL).
+Columns: `filename`, `page`, `page_count`, `text`, `width`, `height` (page size in PDF points), `has_text_layer` (native embedded text is non-blank), `used_ocr` (Tesseract produced the returned text), `ocr_confidence` (Tess MeanTextConf 0–100 when `used_ocr`, else NULL), `label` (printed page label, or NULL).
 
 `has_text_layer` describes the PDF itself (true even when `ocr:=true` forced a re-OCR of a text page). `used_ocr` is true when the page had no extractable text and auto-OCR ran, or when `ocr:=true` forced OCR and the engine returned text. Together they make image-only vs embedded-text detection first-class:
 
@@ -134,7 +138,7 @@ GROUP BY filename;
 
 ### `read_pdf_lines` — one row per line
 
-Columns: `filename`, `page`, `line` (1-based, reset per page), `text`. A PDF-aware analog of `read_lines`: grep a PDF the way you'd grep a text file, keeping page + line context.
+Columns: `filename`, `page`, `line` (1-based, reset per page), `text`, `label` (printed page label, or NULL). A PDF-aware analog of `read_lines`: grep a PDF the way you'd grep a text file, keeping page + line context.
 
 ```sql
 SELECT page, line, text
@@ -149,7 +153,7 @@ WHERE text ILIKE '%total due%';
 
 ### `read_pdf_words` — one row per word, with bounding boxes
 
-Columns: `filename`, `page`, `word`, `x0`, `y0`, `x1`, `y1` (PDF points; poppler-cpp `text_list` y is top-down on typical pages — smaller `y0` is higher on the page), `font_name`, `font_size`, `source`, `confidence`, **`line`** (1-based geometric line id within the page), **`page_width`** / **`page_height`** (crop-box size in points for that page — same numbers as `read_pdf.width` / `height`).
+Columns: `filename`, `page`, `word`, `x0`, `y0`, `x1`, `y1` (PDF points; poppler-cpp `text_list` y is top-down on typical pages — smaller `y0` is higher on the page), `font_name`, `font_size`, `source`, `confidence`, **`line`** (1-based geometric line id within the page), **`page_width`** / **`page_height`** (crop-box size in points for that page — same numbers as `read_pdf.width` / `height`), `label` (printed page label, or NULL).
 
 `line` clusters words with the same vertical-overlap rule as `read_pdf_elements` (≥ 50% of the shorter word height). Use it to equi-join marks to line context or rebuild lines in one Poppler walk:
 
@@ -196,6 +200,8 @@ Two detectors run per page:
 - **Lattice (ruled) tables** — horizontal/vertical rule segments are collected from the page content streams and, when they form a usable grid, used as authoritative cell separators. Bordered tables are cut exactly along their lines, including cells whose text alignment alone would mis-cluster.
 - **Unruled tables** — a precision-first geometric heuristic (word bounding-box column clustering with a regularity gate, plus document-wide column-edge voting so **right-aligned numeric columns** cluster correctly). It favors not emitting spurious tables from prose over catching every table.
 
+By default, `read_pdf_tables` emits only whitespace grids that pass the confidence gate. Pass `force := true` to return the best-effort grid for an ambiguous page as well.
+
 Merged cells and borderless/sparse tables remain out of scope — see [Scope](#scope).
 
 ```sql
@@ -212,7 +218,7 @@ ORDER BY filename, page, table_index, row_index;
 
 Columns: `file`, `page_number` (1-based), `element_idx` (1-based within page), `element_type`, `text`, `font_size` (dominant size of the element, `NULL` when the PDF carries no font info), `bbox_x0`, `bbox_y0`, `bbox_x1`, `bbox_y1`.
 
-Elements are built by deterministic geometry over Poppler's positioned word list — words cluster into lines by vertical overlap, lines into blocks by vertical gap (> 0.6× median line height), font-size change (> 15%), or a list marker starting a line. Classification: `heading` = dominant font ≥ 1.15× the document's modal body size and < 200 chars, OR a short ALL-CAPS block at any font size; `list_item` = first line starts with a bullet glyph (`• – ▪ ● ○ ◦ ∙ ‣ ⁃ · ▸`, or `- ` / `* `) or an `N.` / `N)` marker (zero-width format chars after the marker — Google Docs `●<ZWSP>` / `1.<ZWSP>` — are skipped); `paragraph` = any other block of ≥ 3 words; `other` = the rest (page numbers, isolated fragments, and **running headers/footers**). A heading instance that sits in the top or bottom 12% of the page is demoted to `other` when the same text occupies that band on ≥ 5 pages (even/odd running titles). A mid-page cover byline with the same words stays a heading. Reads the native text layer only (no OCR) and does not attempt table detection — use `read_pdf_tables` for tables.
+Elements are built by deterministic geometry over the shared Poppler/Tesseract positioned word list — words cluster into lines by vertical overlap, lines into blocks by vertical gap (> 0.6× median line height), font-size (or OCR box-height) change (> 15%), or a list marker starting a line. Classification: `heading` = dominant font/box-height ≥ 1.15× the document/page body size and < 200 chars, OR a short ALL-CAPS block at any size; `list_item` = first line starts with a bullet glyph (`• – ▪ ● ○ ◦ ∙ ‣ ⁃ · ▸`, or `- ` / `* `) or an `N.` / `N)` marker (zero-width format chars after the marker — Google Docs `●<ZWSP>` / `1.<ZWSP>` — are skipped); `paragraph` = any other block of ≥ 3 words; `other` = the rest (page numbers, isolated fragments, and **running headers/footers**). A heading instance that sits in the top or bottom 12% of the page is demoted to `other` when the same text occupies that band on ≥ 5 pages (even/odd running titles). A mid-page cover byline with the same words stays a heading. OCR elements report `NULL` for `font_size` and `font_name`; table detection remains the job of `read_pdf_tables`.
 
 ```sql
 -- Document outline: just the headings
@@ -965,16 +971,17 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 
 | Function | Type | Description |
 |---|---|---|
-| `read_pdf(files)` | Table | One row per page: text, dimensions, `has_text_layer`, `used_ocr`, **`ocr_confidence`** (NULL if no OCR). Parallel multi-file scan; `ignore_errors` skips bad files. Named OCR knobs include `ocr_vars` MAP + `ocr_config`. |
-| `read_pdf_lines(files)` | Table | One row per layout-preserving line. |
-| `read_pdf_words(files)` / `read_pdf_layout` | Table | One row per word: bbox, font, OCR source/confidence, geometric `line`, `page_width`/`page_height`. |
+| `read_pdf(files)` | Table | One row per page: text, dimensions, printed page `label`, `has_text_layer`, `used_ocr`, **`ocr_confidence`** (NULL if no OCR). Parallel multi-file scan; `ignore_errors` skips bad files. Named OCR knobs include `ocr_vars` MAP + `ocr_config`. |
+| `read_pdf_lines(files)` | Table | One row per layout-preserving line with the printed page `label`. |
+| `read_pdf_words(files)` / `read_pdf_layout` | Table | One row per word: bbox, font, OCR source/confidence, geometric `line`, `page_width`/`page_height`, and printed page `label` on `read_pdf_words`. |
 | `read_pdf_tables(files)` | Table | One row per detected table row; cells as `VARCHAR[]`. |
-| `read_pdf_elements(files)` | Table | One row per layout element (`heading`/`paragraph`/`list_item`/`other`) with bbox. |
-| `pdf_chunks(files)` | Table | Retrieval-ready chunks with section headings; `chunk_size`/`overlap` knobs. |
+| `read_pdf_elements(files)` | Table | One row per layout element with bbox, OCR support, and dominant font name. |
+| `pdf_chunks(files)` | Table | Retrieval-ready chunks with section headings and OCR support; `chunk_size`/`overlap` knobs. |
 | `pdf_info(files)` | Table | Full per-file census: metadata, timestamps, dimensions, size, encryption. |
 | `pdf_pages_info(files)` | Table | One row per page: crop/media size, rotation, orientation, label, duration. |
 | `read_pdf_meta(files)` | Table | Legacy per-file metadata (subset of `pdf_info`). |
 | `pdf_outline(files)` | Table | One row per bookmark, depth-first: `file`, `ord`, `depth`, `title`, `page`. |
+| `pdf_structure(files)` | Table | One row per tagged structure element, depth-first, with resolved role and direct MCIDs. |
 | `pdf_attachments(files)` | Table | One row per embedded file, bytes as `BLOB`. |
 | `pdf_form_fields(files)` | Table | One row per AcroForm field with type and value. |
 | `pdf_annotations(files)` | Table | One row per annotation; `WHERE subtype = 'Link'` extracts hyperlinks. |
@@ -986,6 +993,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_split(file, dir)` | Table | One single-page PDF per page; one row per emitted file. |
 | `pdf_split_blank(file, dir[, blank_threshold])` | Table | Splits on blank-page separators (mailroom batches); one row per emitted document. |
 | `pdf_redact(in, out, boxes [, dpi, password])` | Table | True raster redaction: replace boxed pages with image-only pages (text removed, not covered); one row per output page. |
+| `pdf_ocr(src, dst [, force, OCR knobs])` | Table | Persist an invisible Tesseract text layer; one receipt row per page. |
 | `pdf_redact_lateral(in, out, boxes)` | Table (in-out) | Column-ref / dependent-join form of `pdf_redact` (positional only; dpi=200, password=''). |
 | `pdf_to_text(src [, layout])` | Scalar | Whole document as plain text. Path or `BLOB`. |
 | `pdf_to_markdown(path)` | Scalar | Whole document as GitHub-flavoured Markdown. |

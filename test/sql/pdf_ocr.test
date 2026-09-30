@@ -1,0 +1,92 @@
+# name: test/sql/pdf_ocr.test
+# description: persist Tesseract OCR as an invisible searchable text layer
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# The receipt is one row per source page and reports the persisted output path.
+query IIIIIII
+SELECT page, had_text_layer, ocr_applied, words > 0, mean_confidence BETWEEN 0 AND 100,
+       seconds >= 0, ends_with(out_path, 'ocr_scanned.pdf')
+FROM pdf_ocr('test/data/scanned.pdf', '__TEST_DIR__/ocr_scanned.pdf', ocr_retry := false);
+----
+1	false	true	true	true	true	true
+
+# The output is natively readable by every reader, without an OCR option.
+query III
+SELECT has_text_layer, used_ocr, length(text) > 0
+FROM read_pdf('__TEST_DIR__/ocr_scanned.pdf', auto_ocr := false);
+----
+true	false	true
+
+query I
+SELECT count(*) > 0 FROM read_pdf_elements('__TEST_DIR__/ocr_scanned.pdf');
+----
+true
+
+query I
+SELECT count(*) > 0 FROM pdf_chunks('__TEST_DIR__/ocr_scanned.pdf');
+----
+true
+
+# The word text and x positions round-trip. OCR source coordinates use the
+# reader's bottom-up convention, while Poppler's native boxes are top-down.
+query I
+WITH src AS (
+  SELECT row_number() OVER (ORDER BY round(x0, 1), page_height - y1, word) AS rn, word, x0, y1, page_height
+  FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_retry := false)
+), dst AS (
+  SELECT row_number() OVER (ORDER BY round(x0, 1), y0, word) AS rn, word, x0, y0, source
+  FROM read_pdf_words('__TEST_DIR__/ocr_scanned.pdf', auto_ocr := false)
+)
+SELECT count(*) = 12
+   AND bool_and(src.word = dst.word)
+   AND bool_and(dst.source = 'text')
+   AND max(abs(src.x0 - dst.x0)) < 1
+   AND max(abs(dst.y0 - (src.page_height - src.y1))) < 10
+FROM src JOIN dst USING (rn);
+----
+true
+
+# Skewed scans use the same persisted renderer after the existing preprocessing.
+query IIII
+SELECT page, had_text_layer, ocr_applied, words > 0
+FROM pdf_ocr('test/data/skewed_scan.pdf', '__TEST_DIR__/ocr_skewed.pdf', ocr_preprocess := true,
+             ocr_retry := false);
+----
+1	false	true	true
+
+query II
+SELECT count(*) > 0, bool_and(source = 'text')
+FROM read_pdf_words('__TEST_DIR__/ocr_skewed.pdf', auto_ocr := false);
+----
+true	true
+
+# Native pages are copied through in try mode and retain their text exactly.
+query III
+SELECT page, had_text_layer, ocr_applied
+FROM pdf_ocr('test/data/two_pages.pdf', '__TEST_DIR__/ocr_native.pdf')
+ORDER BY page;
+----
+1	true	false
+2	true	false
+
+query I
+WITH src AS (
+  SELECT page, text FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false)
+), dst AS (
+  SELECT page, text FROM read_pdf('__TEST_DIR__/ocr_native.pdf', auto_ocr := false)
+)
+SELECT bool_and(src.text = dst.text) FROM src JOIN dst USING (page);
+----
+true
+
+# force OCR applies to a native page too; the output remains searchable.
+query I
+SELECT bool_and(ocr_applied) FROM pdf_ocr('test/data/hello.pdf', '__TEST_DIR__/ocr_forced.pdf', force := true,
+                                           ocr_retry := false);
+----
+true

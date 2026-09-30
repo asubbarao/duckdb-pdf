@@ -1,6 +1,6 @@
 /*
  * gen_table_fixtures.c — reproducible fixtures for read_pdf_tables lattice /
- * right-aligned column tests.
+ * right-aligned column and card-layout tests.
  *
  * Build & run (from repo root, needs libharu):
  *   cc -O2 -o /tmp/gen_table_fixtures test/data/gen_table_fixtures.c \
@@ -12,6 +12,7 @@
  *   test/data/financial_right_aligned.pdf  — borderless, right-aligned amounts
  *   test/data/ruled_lattice.pdf            — fully bordered 3x4 lattice table
  *   test/data/mixed_prose_table.pdf        — prose around a borderless table
+ *   test/data/card_layout.pdf              — filled, independently staggered cards
  */
 #include <hpdf.h>
 #include <stdio.h>
@@ -167,6 +168,56 @@ static int make_mixed_prose(const char *path) {
 	return st != HPDF_OK;
 }
 
+static void write_card(HPDF_Page page, HPDF_Font heading, HPDF_Font italic, HPDF_Font font, float x, float y,
+                       const char *name, const char *property, const char *bullet) {
+	HPDF_Page_SetRGBFill(page, 0.93f, 0.95f, 0.98f);
+	const float r = 6.0f;
+	HPDF_Page_MoveTo(page, x + r, y);
+	HPDF_Page_CurveTo(page, x + 2.0f, y, x, y + 2.0f, x, y + r);
+	HPDF_Page_CurveTo(page, x, y + 56.0f, x + 2.0f, y + 58.0f, x + r, y + 58.0f);
+	HPDF_Page_CurveTo(page, x + 140.0f, y + 58.0f, x + 142.0f, y + 56.0f, x + 142.0f, y + 52.0f);
+	HPDF_Page_CurveTo(page, x + 142.0f, y + 2.0f, x + 140.0f, y, x + r, y);
+	HPDF_Page_Fill(page);
+	write_left(page, heading, 14, x + 8.0f, y + 38.0f, name);
+	HPDF_Page_SetLineWidth(page, 0.5f);
+	HPDF_Page_MoveTo(page, x + 8.0f, y + 36.0f);
+	HPDF_Page_LineTo(page, x + 8.0f + HPDF_Page_TextWidth(page, name), y + 36.0f);
+	HPDF_Page_Stroke(page);
+	write_left(page, italic, 10, x + 8.0f, y + 22.0f, property);
+	write_left(page, font, 10, x + 8.0f, y + 7.0f, bullet);
+}
+
+/* Independent vertical pitches keep each card stack internally regular while
+ * preventing a whitespace detector from treating the page as one table. */
+static int make_card_layout(const char *path) {
+	HPDF_Doc pdf = HPDF_New(NULL, NULL);
+	if (!pdf) {
+		return 1;
+	}
+	HPDF_Page page = HPDF_AddPage(pdf);
+	HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_LETTER, HPDF_PAGE_LANDSCAPE);
+	HPDF_Font font = HPDF_GetFont(pdf, "Helvetica", NULL);
+	HPDF_Font italic = HPDF_GetFont(pdf, "Helvetica-Oblique", NULL);
+	HPDF_Font heading = HPDF_GetFont(pdf, "Helvetica-Bold", NULL);
+	const float x[] = {36.0f, 226.0f, 416.0f};
+	const float y0[] = {500.0f, 526.0f, 488.0f};
+	const int counts[] = {6, 6, 4};
+	const char *names[] = {"Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"};
+	const char *properties[] = {"property: one", "property: two", "property: three", "property: four"};
+	const char *bullets[] = {"* first detail",  "* second detail", "* third detail",
+	                         "* fourth detail", "* fifth detail",  "* sixth detail"};
+	const float pitches[] = {68.0f, 61.0f, 83.0f};
+	for (int col = 0; col < 3; col++) {
+		for (int card = 0; card < counts[col]; card++) {
+			write_card(page, heading, italic, font, x[col], y0[col] - pitches[col] * card, names[card],
+			           properties[card % 4], bullets[card]);
+		}
+	}
+	HPDF_STATUS st = HPDF_SaveToFile(pdf, path);
+	HPDF_Free(pdf);
+	return st != HPDF_OK;
+}
+
 int main(int argc, char **argv) {
 	const char *dir = (argc > 1) ? argv[1] : "test/data";
 	char path[1024];
@@ -187,6 +238,13 @@ int main(int argc, char **argv) {
 
 	snprintf(path, sizeof(path), "%s/mixed_prose_table.pdf", dir);
 	if (make_mixed_prose(path)) {
+		fprintf(stderr, "failed to write %s\n", path);
+		return 1;
+	}
+	fprintf(stdout, "wrote %s\n", path);
+
+	snprintf(path, sizeof(path), "%s/card_layout.pdf", dir);
+	if (make_card_layout(path)) {
 		fprintf(stderr, "failed to write %s\n", path);
 		return 1;
 	}
