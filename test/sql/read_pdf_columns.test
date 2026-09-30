@@ -161,15 +161,16 @@ true
 
 # ── column_index is the band, and it is queryable ───────────────────────────
 
-# Two columns on the paper's body pages, numbered left to right; the figure
-# page between them has one.
+# Two columns on the paper's body pages, numbered left to right. Page 3 has a
+# figure across the top and two columns of text under it; the figure does not
+# turn the gutter off for the text.
 query II
 SELECT page, list(DISTINCT column_index ORDER BY column_index) AS bands
 FROM read_pdf_words('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf',
                     first_page := 3, last_page := 5)
 GROUP BY page ORDER BY page;
 ----
-3	[0]
+3	[0, 1]
 4	[0, 1]
 5	[0, 1]
 
@@ -187,15 +188,20 @@ GROUP BY page ORDER BY page;
 6	true
 9	true
 
+# Reading order goes down the page in sections: a full-width block ends one
+# section and starts the next, and each section reads its left column before its
+# right. On these pages the body is one section, so the whole left column
+# precedes the whole right column. (Page 3 opens with a figure whose right-hand
+# labels are read before the text columns, so the page-wide statement is not
+# the right one there.)
 query II
 SELECT page, max(line) FILTER (column_index = 0) < min(line) FILTER (column_index = 1)
 FROM read_pdf_words('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf',
                     first_page := 1, last_page := 9)
-WHERE page IN (1, 3, 6, 9)
+WHERE page IN (1, 6, 9)
 GROUP BY page ORDER BY page;
 ----
 1	true
-3	true
 6	true
 9	true
 
