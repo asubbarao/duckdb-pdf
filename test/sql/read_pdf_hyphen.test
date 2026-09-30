@@ -25,6 +25,26 @@ The argument continues onto the next line.
 The page ends on a well-
 
 # The same lines as poppler's reading order.
+query ITITTIT
+WITH auto AS (
+  SELECT line, text
+  FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'auto', auto_ocr := false)
+), reading AS (
+  SELECT line, text
+  FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'reading', auto_ocr := false)
+  WHERE trim(text) <> ''
+)
+SELECT coalesce(a.line, r.line), a.text, length(a.text), hex(a.text),
+       r.text, length(r.text), hex(r.text)
+FROM auto a
+FULL OUTER JOIN reading r ON a.line = r.line
+WHERE a.line IS NULL OR r.line IS NULL
+   OR a.text IS DISTINCT FROM r.text
+   OR length(a.text) IS DISTINCT FROM length(r.text)
+   OR hex(a.text) IS DISTINCT FROM hex(r.text)
+ORDER BY 1;
+----
+
 query I
 SELECT list(text ORDER BY line) FILTER (WHERE layout = 'auto')
      = list(text ORDER BY line) FILTER (WHERE layout = 'reading')
