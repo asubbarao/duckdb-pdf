@@ -346,9 +346,73 @@ struct LayoutWord {
 	string text;
 };
 
+struct MergedTextBox {
+	double x0 = 0.0;
+	double y0 = 0.0;
+	double x1 = 0.0;
+	double y1 = 0.0;
+	string text;
+	string font_name;
+	double font_size = 0.0;
+	bool has_font = false;
+	bool has_space_after = true;
+};
+
 // A word joins a line when it overlaps that line vertically by at least this
 // fraction of the shorter of the two heights.
 static constexpr double LAYOUT_LINE_OVERLAP_MIN_RATIO = 0.5;
+
+// Two boxes on one line that touch within this fraction of the shorter box height
+// are one word when poppler says no space follows the first. A ligature run and the
+// rest of its word overlap by a small fraction of the type size (0.2pt at 12.75pt),
+// while a real word space is about a quarter of it; scaling by height keeps the
+// test the same from footnote to display type, including boxes with no font info.
+static constexpr double LAYOUT_JOIN_MAX_GAP_RATIO = 0.1;
+
+// Poppler reports a ligature run, or a superscript such as "26" + "th", as separate
+// boxes and the extension would join them with a space. Merge them back into one word.
+static std::vector<MergedTextBox> MergeSpacelessBoxes(std::vector<poppler::text_box> boxes) {
+	std::vector<MergedTextBox> merged;
+	merged.reserve(boxes.size());
+	for (auto &box : boxes) {
+		string text = UStringToUtf8(box.text());
+		if (!pdf_ocr::HasGlyphs(text)) {
+			continue;
+		}
+		auto r = box.bbox();
+		MergedTextBox current;
+		current.x0 = r.x();
+		current.y0 = r.y();
+		current.x1 = r.x() + r.width();
+		current.y1 = r.y() + r.height();
+		current.text = std::move(text);
+		current.has_font = box.has_font_info();
+		if (current.has_font) {
+			current.font_name = box.get_font_name();
+			current.font_size = box.get_font_size();
+		}
+		current.has_space_after = box.has_space_after();
+		if (!merged.empty()) {
+			auto &previous = merged.back();
+			double gap = current.x0 - previous.x1;
+			double overlap = MinValue<double>(current.y1, previous.y1) - MaxValue<double>(current.y0, previous.y0);
+			double shorter = MinValue<double>(current.y1 - current.y0, previous.y1 - previous.y0);
+			bool same_line = shorter > 0.0 && overlap >= LAYOUT_LINE_OVERLAP_MIN_RATIO * shorter;
+			if (!previous.has_space_after && same_line && std::fabs(gap) < LAYOUT_JOIN_MAX_GAP_RATIO * shorter) {
+				previous.text += current.text;
+				previous.x0 = MinValue<double>(previous.x0, current.x0);
+				previous.y0 = MinValue<double>(previous.y0, current.y0);
+				previous.x1 = MaxValue<double>(previous.x1, current.x1);
+				previous.y1 = MaxValue<double>(previous.y1, current.y1);
+				previous.has_space_after = current.has_space_after; // a word of three runs keeps merging
+				continue;
+			}
+		}
+		merged.push_back(std::move(current));
+	}
+	return merged;
+}
+
 // A candidate gutter must be this many median character widths wide, measured
 // in the units the page itself chose rather than in absolute points.
 static constexpr double LAYOUT_GUTTER_MIN_CHARS = 3.0;
@@ -368,6 +432,26 @@ static constexpr double LAYOUT_BAND_MIN_CHARS = 20.0;
 // Pages with less text than this are never split.
 static constexpr size_t LAYOUT_MIN_WORDS_TO_SPLIT = 12;
 static constexpr size_t LAYOUT_MAX_BANDS = 8;
+// A fallback edge must recur on three words; the affected paper pages have
+// hundreds of aligned body edges, while figure/table edges are shorter runs.
+static constexpr size_t LAYOUT_MIN_GUTTER_EDGE_SUPPORT = 3;
+// A fallback gutter needs 20 words on each side; the paper has hundreds per
+// body column, while the markdown fixture's right-side table has only ten.
+static constexpr size_t LAYOUT_MIN_GUTTER_SIDE_WORDS = 20;
+// Poppler's repeated column edges vary by less than 1.5pt in the measured
+// paper, so this tolerance ignores that jitter without merging adjacent cells.
+static constexpr double LAYOUT_GUTTER_EDGE_TOLERANCE = 1.5;
+// A fallback gutter may be crossed only by lines that carry little of the page's text:
+// at most this fraction of all words may sit on a line the corridor crosses. Figure
+// labels and titles crossing a real gutter are a handful of words per line, whereas
+// full-width prose above or beside a figure or table is most of the page's words, and
+// cutting there would slice each of those lines in two. Each side also needs this many
+// lines of its own.
+static constexpr double LAYOUT_GUTTER_MAX_CROSSING_WORD_RATIO = 0.2;
+static constexpr size_t LAYOUT_MIN_GUTTER_SIDE_LINES = 8;
+// LayoutLineIds is defined after the band code that calls it.
+static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, std::vector<int32_t> &bands,
+                                          const std::vector<std::pair<double, double>> &gutters = {});
 // Words set this much larger than the body font are display type — titles and
 // banners, which routinely straddle a gutter. They get no vote on where the
 // gutters are, but they are still placed in a band afterwards.
@@ -384,9 +468,8 @@ static double LayoutMedianCharWidth(const std::vector<LayoutWord> &words) {
 	return Median(std::move(widths));
 }
 
-// Vertical whitespace corridors at least `min_width` wide that no word crosses.
-// Sweeping the x-intervals in x0 order is enough: a word that straddled a
-// corridor would have been seen earlier and raised the running maximum.
+// Keep the existing page-wide candidates first; the vertical-run fallback below
+// is only needed when spanning content makes those candidates unusable.
 static std::vector<std::pair<double, double>> LayoutGutters(const std::vector<LayoutWord> &words, double min_width) {
 	std::vector<std::pair<double, double>> spans;
 	spans.reserve(words.size());
@@ -408,10 +491,134 @@ static std::vector<std::pair<double, double>> LayoutGutters(const std::vector<La
 	return gutters;
 }
 
+// Find edge pairs whose corridor stays clear across the longest vertical run.
+// A spanning word blocks only its own y-range rather than the whole page.
+static std::vector<std::pair<double, double>> LayoutGuttersByVerticalRun(const std::vector<LayoutWord> &words,
+                                                                         double min_width, double page_left,
+                                                                         double page_right, double min_band) {
+	struct EdgeCluster {
+		double position;
+		size_t count;
+	};
+	const double edge_tol = LAYOUT_GUTTER_EDGE_TOLERANCE;
+	auto cluster_edges = [&](bool right_edges) {
+		std::vector<double> positions;
+		positions.reserve(words.size());
+		for (const auto &word : words) {
+			positions.push_back(right_edges ? word.x1 : word.x0);
+		}
+		std::sort(positions.begin(), positions.end());
+		std::vector<EdgeCluster> clusters;
+		for (double position : positions) {
+			if (clusters.empty() || position - clusters.back().position > edge_tol) {
+				clusters.push_back({position, 1});
+			} else {
+				clusters.back().position =
+				    (clusters.back().position * static_cast<double>(clusters.back().count) + position) /
+				    static_cast<double>(clusters.back().count + 1);
+				clusters.back().count++;
+			}
+		}
+		return clusters;
+	};
+	auto left_edges = cluster_edges(true);
+	auto right_edges = cluster_edges(false);
+	struct Candidate {
+		double first;
+		double second;
+		size_t side_lines; // lines that sit wholly on one side of the corridor
+	};
+	std::vector<Candidate> candidates;
+	// Lines are grouped without regard to columns, so a line of two-column text is
+	// one line with words on both sides of the corridor.
+	std::vector<int32_t> no_bands(words.size(), 0);
+	const auto line_of = LayoutLineIds(words, no_bands);
+	int32_t n_lines = 0;
+	for (int32_t l : line_of) {
+		n_lines = MaxValue<int32_t>(n_lines, l);
+	}
+	std::vector<size_t> words_on_line(static_cast<size_t>(n_lines) + 1, 0);
+	for (int32_t l : line_of) {
+		words_on_line[static_cast<size_t>(l)]++;
+	}
+	for (const auto &left : left_edges) {
+		if (left.count < LAYOUT_MIN_GUTTER_EDGE_SUPPORT) {
+			continue;
+		}
+		for (const auto &right : right_edges) {
+			if (right.count < LAYOUT_MIN_GUTTER_EDGE_SUPPORT || right.position - left.position < min_width) {
+				continue;
+			}
+			const double midpoint = 0.5 * (left.position + right.position);
+			if (midpoint - page_left < min_band || page_right - midpoint < min_band) {
+				continue;
+			}
+			size_t left_words = 0;
+			size_t right_words = 0;
+			for (const auto &word : words) {
+				left_words += word.x1 <= left.position + edge_tol;
+				right_words += word.x0 >= right.position - edge_tol;
+			}
+			if (left_words < LAYOUT_MIN_GUTTER_SIDE_WORDS || right_words < LAYOUT_MIN_GUTTER_SIDE_WORDS) {
+				continue;
+			}
+			// A gutter has text on both sides of it, at the same heights, on most lines.
+			// Blank space alone is not evidence: the empty middle of a figure is clear
+			// too, and cutting there would slice every full-width prose line in two.
+			std::vector<char> has_left(static_cast<size_t>(n_lines) + 1, 0);
+			std::vector<char> has_right(static_cast<size_t>(n_lines) + 1, 0);
+			std::vector<char> crosses(static_cast<size_t>(n_lines) + 1, 0);
+			for (size_t i = 0; i < words.size(); i++) {
+				const auto &word = words[i];
+				const size_t l = static_cast<size_t>(line_of[i]);
+				if (word.x1 <= left.position + edge_tol) {
+					has_left[l] = 1;
+				} else if (word.x0 >= right.position - edge_tol) {
+					has_right[l] = 1;
+				} else {
+					crosses[l] = 1;
+				}
+			}
+			size_t crossing_words = 0;
+			size_t left_lines = 0;
+			size_t right_lines = 0;
+			for (size_t l = 1; l <= static_cast<size_t>(n_lines); l++) {
+				if (crosses[l]) {
+					crossing_words += words_on_line[l];
+				} else if (has_left[l] || has_right[l]) {
+					left_lines += has_left[l];
+					right_lines += has_right[l];
+				}
+			}
+			if (static_cast<double>(crossing_words) >
+			        LAYOUT_GUTTER_MAX_CROSSING_WORD_RATIO * static_cast<double>(words.size()) ||
+			    left_lines < LAYOUT_MIN_GUTTER_SIDE_LINES || right_lines < LAYOUT_MIN_GUTTER_SIDE_LINES) {
+				continue;
+			}
+			candidates.push_back({left.position, right.position, left_lines + right_lines});
+		}
+	}
+	if (candidates.empty()) {
+		return {};
+	}
+	Candidate best = candidates.front();
+	for (const auto &candidate : candidates) {
+		if (candidate.side_lines > best.side_lines || (candidate.side_lines == best.side_lines &&
+		                                               candidate.second - candidate.first > best.second - best.first)) {
+			best = candidate;
+		}
+	}
+	return {{best.first, best.second}};
+}
+
 // Split a page into reading columns. Returns a 0-based band id per input word,
 // parallel to `words`; an all-zero result means one column.
-static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &words, double page_width) {
+static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &words, double page_width,
+                                              std::vector<std::pair<double, double>> *accepted_gutters = nullptr) {
 	std::vector<int32_t> band_of(words.size(), 0);
+	if (accepted_gutters) {
+		accepted_gutters->clear();
+	}
 	if (words.size() < LAYOUT_MIN_WORDS_TO_SPLIT || page_width <= 0.0) {
 		return band_of;
 	}
@@ -434,10 +641,6 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 	}
 	const double char_width = LayoutMedianCharWidth(body_words);
 	const double min_gutter = MaxValue<double>(LAYOUT_GUTTER_MIN_CHARS * char_width, 1.0);
-	auto gutters = LayoutGutters(body_words, min_gutter);
-	if (gutters.empty()) {
-		return band_of;
-	}
 	double left = body_words.front().x0;
 	double right = body_words.front().x1;
 	for (const auto &w : body_words) {
@@ -450,62 +653,81 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 	// calendar's seven 20.6pt cell gaps sit far enough apart to pass the
 	// band-width test individually, which chops its date grid into four columns.
 	const double width_tol = MaxValue<double>(1.5, 0.25 * char_width);
-	std::vector<double> class_width;             // representative width per class
-	std::vector<std::vector<double>> class_cuts; // gutter midpoints in that class
-	for (const auto &g : gutters) {
-		const double w = g.second - g.first;
-		size_t at = class_width.size();
-		for (size_t i = 0; i < class_width.size(); i++) {
-			if (std::fabs(class_width[i] - w) <= width_tol) {
-				at = i;
-				break;
-			}
-		}
-		if (at == class_width.size()) {
-			class_width.push_back(w);
-			class_cuts.emplace_back();
-		}
-		class_cuts[at].push_back(0.5 * (g.first + g.second));
-	}
-	std::vector<size_t> by_width(class_width.size());
-	for (size_t i = 0; i < by_width.size(); i++) {
-		by_width[i] = i;
-	}
-	std::sort(by_width.begin(), by_width.end(), [&](size_t a, size_t b) { return class_width[a] > class_width[b]; });
-
-	// Widest class first, and take a class only while every column it leaves
-	// behind is still wide enough to be a column rather than a cell.
 	const double min_band =
 	    MaxValue<double>(LAYOUT_BAND_MIN_WIDTH_RATIO * page_width, LAYOUT_BAND_MIN_CHARS * char_width);
-	std::vector<double> cuts;
-	for (size_t ci : by_width) {
-		const auto &members = class_cuts[ci];
-		if (cuts.size() + members.size() + 1 > LAYOUT_MAX_BANDS) {
-			continue;
-		}
-		auto trial = cuts;
-		trial.insert(trial.end(), members.begin(), members.end());
-		std::sort(trial.begin(), trial.end());
-		bool ok = true;
-		double prev = left;
-		for (double c : trial) {
-			if (c - prev < min_band) {
-				ok = false;
-				break;
+	auto choose_gutters = [&](const std::vector<std::pair<double, double>> &candidates) {
+		std::vector<double> class_width; // representative width per class
+		std::vector<std::vector<std::pair<double, double>>> class_gutters;
+		for (const auto &g : candidates) {
+			const double w = g.second - g.first;
+			size_t at = class_width.size();
+			for (size_t i = 0; i < class_width.size(); i++) {
+				if (std::fabs(class_width[i] - w) <= width_tol) {
+					at = i;
+					break;
+				}
 			}
-			prev = c;
+			if (at == class_width.size()) {
+				class_width.push_back(w);
+				class_gutters.emplace_back();
+			}
+			class_gutters[at].push_back(g);
 		}
-		if (ok && right - prev >= min_band) {
-			cuts = std::move(trial);
+		std::vector<std::pair<double, double>> gutters;
+		std::vector<size_t> by_width(class_width.size());
+		for (size_t i = 0; i < by_width.size(); i++) {
+			by_width[i] = i;
 		}
+		std::sort(by_width.begin(), by_width.end(),
+		          [&](size_t a, size_t b) { return class_width[a] > class_width[b]; });
+
+		// Widest class first, and take a class only while every column it leaves
+		// behind is still wide enough to be a column rather than a cell.
+		for (size_t ci : by_width) {
+			const auto &members = class_gutters[ci];
+			if (gutters.size() + members.size() + 1 > LAYOUT_MAX_BANDS) {
+				continue;
+			}
+			auto trial = gutters;
+			trial.insert(trial.end(), members.begin(), members.end());
+			std::sort(trial.begin(), trial.end(),
+			          [](const std::pair<double, double> &a, const std::pair<double, double> &b) {
+				          return 0.5 * (a.first + a.second) < 0.5 * (b.first + b.second);
+			          });
+			bool ok = true;
+			double prev = left;
+			for (const auto &g : trial) {
+				double c = 0.5 * (g.first + g.second);
+				if (c - prev < min_band) {
+					ok = false;
+					break;
+				}
+				prev = c;
+			}
+			if (ok && right - prev >= min_band) {
+				gutters = std::move(trial);
+			}
+		}
+		return gutters;
+	};
+
+	// A page-wide sweep can leave only figure/table corridors. Retry with the
+	// longest line-spanning runs before concluding that the page is one column.
+	auto gutters = choose_gutters(LayoutGutters(body_words, min_gutter));
+	if (gutters.empty()) {
+		gutters = choose_gutters(LayoutGuttersByVerticalRun(body_words, min_gutter, left, right, min_band));
 	}
-	if (cuts.empty()) {
+	if (gutters.empty()) {
 		return band_of;
+	}
+	if (accepted_gutters) {
+		*accepted_gutters = gutters;
 	}
 	for (size_t i = 0; i < words.size(); i++) {
 		const double mid = 0.5 * (words[i].x0 + words[i].x1);
 		int32_t band = 0;
-		for (double c : cuts) {
+		for (const auto &g : gutters) {
+			double c = 0.5 * (g.first + g.second);
 			if (mid > c) {
 				band++;
 			}
@@ -517,11 +739,19 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 
 // 1-based line ids in reading order: columns left to right, lines top to bottom
 // within a column. Parallel to `words`.
-static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, const std::vector<int32_t> &bands) {
+static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, std::vector<int32_t> &bands,
+                                          const std::vector<std::pair<double, double>> &gutters) {
 	std::vector<int32_t> line_of(words.size(), 0);
 	if (words.empty()) {
 		return line_of;
 	}
+	struct LineGroup {
+		std::vector<size_t> members;
+		int32_t band;
+		double y0;
+		double y1;
+		bool spanning;
+	};
 	std::vector<size_t> order(words.size());
 	for (size_t i = 0; i < order.size(); i++) {
 		order[i] = i;
@@ -535,29 +765,165 @@ static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, 
 		}
 		return words[a].x0 < words[b].x0;
 	});
-	int32_t line_no = 0;
-	int32_t cur_band = -1;
-	double cur_y0 = 0.0;
-	double cur_y1 = 0.0;
+	std::vector<LineGroup> fragments;
 	for (size_t idx : order) {
 		const auto &w = words[idx];
-		bool joined = false;
-		if (line_no > 0 && bands[idx] == cur_band) {
-			const double overlap = MinValue<double>(w.y1, cur_y1) - MaxValue<double>(w.y0, cur_y0);
-			const double shorter = MinValue<double>(w.y1 - w.y0, cur_y1 - cur_y0);
-			if (shorter > 0.0 && overlap >= LAYOUT_LINE_OVERLAP_MIN_RATIO * shorter) {
-				cur_y0 = MinValue<double>(cur_y0, w.y0);
-				cur_y1 = MaxValue<double>(cur_y1, w.y1);
-				joined = true;
+		bool joined = !fragments.empty() && bands[idx] == fragments.back().band;
+		if (joined) {
+			const auto &fragment = fragments.back();
+			const double overlap = MinValue<double>(w.y1, fragment.y1) - MaxValue<double>(w.y0, fragment.y0);
+			const double shorter = MinValue<double>(w.y1 - w.y0, fragment.y1 - fragment.y0);
+			joined = shorter > 0.0 && overlap >= LAYOUT_LINE_OVERLAP_MIN_RATIO * shorter;
+		}
+		if (joined) {
+			auto &fragment = fragments.back();
+			fragment.members.push_back(idx);
+			fragment.y0 = MinValue<double>(fragment.y0, w.y0);
+			fragment.y1 = MaxValue<double>(fragment.y1, w.y1);
+		} else {
+			fragments.push_back({{idx}, bands[idx], w.y0, w.y1, false});
+		}
+	}
+	for (auto &fragment : fragments) {
+		for (size_t idx : fragment.members) {
+			for (const auto &gutter : gutters) {
+				if (words[idx].x0 < gutter.second - LAYOUT_GUTTER_EDGE_TOLERANCE &&
+				    words[idx].x1 > gutter.first + LAYOUT_GUTTER_EDGE_TOLERANCE) {
+					fragment.spanning = true;
+					break;
+				}
+			}
+			if (fragment.spanning) {
+				break;
 			}
 		}
-		if (!joined) {
-			line_no++;
-			cur_band = bands[idx];
-			cur_y0 = w.y0;
-			cur_y1 = w.y1;
+	}
+	std::vector<LineGroup> groups;
+	std::vector<bool> consumed(fragments.size(), false);
+	auto overlaps = [](const LineGroup &a, const LineGroup &b) {
+		const double overlap = MinValue<double>(a.y1, b.y1) - MaxValue<double>(a.y0, b.y0);
+		const double shorter = MinValue<double>(a.y1 - a.y0, b.y1 - b.y0);
+		return shorter > 0.0 && overlap >= LAYOUT_LINE_OVERLAP_MIN_RATIO * shorter;
+	};
+	const double max_span_gap = MaxValue<double>(6.0, 1.5 * LayoutMedianCharWidth(words));
+	auto connects = [&](const LineGroup &a, const LineGroup &b) {
+		if (a.band == b.band) {
+			return false;
 		}
-		line_of[idx] = line_no;
+		const auto &left_group = a.band < b.band ? a : b;
+		const auto &right_group = a.band < b.band ? b : a;
+		double left_end = left_group.members.empty() ? 0.0 : words[left_group.members.front()].x1;
+		for (size_t idx : left_group.members) {
+			left_end = MaxValue<double>(left_end, words[idx].x1);
+		}
+		double right_start = right_group.members.empty() ? 0.0 : words[right_group.members.front()].x0;
+		for (size_t idx : right_group.members) {
+			right_start = MinValue<double>(right_start, words[idx].x0);
+		}
+		return right_start - left_end <= max_span_gap;
+	};
+	for (size_t i = 0; i < fragments.size(); i++) {
+		if (consumed[i]) {
+			continue;
+		}
+		bool merge = fragments[i].spanning;
+		if (!merge) {
+			for (size_t j = 0; j < fragments.size(); j++) {
+				if (fragments[j].spanning && overlaps(fragments[i], fragments[j])) {
+					merge = true;
+					break;
+				}
+			}
+		}
+		LineGroup group = fragments[i];
+		consumed[i] = true;
+		if (merge) {
+			bool changed = true;
+			while (changed) {
+				changed = false;
+				for (size_t j = 0; j < fragments.size(); j++) {
+					if (consumed[j] || !overlaps(group, fragments[j]) || !connects(group, fragments[j])) {
+						continue;
+					}
+					group.members.insert(group.members.end(), fragments[j].members.begin(), fragments[j].members.end());
+					group.y0 = MinValue<double>(group.y0, fragments[j].y0);
+					group.y1 = MaxValue<double>(group.y1, fragments[j].y1);
+					consumed[j] = true;
+					changed = true;
+				}
+			}
+			group.spanning = false;
+			for (size_t member : group.members) {
+				if (bands[member] != group.band) {
+					group.spanning = true;
+					break;
+				}
+			}
+		}
+		groups.push_back(std::move(group));
+	}
+	std::vector<size_t> spanning_groups;
+	for (size_t i = 0; i < groups.size(); i++) {
+		if (groups[i].spanning) {
+			spanning_groups.push_back(i);
+		}
+	}
+	std::sort(spanning_groups.begin(), spanning_groups.end(),
+	          [&](size_t a, size_t b) { return groups[a].y0 < groups[b].y0; });
+	auto spanning_rank = [&](size_t group_index) {
+		for (size_t rank = 0; rank < spanning_groups.size(); rank++) {
+			if (spanning_groups[rank] == group_index) {
+				return rank;
+			}
+		}
+		return spanning_groups.size();
+	};
+	std::vector<size_t> group_order(groups.size());
+	for (size_t i = 0; i < group_order.size(); i++) {
+		group_order[i] = i;
+	}
+	std::sort(group_order.begin(), group_order.end(), [&](size_t a, size_t b) {
+		auto section = [&](size_t group_index) {
+			if (groups[group_index].spanning) {
+				return spanning_rank(group_index);
+			}
+			size_t result = 0;
+			for (size_t span : spanning_groups) {
+				result += groups[span].y0 <= groups[group_index].y0;
+			}
+			return result;
+		};
+		const size_t section_a = section(a);
+		const size_t section_b = section(b);
+		if (section_a != section_b) {
+			return section_a < section_b;
+		}
+		if (groups[a].spanning != groups[b].spanning) {
+			return !groups[a].spanning;
+		}
+		if (!groups[a].spanning && groups[a].band != groups[b].band) {
+			return groups[a].band < groups[b].band;
+		}
+		return groups[a].y0 < groups[b].y0;
+	});
+	for (const auto &group : groups) {
+		if (!group.spanning || group.members.empty()) {
+			continue;
+		}
+		int32_t band = bands[group.members.front()];
+		for (size_t idx : group.members) {
+			band = MinValue<int32_t>(band, bands[idx]);
+		}
+		for (size_t idx : group.members) {
+			bands[idx] = band;
+		}
+	}
+	int32_t line_no = 0;
+	for (size_t group_index : group_order) {
+		line_no++;
+		for (size_t idx : groups[group_index].members) {
+			line_of[idx] = line_no;
+		}
 	}
 	return line_of;
 }
@@ -567,8 +933,9 @@ static string LayoutPageText(const std::vector<LayoutWord> &words, double page_w
 	if (words.empty()) {
 		return string();
 	}
-	auto bands = LayoutColumnBands(words, page_width);
-	auto lines = LayoutLineIds(words, bands);
+	std::vector<std::pair<double, double>> gutters;
+	auto bands = LayoutColumnBands(words, page_width, &gutters);
+	auto lines = LayoutLineIds(words, bands, gutters);
 	int32_t max_line = 0;
 	for (int32_t l : lines) {
 		max_line = MaxValue<int32_t>(max_line, l);
@@ -600,34 +967,20 @@ static string LayoutPageText(const std::vector<LayoutWord> &words, double page_w
 
 // poppler text_list() -> the layout engine's word grain. Boxes that carry no
 // glyphs are dropped so they cannot anchor a phantom line.
-static std::vector<LayoutWord> LayoutWordsFromBoxes(const std::vector<poppler::text_box> &boxes) {
+static std::vector<LayoutWord> LayoutWordsFromBoxes(const std::vector<MergedTextBox> &boxes) {
 	std::vector<LayoutWord> words;
 	words.reserve(boxes.size());
 	for (const auto &b : boxes) {
-		string text = UStringToUtf8(b.text());
-		if (!pdf_ocr::HasGlyphs(text)) {
-			continue;
-		}
-		auto r = b.bbox();
 		LayoutWord w;
-		w.x0 = r.x();
-		w.y0 = r.y();
-		w.x1 = r.x() + r.width();
-		w.y1 = r.y() + r.height();
-		w.font_size = b.has_font_info() ? b.get_font_size() : 0.0;
-		w.text = std::move(text);
+		w.x0 = b.x0;
+		w.y0 = b.y0;
+		w.x1 = b.x1;
+		w.y1 = b.y1;
+		w.font_size = b.has_font ? b.font_size : 0.0;
+		w.text = b.text;
 		words.push_back(std::move(w));
 	}
 	return words;
-}
-
-// The same drop, applied to the box list itself. A page left with no boxes has
-// no text layer, which is the word-grain spelling of read_pdf's has_text_layer —
-// so both grains route the same pages to OCR and report the same used_ocr.
-static void DropGlyphlessBoxes(std::vector<poppler::text_box> &boxes) {
-	boxes.erase(std::remove_if(boxes.begin(), boxes.end(),
-	                           [](const poppler::text_box &b) { return !pdf_ocr::HasGlyphs(UStringToUtf8(b.text())); }),
-	            boxes.end());
 }
 
 // Geometry consumer for the qpdf-collected ruling segments — no qpdf here.
@@ -899,7 +1252,7 @@ static size_t AssignCellToColumn(const ProvCell &c, const std::vector<double> &c
 }
 
 // Merge sparse multi-line continuation rows into the previous row.
-static void MergeContinuationRows(std::vector<std::vector<string>> &grid) {
+static void MergeContinuationRows(std::vector<std::vector<string>> &grid, bool allow_dense_continuation = false) {
 	if (grid.size() < 2) {
 		return;
 	}
@@ -935,8 +1288,10 @@ static void MergeContinuationRows(std::vector<std::vector<string>> &grid) {
 		// Continuation: sparse row whose non-empty cells continue columns that
 		// already have text in the previous row (wrapped multi-line cell), and
 		// that does not introduce many brand-new columns.
+		bool sparse_enough =
+		    allow_dense_continuation ? filled_cur < filled_prev : filled_cur <= std::max(1, filled_prev / 2);
 		bool is_cont = filled_cur > 0 && filled_cur < filled_prev && shared_nonempty >= filled_cur && only_cur == 0 &&
-		               filled_cur <= std::max(1, filled_prev / 2);
+		               sparse_enough;
 		if (is_cont) {
 			for (size_t c = 0; c < cur.size(); ++c) {
 				if (cur[c].empty()) {
@@ -1105,11 +1460,75 @@ static std::vector<std::vector<string>> ReconstructLatticeGrid(const std::vector
 	return grid;
 }
 
+// Reconstruct one whitespace-region grid from already clustered provisional cells.
+static std::vector<std::vector<string>> ReconstructWhitespaceGrid(const std::vector<std::vector<ProvCell>> &row_cells,
+                                                                  double col_tol,
+                                                                  bool allow_dense_continuation = false) {
+	std::vector<std::vector<string>> grid;
+	if (row_cells.empty()) {
+		return grid;
+	}
+
+	std::vector<double> col_centers = DetectColumnsGlobal(row_cells, col_tol);
+	if (col_centers.size() < 2) {
+		return grid;
+	}
+
+	const size_t ncols = col_centers.size();
+	for (const auto &source_cells : row_cells) {
+		std::vector<ProvCell> cells = source_cells;
+		std::vector<string> line(ncols);
+		// Assign L→R so same-row cells never collide on one column when possible
+		std::sort(cells.begin(), cells.end(), [](const ProvCell &a, const ProvCell &b) { return a.xMin < b.xMin; });
+		std::vector<bool> used(ncols, false);
+		for (auto &c : cells) {
+			size_t best = 0;
+			double best_score = 1e300;
+			for (size_t k = 0; k < ncols; ++k) {
+				if (used[k]) {
+					continue;
+				}
+				// temporary un-mark: score as if free
+				ProvCell tmp = c;
+				// reuse AssignCellToColumn logic inline with used mask
+				double mid = 0.5 * (c.xMin + c.xMax);
+				double center = col_centers[k];
+				double d = std::min({std::fabs(c.xMin - center), std::fabs(c.xMax - center), std::fabs(mid - center)});
+				if (c.xMin - col_tol <= center && center <= c.xMax + col_tol) {
+					d = std::min(d, 0.25 * std::fabs(mid - center));
+				}
+				if (d < best_score) {
+					best_score = d;
+					best = k;
+				}
+				(void)tmp;
+			}
+			// If all columns used, fall back to absolute best including collisions
+			if (used[best] || best_score > col_tol * 8) {
+				best = AssignCellToColumn(c, col_centers, col_tol);
+			}
+			used[best] = true;
+			if (!line[best].empty()) {
+				line[best].push_back(' ');
+			}
+			line[best] += c.text;
+		}
+		grid.push_back(std::move(line));
+	}
+
+	MergeContinuationRows(grid, allow_dense_continuation);
+	if (!PassesTabularGate(grid, /*lattice=*/false)) {
+		grid.clear();
+	}
+	return grid;
+}
+
 // Reconstruct one page's words into a grid of text cells. Returns an empty grid
 // for non-tabular pages (prose, single column/row, irregular cell counts).
 // When `rules` is non-null and usable, lattice separators are authoritative.
 static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord> page_words,
-                                                            const RulingLines *rules = nullptr) {
+                                                            const RulingLines *rules = nullptr,
+                                                            bool allow_dense_continuation = false) {
 	std::vector<std::vector<string>> grid;
 	if (page_words.size() < 2) {
 		return grid;
@@ -1194,59 +1613,168 @@ static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord>
 		row_cells.push_back(GroupRowIntoCells(std::move(rows[r]), cell_gap_tol, r));
 	}
 
-	// --- global column model (left + right alignment recurrence) ---
-	std::vector<double> col_centers = DetectColumnsGlobal(row_cells, col_tol);
-	if (col_centers.size() < 2) {
-		return grid;
-	}
+	return ReconstructWhitespaceGrid(row_cells, col_tol, allow_dense_continuation);
+}
 
-	const size_t ncols = col_centers.size();
-	for (auto &cells : row_cells) {
-		std::vector<string> line(ncols);
-		// Assign L→R so same-row cells never collide on one column when possible
-		std::sort(cells.begin(), cells.end(), [](const ProvCell &a, const ProvCell &b) { return a.xMin < b.xMin; });
-		std::vector<bool> used(ncols, false);
-		for (auto &c : cells) {
-			size_t best = 0;
-			double best_score = 1e300;
-			for (size_t k = 0; k < ncols; ++k) {
-				if (used[k]) {
-					continue;
-				}
-				// temporary un-mark: score as if free
-				ProvCell tmp = c;
-				// reuse AssignCellToColumn logic inline with used mask
-				double mid = 0.5 * (c.xMin + c.xMax);
-				double center = col_centers[k];
-				double d = std::min({std::fabs(c.xMin - center), std::fabs(c.xMax - center), std::fabs(mid - center)});
-				if (c.xMin - col_tol <= center && center <= c.xMax + col_tol) {
-					d = std::min(d, 0.25 * std::fabs(mid - center));
-				}
-				if (d < best_score) {
-					best_score = d;
-					best = k;
-				}
-				(void)tmp;
-			}
-			// If all columns used, fall back to absolute best including collisions
-			if (used[best] || best_score > col_tol * 8) {
-				best = AssignCellToColumn(c, col_centers, col_tol);
-			}
-			used[best] = true;
-			if (!line[best].empty()) {
-				line[best].push_back(' ');
-			}
-			line[best] += c.text;
+static bool IsTabularRow(const std::vector<ProvCell> &row, double clear_gap_tol) {
+	if (row.size() < 2) {
+		return false;
+	}
+	double largest_gap = 0.0;
+	for (size_t c = 1; c < row.size(); ++c) {
+		largest_gap = std::max(largest_gap, row[c].xMin - row[c - 1].xMax);
+	}
+	return largest_gap >= clear_gap_tol;
+}
+
+static bool IsTableContinuationRow(const std::vector<ProvCell> &row, const std::vector<std::vector<ProvCell>> &rows,
+                                   size_t region_start, size_t row_idx, double col_tol, double clear_gap_tol) {
+	if (row.empty() || IsTabularRow(row, clear_gap_tol) || row_idx == region_start) {
+		return false;
+	}
+	const auto &cell = row.front();
+	bool matches_nonfirst_column = false;
+	size_t tabular_rows = 0;
+	for (size_t r = region_start; r < row_idx; ++r) {
+		if (!IsTabularRow(rows[r], clear_gap_tol)) {
+			continue;
 		}
-		grid.push_back(std::move(line));
+		tabular_rows++;
+		if (tabular_rows < 2) {
+			continue;
+		}
+		for (size_t c = 1; c < rows[r].size(); ++c) {
+			const auto &table_cell = rows[r][c];
+			if (std::fabs(cell.xMin - table_cell.xMin) <= col_tol * 2.0) {
+				matches_nonfirst_column = true;
+				break;
+			}
+		}
+		if (matches_nonfirst_column) {
+			break;
+		}
+	}
+	if (matches_nonfirst_column) {
+		return true;
+	}
+	// A sparse line between two full rows can wrap the first column as well.
+	return row_idx + 1 < rows.size() && IsTabularRow(rows[row_idx - 1], clear_gap_tol) &&
+	       IsTabularRow(rows[row_idx + 1], clear_gap_tol);
+}
+
+// Find independent whitespace tables on a page. Ruled pages stay on the
+// existing lattice path; only the borderless path is segmented here.
+static std::vector<std::vector<std::vector<string>>> ReconstructTableGrids(std::vector<PdfWord> page_words,
+                                                                           const RulingLines *rules = nullptr) {
+	std::vector<std::vector<std::vector<string>>> grids;
+	if (rules && rules->Usable()) {
+		auto grid = ReconstructPageGrid(page_words, rules);
+		if (!grid.empty()) {
+			grids.push_back(std::move(grid));
+			return grids;
+		}
+	}
+	if (page_words.size() < 2) {
+		return grids;
 	}
 
-	// --- multi-line cell merge + regularity gate ---
-	MergeContinuationRows(grid);
-	if (!PassesTabularGate(grid, /*lattice=*/false)) {
-		grid.clear();
+	std::vector<double> heights;
+	std::vector<double> widths;
+	heights.reserve(page_words.size());
+	widths.reserve(page_words.size());
+	for (const auto &w : page_words) {
+		double h = w.yMax - w.yMin;
+		if (h > 0) {
+			heights.push_back(h);
+		}
+		double ww = w.xMax - w.xMin;
+		size_t len = w.text.size();
+		if (ww > 0 && len > 0) {
+			widths.push_back(ww / static_cast<double>(len));
+		}
 	}
-	return grid;
+	double med_h = Median(heights);
+	if (med_h <= 0) {
+		med_h = 10.0;
+	}
+	double char_w = Median(widths);
+	if (char_w <= 0) {
+		char_w = med_h * 0.5;
+	}
+	double row_tol = med_h * 0.5;
+	double col_tol = char_w * 1.5;
+	double cell_gap_tol = char_w * 1.8;
+	double clear_gap_tol = std::max(10.0, cell_gap_tol * 1.5);
+
+	std::sort(page_words.begin(), page_words.end(), [](const PdfWord &a, const PdfWord &b) { return a.yMin < b.yMin; });
+	std::vector<std::vector<PdfWord>> word_rows;
+	std::vector<PdfWord> current;
+	double row_anchor = page_words.front().yMin;
+	for (auto &w : page_words) {
+		if (current.empty()) {
+			current.push_back(w);
+			row_anchor = w.yMin;
+		} else if (std::fabs(w.yMin - row_anchor) <= row_tol) {
+			current.push_back(w);
+		} else {
+			word_rows.push_back(std::move(current));
+			current.clear();
+			current.push_back(w);
+			row_anchor = w.yMin;
+		}
+	}
+	if (!current.empty()) {
+		word_rows.push_back(std::move(current));
+	}
+
+	std::vector<std::vector<ProvCell>> row_cells;
+	row_cells.reserve(word_rows.size());
+	for (size_t r = 0; r < word_rows.size(); ++r) {
+		row_cells.push_back(GroupRowIntoCells(word_rows[r], cell_gap_tol, r));
+	}
+
+	for (size_t start = 0; start < row_cells.size();) {
+		if (!IsTabularRow(row_cells[start], clear_gap_tol)) {
+			start++;
+			continue;
+		}
+		// A section heading can have a large gap but is narrower than the table
+		// header immediately below it; do not let it seed the table region.
+		if (start + 1 < row_cells.size() && row_cells[start + 1].size() >= row_cells[start].size() + 2) {
+			start++;
+			continue;
+		}
+		size_t end = start + 1;
+		while (end < row_cells.size()) {
+			if (IsTabularRow(row_cells[end], clear_gap_tol) ||
+			    IsTableContinuationRow(row_cells[end], row_cells, start, end, col_tol, clear_gap_tol)) {
+				end++;
+				continue;
+			}
+			break;
+		}
+		if (end - start >= 3) {
+			std::vector<PdfWord> region_words;
+			for (size_t r = start; r < end; ++r) {
+				region_words.insert(region_words.end(), word_rows[r].begin(), word_rows[r].end());
+			}
+			auto grid = ReconstructPageGrid(std::move(region_words), nullptr, true);
+			if (!grid.empty()) {
+				grids.push_back(std::move(grid));
+			}
+		}
+		start = end;
+	}
+	// A page whose whole layout is one table (a calendar month) has no prose to
+	// separate it from, so region segmentation can miss it; keep the whole-page
+	// reading as a floor so segmentation only ever adds tables.
+	if (grids.empty()) {
+		auto grid = ReconstructPageGrid(std::move(page_words), nullptr);
+		if (!grid.empty()) {
+			grids.push_back(std::move(grid));
+		}
+	}
+	return grids;
 }
 
 //===--------------------------------------------------------------------===//
@@ -1814,11 +2342,10 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 				// Probe the native text layer even under force_ocr so the
 				// has_text_layer flag always reflects the PDF itself, not the
 				// extraction path chosen by the caller.
-				string native =
-				    auto_layout
-				        ? LayoutPageText(LayoutWordsFromBoxes(page->text_list(poppler::page::text_list_include_font)),
-				                         width)
-				        : UStringToUtf8(page->text(poppler::rectf(), layout));
+				string native = auto_layout ? LayoutPageText(LayoutWordsFromBoxes(MergeSpacelessBoxes(page->text_list(
+				                                                 poppler::page::text_list_include_font))),
+				                                             width)
+				                            : UStringToUtf8(page->text(poppler::rectf(), layout));
 				has_text_layer = pdf_ocr::HasGlyphs(native);
 				text = native;
 				want_ocr = bind.opt.force_ocr || (bind.opt.auto_ocr && !has_text_layer);
@@ -2127,6 +2654,7 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 struct PdfOutlineRow {
 	int ord = 0;   // 1-based, depth-first document order
 	int depth = 0; // 1 = top level
+	int page = 0;  // 1-based physical page; zero is SQL NULL
 	string title;
 };
 
@@ -2155,8 +2683,9 @@ struct PdfOutlineState : public GlobalTableFunctionState {
 
 static unique_ptr<FunctionData> PdfOutlineBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<string> &names) {
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR};
-	names = {"file", "ord", "depth", "title"};
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::INTEGER};
+	names = {"file", "ord", "depth", "title", "page"};
 	return PdfInspectBindCommon(context, input);
 }
 
@@ -2179,12 +2708,29 @@ static void PdfOutlineScan(ClientContext &context, TableFunctionInput &data_p, D
 			st.row_idx = 0;
 			st.current_file = bind.files[st.file_idx++];
 			string bytes;
-			ReadAllBytes(context, st.current_file, bytes);
-			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
-			unique_ptr<poppler::toc> toc(doc->create_toc());
-			if (toc && toc->root()) {
-				int ord = 0;
-				OutlineWalk(toc->root(), 1, ord, st.rows);
+			try {
+				ReadAllBytes(context, st.current_file, bytes);
+				auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+				unique_ptr<poppler::toc> toc(doc->create_toc());
+				if (toc && toc->root()) {
+					int ord = 0;
+					OutlineWalk(toc->root(), 1, ord, st.rows);
+				}
+				try {
+					auto pages = pdf_qpdf::ReadOutlinePages(bytes, bind.opt.password);
+					if (pages.size() == st.rows.size()) {
+						for (idx_t i = 0; i < st.rows.size(); i++) {
+							st.rows[i].page = pages[i];
+						}
+					}
+				} catch (const std::exception &) {
+					// Poppler remains authoritative for rows; an unresolved qpdf pass means NULL pages.
+				}
+			} catch (const std::exception &) {
+				if (!bind.opt.ignore_errors) {
+					throw;
+				}
+				continue;
 			}
 			continue;
 		}
@@ -2193,6 +2739,11 @@ static void PdfOutlineScan(ClientContext &context, TableFunctionInput &data_p, D
 		OutInt32(output.data[1], count, row.ord);
 		OutInt32(output.data[2], count, row.depth);
 		OutString(output.data[3], count, row.title);
+		if (row.page > 0) {
+			OutInt32(output.data[4], count, row.page);
+		} else {
+			OutInt32Null(output.data[4], count);
+		}
 		st.row_idx++;
 		count++;
 	}
@@ -2688,7 +3239,7 @@ struct ReadPdfWordsState : public GlobalTableFunctionState {
 	idx_t word_idx = 0;
 	string file_bytes;
 	unique_ptr<poppler::document> doc;
-	std::vector<poppler::text_box> boxes;
+	std::vector<MergedTextBox> boxes;
 	std::vector<OcrWord> ocr_boxes;
 	// Parallel to boxes / ocr_boxes (whichever is active for the page).
 	std::vector<int32_t> line_ids;
@@ -2721,8 +3272,9 @@ static WordGrouping GroupLayoutWords(const std::vector<LayoutWord> &words, const
 	WordGrouping out;
 	out.line.assign(total, 0);
 	out.column.assign(total, 0);
-	auto bands = LayoutColumnBands(words, page_width);
-	auto lines = LayoutLineIds(words, bands);
+	std::vector<std::pair<double, double>> gutters;
+	auto bands = LayoutColumnBands(words, page_width, &gutters);
+	auto lines = LayoutLineIds(words, bands, gutters);
 	for (size_t i = 0; i < origin.size(); i++) {
 		out.line[origin[i]] = lines[i];
 		out.column[origin[i]] = bands[i];
@@ -2730,24 +3282,19 @@ static WordGrouping GroupLayoutWords(const std::vector<LayoutWord> &words, const
 	return out;
 }
 
-static WordGrouping GroupWordsNative(const std::vector<poppler::text_box> &boxes, double page_width) {
+static WordGrouping GroupWordsNative(const std::vector<MergedTextBox> &boxes, double page_width) {
 	std::vector<LayoutWord> words;
 	std::vector<size_t> origin;
 	words.reserve(boxes.size());
 	origin.reserve(boxes.size());
 	for (size_t i = 0; i < boxes.size(); i++) {
-		string text = UStringToUtf8(boxes[i].text());
-		if (!pdf_ocr::HasGlyphs(text)) {
-			continue;
-		}
-		auto r = boxes[i].bbox();
 		LayoutWord w;
-		w.x0 = r.x();
-		w.y0 = r.y();
-		w.x1 = r.x() + r.width();
-		w.y1 = r.y() + r.height();
-		w.font_size = boxes[i].has_font_info() ? boxes[i].get_font_size() : 0.0;
-		w.text = std::move(text);
+		w.x0 = boxes[i].x0;
+		w.y0 = boxes[i].y0;
+		w.x1 = boxes[i].x1;
+		w.y1 = boxes[i].y1;
+		w.font_size = boxes[i].has_font ? boxes[i].font_size : 0.0;
+		w.text = boxes[i].text;
 		words.push_back(std::move(w));
 		origin.push_back(i);
 	}
@@ -2818,8 +3365,7 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 			// (e.g. missing display fonts on a text-only PDF under vcpkg poppler).
 			// Probe native first so best_effort can stay false on image-only pages
 			// (loud missing-model error under explicit ocr:=true).
-			g.boxes = page->text_list(poppler::page::text_list_include_font);
-			DropGlyphlessBoxes(g.boxes);
+			g.boxes = MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font));
 			const bool has_native = !g.boxes.empty();
 			g.ocr_boxes = OcrPageWords(page.get(), opt, /*best_effort=*/has_native);
 			if (!g.ocr_boxes.empty()) {
@@ -2829,8 +3375,7 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 				g.page_is_ocr = false;
 			}
 		} else {
-			g.boxes = page->text_list(poppler::page::text_list_include_font);
-			DropGlyphlessBoxes(g.boxes);
+			g.boxes = MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font));
 			if (!g.boxes.empty()) {
 				g.page_is_ocr = false;
 			} else if (opt.auto_ocr) {
@@ -2896,15 +3441,14 @@ static void ReadPdfWordsScan(ClientContext &context, TableFunctionInput &data_p,
 			OutDouble(output.data[10], count, w.confidence);
 		} else {
 			auto &b = g.boxes[g.word_idx];
-			auto r = b.bbox();
-			OutString(output.data[2], count, UStringToUtf8(b.text()));
-			OutDouble(output.data[3], count, r.x());
-			OutDouble(output.data[4], count, r.y());
-			OutDouble(output.data[5], count, r.x() + r.width());
-			OutDouble(output.data[6], count, r.y() + r.height());
-			if (b.has_font_info()) {
-				OutString(output.data[7], count, b.get_font_name());
-				OutDouble(output.data[8], count, b.get_font_size());
+			OutString(output.data[2], count, b.text);
+			OutDouble(output.data[3], count, b.x0);
+			OutDouble(output.data[4], count, b.y0);
+			OutDouble(output.data[5], count, b.x1);
+			OutDouble(output.data[6], count, b.y1);
+			if (b.has_font) {
+				OutString(output.data[7], count, b.font_name);
+				OutDouble(output.data[8], count, b.font_size);
 			} else {
 				OutStringNull(output.data[7], count);
 				OutDoubleNull(output.data[8], count);
@@ -2987,10 +3531,10 @@ static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 		// read_pdf_words `line` id names. The poppler modes still split rendered
 		// page text on newlines, which is why their line numbers can disagree on
 		// a multi-column page.
-		string text = auto_layout
-		                  ? LayoutPageText(LayoutWordsFromBoxes(page->text_list(poppler::page::text_list_include_font)),
-		                                   page->page_rect().width())
-		                  : UStringToUtf8(page->text(poppler::rectf(), layout));
+		string text = auto_layout ? LayoutPageText(LayoutWordsFromBoxes(MergeSpacelessBoxes(
+		                                               page->text_list(poppler::page::text_list_include_font))),
+		                                           page->page_rect().width())
+		                          : UStringToUtf8(page->text(poppler::rectf(), layout));
 		size_t start = 0;
 		while (start <= text.size()) {
 			size_t nl = text.find('\n', start);
@@ -3091,12 +3635,13 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 //                  ELEM_CAPS_HEADING_MAX_WORDS words, at least
 //                  ELEM_CAPS_HEADING_MIN_ALPHA alphabetic (ASCII A-Za-z)
 //                  characters, and at least ELEM_CAPS_HEADING_UPPER_RATIO
-//                  of those alphabetic characters are uppercase —
-//                  REGARDLESS of font size. This catches short shouty
-//                  section headers ("PROFESSIONAL SUMMARY") set at body
-//                  size. Because heading is checked first, an all-caps
-//                  block that also opens with a list marker classifies
-//                  as heading, not list_item.
+//                  of those alphabetic characters are uppercase — and, when
+//                  font info is available, at least ELEM_CAPS_HEADING_MIN_SIZE_RATIO
+//                  x the body size. This catches short shouty section headers
+//                  ("PROFESSIONAL SUMMARY") set at body size while excluding
+//                  smaller running furniture. Because heading is checked first,
+//                  an all-caps block that also opens with a list marker
+//                  classifies as heading, not list_item.
 //  5. list_item  : block's first line starts with a bullet glyph
 //                  (• – ▪ ● ○ ◦ ∙ ‣ ⁃ · ▸, or '-' / '*' followed by a
 //                  space) or a numeric marker: 1-3 digits then '.' or ')'
@@ -3131,9 +3676,10 @@ static constexpr size_t ELEM_MIN_PARAGRAPH_WORDS = 3;
 static constexpr size_t ELEM_CAPS_HEADING_MAX_WORDS = 6;
 // ...at least this many ASCII alphabetic characters (filters "42", "IV")...
 static constexpr size_t ELEM_CAPS_HEADING_MIN_ALPHA = 4;
-// ...where at least this fraction of the alphabetic characters are
-// uppercase is a heading regardless of font size.
+// ...where at least this fraction of the alphabetic characters are uppercase.
 static constexpr double ELEM_CAPS_HEADING_UPPER_RATIO = 0.8;
+// A small tolerance keeps body-size caps headings while excluding smaller furniture.
+static constexpr double ELEM_CAPS_HEADING_MIN_SIZE_RATIO = 0.95;
 // Running-header demotion: a heading whose exact text repeats on this
 // many distinct pages AND sits in the top/bottom band on every hit is
 // a page chrome (even/odd running title), not a section heading.
@@ -3187,7 +3733,7 @@ static double ElemModalFontSize(const ElemFontHistogram &hist) {
 	return best_size;
 }
 
-// Rule 4b: short ALL-CAPS block at any font size (see contract above).
+// Rule 4b: short ALL-CAPS block at or near body size (see contract above).
 // Only ASCII letters are counted — multi-byte UTF-8 letters neither help
 // nor hurt the ratio (documented limitation: "RÉSUMÉ" counts 5 of its 6
 // letters).
@@ -3407,8 +3953,9 @@ static std::vector<ElemLine> ElemBuildLines(std::vector<ElemWord> words, double 
 		g.text = w.text;
 		geom.push_back(std::move(g));
 	}
-	auto bands = LayoutColumnBands(geom, page_width);
-	auto line_ids = LayoutLineIds(geom, bands);
+	std::vector<std::pair<double, double>> gutters;
+	auto bands = LayoutColumnBands(geom, page_width, &gutters);
+	auto line_ids = LayoutLineIds(geom, bands, gutters);
 	int32_t line_count = 0;
 	for (int32_t l : line_ids) {
 		line_count = MaxValue<int32_t>(line_count, l);
@@ -3525,7 +4072,8 @@ static void ElemEmitPageBlocks(const std::vector<ElemLine> &lines, int page_numb
 		const string &first_line_text = lines[block.front()].text;
 		if ((row.has_font && body_size > 0 && row.font_size >= ELEM_HEADING_SIZE_RATIO * body_size &&
 		     row.text.size() < ELEM_HEADING_MAX_CHARS) ||
-		    ElemIsAllCapsHeading(row.text, word_count)) {
+		    ((!row.has_font || body_size <= 0 || row.font_size >= ELEM_CAPS_HEADING_MIN_SIZE_RATIO * body_size) &&
+		     ElemIsAllCapsHeading(row.text, word_count))) {
 			row.element_type = "heading"; // rule 4 (font size) or 4b (ALL-CAPS)
 		} else if (ElemIsListMarkerLine(first_line_text)) {
 			row.element_type = "list_item"; // rule 5
@@ -3564,19 +4112,15 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 		}
 		page_h[p + 1] = page->page_rect().height();
 		std::vector<ElemWord> words;
-		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
+		for (auto &b : MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font))) {
 			ElemWord w;
-			w.text = UStringToUtf8(b.text());
-			if (!pdf_ocr::HasGlyphs(w.text)) {
-				continue;
-			}
-			auto r = b.bbox();
-			w.x0 = r.x();
-			w.y0 = r.y();
-			w.x1 = r.x() + r.width();
-			w.y1 = r.y() + r.height();
-			w.has_font = b.has_font_info();
-			w.font_size = w.has_font ? b.get_font_size() : 0.0;
+			w.text = b.text;
+			w.x0 = b.x0;
+			w.y0 = b.y0;
+			w.x1 = b.x1;
+			w.y1 = b.y1;
+			w.has_font = b.has_font;
+			w.font_size = b.has_font ? b.font_size : 0.0;
 			if (w.has_font) {
 				ElemFontTally(doc_hist, w.font_size, w.text.size());
 			}
@@ -4066,8 +4610,7 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 		} catch (...) {
 			ruling_segments.clear();
 		}
-		// table_index is a running counter over the tabular pages of this document
-		// (each tabular page yields one reconstructed grid).
+		// table_index is a running counter over reconstructed tables in this document.
 		int table_index = 0;
 		for (int p = first0; p < last0; p++) {
 			unique_ptr<poppler::page> page(doc->create_page(p));
@@ -4088,26 +4631,24 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 					words.push_back(std::move(w));
 				}
 				if (words.empty()) {
-					for (auto &b : page->text_list()) {
-						auto r = b.bbox();
+					for (auto &b : MergeSpacelessBoxes(page->text_list())) {
 						PdfWord w;
-						w.xMin = r.x();
-						w.yMin = r.y();
-						w.xMax = r.x() + r.width();
-						w.yMax = r.y() + r.height();
-						w.text = UStringToUtf8(b.text());
+						w.xMin = b.x0;
+						w.yMin = b.y0;
+						w.xMax = b.x1;
+						w.yMax = b.y1;
+						w.text = b.text;
 						words.push_back(std::move(w));
 					}
 				}
 			} else {
-				for (auto &b : page->text_list()) {
-					auto r = b.bbox();
+				for (auto &b : MergeSpacelessBoxes(page->text_list())) {
 					PdfWord w;
-					w.xMin = r.x();
-					w.yMin = r.y();
-					w.xMax = r.x() + r.width();
-					w.yMax = r.y() + r.height();
-					w.text = UStringToUtf8(b.text());
+					w.xMin = b.x0;
+					w.yMin = b.y0;
+					w.xMax = b.x1;
+					w.yMax = b.y1;
+					w.text = b.text;
 					words.push_back(std::move(w));
 				}
 				if (words.empty() && bind.opt.auto_ocr) {
@@ -4126,14 +4667,16 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 			// Lattice first when the page content stream has ruling lines (qpdf);
 			// ReconstructPageGrid falls back to the whitespace/stream model.
 			RulingLines rules = RulesForPage(ruling_segments, p);
-			auto grid = ReconstructPageGrid(std::move(words), &rules);
-			if (grid.size() < 2 || grid.front().size() < 2) {
-				continue;
+			auto grids = ReconstructTableGrids(std::move(words), &rules);
+			for (auto &grid : grids) {
+				if (grid.size() < 2 || grid.front().size() < 2) {
+					continue;
+				}
+				for (idx_t r = 0; r < grid.size(); r++) {
+					st->rows.push_back(TableRowOut {f, p + 1, table_index, (int)r, grid[r]});
+				}
+				table_index++;
 			}
-			for (idx_t r = 0; r < grid.size(); r++) {
-				st->rows.push_back(TableRowOut {f, p + 1, table_index, (int)r, grid[r]});
-			}
-			table_index++;
 		}
 	}
 	return std::move(st);
@@ -4357,11 +4900,10 @@ static string DocToXml(poppler::document &doc) {
 		auto rect = page->page_rect();
 		out += "  <page number=\"" + std::to_string(p + 1) + "\" width=\"" + FmtCoord(rect.width()) + "\" height=\"" +
 		       FmtCoord(rect.height()) + "\">\n";
-		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
-			auto r = b.bbox();
-			out += "    <word xMin=\"" + FmtCoord(r.x()) + "\" yMin=\"" + FmtCoord(r.y()) + "\" xMax=\"" +
-			       FmtCoord(r.x() + r.width()) + "\" yMax=\"" + FmtCoord(r.y() + r.height()) + "\">";
-			AppendXmlEscaped(out, UStringToUtf8(b.text()));
+		for (auto &b : MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font))) {
+			out += "    <word xMin=\"" + FmtCoord(b.x0) + "\" yMin=\"" + FmtCoord(b.y0) + "\" xMax=\"" +
+			       FmtCoord(b.x1) + "\" yMax=\"" + FmtCoord(b.y1) + "\">";
+			AppendXmlEscaped(out, b.text);
 			out += "</word>\n";
 		}
 		out += "  </page>\n";
@@ -4400,12 +4942,11 @@ static string DocToHtml(poppler::document &doc) {
 		auto rect = page->page_rect();
 		out += "<div class=\"page\" id=\"page" + std::to_string(p + 1) + "\" style=\"width:" + FmtCoord(rect.width()) +
 		       "px;height:" + FmtCoord(rect.height()) + "px;\">\n";
-		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
-			auto r = b.bbox();
-			double fs = b.has_font_info() ? b.get_font_size() : (r.height() > 0 ? r.height() : 10.0);
-			out += "<span style=\"left:" + FmtCoord(r.x()) + "px;top:" + FmtCoord(r.y()) +
+		for (auto &b : MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font))) {
+			double fs = b.has_font ? b.font_size : (b.y1 - b.y0 > 0 ? b.y1 - b.y0 : 10.0);
+			out += "<span style=\"left:" + FmtCoord(b.x0) + "px;top:" + FmtCoord(b.y0) +
 			       "px;font-size:" + FmtCoord(fs) + "px;\">";
-			AppendXmlEscaped(out, UStringToUtf8(b.text()));
+			AppendXmlEscaped(out, b.text);
 			out += "</span>\n";
 		}
 		out += "</div>\n";
@@ -5724,19 +6265,18 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 		}
 		page_widths[p] = page->page_rect().width();
 		std::vector<MdWord> page_words;
-		for (auto &b : page->text_list(poppler::page::text_list_include_font)) {
-			auto r = b.bbox();
+		for (auto &b : MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font))) {
 			MdWord w;
-			w.xMin = r.x();
-			w.yMin = r.y();
-			w.xMax = r.x() + r.width();
-			w.yMax = r.y() + r.height();
-			w.text = UStringToUtf8(b.text());
-			if (b.has_font_info()) {
-				w.font_name = b.get_font_name();
-				w.font_size = b.get_font_size();
+			w.xMin = b.x0;
+			w.yMin = b.y0;
+			w.xMax = b.x1;
+			w.yMax = b.y1;
+			w.text = b.text;
+			if (b.has_font) {
+				w.font_name = b.font_name;
+				w.font_size = b.font_size;
 			} else {
-				w.font_size = (r.height() > 0 ? r.height() : 10.0);
+				w.font_size = (b.y1 - b.y0 > 0 ? b.y1 - b.y0 : 10.0);
 			}
 			if (w.font_size > 0) {
 				all_font_sizes.push_back(w.font_size);
@@ -5902,8 +6442,9 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 			g.text = w.text;
 			geom.push_back(std::move(g));
 		}
-		auto md_bands = LayoutColumnBands(geom, page_widths[p]);
-		auto md_lines = LayoutLineIds(geom, md_bands);
+		std::vector<std::pair<double, double>> md_gutters;
+		auto md_bands = LayoutColumnBands(geom, page_widths[p], &md_gutters);
+		auto md_lines = LayoutLineIds(geom, md_bands, md_gutters);
 		int32_t md_line_count = 0;
 		for (int32_t l : md_lines) {
 			md_line_count = MaxValue<int32_t>(md_line_count, l);
@@ -8620,6 +9161,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	TableFunction pdf_outline("pdf_outline", {LogicalType::VARCHAR}, PdfOutlineScan, PdfOutlineBind, PdfOutlineInit);
 	pdf_outline.named_parameters["password"] = LogicalType::VARCHAR;
+	pdf_outline.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(pdf_outline);
 
 	TableFunction pdf_attachments("pdf_attachments", {LogicalType::VARCHAR}, PdfAttachmentsScan, PdfAttachmentsBind,

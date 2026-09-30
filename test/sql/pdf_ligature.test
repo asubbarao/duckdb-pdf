@@ -1,0 +1,31 @@
+# name: test/sql/pdf_ligature.test
+# description: adjacent native text runs are one word, while real spaces remain
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# Poppler emits Profi and ling as adjacent boxes, which the layout contract treats as one word.
+query II
+SELECT word, count(*)
+FROM read_pdf_words('test/data/ligature.pdf')
+GROUP BY word
+ORDER BY word;
+----
+Profiling	1
+hello	1
+world	1
+
+query I
+SELECT text FROM read_pdf_lines('test/data/ligature.pdf') ORDER BY page, line;
+----
+Profiling
+hello world
+
+query I
+SELECT contains(text, 'Profiling' || chr(10) || 'hello world')
+FROM read_pdf('test/data/ligature.pdf');
+----
+true

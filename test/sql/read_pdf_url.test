@@ -230,6 +230,15 @@ FROM read_pdf('https://blobs.duckdb.org/events/duckcon7/floyd-berndsen-ducklake-
 ----
 true
 
+# Superscript ordinals are drawn as their own text runs ("15" + raised "th"),
+# which poppler reports as touching boxes with no space after; they are one word.
+query I
+SELECT list(word ORDER BY page, y0, x0) = ['26th,', '1st', '1st', '15th']
+FROM read_pdf_words('https://blobs.duckdb.org/events/duckcon7/floyd-berndsen-ducklake-on-hetzner.pdf')
+WHERE word IN ('26th,', '1st', '15th', '26', 'th', 'st', '15', '1');
+----
+true
+
 # ── a URL is a file everywhere the API takes a file ─────────────────────────
 
 query I

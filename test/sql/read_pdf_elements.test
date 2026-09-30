@@ -258,6 +258,32 @@ WHERE element_type = 'paragraph';
 ----
 3
 
+# A smaller running header must not become a heading just because it contains
+# an all-caps word; an all-caps line at body size remains a heading.
+statement ok
+COPY (
+  SELECT line FROM (VALUES
+    ('BODY SIZE CAPS'),
+    (''),
+    ('Regular body text with enough words to establish the body size')
+  ) t(line)
+) TO '__TEST_DIR__/elements_caps_running_header.pdf'
+  (FORMAT pdf, FONT_SIZE 9, HEADER '4.1 CUDA 97', USE_TMP_FILE false);
+
+query I
+SELECT COUNT(text) = 1
+FROM read_pdf_elements('__TEST_DIR__/elements_caps_running_header.pdf')
+WHERE text = '4.1 CUDA 97' AND element_type <> 'heading';
+----
+true
+
+query I
+SELECT element_type
+FROM read_pdf_elements('__TEST_DIR__/elements_caps_running_header.pdf')
+WHERE text = 'BODY SIZE CAPS';
+----
+heading
+
 # ── Google Docs / Word list markers (● + ZWSP, 1.<ZWSP>) ─────────────────────
 # Fixture: test/data/gdocs_lists.pdf (Arial; COPY FORMAT pdf is WinAnsi and
 # drops U+25CF / U+200B). Word/Docs emit ● and stick ZWSP after the marker.

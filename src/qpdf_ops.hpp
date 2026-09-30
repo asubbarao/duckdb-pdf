@@ -105,6 +105,10 @@ struct Annotation {
 };
 std::vector<Annotation> ReadAnnotations(const std::string &pdf_bytes);
 
+// One 1-based physical page per outline item in qpdf's depth-first order;
+// zero means that the item's destination could not be resolved.
+std::vector<int> ReadOutlinePages(const std::string &pdf_bytes, const std::string &password);
+
 // One axis-aligned-ish ruled line segment collected from a page content stream,
 // used to recover lattice (bordered) tables. Endpoints are in PDF user space
 // (origin bottom-left) as produced by the content-stream path interpreter after
