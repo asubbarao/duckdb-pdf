@@ -36,7 +36,7 @@ ordinary PDF readers.
 
 ### Supported DuckDB host
 
-**DuckDB v1.5.5 only** — linux_amd64/arm64, osx_amd64/arm64, windows_amd64.
+**DuckDB v1.5.6 only** — linux_amd64/arm64, osx_amd64/arm64, windows_amd64.
 
 ### Community (signed)
 
@@ -45,7 +45,7 @@ INSTALL pdf FROM community;
 LOAD pdf;
 ```
 
-Requires **DuckDB v1.5.5**. Or:
+Requires **DuckDB v1.5.6**. Or:
 
 ```sql
 INSTALL pdf FROM 'https://community-extensions.duckdb.org';
@@ -55,15 +55,15 @@ LOAD pdf;
 ### GitHub Release (offline / unsigned)
 
 ```text
-pdf-duckdb-v1.5.5-linux_amd64.duckdb_extension
-pdf-duckdb-v1.5.5-windows_amd64.duckdb_extension
-pdf-duckdb-v1.5.5-osx_arm64.duckdb_extension
+pdf-duckdb-v1.5.6-linux_amd64.duckdb_extension
+pdf-duckdb-v1.5.6-windows_amd64.duckdb_extension
+pdf-duckdb-v1.5.6-osx_arm64.duckdb_extension
 …
 ```
 
 ```sh
 curl -fsSL -o pdf.duckdb_extension \
-  "https://github.com/asubbarao/duckdb-pdf/releases/download/<tag>/pdf-duckdb-v1.5.5-osx_arm64.duckdb_extension"
+  "https://github.com/asubbarao/duckdb-pdf/releases/download/<tag>/pdf-duckdb-v1.5.6-osx_arm64.duckdb_extension"
 duckdb -unsigned -c "LOAD '$(pwd)/pdf.duckdb_extension';"
 ```
 
