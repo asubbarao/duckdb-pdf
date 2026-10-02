@@ -1,0 +1,85 @@
+# name: test/sql/read_pdf_hyphen.test
+# description: layout 'auto' joins a hyphenated line break the way poppler's 'reading' does, without changing words
+# group: [sql]
+
+require pdf
+
+statement ok
+SELECT write_pdf(
+  'The argument contin-' || chr(10) || 'ues onto the next line.' || chr(10) ||
+  '- a list item' || chr(10) || '- another item' || chr(10) ||
+  'The page ends on a well-',
+  '__TEST_DIR__/hyphen_join.pdf') IS NOT NULL;
+
+# The hyphen at the end of a line that continues in the same column is dropped
+# and the two lines are joined. A hyphen that opens a line (a list marker) is
+# kept, and so is a hyphen on the last line of the page: nothing continues it.
+query I
+SELECT text
+FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'auto', auto_ocr := false)
+ORDER BY line;
+----
+The argument continues onto the next line.
+- a list item
+- another item
+The page ends on a well-
+
+# The same lines as poppler's reading order.
+query ITITTIT
+WITH auto AS (
+  SELECT line, text
+  FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'auto', auto_ocr := false)
+), reading AS (
+  SELECT line, text
+  FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'reading', auto_ocr := false)
+  WHERE trim(text) <> ''
+)
+SELECT coalesce(a.line, r.line), a.text, length(a.text), hex(a.text),
+       r.text, length(r.text), hex(r.text)
+FROM auto a
+FULL OUTER JOIN reading r ON a.line = r.line
+WHERE a.line IS NULL OR r.line IS NULL
+   OR a.text IS DISTINCT FROM r.text
+   OR length(a.text) IS DISTINCT FROM length(r.text)
+   OR hex(a.text) IS DISTINCT FROM hex(r.text)
+ORDER BY 1;
+----
+
+query I
+SELECT list(text ORDER BY line) FILTER (WHERE layout = 'auto')
+     = list(text ORDER BY line) FILTER (WHERE layout = 'reading')
+FROM (
+  SELECT 'auto' AS layout, line, text
+  FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'auto', auto_ocr := false)
+  UNION ALL
+  SELECT 'reading' AS layout, line, text
+  FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'reading', auto_ocr := false)
+  WHERE trim(text) <> ''
+);
+----
+true
+
+# read_pdf page text takes the same path.
+query I
+SELECT contains(text, 'continues onto') AND NOT contains(text, 'contin-') AND suffix(text, 'well-')
+FROM read_pdf('__TEST_DIR__/hyphen_join.pdf', layout := 'auto', auto_ocr := false);
+----
+true
+
+# Word geometry is untouched: the split word stays two words on two lines.
+query II
+SELECT word, line
+FROM read_pdf_words('__TEST_DIR__/hyphen_join.pdf', auto_ocr := false)
+WHERE word IN ('contin-', 'ues', 'well-')
+ORDER BY line;
+----
+contin-	1
+ues	2
+well-	5
+
+# poppler ends lines with CRLF on Windows; a line never carries the CR.
+query I
+SELECT bool_and(NOT contains(text, chr(13)))
+FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'reading', auto_ocr := false);
+----
+true

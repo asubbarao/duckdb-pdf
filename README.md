@@ -189,7 +189,7 @@ WHERE source = 'ocr'
 ORDER BY page, line, x0;
 ```
 
-> **Note:** `read_pdf_lines` still splits Poppler `page->text()` on newlines (layout/`physical`/`raw` aware). Geometric `line` on words is the join key for bbox work; text-split line numbers may differ on multi-column or unusually spaced pages. Prefer one pin: words (+ optional `string_agg` lines) when you need both grains.
+> **Note:** `read_pdf_lines` still splits Poppler `page->text()` on newlines (layout/`physical`/`raw` aware). Geometric `line` on words is the join key for bbox work; text-split line numbers may differ on multi-column or unusually spaced pages. Prefer one pin: words (+ optional `string_agg` lines) when you need both grains. Under `layout := 'auto'`, a line ending in a hyphen is joined to the next line of its column with the hyphen dropped, as `'reading'` does (the last line of a column or page keeps its hyphen); the words keep the split.
 
 ### `read_pdf_tables` — structured table extraction
 
