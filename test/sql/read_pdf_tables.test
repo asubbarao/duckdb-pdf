@@ -173,8 +173,8 @@ true
 query I
 SELECT COUNT(*) > 0
 FROM read_pdf_tables('test/data/financial_right_aligned.pdf')
-WHERE list_contains(list_transform(cells, x -> lower(x)), 'account')
-   OR list_contains(list_transform(cells, x -> lower(x)), 'balance');
+WHERE list_contains(list_transform(cells, lambda x: lower(x)), 'account')
+   OR list_contains(list_transform(cells, lambda x: lower(x)), 'balance');
 ----
 true
 
