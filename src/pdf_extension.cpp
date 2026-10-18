@@ -183,7 +183,7 @@ static int64_t Utf8CodepointCount(const string &text) {
 
 // Direct DataChunk writers — allocate strings in DuckDB's vector heap (no Value intermediate).
 static void OutString(Vector &v, idx_t row, const string &s) {
-	FlatVector::GetData<string_t>(v)[row] = StringVector::AddString(v, s);
+	FlatVector::GetDataMutable<string_t>(v)[row] = StringVector::AddString(v, s);
 }
 static void OutStringNull(Vector &v, idx_t row) {
 	FlatVector::SetNull(v, row, true);
@@ -196,16 +196,16 @@ static void OutStringOrNull(Vector &v, idx_t row, const string &s) {
 	}
 }
 static void OutInt32(Vector &v, idx_t row, int32_t x) {
-	FlatVector::GetData<int32_t>(v)[row] = x;
+	FlatVector::GetDataMutable<int32_t>(v)[row] = x;
 }
 static void OutInt64(Vector &v, idx_t row, int64_t x) {
-	FlatVector::GetData<int64_t>(v)[row] = x;
+	FlatVector::GetDataMutable<int64_t>(v)[row] = x;
 }
 static void OutDouble(Vector &v, idx_t row, double x) {
-	FlatVector::GetData<double>(v)[row] = x;
+	FlatVector::GetDataMutable<double>(v)[row] = x;
 }
 static void OutBool(Vector &v, idx_t row, bool x) {
-	FlatVector::GetData<bool>(v)[row] = x;
+	FlatVector::GetDataMutable<bool>(v)[row] = x;
 }
 static void OutDoubleNull(Vector &v, idx_t row) {
 	FlatVector::SetNull(v, row, true);
@@ -217,14 +217,14 @@ static void OutInt64Null(Vector &v, idx_t row) {
 	FlatVector::SetNull(v, row, true);
 }
 static void OutTimestamp(Vector &v, idx_t row, timestamp_t t) {
-	FlatVector::GetData<timestamp_t>(v)[row] = t;
+	FlatVector::GetDataMutable<timestamp_t>(v)[row] = t;
 }
 static void OutTimestampNull(Vector &v, idx_t row) {
 	FlatVector::SetNull(v, row, true);
 }
 // BLOB column: same heap path as scalar pdf_to_png (not AddString — binary-safe).
 static void OutBlob(Vector &v, idx_t row, const string &bytes) {
-	FlatVector::GetData<string_t>(v)[row] =
+	FlatVector::GetDataMutable<string_t>(v)[row] =
 	    StringVector::AddStringOrBlob(v, string_t(bytes.data(), static_cast<uint32_t>(bytes.size())));
 }
 // Empty string -> NULL TIMESTAMP (poppler unset dates are <= 0).
@@ -2274,9 +2274,9 @@ static std::vector<OcrWord> OcrPageWords(poppler::page *page, const PdfOptions &
 	return out;
 }
 
-static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
+static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
 	for (auto &kv : params) {
-		auto key = StringUtil::Lower(kv.first);
+		auto key = StringUtil::Lower(kv.first.GetIdentifierName());
 		if (key == "ocr") {
 			o.force_ocr = BooleanValue::Get(kv.second);
 		} else if (key == "auto_ocr") {
@@ -2354,33 +2354,41 @@ static void ParseNamed(const named_parameter_map_t &params, PdfOptions &o) {
 	}
 }
 
+// Optional named parameters are a typed "**kwargs" schema on the signature: a call that
+// omits one leaves it out of input.named_parameters, as before.
+static void AddNamedParameter(TableFunction &fn, const char *name, const LogicalType &type) {
+	auto &signature = fn.GetSignature();
+	auto add = [&](TypedKwargs &options) { options.Add(name, type); };
+	if (signature.GetTypedKwargs()) {
+		signature.ExtendTypedKwargs(add);
+	} else {
+		signature.WithTypedKwargs("options", add);
+	}
+}
+
 static void AddOcrNamedParams(TableFunction &fn) {
-	fn.named_parameters["ocr"] = LogicalType::BOOLEAN;
-	fn.named_parameters["auto_ocr"] = LogicalType::BOOLEAN;
-	fn.named_parameters["ocr_language"] = LogicalType::VARCHAR;
-	fn.named_parameters["ocr_dpi"] = LogicalType::INTEGER;
-	fn.named_parameters["ocr_psm"] = LogicalType::INTEGER;
-	fn.named_parameters["ocr_oem"] = LogicalType::INTEGER;
-	fn.named_parameters["ocr_preprocess"] = LogicalType::BOOLEAN;
-	fn.named_parameters["ocr_retry"] = LogicalType::BOOLEAN;
-	fn.named_parameters["tessdata_dir"] = LogicalType::VARCHAR;
-	fn.named_parameters["parse_tables"] = LogicalType::BOOLEAN;
-	fn.named_parameters["password"] = LogicalType::VARCHAR;
-	fn.named_parameters["first_page"] = LogicalType::INTEGER;
-	fn.named_parameters["last_page"] = LogicalType::INTEGER;
-	fn.named_parameters["ocr_backend"] = LogicalType::VARCHAR;
-	fn.named_parameters["ocr_plugin"] = LogicalType::VARCHAR;
-	fn.named_parameters["ocr_endpoint"] = LogicalType::VARCHAR;
-	fn.named_parameters["ocr_vars"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
-	fn.named_parameters["ocr_config"] = LogicalType::VARCHAR;
+	AddNamedParameter(fn, "ocr", LogicalType::BOOLEAN);
+	AddNamedParameter(fn, "auto_ocr", LogicalType::BOOLEAN);
+	AddNamedParameter(fn, "ocr_language", LogicalType::VARCHAR);
+	AddNamedParameter(fn, "ocr_dpi", LogicalType::INTEGER);
+	AddNamedParameter(fn, "ocr_psm", LogicalType::INTEGER);
+	AddNamedParameter(fn, "ocr_oem", LogicalType::INTEGER);
+	AddNamedParameter(fn, "ocr_preprocess", LogicalType::BOOLEAN);
+	AddNamedParameter(fn, "ocr_retry", LogicalType::BOOLEAN);
+	AddNamedParameter(fn, "tessdata_dir", LogicalType::VARCHAR);
+	AddNamedParameter(fn, "parse_tables", LogicalType::BOOLEAN);
+	AddNamedParameter(fn, "password", LogicalType::VARCHAR);
+	AddNamedParameter(fn, "first_page", LogicalType::INTEGER);
+	AddNamedParameter(fn, "last_page", LogicalType::INTEGER);
+	AddNamedParameter(fn, "ocr_backend", LogicalType::VARCHAR);
+	AddNamedParameter(fn, "ocr_plugin", LogicalType::VARCHAR);
+	AddNamedParameter(fn, "ocr_endpoint", LogicalType::VARCHAR);
+	AddNamedParameter(fn, "ocr_vars", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR));
+	AddNamedParameter(fn, "ocr_config", LogicalType::VARCHAR);
 }
 
 static void AddCommonNamedParams(TableFunction &fn) {
 	AddOcrNamedParams(fn);
-	fn.named_parameters["parse_tables"] = LogicalType::BOOLEAN;
-	fn.named_parameters["password"] = LogicalType::VARCHAR;
-	fn.named_parameters["first_page"] = LogicalType::INTEGER;
-	fn.named_parameters["last_page"] = LogicalType::INTEGER;
 }
 
 static vector<string> ResolveFiles(ClientContext &context, const string &pattern) {
@@ -2499,7 +2507,7 @@ struct ReadPdfLocalState : public LocalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ReadPdfBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
@@ -2724,7 +2732,7 @@ struct ReadPdfMetaState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> ReadPdfMetaBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ReadPdfMetaBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
@@ -2870,7 +2878,7 @@ struct PdfInfoState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfInfoBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP,
 	                LogicalType::TIMESTAMP, LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
@@ -3016,7 +3024,7 @@ struct PdfStructureState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfStructureBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR,
 	                LogicalType::INTEGER,
 	                LogicalType::INTEGER,
@@ -3114,7 +3122,7 @@ static void PdfStructureScan(ClientContext &context, TableFunctionInput &data_p,
 }
 
 static unique_ptr<FunctionData> PdfOutlineBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::INTEGER};
 	names = {"file", "ord", "depth", "title", "page"};
@@ -3204,7 +3212,7 @@ struct PdfAttachmentsState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfAttachmentsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::BLOB};
 	names = {"file", "name", "description", "size", "mime_type", "data"};
@@ -3578,7 +3586,7 @@ struct PdfRevisionsState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfRevisionsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
 	                LogicalType::BOOLEAN};
 	names = {"revision_index", "startxref_offset", "eof_offset", "size_bytes", "is_incremental"};
@@ -3650,7 +3658,7 @@ struct ReadPdfWordsBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> ReadPdfWordsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ReadPdfWordsBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
@@ -3898,7 +3906,7 @@ struct ReadPdfLinesBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> ReadPdfLinesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ReadPdfLinesBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
@@ -4683,7 +4691,7 @@ struct ReadPdfElementsState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> ReadPdfElementsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ReadPdfElementsBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	// Preserve the legacy native-only default; OCR is opt-in for this reader.
@@ -4812,7 +4820,7 @@ struct PdfChunkRow {
 };
 
 // One packable piece: a whole element, or one slice of an oversized one.
-struct ChunkUnit {
+struct PdfChunkUnit {
 	string text;
 	int page = 0;
 	bool is_heading = false;
@@ -4894,7 +4902,7 @@ static void ChunksProcessFile(ClientContext &context, const string &path, const 
 
 	// Elements -> units, tracking the running heading context (C6) and
 	// pre-splitting oversized elements (C2).
-	std::vector<ChunkUnit> units;
+	std::vector<PdfChunkUnit> units;
 	bool have_heading = false;
 	string current_heading;
 	for (auto &elem : elements) {
@@ -4905,7 +4913,7 @@ static void ChunksProcessFile(ClientContext &context, const string &path, const 
 		}
 		for (auto &piece : elem.text.size() > chunk_size ? ChunkSplitLongText(elem.text, chunk_size)
 		                                                 : std::vector<string> {elem.text}) {
-			ChunkUnit unit;
+			PdfChunkUnit unit;
 			unit.text = std::move(piece);
 			unit.page = elem.page_number;
 			unit.is_heading = is_heading;
@@ -4915,7 +4923,7 @@ static void ChunksProcessFile(ClientContext &context, const string &path, const 
 		}
 	}
 
-	std::vector<ChunkUnit> cur;
+	std::vector<PdfChunkUnit> cur;
 	size_t cur_len = 0;
 	string prev_overlap;
 	int chunk_idx = 0;
@@ -4958,7 +4966,7 @@ static void ChunksProcessFile(ClientContext &context, const string &path, const 
 					continue;
 				}
 				// C3: pop the trailing heading, flush, restart from it
-				ChunkUnit moved = std::move(cur.back());
+				PdfChunkUnit moved = std::move(cur.back());
 				cur.pop_back();
 				flush();
 				cur_len = moved.text.size();
@@ -4993,7 +5001,7 @@ struct PdfChunksState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfChunksBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfChunksBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	// Chunks inherit the element reader's legacy native-only default.
@@ -5002,7 +5010,7 @@ static unique_ptr<FunctionData> PdfChunksBind(ClientContext &context, TableFunct
 	int32_t chunk_size = CHUNK_DEFAULT_SIZE;
 	int32_t overlap = CHUNK_DEFAULT_OVERLAP;
 	for (auto &kv : input.named_parameters) {
-		auto key = StringUtil::Lower(kv.first);
+		auto key = StringUtil::Lower(kv.first.GetIdentifierName());
 		if (key == "chunk_size") {
 			chunk_size = IntegerValue::Get(kv.second);
 		} else if (key == "overlap") {
@@ -5100,7 +5108,7 @@ struct ReadPdfTablesState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> ReadPdfTablesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ReadPdfTablesBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
@@ -5791,7 +5799,7 @@ static void PopplerVersionFun(DataChunk &args, ExpressionState &state, Vector &r
 	(void)state;
 	// Runtime linked version from poppler-cpp; POPPLER_VERSION is the compile-time
 	// header macro (same string when headers match the dylib).
-	result.Reference(Value(poppler::version_string()));
+	result.Reference(Value(poppler::version_string()), count_t(args.size()));
 }
 
 static void PopplerRenderPageFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -5908,8 +5916,8 @@ static void RethrowOcrImageError(const std::exception &e) {
 static void TesseractOcrDispatch(DataChunk &args, ExpressionState &state, Vector &result) {
 	(void)state;
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto out = FlatVector::GetData<string_t>(result);
-	auto &validity = FlatVector::Validity(result);
+	auto out = FlatVector::GetDataMutable<string_t>(result);
+	auto &validity = FlatVector::ValidityMutable(result);
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto blob_v = args.GetValue(0, i);
 		if (blob_v.IsNull()) {
@@ -5936,7 +5944,7 @@ struct OcrImageBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> OcrImageBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	(void)context;
 	auto result = make_uniq<OcrImageBindData>();
 	auto blob_v = input.inputs[0];
@@ -5959,7 +5967,7 @@ static unique_ptr<FunctionData> OcrImageBind(ClientContext &context, TableFuncti
 		if (kv.second.IsNull()) {
 			continue;
 		}
-		auto key = StringUtil::Lower(kv.first);
+		auto key = StringUtil::Lower(kv.first.GetIdentifierName());
 		if (key == "language" || key == "lang" || key == "ocr_language") {
 			result->opt.language = StringValue::Get(kv.second);
 			if (result->opt.language.empty()) {
@@ -6651,16 +6659,18 @@ static double PdfGetDoubleOption(const vector<Value> &set, const string &lopt) {
 }
 
 static unique_ptr<FunctionData> PdfCopyBind(ClientContext &context, CopyFunctionBindInput &input,
-                                            const vector<string> &names, const vector<LogicalType> &sql_types) {
+                                            const vector<Identifier> &names, const vector<LogicalType> &sql_types) {
 	auto result = make_uniq<PdfCopyBindData>();
 	result->file_path = input.info.file_path;
-	result->column_names = names;
+	for (auto &name : names) {
+		result->column_names.push_back(name.GetIdentifierName());
+	}
 	result->column_types = sql_types;
 
 	// Parse (case-insensitive keys: DuckDB populates via Lower in places; we Lower explicitly)
 	// Unknown options now throw (house style); previously were silently ignored.
 	for (auto &option : input.info.options) {
-		string loption = StringUtil::Lower(option.first);
+		string loption = StringUtil::Lower(option.first.GetIdentifierName());
 		auto &set = option.second;
 		if (loption == "title") {
 			result->write_opts.title = PdfGetStringOption(set, loption);
@@ -7350,7 +7360,7 @@ struct PdfSplitState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfSplitBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfSplitBindData>();
 	result->input = StringValue::Get(input.inputs[0]);
 	result->output_dir = StringValue::Get(input.inputs[1]);
@@ -7476,12 +7486,12 @@ struct PdfSplitBlankState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfSplitBlankBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfSplitBlankBindData>();
 	result->input = StringValue::Get(input.inputs[0]);
 	result->output_dir = StringValue::Get(input.inputs[1]);
 	for (auto &kv : input.named_parameters) {
-		auto key = StringUtil::Lower(kv.first);
+		auto key = StringUtil::Lower(kv.first.GetIdentifierName());
 		if (key == "blank_threshold") {
 			result->blank_threshold = DoubleValue::Get(kv.second);
 		}
@@ -7731,13 +7741,13 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 }
 
 static unique_ptr<FunctionData> PdfOcrBind(ClientContext &, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                           vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfOcrBindData>();
 	result->input = StringValue::Get(input.inputs[0]);
 	result->output = StringValue::Get(input.inputs[1]);
 	ParseNamed(input.named_parameters, result->opt);
 	for (auto &kv : input.named_parameters) {
-		if (StringUtil::Lower(kv.first) == "force") {
+		if (StringUtil::Lower(kv.first.GetIdentifierName()) == "force") {
 			result->force = BooleanValue::Get(kv.second);
 		}
 	}
@@ -8031,7 +8041,7 @@ static void PdfQpdfRowsEmit(PdfQpdfRowsState &st, DataChunk &output) {
 // pdf_form_fields(files) -> one row per AcroForm field. page is NULL when the
 // field has no widget annotation on any page; value is NULL when /V is unset.
 static unique_ptr<FunctionData> PdfFormFieldsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfQpdfRowsBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
@@ -8091,7 +8101,7 @@ static void PdfFormFieldsScan(ClientContext &context, TableFunctionInput &data_p
 // one function covers both "extract comments/highlights" and "extract
 // hyperlinks" (WHERE subtype = 'Link').
 static unique_ptr<FunctionData> PdfAnnotationsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfQpdfRowsBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
@@ -8207,11 +8217,11 @@ static Value PdfParseDateOrNull(const string &raw) {
 }
 
 static unique_ptr<FunctionData> PdfSignaturesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfSignaturesBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	for (auto &kv : input.named_parameters) {
-		auto key = StringUtil::Lower(kv.first);
+		auto key = StringUtil::Lower(kv.first.GetIdentifierName());
 		if (key == "password") {
 			result->password = StringValue::Get(kv.second);
 		}
@@ -8285,14 +8295,14 @@ struct PdfSignBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> PdfSignBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfSignBindData>();
 	result->input = StringValue::Get(input.inputs[0]);
 	result->output = StringValue::Get(input.inputs[1]);
 	result->cert_path = StringValue::Get(input.inputs[2]);
 	result->key_path = StringValue::Get(input.inputs[3]);
 	for (auto &kv : input.named_parameters) {
-		auto key = StringUtil::Lower(kv.first);
+		auto key = StringUtil::Lower(kv.first.GetIdentifierName());
 		if (kv.second.IsNull()) {
 			continue;
 		}
@@ -8422,7 +8432,7 @@ static vector<RedactBox> ParseRedactBoxes(const Value &list_val) {
 	auto &struct_children = StructType::GetChildTypes(child_type);
 	vector<string> field_names;
 	for (auto &kv : struct_children) {
-		field_names.push_back(kv.first);
+		field_names.push_back(kv.first.GetIdentifierName());
 	}
 	for (auto &el : ListValue::GetChildren(list_val)) {
 		if (el.IsNull()) {
@@ -8451,14 +8461,14 @@ static vector<RedactBox> ParseRedactBoxes(const Value &list_val) {
 }
 
 static unique_ptr<FunctionData> PdfRedactBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfRedactBindData>();
 	result->input = StringValue::Get(input.inputs[0]);
 	result->output = StringValue::Get(input.inputs[1]);
 	result->boxes = ParseRedactBoxes(input.inputs[2]);
 
 	for (auto &kv : input.named_parameters) {
-		auto key = StringUtil::Lower(kv.first);
+		auto key = StringUtil::Lower(kv.first.GetIdentifierName());
 		if (key == "dpi") {
 			result->dpi = IntegerValue::Get(kv.second.DefaultCastAs(LogicalType::INTEGER));
 		} else if (key == "password") {
@@ -8674,7 +8684,7 @@ static void PdfRedactScan(ClientContext &context, TableFunctionInput &data_p, Da
 // =============================================================================
 
 static unique_ptr<FunctionData> PdfRedactLateralBind(ClientContext &, TableFunctionBindInput &,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::INTEGER};
 	names = {"page", "redacted", "boxes_applied"};
 	return make_uniq<PdfRedactLateralBindData>();
@@ -8797,11 +8807,11 @@ struct PdfImagesBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> PdfImagesBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfImagesBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	for (auto &kv : input.named_parameters) {
-		auto key = StringUtil::Lower(kv.first);
+		auto key = StringUtil::Lower(kv.first.GetIdentifierName());
 		if (key == "password") {
 			result->password = StringValue::Get(kv.second);
 		}
@@ -9024,7 +9034,7 @@ struct PdfPagesInfoState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfPagesInfoBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::DOUBLE,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
 	                LogicalType::DOUBLE,  LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
@@ -9116,7 +9126,7 @@ struct PdfPermissionsState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfPermissionsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
 	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
 	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
@@ -9190,7 +9200,7 @@ struct PdfFontsState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfFontsBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::VARCHAR};
 	names = {"file", "page", "name", "type", "embedded", "subset", "font_file"};
@@ -9288,7 +9298,7 @@ struct PdfDestinationsState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfDestinationsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
 	                LogicalType::DOUBLE,  LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN};
@@ -9382,12 +9392,12 @@ struct PdfPageImagesState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfPageImagesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfPageImagesBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
 	for (auto &kv : input.named_parameters) {
-		if (StringUtil::Lower(kv.first) == "dpi") {
+		if (StringUtil::Lower(kv.first.GetIdentifierName()) == "dpi") {
 			result->dpi = IntegerValue::Get(kv.second);
 		}
 	}
@@ -9544,7 +9554,7 @@ static void PdfWriteBytesToFile(const string &path, const string &bytes, const c
 }
 
 static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfWritePageImagesBindData>();
 	const auto &src = input.inputs[0];
 	if (src.type().id() == LogicalTypeId::LIST) {
@@ -9568,7 +9578,7 @@ static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, T
 	}
 	ParseNamed(input.named_parameters, result->opt);
 	for (auto &kv : input.named_parameters) {
-		if (StringUtil::Lower(kv.first) == "dpi") {
+		if (StringUtil::Lower(kv.first.GetIdentifierName()) == "dpi") {
 			result->dpi = IntegerValue::Get(kv.second);
 		}
 	}
@@ -9682,11 +9692,11 @@ struct PdfQpdfInfoState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> PdfQpdfInfoBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfQpdfInfoBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	for (auto &kv : input.named_parameters) {
-		if (StringUtil::Lower(kv.first) == "password") {
+		if (StringUtil::Lower(kv.first.GetIdentifierName()) == "password") {
 			result->password = StringValue::Get(kv.second);
 		}
 	}
@@ -9837,7 +9847,27 @@ static void PdfRepairNoPwFun(DataChunk &args, ExpressionState &state, Vector &re
 	    });
 }
 
-static void LoadInternal(ExtensionLoader &loader) {
+// DuckDB 2.0 turns an exception from a scalar that is not marked fallible into an INTERNAL
+// error. Every pdf scalar reads a path or blob that can be bad, so all of them are fallible.
+struct PdfLoader {
+	ExtensionLoader &loader;
+
+	void RegisterFunction(ScalarFunction function) {
+		function.SetFallible();
+		loader.RegisterFunction(std::move(function));
+	}
+	void RegisterFunction(ScalarFunctionSet functions) {
+		functions.SetFallible();
+		loader.RegisterFunction(std::move(functions));
+	}
+	template <class FUNCTION>
+	void RegisterFunction(FUNCTION function) {
+		loader.RegisterFunction(std::move(function));
+	}
+};
+
+static void LoadInternal(ExtensionLoader &extension_loader) {
+	PdfLoader loader {extension_loader};
 	// Scalar PDF writers have observable filesystem side effects. Mark them
 	// volatile so constant expressions are executed instead of being folded.
 	auto register_volatile_scalar = [&loader](ScalarFunction function) {
@@ -9845,9 +9875,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		loader.RegisterFunction(std::move(function));
 	};
 	auto mark_volatile_scalars = [](ScalarFunctionSet &functions) {
-		for (auto &function : functions.functions) {
-			function.SetVolatile();
-		}
+		functions.ApplyToFunctions([](ScalarFunction &function) { function.SetVolatile(); });
 	};
 
 	TableFunction read_pdf("read_pdf", {LogicalType::VARCHAR}, ReadPdfScan, ReadPdfBind, ReadPdfInitGlobal,
@@ -9856,45 +9884,45 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// layout is registered per function rather than in AddCommonNamedParams, so a
 	// reader that works off word geometry does not advertise a knob it ignores
 	// (the same reason ignore_errors is registered here and not there).
-	read_pdf.named_parameters["layout"] = LogicalType::VARCHAR;
+	AddNamedParameter(read_pdf, "layout", LogicalType::VARCHAR);
 	// Registered individually (not in AddCommonNamedParams) so it is only
 	// advertised on functions that actually implement the skip behavior.
-	read_pdf.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
+	AddNamedParameter(read_pdf, "ignore_errors", LogicalType::BOOLEAN);
 	loader.RegisterFunction(read_pdf);
 
 	TableFunction read_pdf_meta("read_pdf_meta", {LogicalType::VARCHAR}, ReadPdfMetaScan, ReadPdfMetaBind,
 	                            ReadPdfMetaInit);
-	read_pdf_meta.named_parameters["password"] = LogicalType::VARCHAR;
-	read_pdf_meta.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
+	AddNamedParameter(read_pdf_meta, "password", LogicalType::VARCHAR);
+	AddNamedParameter(read_pdf_meta, "ignore_errors", LogicalType::BOOLEAN);
 	loader.RegisterFunction(read_pdf_meta);
 
 	// inspection suite — read-only, serial per file, password is the only knob
 	TableFunction pdf_info("pdf_info", {LogicalType::VARCHAR}, PdfInfoScan, PdfInfoBind, PdfInfoInit);
-	pdf_info.named_parameters["password"] = LogicalType::VARCHAR;
+	AddNamedParameter(pdf_info, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(pdf_info);
 
 	TableFunction pdf_outline("pdf_outline", {LogicalType::VARCHAR}, PdfOutlineScan, PdfOutlineBind, PdfOutlineInit);
-	pdf_outline.named_parameters["password"] = LogicalType::VARCHAR;
-	pdf_outline.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
+	AddNamedParameter(pdf_outline, "password", LogicalType::VARCHAR);
+	AddNamedParameter(pdf_outline, "ignore_errors", LogicalType::BOOLEAN);
 	loader.RegisterFunction(pdf_outline);
 
 	TableFunction pdf_structure("pdf_structure", {LogicalType::VARCHAR}, PdfStructureScan, PdfStructureBind,
 	                            PdfStructureInit);
-	pdf_structure.named_parameters["password"] = LogicalType::VARCHAR;
-	pdf_structure.named_parameters["first_page"] = LogicalType::INTEGER;
-	pdf_structure.named_parameters["last_page"] = LogicalType::INTEGER;
-	pdf_structure.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
+	AddNamedParameter(pdf_structure, "password", LogicalType::VARCHAR);
+	AddNamedParameter(pdf_structure, "first_page", LogicalType::INTEGER);
+	AddNamedParameter(pdf_structure, "last_page", LogicalType::INTEGER);
+	AddNamedParameter(pdf_structure, "ignore_errors", LogicalType::BOOLEAN);
 	loader.RegisterFunction(pdf_structure);
 
 	TableFunction pdf_attachments("pdf_attachments", {LogicalType::VARCHAR}, PdfAttachmentsScan, PdfAttachmentsBind,
 	                              PdfAttachmentsInit);
-	pdf_attachments.named_parameters["password"] = LogicalType::VARCHAR;
+	AddNamedParameter(pdf_attachments, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(pdf_attachments);
 
 	// Forensic incremental-update revisions (byte-level startxref / /Prev walk)
 	TableFunction pdf_revisions("pdf_revisions", {LogicalType::VARCHAR}, PdfRevisionsScan, PdfRevisionsBind,
 	                            PdfRevisionsInit);
-	pdf_revisions.named_parameters["password"] = LogicalType::VARCHAR;
+	AddNamedParameter(pdf_revisions, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(pdf_revisions);
 
 	TableFunction read_pdf_words("read_pdf_words", {LogicalType::VARCHAR}, ReadPdfWordsScan, ReadPdfWordsBind,
@@ -9914,7 +9942,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction read_pdf_lines("read_pdf_lines", {LogicalType::VARCHAR}, ReadPdfLinesScan, ReadPdfLinesBind,
 	                             ReadPdfLinesInit);
 	AddCommonNamedParams(read_pdf_lines);
-	read_pdf_lines.named_parameters["layout"] = LogicalType::VARCHAR;
+	AddNamedParameter(read_pdf_lines, "layout", LogicalType::VARCHAR);
 	loader.RegisterFunction(read_pdf_lines);
 
 	// read_pdf_elements uses the same OCR/native word source and options as
@@ -9922,9 +9950,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction read_pdf_elements("read_pdf_elements", {LogicalType::VARCHAR}, ReadPdfElementsScan,
 	                                ReadPdfElementsBind, ReadPdfElementsInit);
 	AddOcrNamedParams(read_pdf_elements);
-	read_pdf_elements.named_parameters["password"] = LogicalType::VARCHAR;
-	read_pdf_elements.named_parameters["first_page"] = LogicalType::INTEGER;
-	read_pdf_elements.named_parameters["last_page"] = LogicalType::INTEGER;
 	loader.RegisterFunction(read_pdf_elements);
 
 	// pdf_chunks packs the element grain into retrieval-ready chunks; it
@@ -9932,17 +9957,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// read_pdf_elements plus its own chunk_size / overlap knobs.
 	TableFunction pdf_chunks("pdf_chunks", {LogicalType::VARCHAR}, PdfChunksScan, PdfChunksBind, PdfChunksInit);
 	AddOcrNamedParams(pdf_chunks);
-	pdf_chunks.named_parameters["chunk_size"] = LogicalType::INTEGER;
-	pdf_chunks.named_parameters["overlap"] = LogicalType::INTEGER;
-	pdf_chunks.named_parameters["password"] = LogicalType::VARCHAR;
-	pdf_chunks.named_parameters["first_page"] = LogicalType::INTEGER;
-	pdf_chunks.named_parameters["last_page"] = LogicalType::INTEGER;
+	AddNamedParameter(pdf_chunks, "chunk_size", LogicalType::INTEGER);
+	AddNamedParameter(pdf_chunks, "overlap", LogicalType::INTEGER);
 	loader.RegisterFunction(pdf_chunks);
 
 	TableFunction read_pdf_tables("read_pdf_tables", {LogicalType::VARCHAR}, ReadPdfTablesScan, ReadPdfTablesBind,
 	                              ReadPdfTablesInit);
 	AddCommonNamedParams(read_pdf_tables);
-	read_pdf_tables.named_parameters["force"] = LogicalType::BOOLEAN;
+	AddNamedParameter(read_pdf_tables, "force", LogicalType::BOOLEAN);
 	loader.RegisterFunction(read_pdf_tables);
 
 	ScalarFunctionSet pdf_to_text_set("pdf_to_text");
@@ -10024,23 +10046,23 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Named-param image OCR (scalars cannot take named maps). format=text|hocr|tsv.
 	TableFunction ocr_image("ocr_image", {LogicalType::BLOB}, OcrImageScan, OcrImageBind, OcrImageInit);
-	ocr_image.named_parameters["language"] = LogicalType::VARCHAR;
-	ocr_image.named_parameters["lang"] = LogicalType::VARCHAR;
-	ocr_image.named_parameters["ocr_language"] = LogicalType::VARCHAR;
-	ocr_image.named_parameters["psm"] = LogicalType::INTEGER;
-	ocr_image.named_parameters["ocr_psm"] = LogicalType::INTEGER;
-	ocr_image.named_parameters["oem"] = LogicalType::INTEGER;
-	ocr_image.named_parameters["ocr_oem"] = LogicalType::INTEGER;
-	ocr_image.named_parameters["tessdata_dir"] = LogicalType::VARCHAR;
-	ocr_image.named_parameters["preprocess"] = LogicalType::BOOLEAN;
-	ocr_image.named_parameters["ocr_preprocess"] = LogicalType::BOOLEAN;
-	ocr_image.named_parameters["dpi"] = LogicalType::INTEGER;
-	ocr_image.named_parameters["ocr_dpi"] = LogicalType::INTEGER;
-	ocr_image.named_parameters["vars"] = map_vv;
-	ocr_image.named_parameters["ocr_vars"] = map_vv;
-	ocr_image.named_parameters["config"] = LogicalType::VARCHAR;
-	ocr_image.named_parameters["ocr_config"] = LogicalType::VARCHAR;
-	ocr_image.named_parameters["format"] = LogicalType::VARCHAR;
+	AddNamedParameter(ocr_image, "language", LogicalType::VARCHAR);
+	AddNamedParameter(ocr_image, "lang", LogicalType::VARCHAR);
+	AddNamedParameter(ocr_image, "ocr_language", LogicalType::VARCHAR);
+	AddNamedParameter(ocr_image, "psm", LogicalType::INTEGER);
+	AddNamedParameter(ocr_image, "ocr_psm", LogicalType::INTEGER);
+	AddNamedParameter(ocr_image, "oem", LogicalType::INTEGER);
+	AddNamedParameter(ocr_image, "ocr_oem", LogicalType::INTEGER);
+	AddNamedParameter(ocr_image, "tessdata_dir", LogicalType::VARCHAR);
+	AddNamedParameter(ocr_image, "preprocess", LogicalType::BOOLEAN);
+	AddNamedParameter(ocr_image, "ocr_preprocess", LogicalType::BOOLEAN);
+	AddNamedParameter(ocr_image, "dpi", LogicalType::INTEGER);
+	AddNamedParameter(ocr_image, "ocr_dpi", LogicalType::INTEGER);
+	AddNamedParameter(ocr_image, "vars", map_vv);
+	AddNamedParameter(ocr_image, "ocr_vars", map_vv);
+	AddNamedParameter(ocr_image, "config", LogicalType::VARCHAR);
+	AddNamedParameter(ocr_image, "ocr_config", LogicalType::VARCHAR);
+	AddNamedParameter(ocr_image, "format", LogicalType::VARCHAR);
 	loader.RegisterFunction(ocr_image);
 
 	ScalarFunctionSet to_pdf_set("to_pdf");
@@ -10077,7 +10099,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	TableFunction pdf_split_blank("pdf_split_blank", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfSplitBlankScan,
 	                              PdfSplitBlankBind, PdfSplitBlankInit);
-	pdf_split_blank.named_parameters["blank_threshold"] = LogicalType::DOUBLE;
+	AddNamedParameter(pdf_split_blank, "blank_threshold", LogicalType::DOUBLE);
 	loader.RegisterFunction(pdf_split_blank);
 
 	// qpdf everyday suite
@@ -10126,12 +10148,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// pdf_signatures: detect + verify existing digital signatures (no signing).
 	TableFunction pdf_signatures("pdf_signatures", {LogicalType::VARCHAR}, PdfSignaturesScan, PdfSignaturesBind,
 	                             PdfQpdfRowsInit);
-	pdf_signatures.named_parameters["password"] = LogicalType::VARCHAR;
+	AddNamedParameter(pdf_signatures, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(pdf_signatures);
 
 	// pdf_images: extract embedded raster image XObjects (stored JPEG/bitmap).
 	TableFunction pdf_images("pdf_images", {LogicalType::VARCHAR}, PdfImagesScan, PdfImagesBind, PdfQpdfRowsInit);
-	pdf_images.named_parameters["password"] = LogicalType::VARCHAR;
+	AddNamedParameter(pdf_images, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(pdf_images);
 
 	// pdf_sign: create an adbe.pkcs7.detached CMS signature (inverse of
@@ -10139,12 +10161,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction pdf_sign("pdf_sign",
 	                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                       PdfSignScan, PdfSignBind, PdfQpdfRowsInit);
-	pdf_sign.named_parameters["key_password"] = LogicalType::VARCHAR;
-	pdf_sign.named_parameters["reason"] = LogicalType::VARCHAR;
-	pdf_sign.named_parameters["location"] = LogicalType::VARCHAR;
-	pdf_sign.named_parameters["signer_name"] = LogicalType::VARCHAR;
-	pdf_sign.named_parameters["field_name"] = LogicalType::VARCHAR;
-	pdf_sign.named_parameters["password"] = LogicalType::VARCHAR;
+	AddNamedParameter(pdf_sign, "key_password", LogicalType::VARCHAR);
+	AddNamedParameter(pdf_sign, "reason", LogicalType::VARCHAR);
+	AddNamedParameter(pdf_sign, "location", LogicalType::VARCHAR);
+	AddNamedParameter(pdf_sign, "signer_name", LogicalType::VARCHAR);
+	AddNamedParameter(pdf_sign, "field_name", LogicalType::VARCHAR);
+	AddNamedParameter(pdf_sign, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(pdf_sign);
 
 	// pdf_redact: classic table function (bind-time constant args + named dpi/password).
@@ -10159,8 +10181,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction pdf_redact("pdf_redact",
 	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(redact_struct)},
 	                         PdfRedactScan, PdfRedactBind, PdfRedactInit);
-	pdf_redact.named_parameters["dpi"] = LogicalType::INTEGER;
-	pdf_redact.named_parameters["password"] = LogicalType::VARCHAR;
+	AddNamedParameter(pdf_redact, "dpi", LogicalType::INTEGER);
+	AddNamedParameter(pdf_redact, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(pdf_redact);
 
 	TableFunction pdf_redact_lateral("pdf_redact_lateral",
@@ -10173,35 +10195,35 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// original document so pages without OCR remain structurally untouched.
 	TableFunction pdf_ocr("pdf_ocr", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfOcrScan, PdfOcrBind, PdfOcrInit);
 	AddCommonNamedParams(pdf_ocr);
-	pdf_ocr.named_parameters["force"] = LogicalType::BOOLEAN;
+	AddNamedParameter(pdf_ocr, "force", LogicalType::BOOLEAN);
 	loader.RegisterFunction(pdf_ocr);
 
 	// Comprehensive poppler / qpdf surface
 	TableFunction pdf_pages_info("pdf_pages_info", {LogicalType::VARCHAR}, PdfPagesInfoScan, PdfPagesInfoBind,
 	                             PdfPagesInfoInit);
-	pdf_pages_info.named_parameters["password"] = LogicalType::VARCHAR;
+	AddNamedParameter(pdf_pages_info, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(pdf_pages_info);
 
 	TableFunction pdf_permissions("pdf_permissions", {LogicalType::VARCHAR}, PdfPermissionsScan, PdfPermissionsBind,
 	                              PdfPermissionsInit);
-	pdf_permissions.named_parameters["password"] = LogicalType::VARCHAR;
+	AddNamedParameter(pdf_permissions, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(pdf_permissions);
 
 	TableFunction pdf_fonts("pdf_fonts", {LogicalType::VARCHAR}, PdfFontsScan, PdfFontsBind, PdfFontsInit);
-	pdf_fonts.named_parameters["password"] = LogicalType::VARCHAR;
+	AddNamedParameter(pdf_fonts, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(pdf_fonts);
 
 	TableFunction pdf_destinations("pdf_destinations", {LogicalType::VARCHAR}, PdfDestinationsScan, PdfDestinationsBind,
 	                               PdfDestinationsInit);
-	pdf_destinations.named_parameters["password"] = LogicalType::VARCHAR;
+	AddNamedParameter(pdf_destinations, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(pdf_destinations);
 
 	TableFunction pdf_page_images("pdf_page_images", {LogicalType::VARCHAR}, PdfPageImagesScan, PdfPageImagesBind,
 	                              PdfPageImagesInit);
-	pdf_page_images.named_parameters["password"] = LogicalType::VARCHAR;
-	pdf_page_images.named_parameters["dpi"] = LogicalType::INTEGER;
-	pdf_page_images.named_parameters["first_page"] = LogicalType::INTEGER;
-	pdf_page_images.named_parameters["last_page"] = LogicalType::INTEGER;
+	AddNamedParameter(pdf_page_images, "password", LogicalType::VARCHAR);
+	AddNamedParameter(pdf_page_images, "dpi", LogicalType::INTEGER);
+	AddNamedParameter(pdf_page_images, "first_page", LogicalType::INTEGER);
+	AddNamedParameter(pdf_page_images, "last_page", LogicalType::INTEGER);
 	loader.RegisterFunction(pdf_page_images);
 
 	// VARCHAR (path/glob) and LIST(VARCHAR) overloads — same bind/scan body.
@@ -10215,10 +10237,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 			TableFunction pdf_write_page_images("pdf_write_page_images",
 			                                    {path_type, LogicalType(LogicalTypeId::VARCHAR)},
 			                                    PdfWritePageImagesScan, PdfWritePageImagesBind, PdfWritePageImagesInit);
-			pdf_write_page_images.named_parameters["password"] = LogicalType::VARCHAR;
-			pdf_write_page_images.named_parameters["dpi"] = LogicalType::INTEGER;
-			pdf_write_page_images.named_parameters["first_page"] = LogicalType::INTEGER;
-			pdf_write_page_images.named_parameters["last_page"] = LogicalType::INTEGER;
+			AddNamedParameter(pdf_write_page_images, "password", LogicalType::VARCHAR);
+			AddNamedParameter(pdf_write_page_images, "dpi", LogicalType::INTEGER);
+			AddNamedParameter(pdf_write_page_images, "first_page", LogicalType::INTEGER);
+			AddNamedParameter(pdf_write_page_images, "last_page", LogicalType::INTEGER);
 			pdf_write_page_images_set.AddFunction(std::move(pdf_write_page_images));
 		}
 	}
@@ -10226,7 +10248,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	TableFunction pdf_qpdf_info("pdf_qpdf_info", {LogicalType::VARCHAR}, PdfQpdfInfoScan, PdfQpdfInfoBind,
 	                            PdfQpdfInfoInit);
-	pdf_qpdf_info.named_parameters["password"] = LogicalType::VARCHAR;
+	AddNamedParameter(pdf_qpdf_info, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(pdf_qpdf_info);
 
 	ScalarFunctionSet pdf_json_set("pdf_json");
