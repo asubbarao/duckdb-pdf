@@ -2358,7 +2358,9 @@ static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
 // omits one leaves it out of input.named_parameters, as before.
 static void AddNamedParameter(TableFunction &fn, const char *name, const LogicalType &type) {
 	auto &signature = fn.GetSignature();
-	auto add = [&](TypedKwargs &options) { options.Add(name, type); };
+	auto add = [&](TypedKwargs &options) {
+		options.Add(name, type);
+	};
 	if (signature.GetTypedKwargs()) {
 		signature.ExtendTypedKwargs(add);
 	} else {

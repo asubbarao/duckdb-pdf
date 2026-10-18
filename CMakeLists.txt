@@ -8,95 +8,97 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
+set(CMAKE_CXX_STANDARD
+    "17"
+    CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Dependencies: poppler-cpp (text + rendering), tesseract + leptonica (OCR).
-# In CI / on POSIX these resolve via pkg-config (brew install poppler tesseract
+# Dependencies: poppler-cpp (text + rendering), tesseract + leptonica (OCR). In
+# CI / on POSIX these resolve via pkg-config (brew install poppler tesseract
 # leptonica, or vcpkg-provided .pc files). On Windows + vcpkg we use the CONFIG
 # packages and find_path/find_library instead, since pkgconf static resolution
 # is unreliable there.
 include_directories(src/include)
 
-# libharu (HPDF) for native in-process write_pdf (no LibreOffice).
-# Use find_path (NOT pkg_check_modules) — brew libharu ships no .pc file.
-# A single find_path(HPDF_INCLUDE_DIR hpdf.h) works for BOTH branches:
-#   * vcpkg/CI (static): vcpkg toolchain + include layout makes find_path locate it;
-#     also the GLOB *.a later will auto-include libhpdf.a (and its libpng.a etc).
-#   * local POSIX (brew): we seed common paths (homebrew on arm64/x86, macports, etc).
-# The include_directories below ensures headers are found for the compile of pdf_extension.cpp.
-find_path(HPDF_INCLUDE_DIR
-	NAMES hpdf.h
-	PATHS
-		${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include
-		/opt/homebrew/opt/libharu/include
-		/usr/local/opt/libharu/include
-		/opt/local/include
-		/usr/local/include
-		/usr/include
-	PATH_SUFFIXES include
-)
+# libharu (HPDF) for native in-process write_pdf (no LibreOffice). Use find_path
+# (NOT pkg_check_modules) — brew libharu ships no .pc file. A single
+# find_path(HPDF_INCLUDE_DIR hpdf.h) works for BOTH branches: * vcpkg/CI
+# (static): vcpkg toolchain + include layout makes find_path locate it; also the
+# GLOB *.a later will auto-include libhpdf.a (and its libpng.a etc). * local
+# POSIX (brew): we seed common paths (homebrew on arm64/x86, macports, etc). The
+# include_directories below ensures headers are found for the compile of
+# pdf_extension.cpp.
+find_path(
+  HPDF_INCLUDE_DIR
+  NAMES hpdf.h
+  PATHS ${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include
+        /opt/homebrew/opt/libharu/include /usr/local/opt/libharu/include
+        /opt/local/include /usr/local/include /usr/include
+  PATH_SUFFIXES include)
 if(HPDF_INCLUDE_DIR)
-	include_directories(${HPDF_INCLUDE_DIR})
-	message(STATUS "pdf: libharu headers at ${HPDF_INCLUDE_DIR}")
+  include_directories(${HPDF_INCLUDE_DIR})
+  message(STATUS "pdf: libharu headers at ${HPDF_INCLUDE_DIR}")
 else()
-	# last resort — compiler may still find it via defaults or prior -I
-	find_path(HPDF_INCLUDE_DIR NAMES hpdf.h)
-	if(HPDF_INCLUDE_DIR)
-		include_directories(${HPDF_INCLUDE_DIR})
-	endif()
+  # last resort — compiler may still find it via defaults or prior -I
+  find_path(HPDF_INCLUDE_DIR NAMES hpdf.h)
+  if(HPDF_INCLUDE_DIR)
+    include_directories(${HPDF_INCLUDE_DIR})
+  endif()
 endif()
 
 # pdf_extension.cpp — DuckDB + poppler (no tesseract/leptonica/qpdf headers).
 # ocr_ops.cpp       — tesseract + leptonica only (no duckdb/poppler/qpdf).
-# qpdf_ops.cpp      — qpdf only, forced C++17 (see below).
-# base14_font_data.cpp — generated: embedded URW base-14 OTFs for poppler.
-# tessdata_embed.cpp  — generated: eng.traineddata (tessdata_fast) for zero-host OCR.
+# qpdf_ops.cpp      — qpdf only, forced C++17 (see below). base14_font_data.cpp
+# — generated: embedded URW base-14 OTFs for poppler. tessdata_embed.cpp  —
+# generated: eng.traineddata (tessdata_fast) for zero-host OCR.
 #
-# Community-extensions ship a single .duckdb_extension binary (no companion
-# data files). Fonts are compiled in and registered via GlobalParams::addFontFile
-# so pdf_redact rasterization works without system fontconfig. English OCR models
+# Community-extensions ship a single .duckdb_extension binary (no companion data
+# files). Fonts are compiled in and registered via GlobalParams::addFontFile so
+# pdf_redact rasterization works without system fontconfig. English OCR models
 # are compiled in and extracted on first use so scanned PDFs work without
 # brew/apt tessdata.
 set(BASE14_FONT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts)
-set(BASE14_FONT_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_base14_fonts.py)
+set(BASE14_FONT_SCRIPT
+    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_base14_fonts.py)
 set(BASE14_FONT_GEN ${CMAKE_CURRENT_BINARY_DIR}/base14_font_data.cpp)
 # Poppler setupBaseFonts (no-fontconfig builds) expects these legacy URW names.
 set(BASE14_FONT_FILES
-  ${BASE14_FONT_DIR}/n019003l.pfb
-  ${BASE14_FONT_DIR}/n019004l.pfb
-  ${BASE14_FONT_DIR}/n019023l.pfb
-  ${BASE14_FONT_DIR}/n019024l.pfb
-  ${BASE14_FONT_DIR}/n021003l.pfb
-  ${BASE14_FONT_DIR}/n021004l.pfb
-  ${BASE14_FONT_DIR}/n021023l.pfb
-  ${BASE14_FONT_DIR}/n021024l.pfb
-  ${BASE14_FONT_DIR}/n022003l.pfb
-  ${BASE14_FONT_DIR}/n022004l.pfb
-  ${BASE14_FONT_DIR}/n022023l.pfb
-  ${BASE14_FONT_DIR}/n022024l.pfb
-  ${BASE14_FONT_DIR}/s050000l.pfb
-  ${BASE14_FONT_DIR}/d050000l.pfb
-)
+    ${BASE14_FONT_DIR}/n019003l.pfb
+    ${BASE14_FONT_DIR}/n019004l.pfb
+    ${BASE14_FONT_DIR}/n019023l.pfb
+    ${BASE14_FONT_DIR}/n019024l.pfb
+    ${BASE14_FONT_DIR}/n021003l.pfb
+    ${BASE14_FONT_DIR}/n021004l.pfb
+    ${BASE14_FONT_DIR}/n021023l.pfb
+    ${BASE14_FONT_DIR}/n021024l.pfb
+    ${BASE14_FONT_DIR}/n022003l.pfb
+    ${BASE14_FONT_DIR}/n022004l.pfb
+    ${BASE14_FONT_DIR}/n022023l.pfb
+    ${BASE14_FONT_DIR}/n022024l.pfb
+    ${BASE14_FONT_DIR}/s050000l.pfb
+    ${BASE14_FONT_DIR}/d050000l.pfb)
 set(TESSDATA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tessdata)
 set(TESSDATA_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_tessdata.py)
 set(TESSDATA_GEN ${CMAKE_CURRENT_BINARY_DIR}/tessdata_embed.cpp)
 set(TESSDATA_FILES ${TESSDATA_DIR}/eng.traineddata)
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
+find_package(
+  Python3
+  COMPONENTS Interpreter
+  REQUIRED)
 add_custom_command(
   OUTPUT ${BASE14_FONT_GEN}
-  COMMAND ${Python3_EXECUTABLE} ${BASE14_FONT_SCRIPT} ${BASE14_FONT_DIR} ${BASE14_FONT_GEN}
+  COMMAND ${Python3_EXECUTABLE} ${BASE14_FONT_SCRIPT} ${BASE14_FONT_DIR}
+          ${BASE14_FONT_GEN}
   DEPENDS ${BASE14_FONT_SCRIPT} ${BASE14_FONT_FILES}
   COMMENT "Embedding URW base-14 substitute fonts into base14_font_data.cpp"
-  VERBATIM
-)
+  VERBATIM)
 add_custom_command(
   OUTPUT ${TESSDATA_GEN}
-  COMMAND ${Python3_EXECUTABLE} ${TESSDATA_SCRIPT} ${TESSDATA_DIR} ${TESSDATA_GEN}
+  COMMAND ${Python3_EXECUTABLE} ${TESSDATA_SCRIPT} ${TESSDATA_DIR}
+          ${TESSDATA_GEN}
   DEPENDS ${TESSDATA_SCRIPT} ${TESSDATA_FILES}
   COMMENT "Embedding tessdata_fast eng into tessdata_embed.cpp"
-  VERBATIM
-)
+  VERBATIM)
 set(EXTENSION_SOURCES
     src/pdf_extension.cpp
     src/ocr_ops.cpp
@@ -113,20 +115,24 @@ set_source_files_properties(${BASE14_FONT_GEN} PROPERTIES GENERATED TRUE)
 set_source_files_properties(${TESSDATA_GEN} PROPERTIES GENERATED TRUE)
 
 # C++ isolation (NOT on pdf_extension.cpp — ODR with C++11 libduckdb_static):
-#   qpdf_ops.cpp — qpdf headers need C++17 (string_view).
-#   ocr_renderer.cpp — Tesseract's renderer.h needs C++14 (deduced return type).
-#   poppler_private_ops.cpp + base14_font_data.cpp — GlobalParams.h / Error.h
-#     from poppler private-api now need C++20 (std::span, string::starts_with /
-#     ends_with). C++17 is not enough on current vcpkg poppler. C++11 still
-#     cannot parse them; private-api feature installs the headers.
-# Per-source COMPILE_OPTIONS (not target CXX_STANDARD).
+# qpdf_ops.cpp — qpdf headers need C++17 (string_view). ocr_renderer.cpp —
+# Tesseract's renderer.h needs C++14 (deduced return type).
+# poppler_private_ops.cpp + base14_font_data.cpp — GlobalParams.h / Error.h from
+# poppler private-api now need C++20 (std::span, string::starts_with /
+# ends_with). C++17 is not enough on current vcpkg poppler. C++11 still cannot
+# parse them; private-api feature installs the headers. Per-source
+# COMPILE_OPTIONS (not target CXX_STANDARD).
 set(_PDF_CXX17 "$<IF:$<CXX_COMPILER_ID:MSVC>,/std:c++17,-std=c++17>")
 set(_PDF_CXX14 "$<IF:$<CXX_COMPILER_ID:MSVC>,/std:c++14,-std=c++14>")
 set(_PDF_CXX20 "$<IF:$<CXX_COMPILER_ID:MSVC>,/std:c++20,-std=c++20>")
-set_source_files_properties(src/qpdf_ops.cpp PROPERTIES COMPILE_OPTIONS "${_PDF_CXX17}")
-set_source_files_properties(src/ocr_renderer.cpp PROPERTIES COMPILE_OPTIONS "${_PDF_CXX14}")
-set_source_files_properties(src/poppler_private_ops.cpp PROPERTIES COMPILE_OPTIONS "${_PDF_CXX20}")
-set_source_files_properties(${BASE14_FONT_GEN} PROPERTIES COMPILE_OPTIONS "${_PDF_CXX20}")
+set_source_files_properties(src/qpdf_ops.cpp PROPERTIES COMPILE_OPTIONS
+                                                        "${_PDF_CXX17}")
+set_source_files_properties(src/ocr_renderer.cpp PROPERTIES COMPILE_OPTIONS
+                                                            "${_PDF_CXX14}")
+set_source_files_properties(src/poppler_private_ops.cpp
+                            PROPERTIES COMPILE_OPTIONS "${_PDF_CXX20}")
+set_source_files_properties(${BASE14_FONT_GEN} PROPERTIES COMPILE_OPTIONS
+                                                          "${_PDF_CXX20}")
 
 if(NOT WIN32)
   # ---- POSIX path: pkg-config ----
@@ -135,22 +141,24 @@ if(NOT WIN32)
   if(VCPKG_TOOLCHAIN)
     # ---- vcpkg (static) path: the community-extensions CI ----
     # vcpkg ships poppler/tesseract/leptonica as STATIC archives. We use
-    # pkg-config only to locate headers + the install lib dir; we do NOT trust its
-    # link line. vcpkg builds tesseract with CMake, and the generated tesseract.pc
-    # does not declare the full transitive static closure: libtesseract.a
-    # references libcurl + libarchive (traineddata download / archive reading),
-    # which in turn pull in ssl/crypto/zstd/lzma/bz2/..., and libpoppler.a
-    # references freetype/harfbuzz/jpeg/png/openjpeg/zlib. `pkg-config --static`
-    # silently omits any of these not reachable via Requires.private, so the final
-    # link fails with undefined curl_easy_*/archive_* symbols.
+    # pkg-config only to locate headers + the install lib dir; we do NOT trust
+    # its link line. vcpkg builds tesseract with CMake, and the generated
+    # tesseract.pc does not declare the full transitive static closure:
+    # libtesseract.a references libcurl + libarchive (traineddata download /
+    # archive reading), which in turn pull in ssl/crypto/zstd/lzma/bz2/..., and
+    # libpoppler.a references freetype/harfbuzz/jpeg/png/openjpeg/zlib.
+    # `pkg-config --static` silently omits any of these not reachable via
+    # Requires.private, so the final link fails with undefined
+    # curl_easy_*/archive_* symbols.
     #
-    # Rather than hand-maintain a fragile dependency list, link EVERY archive vcpkg
-    # installed: over-linking is harmless for a static link (the linker pulls in
-    # only objects that resolve a referenced symbol). This mirrors the Windows
-    # branch below. Crucially the archives are attached to the *static* extension
-    # target so the closure also propagates into DuckDB's own executables
-    # (duckdb / unittest / plan_serializer), which link the extension by target
-    # name and -- unlike a shared library -- do not tolerate unresolved symbols.
+    # Rather than hand-maintain a fragile dependency list, link EVERY archive
+    # vcpkg installed: over-linking is harmless for a static link (the linker
+    # pulls in only objects that resolve a referenced symbol). This mirrors the
+    # Windows branch below. Crucially the archives are attached to the *static*
+    # extension target so the closure also propagates into DuckDB's own
+    # executables (duckdb / unittest / plan_serializer), which link the
+    # extension by target name and -- unlike a shared library -- do not tolerate
+    # unresolved symbols.
     pkg_check_modules(POPPLER_CPP REQUIRED poppler-cpp)
     # Core libpoppler headers (Error.h, GlobalParams.h) — NOT re-exported by
     # poppler-cpp. Required for setErrorCallback (fail-loudly) and
@@ -174,12 +182,12 @@ if(NOT WIN32)
       endif()
     endforeach()
     list(REMOVE_DUPLICATES _PDF_POPPLER_INCS)
-    pkg_check_modules(TESSERACT   REQUIRED tesseract)
-    pkg_check_modules(LEPTONICA   REQUIRED lept)
+    pkg_check_modules(TESSERACT REQUIRED tesseract)
+    pkg_check_modules(LEPTONICA REQUIRED lept)
     # qpdf (pdf_merge/pdf_split/pdf_rotate): pkg-config only for headers —
     # libqpdf.a joins the link via the GLOB over-link below like every other
-    # vcpkg archive. Built with default-features OFF, so qpdf uses its
-    # built-in native crypto (no openssl/gnutls in the closure).
+    # vcpkg archive. Built with default-features OFF, so qpdf uses its built-in
+    # native crypto (no openssl/gnutls in the closure).
     pkg_check_modules(LIBQPDF REQUIRED libqpdf)
     # OpenSSL for pdf_signatures CMS/PKCS#7 verification (tier 2). We need only
     # the headers here — vcpkg installs libssl.a / libcrypto.a into the same lib
@@ -187,16 +195,21 @@ if(NOT WIN32)
     # vcpkg archive. (This is OUR dependency, not qpdf's; qpdf still uses its
     # built-in native crypto with default-features OFF.)
     pkg_check_modules(OPENSSL REQUIRED openssl)
-    include_directories(${_PDF_POPPLER_INCS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
-                        ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+    include_directories(
+      ${_PDF_POPPLER_INCS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
+      ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
     # Targets are created before this block; pin includes on them so the
     # generated base14_font_data.cpp (and every other TU) sees core poppler.
-    target_include_directories(${EXTENSION_NAME} PRIVATE
-      ${_PDF_POPPLER_INCS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
-      ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
-    target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
-      ${_PDF_POPPLER_INCS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
-      ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+    target_include_directories(
+      ${EXTENSION_NAME}
+      PRIVATE ${_PDF_POPPLER_INCS} ${TESSERACT_INCLUDE_DIRS}
+              ${LEPTONICA_INCLUDE_DIRS} ${LIBQPDF_INCLUDE_DIRS}
+              ${OPENSSL_INCLUDE_DIRS})
+    target_include_directories(
+      ${LOADABLE_EXTENSION_NAME}
+      PRIVATE ${_PDF_POPPLER_INCS} ${TESSERACT_INCLUDE_DIRS}
+              ${LEPTONICA_INCLUDE_DIRS} ${LIBQPDF_INCLUDE_DIRS}
+              ${OPENSSL_INCLUDE_DIRS})
 
     if(DEFINED TESSERACT_LIBDIR AND EXISTS "${TESSERACT_LIBDIR}")
       set(VCPKG_STATIC_LIBDIR "${TESSERACT_LIBDIR}")
@@ -205,25 +218,31 @@ if(NOT WIN32)
     endif()
     file(GLOB VCPKG_STATIC_ARCHIVES "${VCPKG_STATIC_LIBDIR}/*.a")
     if(NOT VCPKG_STATIC_ARCHIVES)
-      message(FATAL_ERROR "pdf: no static archives found under '${VCPKG_STATIC_LIBDIR}'")
+      message(
+        FATAL_ERROR
+          "pdf: no static archives found under '${VCPKG_STATIC_LIBDIR}'")
     endif()
 
-    # DROP vcpkg's mbedTLS archives (libmbedcrypto/libmbedtls/libmbedx509) from the
-    # over-link set: DuckDB statically bundles its OWN mbedTLS inside
+    # DROP vcpkg's mbedTLS archives (libmbedcrypto/libmbedtls/libmbedx509) from
+    # the over-link set: DuckDB statically bundles its OWN mbedTLS inside
     # libduckdb_static.a (third_party/mbedtls -> cipher_wrap.cpp.o etc.). curl —
     # pulled in transitively by tesseract — references mbedTLS symbols, and the
     # pdf_to_svg PNG-writer code path now reaches that closure, so ld would
-    # otherwise pull cipher_wrap.c.o from BOTH vcpkg's libmbedcrypto.a AND DuckDB's
-    # bundled copy, yielding `duplicate symbol _mbedtls_cipher_definitions /
-    # _mbedtls_cipher_base_lookup_table`. macOS ld64 errors hard on that (Linux's
-    # --start-group merely picks the first, which is why only MacOS failed). Letting
-    # DuckDB's bundled mbedTLS satisfy those references resolves the collision; the
-    # vcpkg curl/poppler objects link against the bundled symbols instead.
+    # otherwise pull cipher_wrap.c.o from BOTH vcpkg's libmbedcrypto.a AND
+    # DuckDB's bundled copy, yielding `duplicate symbol
+    # _mbedtls_cipher_definitions / _mbedtls_cipher_base_lookup_table`. macOS
+    # ld64 errors hard on that (Linux's --start-group merely picks the first,
+    # which is why only MacOS failed). Letting DuckDB's bundled mbedTLS satisfy
+    # those references resolves the collision; the vcpkg curl/poppler objects
+    # link against the bundled symbols instead.
     set(VCPKG_STATIC_ARCHIVES_FILTERED "")
     foreach(_lib ${VCPKG_STATIC_ARCHIVES})
       get_filename_component(_libname "${_lib}" NAME)
       if(_libname MATCHES "^libmbed")
-        message(STATUS "pdf: excluding vcpkg mbedTLS archive from over-link (DuckDB bundles its own): ${_libname}")
+        message(
+          STATUS
+            "pdf: excluding vcpkg mbedTLS archive from over-link (DuckDB bundles its own): ${_libname}"
+        )
       else()
         list(APPEND VCPKG_STATIC_ARCHIVES_FILTERED "${_lib}")
       endif()
@@ -231,26 +250,28 @@ if(NOT WIN32)
     set(VCPKG_STATIC_ARCHIVES ${VCPKG_STATIC_ARCHIVES_FILTERED})
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-      # GNU ld is single-pass; wrap the whole archive set in a group so the cyclic
-      # deps among poppler/tesseract/leptonica/curl/archive/crypto/freetype resolve
+      # GNU ld is single-pass; wrap the whole archive set in a group so the
+      # cyclic deps among
+      # poppler/tesseract/leptonica/curl/archive/crypto/freetype resolve
       # regardless of order. (mach-o ld is multi-pass and neither needs nor
       # supports this, so it is Linux-only.)
-      set(PDF_POSIX_LINK -Wl,--start-group ${VCPKG_STATIC_ARCHIVES} -Wl,--end-group)
+      set(PDF_POSIX_LINK -Wl,--start-group ${VCPKG_STATIC_ARCHIVES}
+                         -Wl,--end-group)
     else()
-      # macOS: ld64 resolves archives order-independently, so no group is needed.
-      # The static closure pulls in macOS *system* dependencies that are not vcpkg
-      # archives and must be linked explicitly:
-      #   * libiconv      — poppler-cpp's ustring::to_utf8 / from_utf8 call iconv.
-      #   * CoreFoundation + SystemConfiguration — libcurl (pulled in by tesseract)
-      #     references _CFRelease and _SCDynamicStoreCopyProxies to read the macOS
-      #     system proxy configuration.
-      #   * Security — libcurl apple TLS verify (_SecTrustEvaluateWithError, …).
-      # (On Linux iconv lives in glibc and curl needs no frameworks.)
+      # macOS: ld64 resolves archives order-independently, so no group is
+      # needed. The static closure pulls in macOS *system* dependencies that are
+      # not vcpkg archives and must be linked explicitly: * libiconv      —
+      # poppler-cpp's ustring::to_utf8 / from_utf8 call iconv. * CoreFoundation
+      # + SystemConfiguration — libcurl (pulled in by tesseract) references
+      # _CFRelease and _SCDynamicStoreCopyProxies to read the macOS system proxy
+      # configuration. * Security — libcurl apple TLS verify
+      # (_SecTrustEvaluateWithError, …). (On Linux iconv lives in glibc and curl
+      # needs no frameworks.)
       find_library(PDF_COREFOUNDATION CoreFoundation REQUIRED)
       find_library(PDF_SYSTEMCONFIGURATION SystemConfiguration REQUIRED)
       find_library(PDF_SECURITY Security REQUIRED)
-      set(PDF_POSIX_LINK ${VCPKG_STATIC_ARCHIVES} -liconv
-          ${PDF_COREFOUNDATION} ${PDF_SYSTEMCONFIGURATION} ${PDF_SECURITY})
+      set(PDF_POSIX_LINK ${VCPKG_STATIC_ARCHIVES} -liconv ${PDF_COREFOUNDATION}
+                         ${PDF_SYSTEMCONFIGURATION} ${PDF_SECURITY})
     endif()
 
     target_link_libraries(${EXTENSION_NAME} ${PDF_POSIX_LINK})
@@ -266,43 +287,60 @@ if(NOT WIN32)
     # setErrorCallback from <Error.h> to fail loudly when display fonts are
     # missing. Direct link is required so the symbol resolves at link time.
     pkg_check_modules(POPPLER REQUIRED IMPORTED_TARGET poppler)
-    pkg_check_modules(TESSERACT   REQUIRED IMPORTED_TARGET tesseract)
-    pkg_check_modules(LEPTONICA   REQUIRED IMPORTED_TARGET lept)
+    pkg_check_modules(TESSERACT REQUIRED IMPORTED_TARGET tesseract)
+    pkg_check_modules(LEPTONICA REQUIRED IMPORTED_TARGET lept)
     # qpdf (pdf_merge/pdf_split/pdf_rotate): brew/apt qpdf ships libqpdf.pc.
-    pkg_check_modules(LIBQPDF     REQUIRED IMPORTED_TARGET libqpdf)
-    # OpenSSL for pdf_signatures CMS/PKCS#7 verification (tier 2). Dynamic on the
-    # shared path, so link the IMPORTED_TARGET explicitly.
-    pkg_check_modules(OPENSSL     REQUIRED IMPORTED_TARGET openssl)
-    include_directories(${POPPLER_CPP_INCLUDE_DIRS} ${POPPLER_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
-                        ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+    pkg_check_modules(LIBQPDF REQUIRED IMPORTED_TARGET libqpdf)
+    # OpenSSL for pdf_signatures CMS/PKCS#7 verification (tier 2). Dynamic on
+    # the shared path, so link the IMPORTED_TARGET explicitly.
+    pkg_check_modules(OPENSSL REQUIRED IMPORTED_TARGET openssl)
+    include_directories(
+      ${POPPLER_CPP_INCLUDE_DIRS} ${POPPLER_INCLUDE_DIRS}
+      ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}
+      ${LIBQPDF_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
 
-    # zlib: qpdf_ops.cpp's minimal PNG encoder (pdf_images) calls crc32/compress2
-    # directly. libqpdf links zlib for itself but does not re-export it, so we
-    # must link it ourselves. It is a system dylib on macOS/apt.
+    # zlib: qpdf_ops.cpp's minimal PNG encoder (pdf_images) calls
+    # crc32/compress2 directly. libqpdf links zlib for itself but does not
+    # re-export it, so we must link it ourselves. It is a system dylib on
+    # macOS/apt.
     find_package(ZLIB REQUIRED)
 
     # ${CMAKE_DL_LIBS} is libdl on Linux (needed for the external OCR plugin
-    # dlopen path in ocr_ops.cpp) and empty on macOS where dlopen is in libSystem.
-    target_link_libraries(${EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::POPPLER PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB
+    # dlopen path in ocr_ops.cpp) and empty on macOS where dlopen is in
+    # libSystem.
+    target_link_libraries(
+      ${EXTENSION_NAME}
+      PkgConfig::POPPLER_CPP
+      PkgConfig::POPPLER
+      PkgConfig::TESSERACT
+      PkgConfig::LEPTONICA
+      PkgConfig::LIBQPDF
+      PkgConfig::OPENSSL
+      ZLIB::ZLIB
       ${CMAKE_DL_LIBS})
-    target_link_libraries(${LOADABLE_EXTENSION_NAME}
-      PkgConfig::POPPLER_CPP PkgConfig::POPPLER PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBQPDF PkgConfig::OPENSSL ZLIB::ZLIB
+    target_link_libraries(
+      ${LOADABLE_EXTENSION_NAME}
+      PkgConfig::POPPLER_CPP
+      PkgConfig::POPPLER
+      PkgConfig::TESSERACT
+      PkgConfig::LEPTONICA
+      PkgConfig::LIBQPDF
+      PkgConfig::OPENSSL
+      ZLIB::ZLIB
       ${CMAKE_DL_LIBS})
 
-    # libharu for write_pdf (local brew path). Dynamic dylib; find explicitly (no pkg-config).
-    # Transitive (libpng, zlib) are satisfied by the dylib itself at runtime.
-    find_library(HPDF_LIBRARY
+    # libharu for write_pdf (local brew path). Dynamic dylib; find explicitly
+    # (no pkg-config). Transitive (libpng, zlib) are satisfied by the dylib
+    # itself at runtime.
+    find_library(
+      HPDF_LIBRARY
       NAMES hpdf libhpdf HPDF
-      PATHS
-        /opt/homebrew/opt/libharu/lib
-        /usr/local/opt/libharu/lib
-        /opt/local/lib
-        /usr/local/lib
-        /usr/lib
-    )
+      PATHS /opt/homebrew/opt/libharu/lib /usr/local/opt/libharu/lib
+            /opt/local/lib /usr/local/lib /usr/lib)
     if(NOT HPDF_LIBRARY)
-      message(FATAL_ERROR "pdf: libharu (libhpdf.dylib) not found. Run: brew install libharu")
+      message(
+        FATAL_ERROR
+          "pdf: libharu (libhpdf.dylib) not found. Run: brew install libharu")
     endif()
     target_link_libraries(${EXTENSION_NAME} ${HPDF_LIBRARY})
     target_link_libraries(${LOADABLE_EXTENSION_NAME} ${HPDF_LIBRARY})
@@ -313,33 +351,44 @@ else()
   find_package(Leptonica CONFIG REQUIRED)
 
   # poppler-cpp has no CMake config export; locate it manually. vcpkg installs
-  # headers under <prefix>/include/poppler/cpp and the import lib as poppler-cpp.lib.
-  find_path(POPPLER_CPP_INCLUDE_DIR
+  # headers under <prefix>/include/poppler/cpp and the import lib as
+  # poppler-cpp.lib.
+  find_path(
+    POPPLER_CPP_INCLUDE_DIR
     NAMES poppler-document.h
     PATH_SUFFIXES poppler/cpp)
   find_library(POPPLER_CPP_LIBRARY NAMES poppler-cpp)
   find_library(POPPLER_LIBRARY NAMES poppler)
 
   if(NOT POPPLER_CPP_INCLUDE_DIR OR NOT POPPLER_CPP_LIBRARY)
-    message(FATAL_ERROR "poppler-cpp not found (include=${POPPLER_CPP_INCLUDE_DIR} lib=${POPPLER_CPP_LIBRARY})")
+    message(
+      FATAL_ERROR
+        "poppler-cpp not found (include=${POPPLER_CPP_INCLUDE_DIR} lib=${POPPLER_CPP_LIBRARY})"
+    )
   endif()
 
   # Include both the cpp subdir (for poppler-document.h etc.) and its parent,
   # plus the top-level vcpkg include dir (for tesseract/baseapi.h,
   # leptonica/allheaders.h). POPPLER_INCLUDE_PARENT is <prefix>/include/poppler;
   # its parent is <prefix>/include.
-  get_filename_component(POPPLER_INCLUDE_PARENT "${POPPLER_CPP_INCLUDE_DIR}" DIRECTORY)
-  get_filename_component(VCPKG_INCLUDE_DIR "${POPPLER_INCLUDE_PARENT}" DIRECTORY)
-  include_directories(${POPPLER_CPP_INCLUDE_DIR} ${POPPLER_INCLUDE_PARENT} ${VCPKG_INCLUDE_DIR})
+  get_filename_component(POPPLER_INCLUDE_PARENT "${POPPLER_CPP_INCLUDE_DIR}"
+                         DIRECTORY)
+  get_filename_component(VCPKG_INCLUDE_DIR "${POPPLER_INCLUDE_PARENT}"
+                         DIRECTORY)
+  include_directories(${POPPLER_CPP_INCLUDE_DIR} ${POPPLER_INCLUDE_PARENT}
+                      ${VCPKG_INCLUDE_DIR})
 
   # qpdf (pdf_merge/pdf_split/pdf_rotate): headers live under the same vcpkg
   # include dir added above (<prefix>/include/qpdf/...), and qpdf.lib joins the
-  # link via the whole-directory GLOB below. Probe for it here only so a
-  # missing vcpkg qpdf install fails at configure time with a clear message
-  # instead of at link time.
+  # link via the whole-directory GLOB below. Probe for it here only so a missing
+  # vcpkg qpdf install fails at configure time with a clear message instead of
+  # at link time.
   find_library(QPDF_LIBRARY NAMES qpdf libqpdf)
   if(NOT QPDF_LIBRARY)
-    message(FATAL_ERROR "pdf: qpdf not found in the vcpkg installed tree (is \"qpdf\" in vcpkg.json?)")
+    message(
+      FATAL_ERROR
+        "pdf: qpdf not found in the vcpkg installed tree (is \"qpdf\" in vcpkg.json?)"
+    )
   endif()
 
   # poppler-cpp/poppler/tesseract/leptonica are static libs; on Windows the
@@ -348,7 +397,8 @@ else()
   # libarchive + openssl for model download/traineddata reading) is NOT resolved
   # automatically the way pkg-config does on POSIX. Link the whole vcpkg static
   # lib directory: over-linking is harmless for a static link (the linker only
-  # pulls in referenced objects) and guarantees every transitive symbol resolves.
+  # pulls in referenced objects) and guarantees every transitive symbol
+  # resolves.
   get_filename_component(VCPKG_LIB_DIR "${POPPLER_CPP_LIBRARY}" DIRECTORY)
   file(GLOB VCPKG_ALL_LIBS "${VCPKG_LIB_DIR}/*.lib")
 
@@ -365,7 +415,9 @@ else()
   # tesseract pulls in): crypt32/secur32/bcrypt (TLS/crypto), ws2_32/iphlpapi
   # (sockets), xmllite (libarchive XAR), wldap32/normaliz (curl), plus the
   # common advapi32/user32/crypt helpers.
-  list(APPEND WIN_PDF_LIBS
+  list(
+    APPEND
+    WIN_PDF_LIBS
     legacy_stdio_definitions.lib
     crypt32.lib
     secur32.lib
@@ -383,9 +435,8 @@ else()
   # duckdb_static, or the link fails — either LNK2038 (RuntimeLibrary MD vs MT
   # mismatch) or LNK2005 duplicate-CRT-symbol errors (e.g. std::codecvt defined
   # in both msvcprt.lib/MSVCP140.dll and the static libs). The CRT is determined
-  # by the vcpkg triplet:
-  #   x64-windows-static-release  -> static CRT (/MT)   [community-extensions CI]
-  #   x64-windows-static-md       -> dynamic CRT (/MD)
+  # by the vcpkg triplet: x64-windows-static-release  -> static CRT (/MT)
+  # [community-extensions CI] x64-windows-static-md       -> dynamic CRT (/MD)
   # Pick to match. Requires policy CMP0091=NEW (MSVC_RUNTIME_LIBRARY), which
   # DuckDB's build already sets.
   if(VCPKG_TARGET_TRIPLET MATCHES "-md")
@@ -393,10 +444,10 @@ else()
   else()
     set(PDF_MSVC_RUNTIME "MultiThreaded")
   endif()
-  set_property(TARGET ${EXTENSION_NAME} PROPERTY
-    MSVC_RUNTIME_LIBRARY "${PDF_MSVC_RUNTIME}")
-  set_property(TARGET ${LOADABLE_EXTENSION_NAME} PROPERTY
-    MSVC_RUNTIME_LIBRARY "${PDF_MSVC_RUNTIME}")
+  set_property(TARGET ${EXTENSION_NAME} PROPERTY MSVC_RUNTIME_LIBRARY
+                                                 "${PDF_MSVC_RUNTIME}")
+  set_property(TARGET ${LOADABLE_EXTENSION_NAME} PROPERTY MSVC_RUNTIME_LIBRARY
+                                                          "${PDF_MSVC_RUNTIME}")
 
   target_link_libraries(${EXTENSION_NAME} ${WIN_PDF_LIBS})
   target_link_libraries(${LOADABLE_EXTENSION_NAME} ${WIN_PDF_LIBS})
