@@ -12,43 +12,45 @@ export DUCKDB_TEST_AUTOLOADING=all
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
-# Autoloading changes what `require pdf` means: instead of the extension linked
-# into the test binary, the runner does INSTALL pdf FROM <local repo> and loads
-# the result out of ~/.duckdb/extensions. INSTALL is a no-op when a copy is
-# already there, so without this the suite silently tests whatever was built
-# last time — a green run that never saw your changes. FORCE overwrites it.
-FORCE_INSTALL_LOCAL = ./build/$(1)/duckdb -unsigned -c \
-	"FORCE INSTALL $(EXT_NAME) FROM '$(PROJ_DIR)build/$(1)/repository';"
-
-test_release_internal: force_install_release
-test_debug_internal: force_install_debug
-test_reldebug_internal: force_install_reldebug
-
-# The runner autoinstalls only from build/<type>/repository, which holds what
-# this tree builds — and httpfs is not among it. So the network tests need the
-# published httpfs installed before they run; without it their first remote
-# statement fails with "Failed to install local extension httpfs". Only when
-# they are enabled, so an offline `make test` never reaches for the network.
-ifneq ($(PDF_NETWORK_TESTS),)
-INSTALL_HTTPFS = ./build/$(1)/duckdb -c "INSTALL httpfs;"
+# `make test` runs DuckDB's scripts/ci/run_tests.py. By default it reports a file
+# skipped at `require pdf` as a pass, so a build whose test binary cannot load
+# the extension goes green having run nothing (every CI job did, from the move to
+# DuckDB 2.0 until this was added). --fail-require-skip fails the batch instead.
+# Skips at `require-env` (opt-in network and LibreOffice tests) still pass.
+ifneq ($(TEST_RUNNER),)
+TEST_RUNNER += --fail-require-skip
 endif
 
-force_install_release:
-	@$(call FORCE_INSTALL_LOCAL,release)
-	@$(call INSTALL_HTTPFS,release)
-force_install_debug:
-	@$(call FORCE_INSTALL_LOCAL,debug)
-	@$(call INSTALL_HTTPFS,debug)
-force_install_reldebug:
-	@$(call FORCE_INSTALL_LOCAL,reldebug)
-	@$(call INSTALL_HTTPFS,reldebug)
+# The network tests need httpfs, which this tree does not build. In DuckDB 2.0
+# the runner gives every test file a fresh HOME and autoinstalls from the build's
+# own repository (build/<type>/repository/<version>/<platform>), so an httpfs
+# installed into ~/.duckdb is never seen. Install the published one straight into
+# that repository instead. Only when the network tests are on, and only where the
+# tests actually run (not the outside-docker pass on Linux, which skips them).
+ifneq ($(PDF_NETWORK_TESTS),)
+ifneq ($(SKIP_TESTS),1)
+test_release: httpfs_into_repository_release
+test_debug: httpfs_into_repository_debug
+test_reldebug: httpfs_into_repository_reldebug
+endif
+endif
 
-.PHONY: force_install_release force_install_debug force_install_reldebug
+INSTALL_HTTPFS_INTO_REPOSITORY = HOME='$(PROJ_DIR)build/$(1)/httpfs_home' ./build/$(1)/duckdb -c \
+	"SET extension_directory = '$(PROJ_DIR)build/$(1)/repository'; INSTALL httpfs;"
+
+httpfs_into_repository_release:
+	$(call INSTALL_HTTPFS_INTO_REPOSITORY,release)
+httpfs_into_repository_debug:
+	$(call INSTALL_HTTPFS_INTO_REPOSITORY,debug)
+httpfs_into_repository_reldebug:
+	$(call INSTALL_HTTPFS_INTO_REPOSITORY,reldebug)
+
+.PHONY: httpfs_into_repository_release httpfs_into_repository_debug httpfs_into_repository_reldebug
 
 # What `make test` must be testing: the version of the artifact just built.
 # Compared against the loaded extension by test/sql/zz_build_guard.test, so a
-# direct `unittest` invocation against a stale ~/.duckdb/extensions copy fails
-# loudly instead of silently testing yesterday's build.
+# test binary that loads some other copy of the extension fails loudly instead
+# of silently testing yesterday's build.
 PDF_BUILT_VERSION = $(shell ./build/release/duckdb -unsigned -noheader -list -c \
 	"LOAD '$(PROJ_DIR)build/release/extension/$(EXT_NAME)/$(EXT_NAME).duckdb_extension'; \
 	 SELECT extension_version FROM duckdb_extensions() WHERE extension_name='$(EXT_NAME)';" 2>/dev/null | tail -1)
