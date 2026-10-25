@@ -4,6 +4,11 @@
 
 require pdf
 
+query I
+SELECT library_version = 'v2.0.0' AND starts_with(source_id, 'd54cbbe3df') FROM pragma_version();
+----
+true
+
 require-env EXPECTED_EXT_VERSION
 
 query I

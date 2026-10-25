@@ -6,6 +6,12 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 DUCKDB_GIT_VERSION ?= v2.0.0
 OVERRIDE_GIT_DESCRIBE ?= v2.0.0
 
+# Staging archives can report an alpha version even for the release commit.
+# Build the pinned stable host so extension repository paths and ABI agree.
+DUCKDB_PREBUILT_LIBRARY :=
+DUCKDB_PREBUILT_EXTENSIONS :=
+EXT_FLAGS += -DPREBUILT_BINARY= -DPREBUILT_EXTENSIONS=
+
 # The URL tests need httpfs, which is not linked into the test binary; the
 # sqllogictest runner only loads it when autoloading is allowed. Without this
 # they are skipped at `require httpfs` and never run at all.
