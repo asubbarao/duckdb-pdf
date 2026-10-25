@@ -1,0 +1,27 @@
+# name: test/sql/pdf_native_protocol.test
+# description: Typed PDF rows and VARIANT survive DuckDB's native Quack transport
+# group: [sql]
+
+require-env PDF_NETWORK_TESTS
+
+require pdf
+
+require httpfs
+
+require quack
+
+statement ok
+CALL quack_serve('quack:127.0.0.1:29328', token := 'pdf-native-test');
+
+query III
+SELECT page, document.page_count::INTEGER, typeof(document)
+FROM quack_query('quack:127.0.0.1:29328',
+    $sql$SELECT page, {'page_count': page_count, 'text': text}::VARIANT AS document
+    FROM read_pdf('test/data/two_pages.pdf') ORDER BY page$sql$,
+    token := 'pdf-native-test');
+----
+1	2	VARIANT
+2	2	VARIANT
+
+statement ok
+CALL quack_stop('quack:127.0.0.1:29328');

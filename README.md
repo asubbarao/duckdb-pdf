@@ -34,9 +34,21 @@ ordinary PDF readers.
 
 ## Installation
 
+The DuckDB 2.0 readers use the engine's native multi-file scan and async read-ahead
+machinery. File opening and byte reads use the `async_threads` pool; decoding runs
+on query workers. Read tasks report their byte sizes to native read-ahead admission.
+`async_threads = 0` or `read_ahead_depth = 0` selects the native synchronous path.
+Reads check DuckDB's native deadline between bounded byte reads and before further
+filesystem requests. An HTTP HEAD request already in flight still follows the
+selected DuckDB HTTP transport's timeout and retry settings, as with native readers.
+Page scans preserve parallel page claiming and projection avoids text extraction
+and OCR when only metadata columns are needed. Inspection, word, line, layout,
+chunk, table, form, signature and image readers share the same file scheduler.
+Existing result schemas and strict/`ignore_errors` behavior remain unchanged.
+
 ### Supported DuckDB host
 
-**DuckDB v1.5.6 only** — linux_amd64/arm64, osx_amd64/arm64, windows_amd64.
+**DuckDB v2.0.0** — linux_amd64/arm64, osx_amd64/arm64, windows_amd64.
 
 ### Community (signed)
 
@@ -45,7 +57,7 @@ INSTALL pdf FROM community;
 LOAD pdf;
 ```
 
-Requires **DuckDB v1.5.6**. Or:
+Requires **DuckDB v2.0.0**. Or:
 
 ```sql
 INSTALL pdf FROM 'https://community-extensions.duckdb.org';
@@ -55,21 +67,26 @@ LOAD pdf;
 ### GitHub Release (offline / unsigned)
 
 ```text
-pdf-duckdb-v1.5.6-linux_amd64.duckdb_extension
-pdf-duckdb-v1.5.6-windows_amd64.duckdb_extension
-pdf-duckdb-v1.5.6-osx_arm64.duckdb_extension
+pdf-duckdb-v2.0.0-linux_amd64.duckdb_extension
+pdf-duckdb-v2.0.0-windows_amd64.duckdb_extension
+pdf-duckdb-v2.0.0-osx_arm64.duckdb_extension
 …
 ```
 
 ```sh
 curl -fsSL -o pdf.duckdb_extension \
-  "https://github.com/asubbarao/duckdb-pdf/releases/download/<tag>/pdf-duckdb-v1.5.6-osx_arm64.duckdb_extension"
+  "https://github.com/asubbarao/duckdb-pdf/releases/download/<tag>/pdf-duckdb-v2.0.0-osx_arm64.duckdb_extension"
 duckdb -unsigned -c "LOAD '$(pwd)/pdf.duckdb_extension';"
 ```
 
 ## Read & extract
 
 Six table functions read a PDF at six grains, plus scalar converters for whole-document output. All of them take a single path or a glob; the extraction never leaves the DuckDB process.
+
+`read_pdf` uses native projection pushdown: metadata-only queries skip text
+extraction and OCR. Selecting `text`, `used_ocr` or `ocr_confidence` runs the OCR
+path when requested; selecting `has_text_layer` inspects embedded text without
+running OCR. Files still use DuckDB's filesystem and secrets for remote access.
 
 Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and `read_pdf_tables`:
 

@@ -417,10 +417,12 @@ WHERE element_type = 'heading' AND text = 'RUNNING HEADER';
 
 # ── error handling ────────────────────────────────────────────────────────────
 
+# Native filesystem errors may normalize this to an absolute Windows path.
+# Assert the missing path while accepting either directory separator.
 statement error
 SELECT * FROM read_pdf_elements('test/data/no_such_file.pdf');
 ----
-test/data/no_such_file.pdf
+<REGEX>:.*test[/\\]data[/\\]no_such_file\.pdf.*
 
 statement error
 SELECT * FROM read_pdf_elements('test/data/two_pages.pdf', first_page := 0);

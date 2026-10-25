@@ -1,0 +1,120 @@
+# name: test/sql/pdf_native_async.test
+# description: DuckDB owns asynchronous PDF file opens, projection and repeated execution
+# group: [sql]
+
+require pdf
+
+statement ok
+SET threads = 1;
+
+statement ok
+SET async_threads = 2;
+
+statement ok
+CALL enable_logging(['AsyncTaskSchedule'], level := 'debug', storage := 'memory');
+
+query II
+SELECT page, page_count FROM read_pdf('test/data/two_pages.pdf') ORDER BY page;
+----
+1	2
+2	2
+
+# Inspect the engine's scheduler, rather than an extension-maintained counter.
+query I
+SELECT len(list(message)) > 0 FROM duckdb_logs()
+WHERE type = 'AsyncTaskSchedule' AND contains(message, 'READ_AHEAD');
+----
+true
+
+statement ok
+PREPARE native_pdf AS SELECT page, text FROM read_pdf('test/data/two_pages.pdf') ORDER BY page;
+
+query II
+SELECT len(list(page)), bool_and(text IS NOT NULL)
+FROM read_pdf('test/data/two_pages.pdf');
+----
+2	true
+
+statement ok
+EXECUTE native_pdf;
+
+statement ok
+EXECUTE native_pdf;
+
+# Every reader owns one file per native scan. Copies of a prepared plan must
+# preserve the extraction options and not retain an exhausted scan state.
+statement ok
+PRAGMA enable_verification;
+
+query I
+SELECT page_count FROM pdf_info('test/data/two_pages.pdf');
+----
+2
+
+query I
+SELECT len(list(word)) > 0 FROM read_pdf_words('test/data/hello.pdf');
+----
+true
+
+# A disabled I/O pool is an explicit native synchronous fallback.
+statement ok
+SET async_threads = 0;
+
+query II
+SELECT list(page ORDER BY page), list(page_count ORDER BY page)
+FROM read_pdf('test/data/two_pages.pdf');
+----
+[1, 2]	[2, 2]
+
+statement ok
+SET async_threads = 2;
+
+statement ok
+SET read_ahead_depth = 0;
+
+query II
+SELECT list(page ORDER BY page), list(page_count ORDER BY page)
+FROM read_pdf('test/data/two_pages.pdf');
+----
+[1, 2]	[2, 2]
+
+statement ok
+SET read_ahead_depth = -1;
+
+# LIMIT abandons prepared read-ahead work. Re-execution must start a fresh scan.
+query I
+SELECT page FROM read_pdf('test/data/two_pages.pdf') ORDER BY page LIMIT 1;
+----
+1
+
+query I
+SELECT list(page ORDER BY page) FROM read_pdf('test/data/two_pages.pdf');
+----
+[1, 2]
+
+# Native VARIANT and triggers compose with the typed PDF scan directly.
+statement ok
+CREATE TABLE native_documents (page INTEGER, document VARIANT);
+
+statement ok
+CREATE TABLE native_document_audit (page INTEGER);
+
+statement ok
+CREATE TRIGGER pdf_document_added AFTER INSERT ON native_documents FOR EACH ROW
+INSERT INTO native_document_audit VALUES (NEW.page);
+
+statement ok
+INSERT INTO native_documents
+SELECT page, {'text': text, 'page_count': page_count}::VARIANT
+FROM read_pdf('test/data/two_pages.pdf');
+
+query II
+SELECT list(page ORDER BY page), bool_and(document.page_count::INTEGER = 2)
+FROM native_documents;
+----
+[1, 2]	true
+
+query I
+SELECT list(page ORDER BY page) FROM native_document_audit;
+----
+[1, 2]
