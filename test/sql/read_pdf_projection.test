@@ -1,0 +1,75 @@
+# name: test/sql/read_pdf_projection.test
+# description: Native projection pushdown skips unrequested OCR without changing rows or values
+# group: [sql]
+
+require pdf
+
+require json
+
+statement ok
+PRAGMA enable_verification;
+
+# Metadata and cardinality scans must not initialize an unavailable OCR model.
+query III
+SELECT page_count, page, has_text_layer
+FROM read_pdf('test/data/scanned.pdf', ocr := true, tessdata_dir := '/no/such/tessdata');
+----
+1	1	false
+
+query I
+SELECT len(list(page)) FROM read_pdf('test/data/scanned.pdf', ocr := true, tessdata_dir := '/no/such/tessdata');
+----
+1
+
+# An empty projection still produces every page.
+query I
+SELECT 42 FROM read_pdf('test/data/two_pages.pdf');
+----
+42
+42
+
+# Requesting an OCR-derived column must still execute OCR and surface its error.
+statement error
+SELECT text FROM read_pdf('test/data/scanned.pdf', ocr := true, tessdata_dir := '/no/such/tessdata');
+----
+could not load the Tesseract model
+
+statement error
+SELECT used_ocr FROM read_pdf('test/data/scanned.pdf', ocr := true, tessdata_dir := '/no/such/tessdata');
+----
+could not load the Tesseract model
+
+# Serializing the whole row forces a full scan. Compare reordered projections,
+# including NULL label/confidence, with those full-scan results.
+query IIIII
+WITH full_scan AS (
+    SELECT page, to_json(r) AS original FROM read_pdf('test/data/two_pages.pdf') r
+), projected AS (
+    SELECT label, text, ocr_confidence, height, page, width, has_text_layer, used_ocr
+    FROM read_pdf('test/data/two_pages.pdf')
+)
+SELECT projected.text = json_extract_string(original, '$.text'),
+       projected.width = json_extract(original, '$.width')::DOUBLE,
+       projected.height = json_extract(original, '$.height')::DOUBLE,
+       projected.label IS NOT DISTINCT FROM json_extract_string(original, '$.label'),
+       projected.ocr_confidence IS NOT DISTINCT FROM json_extract(original, '$.ocr_confidence')::DOUBLE
+FROM projected JOIN full_scan USING (page) ORDER BY page;
+----
+true	true	true	true	true
+true	true	true	true	true
+
+# A text predicate keeps text in the requested columns even when not selected.
+query I
+SELECT page FROM read_pdf('test/data/two_pages.pdf') WHERE contains(lower(text), 'beta');
+----
+2
+
+query II
+SELECT page, page AS duplicate FROM read_pdf('test/data/two_pages.pdf', first_page := 2, last_page := 2);
+----
+2	2
+
+query II
+SELECT width > 0, height > 0 FROM read_pdf('test/data/scanned.pdf', ocr := true, tessdata_dir := '/no/such/tessdata');
+----
+true	true

@@ -6,6 +6,8 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/multi_file/multi_file_function.hpp"
+#include "duckdb/common/multi_file/base_file_reader.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
 #include "duckdb/common/types/date.hpp"
@@ -19,6 +21,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/parallel/callback_async_task.hpp"
 
 // poppler-cpp — text extraction + page rendering + metadata
 #include <poppler-document.h>
@@ -63,7 +66,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2407,16 +2412,20 @@ static vector<string> ResolveFiles(ClientContext &context, const string &pattern
 	return files;
 }
 
-// Read all bytes of a path through DuckDB's FileSystem (works with any fs).
-static void ReadAllBytes(ClientContext &context, const string &path, string &out) {
+// Raw filesystem access; native multi-file readers invoke this on the engine's
+// open-ahead pool before the CPU extraction stage begins.
+static void ReadPdfHandleBytes(ClientContext &context, FileHandle &handle, const string &path, int64_t size,
+                               string &out) {
 	auto &fs = FileSystem::GetFileSystem(context);
-	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
-	int64_t size = fs.GetFileSize(*handle);
+	if (size < 0) {
+		throw IOException("read_pdf: unknown file size for '%s'", path);
+	}
 	out.resize(size);
 	// loop until fully read — fs.Read may return a short count (P0-4)
 	int64_t total = 0;
 	while (total < size) {
-		int64_t n = fs.Read(*handle, &out[total], size - total);
+		context.InterruptCheck();
+		int64_t n = fs.Read(handle, &out[total], MinValue<int64_t>(size - total, 1024 * 1024));
 		if (n <= 0) {
 			break;
 		}
@@ -2425,6 +2434,43 @@ static void ReadAllBytes(ClientContext &context, const string &path, string &out
 	if (total != size) {
 		throw IOException("read_pdf: short read on '%s' (%lld of %lld bytes)", path, (long long)total, (long long)size);
 	}
+}
+
+static void ReadPdfFileBytes(ClientContext &context, const string &path, string &out) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	ReadPdfHandleBytes(context, *handle, path, fs.GetFileSize(*handle), out);
+}
+
+struct PdfNativeInput {
+	ClientContext *context = nullptr;
+	string path;
+	string bytes;
+	std::exception_ptr error;
+};
+
+static thread_local const PdfNativeInput *native_pdf_input = nullptr;
+
+struct ScopedPdfNativeInput {
+	explicit ScopedPdfNativeInput(const PdfNativeInput &input) : previous(native_pdf_input) {
+		native_pdf_input = &input;
+	}
+	~ScopedPdfNativeInput() {
+		native_pdf_input = previous;
+	}
+	const PdfNativeInput *previous;
+};
+
+static void ReadAllBytes(ClientContext &context, const string &path, string &out) {
+	if (native_pdf_input && native_pdf_input->context == &context && native_pdf_input->path == path) {
+		if (native_pdf_input->error) {
+			std::rethrow_exception(native_pdf_input->error);
+		}
+		out = native_pdf_input->bytes;
+		return;
+	}
+	// Scalar compatibility calls use the same filesystem directly.
+	ReadPdfFileBytes(context, path, out);
 }
 
 // Input side of every qpdf-backed reader: one filesystem (DuckDB's, so URLs and
@@ -2494,6 +2540,10 @@ struct ReadPdfGlobalState : public GlobalTableFunctionState {
 	explicit ReadPdfGlobalState(idx_t max_threads_p) : max_threads(max_threads_p) {
 	}
 	vector<unique_ptr<ReadPdfFileSlot>> slots;
+	vector<column_t> column_ids;
+	bool needs_page = false;
+	bool needs_native_text = false;
+	bool needs_ocr = false;
 	const idx_t max_threads;
 	idx_t MaxThreads() const override {
 		return max_threads;
@@ -2616,6 +2666,14 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfInitGlobal(ClientContext &con
 	auto scheduler_threads = (idx_t)TaskScheduler::GetScheduler(context).NumberOfThreads();
 	idx_t max_threads = MaxValue<idx_t>(1, scheduler_threads);
 	auto g = make_uniq<ReadPdfGlobalState>(max_threads);
+	g->column_ids = input.column_ids;
+	for (auto column_id : g->column_ids) {
+		g->needs_ocr = g->needs_ocr || column_id == 3 || column_id == 7 || column_id == 8;
+		g->needs_native_text = g->needs_native_text || column_id == 6;
+		g->needs_page = g->needs_page || column_id == 4 || column_id == 5 || column_id == 9;
+	}
+	g->needs_native_text = g->needs_native_text || g->needs_ocr;
+	g->needs_page = g->needs_page || g->needs_native_text;
 	g->slots.reserve(bind.files.size());
 	for (auto &path : bind.files) {
 		auto slot = make_uniq<ReadPdfFileSlot>();
@@ -2660,7 +2718,9 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 			// RenderPageForOcr re-acquires the lock for rasterization only.
 			// TessBaseAPI is reused per worker (thread_local Init in ocr_ops).
 			PopplerDocGuard poppler_guard;
-			page.reset(l.doc->create_page(l.page_idx));
+			if (g.needs_page) {
+				page.reset(l.doc->create_page(l.page_idx));
+			}
 			if (page) {
 				auto poppler_label = UStringToUtf8(page->label());
 				auto rect = page->page_rect();
@@ -2672,13 +2732,16 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 				// Probe the native text layer even under force_ocr so the
 				// has_text_layer flag always reflects the PDF itself, not the
 				// extraction path chosen by the caller.
-				string native = auto_layout ? LayoutPageText(LayoutWordsFromBoxes(MergeSpacelessBoxes(page->text_list(
-				                                                 poppler::page::text_list_include_font))),
-				                                             width)
-				                            : UStringToUtf8(page->text(poppler::rectf(), layout));
-				has_text_layer = pdf_ocr::HasGlyphs(native);
-				text = native;
-				want_ocr = bind.opt.force_ocr || (bind.opt.auto_ocr && !has_text_layer);
+				if (g.needs_native_text) {
+					string native = auto_layout
+					                    ? LayoutPageText(LayoutWordsFromBoxes(MergeSpacelessBoxes(
+					                                         page->text_list(poppler::page::text_list_include_font))),
+					                                     width)
+					                    : UStringToUtf8(page->text(poppler::rectf(), layout));
+					has_text_layer = pdf_ocr::HasGlyphs(native);
+					text = native;
+					want_ocr = g.needs_ocr && (bind.opt.force_ocr || (bind.opt.auto_ocr && !has_text_layer));
+				}
 			}
 		}
 		if (page && want_ocr) {
@@ -2700,23 +2763,53 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 			text = TrimPdfPageText(std::move(text));
 		}
 
-		OutString(output.data[0], count, l.current_file);
-		OutInt32(output.data[1], count, l.page_idx + 1);
-		OutInt32(output.data[2], count, l.page_count);
-		OutString(output.data[3], count, text);
-		OutDouble(output.data[4], count, width);
-		OutDouble(output.data[5], count, height);
-		OutBool(output.data[6], count, has_text_layer);
-		OutBool(output.data[7], count, used_ocr);
-		if (has_ocr_confidence) {
-			OutDouble(output.data[8], count, ocr_confidence);
-		} else {
-			OutDoubleNull(output.data[8], count);
+		for (idx_t col = 0; col < g.column_ids.size(); col++) {
+			auto &out = output.data[col];
+			switch (g.column_ids[col]) {
+			case 0:
+				OutString(out, count, l.current_file);
+				break;
+			case 1:
+				OutInt32(out, count, l.page_idx + 1);
+				break;
+			case 2:
+				OutInt32(out, count, l.page_count);
+				break;
+			case 3:
+				OutString(out, count, text);
+				break;
+			case 4:
+				OutDouble(out, count, width);
+				break;
+			case 5:
+				OutDouble(out, count, height);
+				break;
+			case 6:
+				OutBool(out, count, has_text_layer);
+				break;
+			case 7:
+				OutBool(out, count, used_ocr);
+				break;
+			case 8:
+				if (has_ocr_confidence) {
+					OutDouble(out, count, ocr_confidence);
+				} else {
+					OutDoubleNull(out, count);
+				}
+				break;
+			case 9:
+				OutStringOrNull(out, count, page_label);
+				break;
+			default:
+				// DuckDB requests a row-id placeholder for cardinality-only scans.
+				D_ASSERT(g.column_ids[col] == COLUMN_IDENTIFIER_ROW_ID);
+				out.SetValue(count, Value::BIGINT(l.page_idx));
+				break;
+			}
 		}
-		OutStringOrNull(output.data[9], count, page_label);
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -2787,7 +2880,7 @@ static void ReadPdfMetaScan(ClientContext &context, TableFunctionInput &data_p, 
 		st.idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -2976,7 +3069,7 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 		st.idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -3120,7 +3213,7 @@ static void PdfStructureScan(ClientContext &context, TableFunctionInput &data_p,
 		st.row_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 static unique_ptr<FunctionData> PdfOutlineBind(ClientContext &context, TableFunctionBindInput &input,
@@ -3189,7 +3282,7 @@ static void PdfOutlineScan(ClientContext &context, TableFunctionInput &data_p, D
 		st.row_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -3275,7 +3368,7 @@ static void PdfAttachmentsScan(ClientContext &context, TableFunctionInput &data_
 		st.row_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -3640,7 +3733,7 @@ static void PdfRevisionsScan(ClientContext &context, TableFunctionInput &data_p,
 		st.row_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -3894,7 +3987,7 @@ static void ReadPdfWordsScan(ClientContext &context, TableFunctionInput &data_p,
 		g.word_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -4034,7 +4127,7 @@ static void ReadPdfLinesScan(ClientContext &context, TableFunctionInput &data_p,
 		g.line_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -4761,7 +4854,7 @@ static void ReadPdfElementsScan(ClientContext &context, TableFunctionInput &data
 		g.row_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -5083,7 +5176,7 @@ static void PdfChunksScan(ClientContext &context, TableFunctionInput &data_p, Da
 		g.row_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -5241,7 +5334,7 @@ static void ReadPdfTablesScan(ClientContext &context, TableFunctionInput &data_p
 		st.idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -6031,7 +6124,7 @@ static void OcrImageScan(ClientContext &context, TableFunctionInput &data_p, Dat
 	auto &bind = data_p.bind_data->Cast<OcrImageBindData>();
 	auto &st = data_p.global_state->Cast<OcrImageState>();
 	if (st.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	st.done = true;
@@ -6049,7 +6142,7 @@ static void OcrImageScan(ClientContext &context, TableFunctionInput &data_p, Dat
 	OutString(output.data[0], 0, r.text);
 	OutDouble(output.data[1], 0, static_cast<double>(r.confidence));
 	OutString(output.data[2], 0, r.format.empty() ? bind.format : r.format);
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 //===--------------------------------------------------------------------===//
@@ -7406,7 +7499,7 @@ static void PdfSplitScan(ClientContext &context, TableFunctionInput &data_p, Dat
 		st.emit_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -7599,7 +7692,7 @@ static void PdfSplitBlankScan(ClientContext &context, TableFunctionInput &data_p
 		st.emit_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -7786,7 +7879,7 @@ static void PdfOcrScan(ClientContext &context, TableFunctionInput &data_p, DataC
 		OutString(output.data[6], count, bind.output);
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 // Shared preamble for the single-input scalar ops.
@@ -8037,7 +8130,7 @@ static void PdfQpdfRowsEmit(PdfQpdfRowsState &st, DataChunk &output) {
 		st.emit_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 // pdf_form_fields(files) -> one row per AcroForm field. page is NULL when the
@@ -8676,7 +8769,7 @@ static void PdfRedactScan(ClientContext &context, TableFunctionInput &data_p, Da
 		st.emit_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 // =============================================================================
@@ -8709,7 +8802,7 @@ static OperatorResultType PdfRedactLateralInOut(ExecutionContext &context, Table
 	auto &state = data_p.local_state->Cast<PdfRedactLateralState>();
 
 	if (input.size() == 0) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return OperatorResultType::FINISHED;
 	}
 
@@ -8777,7 +8870,7 @@ static OperatorResultType PdfRedactLateralInOut(ExecutionContext &context, Table
 		}
 	}
 
-	output.SetCardinality(out_count);
+	output.SetChildCardinality(out_count);
 
 	// More page rows from the active input row?
 	if (state.row_active) {
@@ -9116,7 +9209,7 @@ static void PdfPagesInfoScan(ClientContext &context, TableFunctionInput &data_p,
 		st.row_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //---- pdf_permissions ------------------------------------------------------
@@ -9178,7 +9271,7 @@ static void PdfPermissionsScan(ClientContext &context, TableFunctionInput &data_
 		st.idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //---- pdf_fonts ------------------------------------------------------------
@@ -9277,7 +9370,7 @@ static void PdfFontsScan(ClientContext &context, TableFunctionInput &data_p, Dat
 		st.row_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //---- pdf_destinations -----------------------------------------------------
@@ -9365,7 +9458,7 @@ static void PdfDestinationsScan(ClientContext &context, TableFunctionInput &data
 		st.row_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //---- pdf_page_images — render each page to PNG for SOTA / llm pipelines ----
@@ -9462,7 +9555,7 @@ static void PdfPageImagesScan(ClientContext &context, TableFunctionInput &data_p
 		st.row_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //---- pdf_write_page_images — render each page to on-disk PNG previews --------
@@ -9677,7 +9770,7 @@ static void PdfWritePageImagesScan(ClientContext &context, TableFunctionInput &d
 		st.emit_idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //---- pdf_qpdf_info --------------------------------------------------------
@@ -9790,7 +9883,7 @@ static void PdfQpdfInfoScan(ClientContext &context, TableFunctionInput &data_p, 
 		st.idx++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //---- pdf_json (scalar) ----------------------------------------------------
@@ -9851,6 +9944,269 @@ static void PdfRepairNoPwFun(DataChunk &args, ExpressionState &state, Vector &re
 
 // DuckDB 2.0 turns an exception from a scalar that is not marked fallible into an INTERNAL
 // error. Every pdf scalar reads a path or blob that can be bad, so all of them are fallible.
+// DuckDB owns file discovery, open-ahead, source scheduling, projection mapping
+// and scan teardown. The document libraries below only decode one ready file.
+struct PdfNativeFunctionInfo : public TableFunctionInfo {
+	TableFunction decode;
+	std::function<unique_ptr<FunctionData>(const FunctionData &, const string &)> clone_bind;
+	std::function<vector<string>(const FunctionData &)> files;
+	std::function<unique_ptr<LocalTableFunctionState>()> new_local;
+	explicit PdfNativeFunctionInfo(TableFunction decode) : decode(std::move(decode)) {
+	}
+};
+
+struct PdfNativeBindData : public TableFunctionData {
+	const PdfNativeFunctionInfo &info;
+	unique_ptr<FunctionData> decode_bind;
+	vector<LogicalType> types;
+	vector<Identifier> names;
+	PdfNativeBindData(const PdfNativeFunctionInfo &info, unique_ptr<FunctionData> bind, vector<LogicalType> types,
+	                  vector<Identifier> names)
+	    : info(info), decode_bind(std::move(bind)), types(std::move(types)), names(std::move(names)) {
+	}
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<PdfNativeBindData>(info, info.clone_bind(*decode_bind, string()), types, names);
+	}
+};
+
+struct PdfNativeLocalState : public LocalTableFunctionState {
+	shared_ptr<BaseFileReader> reader;
+	unique_ptr<LocalTableFunctionState> decode_local;
+	DataChunk chunk;
+};
+
+class PdfNativeFileReader : public BaseFileReader {
+public:
+	PdfNativeFileReader(ClientContext &context, const OpenFileInfo &file, const PdfNativeBindData &bind)
+	    : BaseFileReader(file), bind(bind), decode_bind(bind.info.clone_bind(*bind.decode_bind, file.path)),
+	      scan_limit(bind.info.new_local ? MaxValue<idx_t>(1, TaskScheduler::GetScheduler(context).NumberOfThreads())
+	                                     : 1) {
+		columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(bind.names, bind.types);
+		input.context = &context;
+		input.path = file.path;
+		try {
+			auto &fs = FileSystem::GetFileSystem(context);
+			handle = fs.OpenFile(file.path, FileFlags::FILE_FLAGS_READ);
+			file_size = fs.GetFileSize(*handle);
+		} catch (...) {
+			// Extraction keeps its existing strict/ignore_errors policy.
+			input.error = std::current_exception();
+		}
+	}
+	AsyncResult ScheduleIO(ClientContext &context, GlobalTableFunctionState &, LocalTableFunctionState &) override {
+		vector<unique_ptr<AsyncTask>> tasks;
+		auto self = shared_from_this();
+		const auto charge = io_scheduled.exchange(true) ? 0 : MaxValue<int64_t>(0, file_size);
+		tasks.push_back(make_uniq<CallbackAsyncTask>(
+		    [self, &context]() { self->Cast<PdfNativeFileReader>().LoadInput(context); }, charge));
+		return AsyncResult::FromTasks(std::move(tasks), TaskSchedulerType::ASYNC);
+	}
+	bool TryInitializeScan(ClientContext &, GlobalTableFunctionState &, LocalTableFunctionState &local_p) override {
+		if (done) {
+			return false;
+		}
+		// A scan state drains pages in chunks. Admit at most one state per CPU
+		// worker, rather than manufacturing read-ahead jobs until decoding ends.
+		if (claimed.fetch_add(1) >= scan_limit) {
+			return false;
+		}
+		auto &local = local_p.Cast<PdfNativeLocalState>();
+		if (local.reader.get() != this) {
+			local.decode_local.reset();
+			local.chunk.Destroy();
+			local.reader = shared_from_this();
+			if (bind.info.new_local) {
+				local.decode_local = bind.info.new_local();
+			}
+		}
+		return true;
+	}
+	AsyncResult Scan(ClientContext &context, GlobalTableFunctionState &, LocalTableFunctionState &local_p,
+	                 DataChunk &output) override {
+		auto &local = local_p.Cast<PdfNativeLocalState>();
+		// The synchronous path (async_threads=0 or read_ahead_depth=0) uses the
+		// same read operation. Read-ahead has already completed it before Scan.
+		LoadInput(context);
+		ScopedPdfNativeInput ready_input(input);
+		vector<idx_t> selected;
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			selected.push_back(column_ids[MultiFileLocalIndex(i)].GetId());
+		}
+		{
+			std::lock_guard<std::mutex> guard(init_mutex);
+			if (!decode_global) {
+				vector<column_t> decode_columns;
+				if (bind.info.decode.projection_pushdown) {
+					decode_columns.assign(selected.begin(), selected.end());
+				} else {
+					for (idx_t i = 0; i < bind.types.size(); i++) {
+						decode_columns.push_back(i);
+					}
+				}
+				vector<idx_t> no_projection;
+				TableFunctionInitInput init(decode_bind.get(), std::move(decode_columns), no_projection, nullptr);
+				decode_global = bind.info.decode.init_global ? bind.info.decode.init_global(context, init)
+				                                             : make_uniq<GlobalTableFunctionState>();
+			}
+		}
+		if (local.chunk.ColumnCount() == 0) {
+			vector<LogicalType> types;
+			if (bind.info.decode.projection_pushdown) {
+				for (auto id : selected) {
+					types.push_back(bind.types[id]);
+				}
+			} else {
+				types = bind.types;
+			}
+			local.chunk.Initialize(context, types);
+		}
+		local.chunk.Reset();
+		TableFunctionInput decode(decode_bind.get(), local.decode_local.get(), decode_global.get());
+		bind.info.decode.function(context, decode, local.chunk);
+		if (bind.info.decode.projection_pushdown) {
+			output.Reference(local.chunk);
+		} else {
+			output.ReferenceColumns(local.chunk, selected);
+		}
+		if (output.size() == 0) {
+			done = true;
+		}
+		return AsyncResult::FromChunk(output);
+	}
+	string GetReaderType() const override {
+		return "PDF";
+	}
+
+private:
+	void LoadInput(ClientContext &context) {
+		std::lock_guard<std::mutex> guard(input_mutex);
+		if (input_loaded) {
+			return;
+		}
+		if (!input.error) {
+			try {
+				ReadPdfHandleBytes(context, *handle, input.path, file_size, input.bytes);
+			} catch (...) {
+				input.error = std::current_exception();
+			}
+		}
+		handle.reset();
+		input_loaded = true;
+	}
+	const PdfNativeBindData &bind;
+	unique_ptr<FunctionData> decode_bind;
+	PdfNativeInput input;
+	unique_ptr<FileHandle> handle;
+	int64_t file_size = 0;
+	std::mutex input_mutex;
+	bool input_loaded = false;
+	std::atomic<bool> io_scheduled {false};
+	std::mutex init_mutex;
+	unique_ptr<GlobalTableFunctionState> decode_global;
+	const idx_t scan_limit;
+	std::atomic<idx_t> claimed {0};
+	std::atomic<bool> done {false};
+};
+
+class PdfNativeMultiFileInfo : public MultiFileReaderInterface {
+public:
+	PdfNativeMultiFileInfo(const PdfNativeFunctionInfo &info, unique_ptr<FunctionData> bind, vector<LogicalType> types,
+	                       vector<Identifier> names)
+	    : info(info), decode_bind(std::move(bind)), types(std::move(types)), names(std::move(names)) {
+	}
+	static unique_ptr<MultiFileReaderInterface> CreateInterface(ClientContext &) {
+		throw InternalException("PDF multi-file binding requires its extraction descriptor");
+	}
+	unique_ptr<MultiFileReaderInterface> Copy() override {
+		return make_uniq<PdfNativeMultiFileInfo>(info, nullptr, types, names);
+	}
+	unique_ptr<BaseFileReaderOptions> InitializeOptions(ClientContext &, optional_ptr<TableFunctionInfo>) override {
+		return make_uniq<BaseFileReaderOptions>();
+	}
+	bool ParseCopyOption(ClientContext &, const Identifier &, const vector<Value> &, BaseFileReaderOptions &,
+	                     vector<Identifier> &, vector<LogicalType> &) override {
+		return false;
+	}
+	bool ParseOption(ClientContext &, const Identifier &, const Value &, MultiFileOptions &,
+	                 BaseFileReaderOptions &) override {
+		return true;
+	}
+	unique_ptr<TableFunctionData> InitializeBindData(MultiFileBindData &, unique_ptr<BaseFileReaderOptions>) override {
+		return make_uniq<PdfNativeBindData>(info, std::move(decode_bind), types, names);
+	}
+	void BindReader(ClientContext &, vector<LogicalType> &return_types, vector<Identifier> &return_names,
+	                MultiFileBindData &) override {
+		return_types = types;
+		return_names = names;
+	}
+	optional_idx MaxThreads(ClientContext &context, const MultiFileBindData &, const MultiFileGlobalState &,
+	                        FileExpandResult) override {
+		return TaskScheduler::GetScheduler(context).NumberOfThreads();
+	}
+	unique_ptr<GlobalTableFunctionState> InitializeGlobalState(ClientContext &, MultiFileBindData &,
+	                                                           MultiFileGlobalState &) override {
+		return make_uniq<GlobalTableFunctionState>();
+	}
+	unique_ptr<LocalTableFunctionState> InitializeLocalState(ClientContext &, GlobalTableFunctionState &) override {
+		return make_uniq<PdfNativeLocalState>();
+	}
+	bool SupportsReadAhead(const MultiFileBindData &) const override {
+		return true;
+	}
+	shared_ptr<BaseFileReader> CreateReader(ClientContext &context, GlobalTableFunctionState &, BaseUnionData &file,
+	                                        const MultiFileBindData &bind) override {
+		return make_shared_ptr<PdfNativeFileReader>(context, file.file, bind.bind_data->Cast<PdfNativeBindData>());
+	}
+	shared_ptr<BaseFileReader> CreateReader(ClientContext &context, GlobalTableFunctionState &,
+	                                        const OpenFileInfo &file, idx_t, const MultiFileBindData &bind) override {
+		return make_shared_ptr<PdfNativeFileReader>(context, file, bind.bind_data->Cast<PdfNativeBindData>());
+	}
+
+private:
+	const PdfNativeFunctionInfo &info;
+	unique_ptr<FunctionData> decode_bind;
+	vector<LogicalType> types;
+	vector<Identifier> names;
+};
+
+template <class BIND_DATA>
+static TableFunction NativePdfReader(TableFunction decode,
+                                     std::function<unique_ptr<LocalTableFunctionState>()> new_local = nullptr) {
+	auto info = make_shared_ptr<PdfNativeFunctionInfo>(std::move(decode));
+	info->new_local = std::move(new_local);
+	info->clone_bind = [](const FunctionData &source, const string &path) -> unique_ptr<FunctionData> {
+		auto copy = make_uniq<BIND_DATA>(source.Cast<BIND_DATA>());
+		if (!path.empty()) {
+			copy->files = {path};
+		}
+		return std::move(copy);
+	};
+	info->files = [](const FunctionData &source) {
+		return source.Cast<BIND_DATA>().files;
+	};
+	MultiFileFunction<PdfNativeMultiFileInfo> native(info->decode.name,
+	                                                 MultiFileReader::MultiFileParameters::ALLOW_EMPTY_ONLY);
+	native.GetSignature() = info->decode.GetSignature();
+	native.function_info = info;
+	native.bind = [](ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &types,
+	                 vector<Identifier> &names) -> unique_ptr<FunctionData> {
+		auto &info = input.info->Cast<PdfNativeFunctionInfo>();
+		auto decode_bind = info.decode.bind(context, input, types, names);
+		vector<OpenFileInfo> paths;
+		for (auto &path : info.files(*decode_bind)) {
+			paths.emplace_back(path);
+		}
+		auto interface = make_uniq<PdfNativeMultiFileInfo>(info, std::move(decode_bind), types, names);
+		MultiFileOptions options;
+		options.auto_detect_hive_partitioning = false;
+		return MultiFileFunction<PdfNativeMultiFileInfo>::MultiFileBindInternal(
+		    context, MultiFileReader::Create(input.table_function),
+		    make_shared_ptr<SimpleMultiFileList>(std::move(paths)), types, names, std::move(options),
+		    make_uniq<BaseFileReaderOptions>(), std::move(interface));
+	};
+	return native;
+}
+
 struct PdfLoader {
 	ExtensionLoader &loader;
 
@@ -9882,6 +10238,7 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 
 	TableFunction read_pdf("read_pdf", {LogicalType::VARCHAR}, ReadPdfScan, ReadPdfBind, ReadPdfInitGlobal,
 	                       ReadPdfInitLocal);
+	read_pdf.projection_pushdown = true;
 	AddCommonNamedParams(read_pdf);
 	// layout is registered per function rather than in AddCommonNamedParams, so a
 	// reader that works off word geometry does not advertise a knob it ignores
@@ -9890,23 +10247,24 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	// Registered individually (not in AddCommonNamedParams) so it is only
 	// advertised on functions that actually implement the skip behavior.
 	AddNamedParameter(read_pdf, "ignore_errors", LogicalType::BOOLEAN);
-	loader.RegisterFunction(read_pdf);
+	loader.RegisterFunction(NativePdfReader<ReadPdfBindData>(
+	    read_pdf, []() -> unique_ptr<LocalTableFunctionState> { return make_uniq<ReadPdfLocalState>(); }));
 
 	TableFunction read_pdf_meta("read_pdf_meta", {LogicalType::VARCHAR}, ReadPdfMetaScan, ReadPdfMetaBind,
 	                            ReadPdfMetaInit);
 	AddNamedParameter(read_pdf_meta, "password", LogicalType::VARCHAR);
 	AddNamedParameter(read_pdf_meta, "ignore_errors", LogicalType::BOOLEAN);
-	loader.RegisterFunction(read_pdf_meta);
+	loader.RegisterFunction(NativePdfReader<ReadPdfMetaBindData>(read_pdf_meta));
 
 	// inspection suite — read-only, serial per file, password is the only knob
 	TableFunction pdf_info("pdf_info", {LogicalType::VARCHAR}, PdfInfoScan, PdfInfoBind, PdfInfoInit);
 	AddNamedParameter(pdf_info, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(pdf_info);
+	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_info));
 
 	TableFunction pdf_outline("pdf_outline", {LogicalType::VARCHAR}, PdfOutlineScan, PdfOutlineBind, PdfOutlineInit);
 	AddNamedParameter(pdf_outline, "password", LogicalType::VARCHAR);
 	AddNamedParameter(pdf_outline, "ignore_errors", LogicalType::BOOLEAN);
-	loader.RegisterFunction(pdf_outline);
+	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_outline));
 
 	TableFunction pdf_structure("pdf_structure", {LogicalType::VARCHAR}, PdfStructureScan, PdfStructureBind,
 	                            PdfStructureInit);
@@ -9914,23 +10272,23 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	AddNamedParameter(pdf_structure, "first_page", LogicalType::INTEGER);
 	AddNamedParameter(pdf_structure, "last_page", LogicalType::INTEGER);
 	AddNamedParameter(pdf_structure, "ignore_errors", LogicalType::BOOLEAN);
-	loader.RegisterFunction(pdf_structure);
+	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_structure));
 
 	TableFunction pdf_attachments("pdf_attachments", {LogicalType::VARCHAR}, PdfAttachmentsScan, PdfAttachmentsBind,
 	                              PdfAttachmentsInit);
 	AddNamedParameter(pdf_attachments, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(pdf_attachments);
+	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_attachments));
 
 	// Forensic incremental-update revisions (byte-level startxref / /Prev walk)
 	TableFunction pdf_revisions("pdf_revisions", {LogicalType::VARCHAR}, PdfRevisionsScan, PdfRevisionsBind,
 	                            PdfRevisionsInit);
 	AddNamedParameter(pdf_revisions, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(pdf_revisions);
+	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_revisions));
 
 	TableFunction read_pdf_words("read_pdf_words", {LogicalType::VARCHAR}, ReadPdfWordsScan, ReadPdfWordsBind,
 	                             ReadPdfWordsInit);
 	AddCommonNamedParams(read_pdf_words);
-	loader.RegisterFunction(read_pdf_words);
+	loader.RegisterFunction(NativePdfReader<ReadPdfWordsBindData>(read_pdf_words));
 
 	// Gemini/high-level layout name: same word+bbox engine as read_pdf_words
 	// (page, word, x0, y0, x1, y1, font_name, font_size, source, confidence).
@@ -9939,20 +10297,20 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	TableFunction read_pdf_layout("read_pdf_layout", {LogicalType::VARCHAR}, ReadPdfWordsScan, ReadPdfWordsBind,
 	                              ReadPdfWordsInit);
 	AddCommonNamedParams(read_pdf_layout);
-	loader.RegisterFunction(read_pdf_layout);
+	loader.RegisterFunction(NativePdfReader<ReadPdfWordsBindData>(read_pdf_layout));
 
 	TableFunction read_pdf_lines("read_pdf_lines", {LogicalType::VARCHAR}, ReadPdfLinesScan, ReadPdfLinesBind,
 	                             ReadPdfLinesInit);
 	AddCommonNamedParams(read_pdf_lines);
 	AddNamedParameter(read_pdf_lines, "layout", LogicalType::VARCHAR);
-	loader.RegisterFunction(read_pdf_lines);
+	loader.RegisterFunction(NativePdfReader<ReadPdfLinesBindData>(read_pdf_lines));
 
 	// read_pdf_elements uses the same OCR/native word source and options as
 	// read_pdf_words; layout-specific knobs are intentionally not advertised.
 	TableFunction read_pdf_elements("read_pdf_elements", {LogicalType::VARCHAR}, ReadPdfElementsScan,
 	                                ReadPdfElementsBind, ReadPdfElementsInit);
 	AddOcrNamedParams(read_pdf_elements);
-	loader.RegisterFunction(read_pdf_elements);
+	loader.RegisterFunction(NativePdfReader<ReadPdfElementsBindData>(read_pdf_elements));
 
 	// pdf_chunks packs the element grain into retrieval-ready chunks; it
 	// honors the same file handling + page-range/password params as
@@ -9961,13 +10319,13 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	AddOcrNamedParams(pdf_chunks);
 	AddNamedParameter(pdf_chunks, "chunk_size", LogicalType::INTEGER);
 	AddNamedParameter(pdf_chunks, "overlap", LogicalType::INTEGER);
-	loader.RegisterFunction(pdf_chunks);
+	loader.RegisterFunction(NativePdfReader<PdfChunksBindData>(pdf_chunks));
 
 	TableFunction read_pdf_tables("read_pdf_tables", {LogicalType::VARCHAR}, ReadPdfTablesScan, ReadPdfTablesBind,
 	                              ReadPdfTablesInit);
 	AddCommonNamedParams(read_pdf_tables);
 	AddNamedParameter(read_pdf_tables, "force", LogicalType::BOOLEAN);
-	loader.RegisterFunction(read_pdf_tables);
+	loader.RegisterFunction(NativePdfReader<ReadPdfTablesBindData>(read_pdf_tables));
 
 	ScalarFunctionSet pdf_to_text_set("pdf_to_text");
 	pdf_to_text_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToTextFun));
@@ -10141,22 +10499,22 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 
 	TableFunction pdf_form_fields("pdf_form_fields", {LogicalType::VARCHAR}, PdfFormFieldsScan, PdfFormFieldsBind,
 	                              PdfQpdfRowsInit);
-	loader.RegisterFunction(pdf_form_fields);
+	loader.RegisterFunction(NativePdfReader<PdfQpdfRowsBindData>(pdf_form_fields));
 
 	TableFunction pdf_annotations("pdf_annotations", {LogicalType::VARCHAR}, PdfAnnotationsScan, PdfAnnotationsBind,
 	                              PdfQpdfRowsInit);
-	loader.RegisterFunction(pdf_annotations);
+	loader.RegisterFunction(NativePdfReader<PdfQpdfRowsBindData>(pdf_annotations));
 
 	// pdf_signatures: detect + verify existing digital signatures (no signing).
 	TableFunction pdf_signatures("pdf_signatures", {LogicalType::VARCHAR}, PdfSignaturesScan, PdfSignaturesBind,
 	                             PdfQpdfRowsInit);
 	AddNamedParameter(pdf_signatures, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(pdf_signatures);
+	loader.RegisterFunction(NativePdfReader<PdfSignaturesBindData>(pdf_signatures));
 
 	// pdf_images: extract embedded raster image XObjects (stored JPEG/bitmap).
 	TableFunction pdf_images("pdf_images", {LogicalType::VARCHAR}, PdfImagesScan, PdfImagesBind, PdfQpdfRowsInit);
 	AddNamedParameter(pdf_images, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(pdf_images);
+	loader.RegisterFunction(NativePdfReader<PdfImagesBindData>(pdf_images));
 
 	// pdf_sign: create an adbe.pkcs7.detached CMS signature (inverse of
 	// pdf_signatures). Single-row table function so it can carry named options.
@@ -10204,21 +10562,21 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	TableFunction pdf_pages_info("pdf_pages_info", {LogicalType::VARCHAR}, PdfPagesInfoScan, PdfPagesInfoBind,
 	                             PdfPagesInfoInit);
 	AddNamedParameter(pdf_pages_info, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(pdf_pages_info);
+	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_pages_info));
 
 	TableFunction pdf_permissions("pdf_permissions", {LogicalType::VARCHAR}, PdfPermissionsScan, PdfPermissionsBind,
 	                              PdfPermissionsInit);
 	AddNamedParameter(pdf_permissions, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(pdf_permissions);
+	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_permissions));
 
 	TableFunction pdf_fonts("pdf_fonts", {LogicalType::VARCHAR}, PdfFontsScan, PdfFontsBind, PdfFontsInit);
 	AddNamedParameter(pdf_fonts, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(pdf_fonts);
+	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_fonts));
 
 	TableFunction pdf_destinations("pdf_destinations", {LogicalType::VARCHAR}, PdfDestinationsScan, PdfDestinationsBind,
 	                               PdfDestinationsInit);
 	AddNamedParameter(pdf_destinations, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(pdf_destinations);
+	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_destinations));
 
 	TableFunction pdf_page_images("pdf_page_images", {LogicalType::VARCHAR}, PdfPageImagesScan, PdfPageImagesBind,
 	                              PdfPageImagesInit);
@@ -10226,7 +10584,7 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	AddNamedParameter(pdf_page_images, "dpi", LogicalType::INTEGER);
 	AddNamedParameter(pdf_page_images, "first_page", LogicalType::INTEGER);
 	AddNamedParameter(pdf_page_images, "last_page", LogicalType::INTEGER);
-	loader.RegisterFunction(pdf_page_images);
+	loader.RegisterFunction(NativePdfReader<PdfPageImagesBindData>(pdf_page_images));
 
 	// VARCHAR (path/glob) and LIST(VARCHAR) overloads — same bind/scan body.
 	// (Do not brace-init mixed LogicalTypeId + LogicalType — deduction fails on C++11 CI.)
@@ -10251,7 +10609,7 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	TableFunction pdf_qpdf_info("pdf_qpdf_info", {LogicalType::VARCHAR}, PdfQpdfInfoScan, PdfQpdfInfoBind,
 	                            PdfQpdfInfoInit);
 	AddNamedParameter(pdf_qpdf_info, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(pdf_qpdf_info);
+	loader.RegisterFunction(NativePdfReader<PdfQpdfInfoBindData>(pdf_qpdf_info));
 
 	ScalarFunctionSet pdf_json_set("pdf_json");
 	pdf_json_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfJsonPathOnlyFun));

@@ -3,6 +3,8 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # Configuration of extension
 EXT_NAME=pdf
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
+DUCKDB_GIT_VERSION ?= v2.0.0
+OVERRIDE_GIT_DESCRIBE ?= v2.0.0
 
 # The URL tests need httpfs, which is not linked into the test binary; the
 # sqllogictest runner only loads it when autoloading is allowed. Without this
@@ -35,8 +37,8 @@ test_reldebug: httpfs_into_repository_reldebug
 endif
 endif
 
-INSTALL_HTTPFS_INTO_REPOSITORY = HOME='$(PROJ_DIR)build/$(1)/httpfs_home' ./build/$(1)/duckdb -c \
-	"SET extension_directory = '$(PROJ_DIR)build/$(1)/repository'; INSTALL httpfs;"
+INSTALL_HTTPFS_INTO_REPOSITORY = ./build/$(1)/duckdb -no-agent -c \
+	"SET extension_directory = '$(PROJ_DIR)build/$(1)/repository'; INSTALL httpfs; INSTALL quack;"
 
 httpfs_into_repository_release:
 	$(call INSTALL_HTTPFS_INTO_REPOSITORY,release)
@@ -51,7 +53,7 @@ httpfs_into_repository_reldebug:
 # Compared against the loaded extension by test/sql/zz_build_guard.test, so a
 # test binary that loads some other copy of the extension fails loudly instead
 # of silently testing yesterday's build.
-PDF_BUILT_VERSION = $(shell ./build/release/duckdb -unsigned -noheader -list -c \
+PDF_BUILT_VERSION = $(shell ./build/release/duckdb -unsigned -no-agent -noheader -list -c \
 	"LOAD '$(PROJ_DIR)build/release/extension/$(EXT_NAME)/$(EXT_NAME).duckdb_extension'; \
 	 SELECT extension_version FROM duckdb_extensions() WHERE extension_name='$(EXT_NAME)';" 2>/dev/null | tail -1)
 export EXPECTED_EXT_VERSION = $(PDF_BUILT_VERSION)
