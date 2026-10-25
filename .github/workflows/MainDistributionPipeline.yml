@@ -27,6 +27,8 @@ jobs:
       ci_tools_version: fe955ed3a046b0324cac2c691e73d8d776a7d5cc
       extension_name: pdf
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools;windows_arm64
+      opt_in_archs: osx_amd64
+      reduced_ci_mode: disabled
       vcpkg_commit: 84bab45d415d22042bd0b9081aea57f362da3f35
 
   # The tests that read real published PDFs over https (read_pdf_url.test,
