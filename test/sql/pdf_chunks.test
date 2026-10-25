@@ -211,4 +211,4 @@ overlap
 statement error
 SELECT * FROM pdf_chunks('test/data/no_such_file.pdf');
 ----
-test/data/no_such_file.pdf
+<REGEX>:.*test[/\\]data[/\\]no_such_file\.pdf.*
