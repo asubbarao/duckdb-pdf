@@ -2424,7 +2424,7 @@ static void ReadPdfHandleBytes(ClientContext &context, FileHandle &handle, const
 	// loop until fully read — fs.Read may return a short count (P0-4)
 	int64_t total = 0;
 	while (total < size) {
-		context.InterruptCheck();
+		context.BlockingInterruptCheck();
 		int64_t n = fs.Read(handle, &out[total], MinValue<int64_t>(size - total, 1024 * 1024));
 		if (n <= 0) {
 			break;
@@ -9994,6 +9994,9 @@ public:
 		} catch (...) {
 			// Extraction keeps its existing strict/ignore_errors policy.
 			input.error = std::current_exception();
+			// Do not begin another blocking filesystem request after the caller's
+			// native deadline or interruption has already ended the query.
+			context.BlockingInterruptCheck();
 			// qpdf readers distinguish a missing file from another open failure.
 			// Resolve that on the open-ahead task too, never with a second HEAD
 			// request on the CPU decoding thread after the file is ready.
@@ -10034,6 +10037,7 @@ public:
 	}
 	AsyncResult Scan(ClientContext &context, GlobalTableFunctionState &, LocalTableFunctionState &local_p,
 	                 DataChunk &output) override {
+		context.BlockingInterruptCheck();
 		auto &local = local_p.Cast<PdfNativeLocalState>();
 		// The synchronous path (async_threads=0 or read_ahead_depth=0) uses the
 		// same read operation. Read-ahead has already completed it before Scan.
@@ -10090,6 +10094,7 @@ public:
 
 private:
 	void LoadInput(ClientContext &context) {
+		context.BlockingInterruptCheck();
 		std::lock_guard<std::mutex> guard(input_mutex);
 		if (input_loaded) {
 			return;
@@ -10101,6 +10106,7 @@ private:
 				input.error = std::current_exception();
 			}
 		}
+		context.BlockingInterruptCheck();
 		handle.reset();
 		input_loaded = true;
 	}

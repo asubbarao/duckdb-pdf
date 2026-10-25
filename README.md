@@ -38,6 +38,9 @@ The DuckDB 2.0 readers use the engine's native multi-file scan and async read-ah
 machinery. File opening and byte reads use the `async_threads` pool; decoding runs
 on query workers. Read tasks report their byte sizes to native read-ahead admission.
 `async_threads = 0` or `read_ahead_depth = 0` selects the native synchronous path.
+Reads check DuckDB's native deadline between bounded byte reads and before further
+filesystem requests. An HTTP HEAD request already in flight still follows the
+selected DuckDB HTTP transport's timeout and retry settings, as with native readers.
 Page scans preserve parallel page claiming and projection avoids text extraction
 and OCR when only metadata columns are needed. Inspection, word, line, layout,
 chunk, table, form, signature and image readers share the same file scheduler.
