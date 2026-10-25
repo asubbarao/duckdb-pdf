@@ -2447,6 +2447,7 @@ struct PdfNativeInput {
 	string path;
 	string bytes;
 	std::exception_ptr error;
+	bool file_exists = true;
 };
 
 static thread_local const PdfNativeInput *native_pdf_input = nullptr;
@@ -2478,7 +2479,9 @@ static void ReadAllBytes(ClientContext &context, const string &path, string &out
 // the user called.
 static void ReadPdfInput(ClientContext &context, const char *fn, const string &path, string &bytes) {
 	auto &fs = FileSystem::GetFileSystem(context);
-	if (!fs.FileExists(path)) {
+	const bool ready_input =
+	    native_pdf_input && native_pdf_input->context == &context && native_pdf_input->path == path;
+	if (ready_input ? !native_pdf_input->file_exists : !fs.FileExists(path)) {
 		throw InvalidInputException("%s: input file '%s' does not exist", fn, path);
 	}
 	ReadAllBytes(context, path, bytes);
@@ -9991,6 +9994,14 @@ public:
 		} catch (...) {
 			// Extraction keeps its existing strict/ignore_errors policy.
 			input.error = std::current_exception();
+			// qpdf readers distinguish a missing file from another open failure.
+			// Resolve that on the open-ahead task too, never with a second HEAD
+			// request on the CPU decoding thread after the file is ready.
+			try {
+				input.file_exists = FileSystem::GetFileSystem(context).FileExists(file.path);
+			} catch (...) {
+				// Preserve the original open error when even existence cannot be checked.
+			}
 		}
 	}
 	AsyncResult ScheduleIO(ClientContext &context, GlobalTableFunctionState &, LocalTableFunctionState &) override {
