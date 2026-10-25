@@ -4,20 +4,20 @@
 
 require pdf
 
-# httpfs is out of tree in DuckDB 1.5, so the test binary only has it when the
-# runner is allowed to autoload, and the runner autoinstalls only from the
-# build's own repository, which has no httpfs. So with PDF_NETWORK_TESTS set
-# the repo Makefile installs the published one, and it exports
-# DUCKDB_TEST_AUTOLOADING=all. Running this file by hand:
+# Network test. Opt in with PDF_NETWORK_TESTS=1 so an offline `make test` and a
+# CI runner without egress both stay green. This comes before `require httpfs`
+# on purpose: CI runs the suite with --fail-require-skip, which fails a run that
+# skips a file at a `require <extension>` line but not at `require-env`, so an
+# offline run must stop here rather than at a missing httpfs.
+require-env PDF_NETWORK_TESTS
+
+# httpfs is not linked into the test binary, so it is only there when the runner
+# may autoload (the repo Makefile exports DUCKDB_TEST_AUTOLOADING=all). Running
+# this file by hand:
 #
-#   ./build/release/duckdb -c "INSTALL httpfs;"
 #   DUCKDB_TEST_AUTOLOADING=all PDF_NETWORK_TESTS=1 \
 #     ./build/release/test/unittest test/sql/read_pdf_columns.test
 require httpfs
-
-# Network test. Opt in with PDF_NETWORK_TESTS=1 so an offline `make test` and a
-# CI runner without egress both stay green.
-require-env PDF_NETWORK_TESTS
 
 statement ok
 PRAGMA enable_verification
