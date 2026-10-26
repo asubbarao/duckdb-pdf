@@ -1,0 +1,12 @@
+# description: reject nonfinite PDF layout settings before invoking libharu
+require pdf
+
+statement error
+COPY (SELECT 'text') TO '__TEST_DIR__/nan_font.pdf' (FORMAT pdf, font_size 'NaN');
+----
+font_size must be between 4 and 72
+
+statement error
+COPY (SELECT 'text') TO '__TEST_DIR__/nan_margin.pdf' (FORMAT pdf, margin 'NaN');
+----
+margin must be between 0 and 216

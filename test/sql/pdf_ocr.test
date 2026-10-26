@@ -85,6 +85,27 @@ SELECT bool_and(src.text = dst.text) FROM src JOIN dst USING (page);
 true
 
 # force OCR applies to a native page too; the output remains searchable.
+# A page range selects OCR work while status rows still cover the document.
+query III
+SELECT page, had_text_layer, ocr_applied
+FROM pdf_ocr('test/data/two_pages.pdf', '__TEST_DIR__/ocr_range.pdf', force := true,
+             first_page := 2, last_page := 2, ocr_retry := false)
+ORDER BY page;
+----
+1	true	false
+2	true	true
+
+# The page outside the requested range keeps its original text.
+query I
+WITH original AS (
+  SELECT text FROM read_pdf('test/data/two_pages.pdf', first_page := 1, last_page := 1, auto_ocr := false)
+), rewritten AS (
+  SELECT text FROM read_pdf('__TEST_DIR__/ocr_range.pdf', first_page := 1, last_page := 1, auto_ocr := false)
+)
+SELECT original.text = rewritten.text FROM original JOIN rewritten ON original.text = rewritten.text;
+----
+true
+
 query I
 SELECT bool_and(ocr_applied) FROM pdf_ocr('test/data/hello.pdf', '__TEST_DIR__/ocr_forced.pdf', force := true,
                                            ocr_retry := false);

@@ -196,14 +196,27 @@ bool ModelExistsIn(const std::string &dir, const std::string &language) {
 	if (dir.empty()) {
 		return false;
 	}
-	std::string path = dir;
-	char sep = path.back();
+	std::string prefix = dir;
+	char sep = prefix.back();
 	if (sep != '/' && sep != '\\') {
-		path += '/';
+		prefix += '/';
 	}
-	path += language + ".traineddata";
-	std::ifstream f(path.c_str());
-	return f.good();
+	// Tesseract language expressions select separate models, e.g. eng+fra.
+	// A ~name component excludes a model and need not exist on disk.
+	bool selected = false;
+	for (size_t start = 0; start <= language.size();) {
+		auto end = language.find('+', start);
+		auto model = language.substr(start, end == std::string::npos ? end : end - start);
+		if (model.empty()) return false;
+		if (model[0] != '~') {
+			selected = true;
+			std::ifstream file((prefix + model + ".traineddata").c_str());
+			if (!file.good()) return false;
+		}
+		if (end == std::string::npos) break;
+		start = end + 1;
+	}
+	return selected;
 }
 
 // True if <dir>/<lang>.traineddata OR <dir>/tessdata/<lang>.traineddata exists.
@@ -269,7 +282,9 @@ std::string ResolveTessdataDir(const std::string &language, const std::string &e
 		}
 	}
 	// Zero host install: eng.traineddata is compiled into the extension.
-	return EnsureBundledTessdataDir(language);
+	// The bundled directory can satisfy combinations of bundled models too.
+	auto bundled = EnsureBundledTessdataDir("eng");
+	return ModelExistsIn(bundled, language) ? bundled : std::string();
 }
 
 // Convert raw poppler-style pixels into a 32bpp leptonica Pix. Returns nullptr
@@ -860,7 +875,7 @@ TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Opti
 			return out;
 		}
 		throw std::runtime_error("could not decode image BLOB "
-		                         "(expected PNG/JPEG/etc. readable by leptonica, e.g. from poppler_render_page)");
+		                         "(expected PNG/JPEG/etc. readable by leptonica, e.g. from pdf_to_png)");
 	}
 
 	if (!EnsureTesseract(opt)) {

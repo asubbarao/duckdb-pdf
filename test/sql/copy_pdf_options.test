@@ -4,12 +4,12 @@
 
 require pdf
 
-# --- TITLE / AUTHOR roundtrip via read_pdf_meta ---
+# --- TITLE / AUTHOR roundtrip via pdf_info ---
 statement ok
 COPY (SELECT 'tav' AS c) TO '__TEST_DIR__/copy_opts_ta.pdf' (FORMAT pdf, TITLE 'Q3 Report', AUTHOR 'Alok', USE_TMP_FILE false);
 
 query I
-SELECT title = 'Q3 Report' AND author = 'Alok' FROM read_pdf_meta('__TEST_DIR__/copy_opts_ta.pdf');
+SELECT title = 'Q3 Report' AND author = 'Alok' FROM pdf_info('__TEST_DIR__/copy_opts_ta.pdf');
 ----
 true
 

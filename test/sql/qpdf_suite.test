@@ -90,7 +90,7 @@ SELECT max(page_count) FROM read_pdf('__TEST_DIR__/qsenc.pdf', password := 'hunt
 3
 
 query I
-SELECT encrypted FROM read_pdf_meta('__TEST_DIR__/qsenc.pdf', password := 'hunter2');
+SELECT is_encrypted FROM pdf_info('__TEST_DIR__/qsenc.pdf', password := 'hunter2');
 ----
 true
 
@@ -106,7 +106,7 @@ SELECT ends_with(pdf_decrypt('__TEST_DIR__/qsenc.pdf', '__TEST_DIR__/qsdec.pdf',
 true
 
 query I
-SELECT encrypted FROM read_pdf_meta('__TEST_DIR__/qsdec.pdf');
+SELECT is_encrypted FROM pdf_info('__TEST_DIR__/qsdec.pdf');
 ----
 false
 

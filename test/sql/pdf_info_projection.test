@@ -1,0 +1,405 @@
+# description: every consolidated pdf_info column projects correctly
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+COPY (SELECT 'Document metadata projection' AS text) TO '__TEST_DIR__/projection_metadata.pdf'
+(FORMAT pdf, TITLE 'Projection title', AUTHOR 'Projection author');
+
+# Materialize full rows before checking one-column projections. The fixtures
+# exercise populated metadata, PDF/A, form fields, IDs and mixed permissions.
+statement ok
+CREATE TABLE info_reference AS
+SELECT * FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+UNION ALL SELECT * FROM pdf_info('test/data/pdfa.pdf')
+UNION ALL SELECT * FROM pdf_info('__TEST_DIR__/projection_metadata.pdf');
+
+query IIIIIIIIIIT
+SELECT is_encrypted, perm_print, perm_print_high_resolution, perm_change, perm_copy,
+       perm_add_notes, perm_fill_forms, perm_accessibility, perm_assemble, has_javascript, form_type
+FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader');
+----
+true	true	false	false	false	false	false	true	false	false	acro
+
+# Poppler's ID strings are encoded values; presence and projected identity matter.
+query I
+SELECT permanent_id IS NOT NULL AND update_id IS NOT NULL
+FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader');
+----
+true
+
+statement error
+SELECT file FROM pdf_info('test/data/restricted_permissions.pdf');
+----
+
+query I
+SELECT len(coalesce(list(file), []))
+FROM pdf_info('test/data/restricted_permissions.pdf', ignore_errors := true);
+----
+0
+
+query I
+WITH projected AS (
+  SELECT file, file AS projected_file FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, file AS projected_file FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, file AS projected_file FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.projected_file IS NOT DISTINCT FROM r.file)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, title FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, title FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, title FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.title IS NOT DISTINCT FROM r.title)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, author FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, author FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, author FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.author IS NOT DISTINCT FROM r.author)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, subject FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, subject FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, subject FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.subject IS NOT DISTINCT FROM r.subject)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, keywords FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, keywords FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, keywords FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.keywords IS NOT DISTINCT FROM r.keywords)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, creator FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, creator FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, creator FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.creator IS NOT DISTINCT FROM r.creator)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, producer FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, producer FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, producer FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.producer IS NOT DISTINCT FROM r.producer)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, creation_date FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, creation_date FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, creation_date FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.creation_date IS NOT DISTINCT FROM r.creation_date)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, mod_date FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, mod_date FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, mod_date FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.mod_date IS NOT DISTINCT FROM r.mod_date)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, page_count FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, page_count FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, page_count FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.page_count IS NOT DISTINCT FROM r.page_count)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, is_encrypted FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, is_encrypted FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, is_encrypted FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.is_encrypted IS NOT DISTINCT FROM r.is_encrypted)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, is_linearized FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, is_linearized FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, is_linearized FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.is_linearized IS NOT DISTINCT FROM r.is_linearized)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, pdf_version FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, pdf_version FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, pdf_version FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.pdf_version IS NOT DISTINCT FROM r.pdf_version)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, width FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, width FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, width FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.width IS NOT DISTINCT FROM r.width)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, height FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, height FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, height FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.height IS NOT DISTINCT FROM r.height)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, file_size FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, file_size FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, file_size FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.file_size IS NOT DISTINCT FROM r.file_size)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, pdfa_part FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, pdfa_part FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, pdfa_part FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.pdfa_part IS NOT DISTINCT FROM r.pdfa_part)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, pdfa_conformance FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, pdfa_conformance FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, pdfa_conformance FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.pdfa_conformance IS NOT DISTINCT FROM r.pdfa_conformance)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, is_locked FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, is_locked FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, is_locked FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.is_locked IS NOT DISTINCT FROM r.is_locked)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, perm_print FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, perm_print FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, perm_print FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.perm_print IS NOT DISTINCT FROM r.perm_print)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, perm_print_high_resolution FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, perm_print_high_resolution FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, perm_print_high_resolution FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.perm_print_high_resolution IS NOT DISTINCT FROM r.perm_print_high_resolution)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, perm_change FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, perm_change FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, perm_change FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.perm_change IS NOT DISTINCT FROM r.perm_change)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, perm_copy FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, perm_copy FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, perm_copy FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.perm_copy IS NOT DISTINCT FROM r.perm_copy)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, perm_add_notes FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, perm_add_notes FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, perm_add_notes FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.perm_add_notes IS NOT DISTINCT FROM r.perm_add_notes)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, perm_fill_forms FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, perm_fill_forms FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, perm_fill_forms FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.perm_fill_forms IS NOT DISTINCT FROM r.perm_fill_forms)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, perm_accessibility FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, perm_accessibility FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, perm_accessibility FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.perm_accessibility IS NOT DISTINCT FROM r.perm_accessibility)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, perm_assemble FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, perm_assemble FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, perm_assemble FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.perm_assemble IS NOT DISTINCT FROM r.perm_assemble)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, has_javascript FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, has_javascript FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, has_javascript FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.has_javascript IS NOT DISTINCT FROM r.has_javascript)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, form_type FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, form_type FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, form_type FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.form_type IS NOT DISTINCT FROM r.form_type)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, page_mode FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, page_mode FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, page_mode FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.page_mode IS NOT DISTINCT FROM r.page_mode)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, page_layout FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, page_layout FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, page_layout FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.page_layout IS NOT DISTINCT FROM r.page_layout)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, permanent_id FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, permanent_id FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, permanent_id FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.permanent_id IS NOT DISTINCT FROM r.permanent_id)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+
+query I
+WITH projected AS (
+  SELECT file, update_id FROM pdf_info('test/data/restricted_permissions.pdf', password := 'reader')
+  UNION ALL SELECT file, update_id FROM pdf_info('test/data/pdfa.pdf')
+  UNION ALL SELECT file, update_id FROM pdf_info('__TEST_DIR__/projection_metadata.pdf')
+)
+SELECT bool_and(p.update_id IS NOT DISTINCT FROM r.update_id)
+FROM projected p JOIN info_reference r ON p.file = r.file;
+----
+true
+

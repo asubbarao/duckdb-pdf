@@ -1,0 +1,18 @@
+# description: plus-separated OCR language models resolve individually
+require pdf
+
+# eng is bundled on hosts without a system model installation. A combined
+# expression must not be looked up as the filename eng+eng.traineddata.
+query I
+SELECT contains(upper(text), 'ITEM') OR contains(upper(text), 'LTEM')
+FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_language := 'eng+eng', ocr_retry := false);
+----
+true
+
+# A missing component must fail rather than silently use only English.
+statement error
+SELECT text FROM read_pdf('test/data/scanned.pdf', ocr := true,
+                         ocr_language := 'eng+pdf_model_missing',
+                         tessdata_dir := 'test/data', ocr_retry := false);
+----
+could not load the Tesseract model

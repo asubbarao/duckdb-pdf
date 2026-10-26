@@ -146,7 +146,7 @@ FROM read_pdf_words('scan.pdf', ocr := true,
 -- Scalar on a rendered PNG BLOB (positional: lang, psm, oem, tessdata_dir,
 -- preprocess, vars MAP, config path — empty string = default tessdata)
 SELECT tesseract_ocr(
-  poppler_render_page((SELECT content FROM read_blob('scan.pdf')), 1, 200),
+  pdf_to_png((SELECT content FROM read_blob('scan.pdf')), 1, 200),
   'eng', 6, 3, '', true,
   MAP {'tessedit_char_whitelist': 'ABC0123456789'},
   ''
@@ -178,7 +178,7 @@ First arg must be foldable (no subqueries):
 
 ```sql
 SET VARIABLE page_png = (
-  SELECT poppler_render_page(content, 1, 200) FROM read_blob('scan.pdf')
+  SELECT pdf_to_png(content, 1, 200) FROM read_blob('scan.pdf')
 );
 SELECT text, confidence, format
 FROM ocr_image(
@@ -224,7 +224,7 @@ FROM pdf_words;
 ```
 
 **Gotcha:** geometric `line` is the join key for bbox work. `read_pdf_lines`
-(Poppler `page->text()` split on `\n`) can still differ on multi-column pages —
+(geometry text for `layout := 'auto'`, Poppler text for other layouts) can differ on multi-column pages —
 use it when you only need grep-style line context without boxes. Prefer
 `pdf_pages_info` when you need rotation/media box **without** extracting words.
 Raster previews: `pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100)` —
@@ -252,8 +252,8 @@ SELECT DISTINCT filename FROM read_pdf('docs/*.pdf', ignore_errors := true);
 ```
 
 **Gotcha:** without `ignore_errors := true`, **one bad file aborts the whole
-scan** (the default). `ignore_errors` is accepted only by `read_pdf` and
-`read_pdf_meta`. Encrypted files count as "unopenable" unless you pass the
+scan** (the default). `ignore_errors` is accepted by `read_pdf`,
+`pdf_info`, `pdf_outline`, and `pdf_structure`. Encrypted files count as "unopenable" unless you pass the
 `password`, so a password-protected file shows up in the quarantine list too.
 
 ---
@@ -546,7 +546,8 @@ The runnable script is [`examples/digest_long_document.sql`](examples/digest_lon
 quickly and no query pays for OCR twice.
 
 ```sql
--- pdf_ocr(src, dst, force := false, <the OCR options the readers take>)
+-- Supported controls include force, first_page/last_page, password,
+-- ocr_language/dpi/psm/oem/preprocess/retry, tessdata_dir, ocr_vars/config.
 -- One row per page: page, had_text_layer, ocr_applied, words, mean_confidence, seconds, out_path
 FROM pdf_ocr('scans/invoice.pdf', 'scans/invoice.searchable.pdf');
 
@@ -555,8 +556,11 @@ SELECT page_number, element_type, text FROM read_pdf_elements('scans/invoice.sea
 SELECT chunk_idx, page_start, n_chars    FROM pdf_chunks('scans/invoice.searchable.pdf');
 ```
 
-Pages that already have a text layer are copied untouched (`ocr_applied = false`); `force := true`
-OCRs every page. OCR runs through Tesseract and the text layer is Tesseract's own invisible one,
+Pages that already have a text layer retain their content (`ocr_applied = false`); `force := true`
+OCRs every selected page. `first_page` / `last_page` limit OCR selection while status
+rows still cover the whole document. The document is rewritten, not byte-preserved.
+The compatibility options `ocr`, `auto_ocr` and `parse_tables` do not control this writer.
+OCR runs through Tesseract and the text layer is Tesseract's own invisible one,
 spliced into the original with qpdf, so links, outline and metadata survive.
 
 **Gotcha:** this is best-effort OCR for clean printed text. On the repository's scanned invoice

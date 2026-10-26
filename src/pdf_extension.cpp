@@ -18,6 +18,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "pdf_function_docs.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/client_context_file_opener.hpp"
@@ -1632,11 +1633,19 @@ static std::vector<std::vector<string>> ReconstructLatticeGrid(const std::vector
 	};
 
 	for (const auto &w : page_words) {
-		double mx = 0.5 * (w.xMin + w.xMax);
 		double my = 0.5 * (w.yMin + w.yMax);
-		int c = col_of(mx);
 		int r = row_of(my);
-		if (c < 0 || r < 0) {
+		if (r < 0) continue; // A title outside the ruled rows is not table content.
+		// Decorative strokes can supply apparent column boundaries through a
+		// paragraph. A real separator must not cut through a word's glyph box.
+		for (size_t i = 1; i + 1 < rules.v_rules.size(); ++i) {
+			if (w.xMin < rules.v_rules[i] - 1.0 && w.xMax > rules.v_rules[i] + 1.0) {
+				return {};
+			}
+		}
+		double mx = 0.5 * (w.xMin + w.xMax);
+		int c = col_of(mx);
+		if (c < 0) {
 			continue;
 		}
 		band_words[static_cast<size_t>(r)][static_cast<size_t>(c)].push_back(w);
@@ -2821,89 +2830,17 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 }
 
 //===--------------------------------------------------------------------===//
-// read_pdf_meta  -> one row per file
-//===--------------------------------------------------------------------===//
-struct ReadPdfMetaBindData : public TableFunctionData {
-	vector<string> files;
-	PdfOptions opt;
-};
-struct ReadPdfMetaState : public GlobalTableFunctionState {
-	idx_t idx = 0;
-	idx_t MaxThreads() const override {
-		return 1;
-	}
-};
-
-static unique_ptr<FunctionData> ReadPdfMetaBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
-	auto result = make_uniq<ReadPdfMetaBindData>();
-	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
-	ParseNamed(input.named_parameters, result->opt);
-	PdfCheckOcrPaths(context, result->opt);
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
-	                LogicalType::VARCHAR, LogicalType::BOOLEAN};
-	names = {"filename", "title",    "author", "subject",     "keywords",
-	         "creator",  "producer", "pages",  "pdf_version", "encrypted"};
-	return std::move(result);
-}
-
-static unique_ptr<GlobalTableFunctionState> ReadPdfMetaInit(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<ReadPdfMetaState>();
-}
-
-static void ReadPdfMetaScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-	auto &bind = data_p.bind_data->Cast<ReadPdfMetaBindData>();
-	auto &st = data_p.global_state->Cast<ReadPdfMetaState>();
-	idx_t count = 0;
-	while (count < STANDARD_VECTOR_SIZE && st.idx < bind.files.size()) {
-		auto &path = bind.files[st.idx];
-		string bytes;
-		unique_ptr<poppler::document> doc;
-		try {
-			ReadAllBytes(context, path, bytes);
-			doc = LoadDoc(bytes, bind.opt.password, path);
-		} catch (const std::exception &) {
-			// Strict by default; opt in to skipping bad files with ignore_errors.
-			if (!bind.opt.ignore_errors) {
-				throw;
-			}
-			st.idx++;
-			continue; // skip this file, advance to the next
-		}
-
-		int major = 0, minor = 0;
-		doc->get_pdf_version(&major, &minor);
-
-		OutString(output.data[0], count, path);
-		OutString(output.data[1], count, UStringToUtf8(doc->info_key("Title")));
-		OutString(output.data[2], count, UStringToUtf8(doc->info_key("Author")));
-		OutString(output.data[3], count, UStringToUtf8(doc->info_key("Subject")));
-		OutString(output.data[4], count, UStringToUtf8(doc->info_key("Keywords")));
-		OutString(output.data[5], count, UStringToUtf8(doc->info_key("Creator")));
-		OutString(output.data[6], count, UStringToUtf8(doc->info_key("Producer")));
-		OutInt32(output.data[7], count, doc->pages());
-		OutString(output.data[8], count, to_string(major) + "." + to_string(minor));
-		OutBool(output.data[9], count, doc->is_encrypted());
-		st.idx++;
-		count++;
-	}
-	output.SetChildCardinality(count);
-}
-
-//===--------------------------------------------------------------------===//
 // Inspection suite: pdf_info / pdf_outline / pdf_attachments
 //
 // Read-only "folder census" functions. All three take the same files argument
 // as read_pdf (single path or glob), run serially per file, and follow the
-// same failure contract as read_pdf_meta: a corrupt/missing/locked file
-// throws (never silently yields zero rows). Poppler work stays inside the
+// strict-by-default failure contract: corrupt/missing/locked files throw unless
+// the reader supports ignore_errors and the caller opts in. Poppler work stays inside the
 // per-call PopplerMutex critical section.
 //===--------------------------------------------------------------------===//
 struct PdfInspectBindData : public TableFunctionData {
 	vector<string> files;
-	PdfOptions opt; // only `password` is honored here
+	PdfOptions opt; // readers register only the options they honor
 };
 
 // Shared bind: resolve the file list and parse the password named parameter.
@@ -2975,28 +2912,49 @@ static string ExtractPdfaId(const string &xmp, const string &key) {
 //===--------------------------------------------------------------------===//
 // pdf_info  -> one row per file (identity + geometry + storage census)
 //===--------------------------------------------------------------------===//
+static const char *PageModeName(poppler::document::page_mode_enum mode);
+static const char *PageLayoutName(poppler::document::page_layout_enum layout);
+static const char *FormTypeName(int type);
+
 struct PdfInfoState : public GlobalTableFunctionState {
 	idx_t idx = 0;
-	idx_t MaxThreads() const override {
-		return 1;
-	}
+	vector<column_t> column_ids;
+	bool needs_geometry = false;
+	bool needs_pdfa = false;
+	bool needs_features = false;
+	bool needs_ids = false;
+	idx_t MaxThreads() const override { return 1; }
 };
 
 static unique_ptr<FunctionData> PdfInfoBind(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
-	return_types = {LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP,
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP,
 	                LogicalType::TIMESTAMP, LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::VARCHAR,   LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BIGINT,
-	                LogicalType::INTEGER,   LogicalType::VARCHAR};
-	names = {"file",        "title",         "author",   "subject",    "keywords",     "creator",
-	         "producer",    "creation_date", "mod_date", "page_count", "is_encrypted", "is_linearized",
-	         "pdf_version", "width",         "height",   "file_size",  "pdfa_part",    "pdfa_conformance"};
+	                LogicalType::VARCHAR, LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::BIGINT,
+	                LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	names = {"file", "title", "author", "subject", "keywords", "creator", "producer", "creation_date", "mod_date",
+	         "page_count", "is_encrypted", "is_linearized", "pdf_version", "width", "height", "file_size",
+	         "pdfa_part", "pdfa_conformance", "is_locked", "perm_print", "perm_print_high_resolution", "perm_change",
+	         "perm_copy", "perm_add_notes", "perm_fill_forms", "perm_accessibility", "perm_assemble",
+	         "has_javascript", "form_type", "page_mode", "page_layout", "permanent_id", "update_id"};
 	return PdfInspectBindCommon(context, input);
 }
 
-static unique_ptr<GlobalTableFunctionState> PdfInfoInit(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<PdfInfoState>();
+static unique_ptr<GlobalTableFunctionState> PdfInfoInit(ClientContext &, TableFunctionInitInput &input) {
+	auto state = make_uniq<PdfInfoState>();
+	state->column_ids = input.column_ids;
+	for (auto column : state->column_ids) {
+		state->needs_geometry |= column == 13 || column == 14;
+		state->needs_pdfa |= column == 16 || column == 17;
+		state->needs_features |= column == 27 || column == 28;
+		state->needs_ids |= column == 31 || column == 32;
+	}
+	return std::move(state);
 }
 
 static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
@@ -3005,79 +2963,112 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 	auto &st = data_p.global_state->Cast<PdfInfoState>();
 	idx_t count = 0;
 	while (count < STANDARD_VECTOR_SIZE && st.idx < bind.files.size()) {
-		auto &path = bind.files[st.idx];
+		context.BlockingInterruptCheck();
+		const auto &path = bind.files[st.idx++];
 		string bytes;
-		ReadAllBytes(context, path, bytes);
-		auto doc = LoadDoc(bytes, bind.opt.password, path);
-
-		int major = 0, minor = 0;
-		doc->get_pdf_version(&major, &minor);
-
-		// first-page media box, in points; NULL if the page will not open
-		bool has_page_size = false;
-		double page_width = 0, page_height = 0;
-		unique_ptr<poppler::page> first_page(doc->create_page(0));
-		if (first_page) {
-			auto rect = first_page->page_rect(poppler::media_box);
-			page_width = rect.width();
-			page_height = rect.height();
-			has_page_size = true;
+		unique_ptr<poppler::document> doc;
+		try {
+			ReadAllBytes(context, path, bytes);
+			doc = LoadDoc(bytes, bind.opt.password, path);
+		} catch (const std::exception &) {
+			context.BlockingInterruptCheck();
+			if (!bind.opt.ignore_errors) throw;
+			continue;
 		}
-
-		// PDF/A identification from the XMP metadata packet (detection only,
-		// no validation): pdfaid:part (INTEGER) and pdfaid:conformance (A/B/U).
-		bool has_pdfa_part = false;
+		bool has_page_size = false, has_pdfa_part = false;
+		double page_width = 0, page_height = 0;
 		int32_t pdfa_part = 0;
 		string pdfa_conformance;
-		{
-			string xmp = UStringToUtf8(doc->metadata());
-			if (!xmp.empty()) {
-				string part_str = ExtractPdfaId(xmp, "part");
-				if (!part_str.empty()) {
-					try {
-						size_t consumed = 0;
-						int part = std::stoi(part_str, &consumed);
-						if (consumed == part_str.size()) {
-							pdfa_part = part;
-							has_pdfa_part = true;
-						}
-					} catch (const std::exception &) {
-						// non-numeric part -> leave NULL
-					}
-				}
-				pdfa_conformance = ExtractPdfaId(xmp, "conformance");
+		if (st.needs_geometry) {
+			unique_ptr<poppler::page> page(doc->create_page(0));
+			if (page) {
+				auto rect = page->page_rect(poppler::media_box);
+				page_width = rect.width();
+				page_height = rect.height();
+				has_page_size = true;
 			}
 		}
-
-		OutString(output.data[0], count, path);
-		OutStringOrNull(output.data[1], count, UStringToUtf8(doc->info_key("Title")));
-		OutStringOrNull(output.data[2], count, UStringToUtf8(doc->info_key("Author")));
-		OutStringOrNull(output.data[3], count, UStringToUtf8(doc->info_key("Subject")));
-		OutStringOrNull(output.data[4], count, UStringToUtf8(doc->info_key("Keywords")));
-		OutStringOrNull(output.data[5], count, UStringToUtf8(doc->info_key("Creator")));
-		OutStringOrNull(output.data[6], count, UStringToUtf8(doc->info_key("Producer")));
-		OutDateOrNull(output.data[7], count, doc->info_date_t("CreationDate"));
-		OutDateOrNull(output.data[8], count, doc->info_date_t("ModDate"));
-		OutInt32(output.data[9], count, doc->pages());
-		OutBool(output.data[10], count, doc->is_encrypted());
-		OutBool(output.data[11], count, doc->is_linearized());
-		OutString(output.data[12], count, to_string(major) + "." + to_string(minor));
-		if (has_page_size) {
-			OutDouble(output.data[13], count, page_width);
-			OutDouble(output.data[14], count, page_height);
-		} else {
-			OutDoubleNull(output.data[13], count);
-			OutDoubleNull(output.data[14], count);
+		if (st.needs_pdfa) {
+			auto xmp = UStringToUtf8(doc->metadata());
+			auto part_str = ExtractPdfaId(xmp, "part");
+			if (!part_str.empty()) {
+				try {
+					size_t consumed = 0;
+					pdfa_part = std::stoi(part_str, &consumed);
+					has_pdfa_part = consumed == part_str.size();
+				} catch (const std::exception &) {
+					// Invalid identification metadata stays NULL.
+				}
+			}
+			pdfa_conformance = ExtractPdfaId(xmp, "conformance");
 		}
-		OutInt64(output.data[15], count, (int64_t)bytes.size());
-		if (has_pdfa_part) {
-			OutInt32(output.data[16], count, pdfa_part);
-		} else {
-			OutInt32Null(output.data[16], count);
+		std::string permanent_id, update_id;
+		if (st.needs_ids) doc->get_pdf_id(&permanent_id, &update_id);
+		bool has_features = true, javascript = false;
+		int form_type = 0;
+		if (st.needs_features) {
+#if POPPLER_VERSION_MAJOR >= 25
+			javascript = doc->has_javascript();
+			form_type = static_cast<int>(doc->form_type());
+#else
+			has_features = PopplerLegacyDocumentFeatures(bytes, bind.opt.password, javascript, form_type);
+#endif
 		}
-		OutStringOrNull(output.data[17], count, pdfa_conformance);
-		st.idx++;
-		count++;
+		static const char *metadata_keys[] = {"Title", "Author", "Subject", "Keywords", "Creator", "Producer"};
+		static const poppler::permission_enum permissions[] = {
+		    poppler::perm_print, poppler::perm_print_high_resolution, poppler::perm_change, poppler::perm_copy,
+		    poppler::perm_add_notes, poppler::perm_fill_forms, poppler::perm_accessibility, poppler::perm_assemble};
+		for (idx_t col = 0; col < st.column_ids.size(); ++col) {
+			auto &out = output.data[col];
+			auto id = st.column_ids[col];
+			if (id >= 1 && id <= 6) {
+				OutStringOrNull(out, count, UStringToUtf8(doc->info_key(metadata_keys[id - 1])));
+				continue;
+			}
+			if (id >= 19 && id <= 26) {
+				OutBool(out, count, doc->has_permission(permissions[id - 19]));
+				continue;
+			}
+			switch (id) {
+			case 0: OutString(out, count, path); break;
+			case 7: OutDateOrNull(out, count, doc->info_date_t("CreationDate")); break;
+			case 8: OutDateOrNull(out, count, doc->info_date_t("ModDate")); break;
+			case 9: OutInt32(out, count, doc->pages()); break;
+			case 10: OutBool(out, count, doc->is_encrypted()); break;
+			case 11: OutBool(out, count, doc->is_linearized()); break;
+			case 12: {
+				int major = 0, minor = 0;
+				doc->get_pdf_version(&major, &minor);
+				OutString(out, count, to_string(major) + "." + to_string(minor));
+				break;
+			}
+			case 13: case 14:
+				if (has_page_size) OutDouble(out, count, id == 13 ? page_width : page_height);
+				else OutDoubleNull(out, count);
+				break;
+			case 15: OutInt64(out, count, static_cast<int64_t>(bytes.size())); break;
+			case 16:
+				if (has_pdfa_part) OutInt32(out, count, pdfa_part);
+				else OutInt32Null(out, count);
+				break;
+			case 17: OutStringOrNull(out, count, pdfa_conformance); break;
+			case 18: OutBool(out, count, doc->is_locked()); break;
+			case 27:
+				if (has_features) OutBool(out, count, javascript);
+				else FlatVector::SetNull(out, count, true);
+				break;
+			case 28:
+				if (has_features) OutString(out, count, FormTypeName(form_type));
+				else OutStringNull(out, count);
+				break;
+			case 29: OutString(out, count, PageModeName(doc->page_mode())); break;
+			case 30: OutString(out, count, PageLayoutName(doc->page_layout())); break;
+			case 31: OutStringOrNull(out, count, permanent_id); break;
+			case 32: OutStringOrNull(out, count, update_id); break;
+			default: out.SetValue(count, Value::BIGINT(st.idx - 1)); break;
+			}
+		}
+		++count;
 	}
 	output.SetChildCardinality(count);
 }
@@ -3805,7 +3796,7 @@ struct ReadPdfWordsState : public GlobalTableFunctionState {
 };
 
 // Geometric line ids for a page of word bboxes. Same vertical-overlap rule as
-// Word grouping for read_pdf_words / read_pdf_layout. Both the line id and the
+// Word grouping for read_pdf_words. Both the line id and the
 // column id come from the shared layout engine, so `line` means the same thing
 // here, in read_pdf_lines and in read_pdf_elements: words that share a line of
 // a column. Grouping words by vertical overlap alone — which is what this used
@@ -3834,19 +3825,10 @@ static WordGrouping GroupLayoutWords(const std::vector<LayoutWord> &words, const
 }
 
 static WordGrouping GroupWordsNative(const std::vector<MergedTextBox> &boxes, double page_width) {
-	std::vector<LayoutWord> words;
+	auto words = LayoutWordsFromBoxes(boxes);
 	std::vector<size_t> origin;
-	words.reserve(boxes.size());
 	origin.reserve(boxes.size());
 	for (size_t i = 0; i < boxes.size(); i++) {
-		LayoutWord w;
-		w.x0 = boxes[i].x0;
-		w.y0 = boxes[i].y0;
-		w.x1 = boxes[i].x1;
-		w.y1 = boxes[i].y1;
-		w.font_size = boxes[i].has_font ? boxes[i].font_size : 0.0;
-		w.text = boxes[i].text;
-		words.push_back(std::move(w));
 		origin.push_back(i);
 	}
 	return GroupLayoutWords(words, origin, boxes.size(), page_width);
@@ -5942,11 +5924,11 @@ static void PdfToPngBlobDpiFun(DataChunk &args, ExpressionState &state, Vector &
 //===--------------------------------------------------------------------===//
 // Low-level building blocks (Gemini checklist):
 //   poppler_version() -> VARCHAR
-//   poppler_render_page(pdf_blob, page, dpi) -> BLOB  (PNG)
+//   pdf_to_png(pdf_blob, page, dpi) -> BLOB  (PNG)
 //   tesseract_ocr(image_blob[, lang[, psm[, oem[, tessdata_dir[, preprocess[, vars[, config]]]]]]])
 //
-// poppler_render_page reuses LoadBlobDoc + RenderPageToPngBytes (same raster
-// path as pdf_to_png BLOB overloads). tesseract_ocr runs in-process OCR on an
+// pdf_to_png uses LoadBlobDoc + RenderPageToPngBytes for BLOB inputs.
+// tesseract_ocr runs in-process OCR on an
 // encoded image BLOB via pdf_ocr::RecognizeImageBlob (leptonica pixReadMem).
 // Scalar overloads are positional (DuckDB scalars have no named-param map);
 // table readers expose the same knobs as ocr_* named params including ocr_vars
@@ -5959,27 +5941,6 @@ static void PopplerVersionFun(DataChunk &args, ExpressionState &state, Vector &r
 	// Runtime linked version from poppler-cpp; POPPLER_VERSION is the compile-time
 	// header macro (same string when headers match the dylib).
 	result.Reference(Value(poppler::version_string()), count_t(args.size()));
-}
-
-static void PopplerRenderPageFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	TernaryExecutor::Execute<string_t, int32_t, int32_t, string_t>(
-	    args.data[0], args.data[1], args.data[2], result, args.size(),
-	    [&](string_t blob, int32_t page_no, int32_t dpi) {
-		    auto handle = LoadBlobDoc("poppler_render_page", blob.GetDataUnsafe(), blob.GetSize());
-		    // Validate with this function's name so messages match the call site
-		    // (same rules as pdf_to_png BLOB overloads: 1-based page, dpi 1..2400).
-		    std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-		    int n = handle.doc->pages();
-		    if (page_no < 1 || page_no > n) {
-			    throw IOException("poppler_render_page: page %d is out of range (document has %d page%s)", (int)page_no,
-			                      n, n == 1 ? "" : "s");
-		    }
-		    if (dpi < 1 || dpi > 2400) {
-			    throw InvalidInputException("poppler_render_page: dpi must be between 1 and 2400 (got %d)", (int)dpi);
-		    }
-		    auto png = RenderPageToPngBytes(*handle.doc, page_no, dpi, "poppler_render_page");
-		    return StringVector::AddStringOrBlob(result, string_t(png.data(), static_cast<uint32_t>(png.size())));
-	    });
 }
 
 // Build Options from tesseract_ocr positional arity (ColumnCount):
@@ -6970,7 +6931,7 @@ static unique_ptr<FunctionData> PdfCopyBind(ClientContext &context, CopyFunction
 			result->write_opts.footer = PdfGetStringOption(set, loption);
 		} else if (loption == "font_size") {
 			double fs = PdfGetDoubleOption(set, loption);
-			if (fs < 4.0 || fs > 72.0) {
+			if (!std::isfinite(fs) || fs < 4.0 || fs > 72.0) {
 				throw BinderException("font_size must be between 4 and 72");
 			}
 			result->write_opts.font_size = fs;
@@ -6982,7 +6943,7 @@ static unique_ptr<FunctionData> PdfCopyBind(ClientContext &context, CopyFunction
 			result->write_opts.page_size = ps;
 		} else if (loption == "margin") {
 			double m = PdfGetDoubleOption(set, loption);
-			if (m < 0.0 || m > 216.0) {
+			if (!std::isfinite(m) || m < 0.0 || m > 216.0) {
 				throw BinderException("margin must be between 0 and 216");
 			}
 			result->write_opts.margin = m;
@@ -7544,7 +7505,7 @@ static void PdfOpsCheckOutputDir(const char *fn, const string &dir) {
 // pdf_merge(inputs LIST(VARCHAR), output VARCHAR) -> VARCHAR (the output path).
 // Concatenates the inputs' pages in list order. Build the list in SQL — the
 // glob recipe is: SELECT list(DISTINCT filename ORDER BY filename) FROM
-// read_pdf_meta('dir/*.pdf').
+// pdf_info('dir/*.pdf').
 // Compare file identity, not just spelling: qpdf reads input lazily.
 static bool PdfSameFile(const string &a, const string &b) {
  if (a == b) return true;
@@ -8045,7 +8006,8 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 		row.page = page_idx + 1;
 		row.had_text_layer = had_text_layer;
 		row.words = native_words;
-		if (had_text_layer && !force) {
+		const bool selected = row.page >= po.first_page && (po.last_page < 0 || row.page <= po.last_page);
+		if (!selected || (had_text_layer && !force)) {
 			rows.push_back(row);
 			continue;
 		}
@@ -8147,16 +8109,22 @@ static void PdfOpsCheckInOut(const char *fn, const string &input, const string &
 // Structural optimization only: object streams, stream recompression, and
 // linearization ("fast web view"). Image data is carried over as-is — this
 // does NOT downsample or re-encode images.
-static string PdfCompressImpl(const string &input, const string &output) {
-	PdfOpsCheckInOut("pdf_compress", input, output);
+template <class WRITE>
+static string PdfStagedOperation(const char *name, const string &input, const string &output, WRITE write) {
+	PdfOpsCheckInOut(name, input, output);
 	try {
 		AtomicPdfOutput staged(output);
-		pdf_qpdf::Compress(input, staged.TempPath());
+		write(staged.TempPath());
 		staged.Commit();
 	} catch (const std::exception &e) {
-		throw InvalidInputException("pdf_compress: %s", string(e.what()));
+		throw InvalidInputException("%s: %s", name, string(e.what()));
 	}
 	return output;
+}
+
+static string PdfCompressImpl(const string &input, const string &output) {
+	return PdfStagedOperation("pdf_compress", input, output,
+	                          [&](const string &path) { pdf_qpdf::Compress(input, path); });
 }
 
 static void PdfCompressFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -8180,16 +8148,9 @@ static void PdfCompressFun(DataChunk &args, ExpressionState &state, Vector &resu
 // password falls back to the user password.
 static string PdfEncryptImpl(const string &input, const string &output, const string &user_password,
                              const string &owner_password) {
-	PdfOpsCheckInOut("pdf_encrypt", input, output);
 	const string &owner = owner_password.empty() ? user_password : owner_password;
-	try {
-		AtomicPdfOutput staged(output);
-		pdf_qpdf::Encrypt(input, staged.TempPath(), user_password, owner);
-		staged.Commit();
-	} catch (const std::exception &e) {
-		throw InvalidInputException("pdf_encrypt: %s", string(e.what()));
-	}
-	return output;
+	return PdfStagedOperation("pdf_encrypt", input, output,
+	                          [&](const string &path) { pdf_qpdf::Encrypt(input, path, user_password, owner); });
 }
 
 static void PdfEncryptFunInternal(DataChunk &args, Vector &result, bool has_owner_arg) {
@@ -8222,15 +8183,8 @@ static void PdfEncryptOwnerFun(DataChunk &args, ExpressionState &state, Vector &
 // (user or owner) and writes an unencrypted copy. A wrong password surfaces
 // qpdf's "invalid password" as an InvalidInput error.
 static string PdfDecryptImpl(const string &input, const string &output, const string &password) {
-	PdfOpsCheckInOut("pdf_decrypt", input, output);
-	try {
-		AtomicPdfOutput staged(output);
-		pdf_qpdf::Decrypt(input, staged.TempPath(), password);
-		staged.Commit();
-	} catch (const std::exception &e) {
-		throw InvalidInputException("pdf_decrypt: %s", string(e.what()));
-	}
-	return output;
+	return PdfStagedOperation("pdf_decrypt", input, output,
+	                          [&](const string &path) { pdf_qpdf::Decrypt(input, path, password); });
 }
 
 static void PdfDecryptFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -8253,15 +8207,8 @@ static void PdfDecryptFun(DataChunk &args, ExpressionState &state, Vector &resul
 // selected by a qpdf-style numeric range ('1-3,7' / 'z' = last / 'r2' =
 // second-to-last) into a new document, in range order (repeats allowed).
 static string PdfPagesImpl(const string &input, const string &output, const string &ranges) {
-	PdfOpsCheckInOut("pdf_pages", input, output);
-	try {
-		AtomicPdfOutput staged(output);
-		pdf_qpdf::Pages(input, staged.TempPath(), ranges);
-		staged.Commit();
-	} catch (const std::exception &e) {
-		throw InvalidInputException("pdf_pages: %s", string(e.what()));
-	}
-	return output;
+	return PdfStagedOperation("pdf_pages", input, output,
+	                          [&](const string &path) { pdf_qpdf::Pages(input, path, ranges); });
 }
 
 static void PdfPagesFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -8329,15 +8276,9 @@ static void PdfWatermarkOpacityFun(DataChunk &args, ExpressionState &state, Vect
 // Bates numbering: stamps prefix + a zero-padded (min 6 digits) sequential
 // number at the bottom-right of each page as real Helvetica text.
 static string PdfBatesImpl(const string &input, const string &output, const string &prefix, int64_t start_number) {
-	PdfOpsCheckInOut("pdf_bates", input, output);
-	try {
-		AtomicPdfOutput staged(output);
-		pdf_qpdf::Bates(input, staged.TempPath(), prefix, static_cast<long long>(start_number), nullptr);
-		staged.Commit();
-	} catch (const std::exception &e) {
-		throw InvalidInputException("pdf_bates: %s", string(e.what()));
-	}
-	return output;
+	return PdfStagedOperation("pdf_bates", input, output, [&](const string &path) {
+		pdf_qpdf::Bates(input, path, prefix, static_cast<long long>(start_number), nullptr);
+	});
 }
 
 static void PdfBatesFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -9258,7 +9199,7 @@ static void PdfImagesScan(ClientContext &context, TableFunctionInput &data_p, Da
 //===--------------------------------------------------------------------===//
 // Comprehensive poppler-cpp surface (high-value gaps)
 //   pdf_pages_info  — per-page geometry / orientation / label
-//   pdf_permissions — document permission bits + form/js/ids/mode
+//   pdf_info        — includes permission bits + form/js/ids/mode
 //   pdf_fonts       — embedded/external font inventory
 //   pdf_destinations— named destination map
 //   pdf_page_images — render every page to PNG (SQL handoff for SOTA OCR)
@@ -9507,80 +9448,6 @@ static void PdfPagesInfoScan(ClientContext &context, TableFunctionInput &data_p,
 			OutDouble(output.data[12], count, row.duration);
 		}
 		st.row_idx++;
-		count++;
-	}
-	output.SetChildCardinality(count);
-}
-
-//---- pdf_permissions ------------------------------------------------------
-struct PdfPermissionsState : public GlobalTableFunctionState {
-	idx_t idx = 0;
-	idx_t MaxThreads() const override {
-		return 1;
-	}
-};
-
-static unique_ptr<FunctionData> PdfPermissionsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
-	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::VARCHAR};
-	names = {"file",          "is_encrypted",   "is_locked",      "perm_print",      "perm_print_high_resolution",
-	         "perm_change",   "perm_copy",      "perm_add_notes", "perm_fill_forms", "perm_accessibility",
-	         "perm_assemble", "has_javascript", "form_type",      "is_linearized",   "page_mode",
-	         "page_layout",   "permanent_id",   "update_id"};
-	return PdfInspectBindCommon(context, input);
-}
-
-static unique_ptr<GlobalTableFunctionState> PdfPermissionsInit(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<PdfPermissionsState>();
-}
-
-static void PdfPermissionsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-	auto &bind = data_p.bind_data->Cast<PdfInspectBindData>();
-	auto &st = data_p.global_state->Cast<PdfPermissionsState>();
-	idx_t count = 0;
-	while (count < STANDARD_VECTOR_SIZE && st.idx < bind.files.size()) {
-		auto &path = bind.files[st.idx];
-		string bytes;
-		ReadAllBytes(context, path, bytes);
-		auto doc = LoadDoc(bytes, bind.opt.password, path);
-		std::string permanent_id, update_id;
-		doc->get_pdf_id(&permanent_id, &update_id);
-		OutString(output.data[0], count, path);
-		OutBool(output.data[1], count, doc->is_encrypted());
-		OutBool(output.data[2], count, doc->is_locked());
-		OutBool(output.data[3], count, doc->has_permission(poppler::perm_print));
-		OutBool(output.data[4], count, doc->has_permission(poppler::perm_print_high_resolution));
-		OutBool(output.data[5], count, doc->has_permission(poppler::perm_change));
-		OutBool(output.data[6], count, doc->has_permission(poppler::perm_copy));
-		OutBool(output.data[7], count, doc->has_permission(poppler::perm_add_notes));
-		OutBool(output.data[8], count, doc->has_permission(poppler::perm_fill_forms));
-		OutBool(output.data[9], count, doc->has_permission(poppler::perm_accessibility));
-		OutBool(output.data[10], count, doc->has_permission(poppler::perm_assemble));
-#if POPPLER_VERSION_MAJOR >= 25
-		OutBool(output.data[11], count, doc->has_javascript());
-		OutString(output.data[12], count, string(FormTypeName(static_cast<int>(doc->form_type()))));
-#else
-		bool javascript = false;
-		int form_type = 0;
-		if (PopplerLegacyDocumentFeatures(bytes, bind.opt.password, javascript, form_type)) {
-			OutBool(output.data[11], count, javascript);
-			OutString(output.data[12], count, string(FormTypeName(form_type)));
-		} else {
-			FlatVector::SetNull(output.data[11], count, true);
-			OutStringNull(output.data[12], count);
-		}
-#endif
-		OutBool(output.data[13], count, doc->is_linearized());
-		OutString(output.data[14], count, string(PageModeName(doc->page_mode())));
-		OutString(output.data[15], count, string(PageLayoutName(doc->page_layout())));
-		OutStringOrNull(output.data[16], count, permanent_id);
-		OutStringOrNull(output.data[17], count, update_id);
-		st.idx++;
 		count++;
 	}
 	output.SetChildCardinality(count);
@@ -10562,7 +10429,9 @@ struct PdfLoader {
 			function.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
 		}
 		function.SetFallible();
-		loader.RegisterFunction(std::move(function));
+		CreateScalarFunctionInfo info(std::move(function));
+		info.functions.ApplyToFunctions([&](ScalarFunction &overload) { AddPdfFunctionDocs(overload, info); });
+		loader.RegisterFunction(std::move(info));
 	}
 	void RegisterFunction(ScalarFunctionSet functions) {
 		const bool path_converter = functions.name.GetIdentifierName().compare(0, 7, "pdf_to_") == 0;
@@ -10573,7 +10442,19 @@ struct PdfLoader {
             }
         });
 		functions.SetFallible();
-		loader.RegisterFunction(std::move(functions));
+		CreateScalarFunctionInfo info(std::move(functions));
+		info.functions.ApplyToFunctions([&](ScalarFunction &overload) { AddPdfFunctionDocs(overload, info); });
+		loader.RegisterFunction(std::move(info));
+	}
+	void RegisterFunction(TableFunction function) {
+		CreateTableFunctionInfo info(std::move(function));
+		info.functions.ApplyToFunctions([&](TableFunction &overload) { AddPdfFunctionDocs(overload, info); });
+		loader.RegisterFunction(std::move(info));
+	}
+	void RegisterFunction(TableFunctionSet functions) {
+		CreateTableFunctionInfo info(std::move(functions));
+		info.functions.ApplyToFunctions([&](TableFunction &overload) { AddPdfFunctionDocs(overload, info); });
+		loader.RegisterFunction(std::move(info));
 	}
 	template <class FUNCTION>
 	void RegisterFunction(FUNCTION function) {
@@ -10582,6 +10463,7 @@ struct PdfLoader {
 };
 
 static void LoadInternal(ExtensionLoader &extension_loader) {
+	extension_loader.SetDescription("PDF text, layout, OCR, inspection, rendering and document operations.");
 	PdfLoader loader {extension_loader};
 	// Scalar PDF writers have observable filesystem side effects. Mark them
 	// volatile so constant expressions are executed instead of being folded.
@@ -10607,15 +10489,11 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	loader.RegisterFunction(NativePdfReader<ReadPdfBindData>(
 	    read_pdf, []() -> unique_ptr<LocalTableFunctionState> { return make_uniq<ReadPdfLocalState>(); }));
 
-	TableFunction read_pdf_meta("read_pdf_meta", {LogicalType::VARCHAR}, ReadPdfMetaScan, ReadPdfMetaBind,
-	                            ReadPdfMetaInit);
-	AddNamedParameter(read_pdf_meta, "password", LogicalType::VARCHAR);
-	AddNamedParameter(read_pdf_meta, "ignore_errors", LogicalType::BOOLEAN);
-	loader.RegisterFunction(NativePdfReader<ReadPdfMetaBindData>(read_pdf_meta));
-
 	// inspection suite — read-only, serial per file, password is the only knob
 	TableFunction pdf_info("pdf_info", {LogicalType::VARCHAR}, PdfInfoScan, PdfInfoBind, PdfInfoInit);
+	pdf_info.projection_pushdown = true;
 	AddNamedParameter(pdf_info, "password", LogicalType::VARCHAR);
+	AddNamedParameter(pdf_info, "ignore_errors", LogicalType::BOOLEAN);
 	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_info));
 
 	TableFunction pdf_outline("pdf_outline", {LogicalType::VARCHAR}, PdfOutlineScan, PdfOutlineBind, PdfOutlineInit);
@@ -10646,15 +10524,6 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	                             ReadPdfWordsInit);
 	AddCommonNamedParams(read_pdf_words);
 	loader.RegisterFunction(NativePdfReader<ReadPdfWordsBindData>(read_pdf_words));
-
-	// Gemini/high-level layout name: same word+bbox engine as read_pdf_words
-	// (page, word, x0, y0, x1, y1, font_name, font_size, source, confidence).
-	// Registered as its own table function so SQL can say read_pdf_layout(...)
-	// without learning the words name.
-	TableFunction read_pdf_layout("read_pdf_layout", {LogicalType::VARCHAR}, ReadPdfWordsScan, ReadPdfWordsBind,
-	                              ReadPdfWordsInit);
-	AddCommonNamedParams(read_pdf_layout);
-	loader.RegisterFunction(NativePdfReader<ReadPdfWordsBindData>(read_pdf_layout));
 
 	TableFunction read_pdf_lines("read_pdf_lines", {LogicalType::VARCHAR}, ReadPdfLinesScan, ReadPdfLinesBind,
 	                             ReadPdfLinesInit);
@@ -10730,9 +10599,6 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 
 	// Low-level engine surfaces (version / single-page PNG / image OCR).
 	loader.RegisterFunction(ScalarFunction("poppler_version", {}, LogicalType::VARCHAR, PopplerVersionFun));
-	loader.RegisterFunction(ScalarFunction("poppler_render_page",
-	                                       {LogicalType::BLOB, LogicalType::INTEGER, LogicalType::INTEGER},
-	                                       LogicalType::BLOB, PopplerRenderPageFun));
 	// tesseract_ocr positional overloads (scalar has no named-param map):
 	// blob [, lang [, psm [, oem [, tessdata_dir [, preprocess [, vars [, config]]]]]]]
 	const auto map_vv = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
@@ -10920,11 +10786,6 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	                             PdfPagesInfoInit);
 	AddNamedParameter(pdf_pages_info, "password", LogicalType::VARCHAR);
 	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_pages_info));
-
-	TableFunction pdf_permissions("pdf_permissions", {LogicalType::VARCHAR}, PdfPermissionsScan, PdfPermissionsBind,
-	                              PdfPermissionsInit);
-	AddNamedParameter(pdf_permissions, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_permissions));
 
 	TableFunction pdf_fonts("pdf_fonts", {LogicalType::VARCHAR}, PdfFontsScan, PdfFontsBind, PdfFontsInit);
 	AddNamedParameter(pdf_fonts, "password", LogicalType::VARCHAR);

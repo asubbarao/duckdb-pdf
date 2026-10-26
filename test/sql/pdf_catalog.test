@@ -1,0 +1,35 @@
+# description: public PDF functions expose descriptions, examples and real names
+require pdf
+
+query I
+SELECT bool_and(description IS NOT NULL AND description <> '' AND len(examples) > 0
+                AND len(list_filter(parameters, lambda p: starts_with(p, 'col'))) = 0)
+FROM duckdb_functions()
+WHERE starts_with(function_name, 'pdf_')
+   OR starts_with(function_name, 'read_pdf')
+   OR starts_with(function_name, 'poppler_')
+   OR function_name IN ('tesseract_ocr', 'ocr_image', 'to_pdf', 'write_pdf');
+----
+true
+
+query I
+SELECT parameters[1] = 'files' AND list_contains(parameters, 'first_page')
+       AND list_contains(parameters, 'last_page') AND list_contains(parameters, 'ocr_language')
+FROM duckdb_functions() WHERE function_name = 'read_pdf';
+----
+true
+
+query I
+SELECT len(coalesce(list(function_name), [])) = 0
+FROM duckdb_functions()
+WHERE function_name IN ('read_pdf_layout', 'read_pdf_meta', 'pdf_permissions', 'poppler_render_page');
+----
+true
+
+query I
+SELECT len(list(DISTINCT function_name)) FROM duckdb_functions()
+WHERE starts_with(function_name, 'pdf_') OR starts_with(function_name, 'read_pdf')
+   OR starts_with(function_name, 'poppler_')
+   OR function_name IN ('tesseract_ocr', 'ocr_image', 'to_pdf', 'write_pdf');
+----
+48
