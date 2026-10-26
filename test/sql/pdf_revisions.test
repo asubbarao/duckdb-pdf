@@ -93,3 +93,9 @@ query I
 SELECT count(*) FROM pdf_revisions('test/data/hello.pdf');
 ----
 1
+
+query I
+SELECT count(DISTINCT filename) FROM pdf_revisions('test/data/hello*.pdf')
+WHERE ends_with(filename, 'hello.pdf');
+----
+1

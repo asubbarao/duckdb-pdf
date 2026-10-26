@@ -1,8 +1,8 @@
 # duckdb-pdf
 
-**Everything PDF, in SQL.** A DuckDB community extension (`pdf`) that turns PDFs into tables and tables into PDFs: read text at every grain (page, line, word, layout element, retrieval chunk), inspect metadata / outlines / attachments / form fields / annotations / revisions / digital signatures, and do the everyday document operations people open Adobe Acrobat for — merge, split, rotate, compress, encrypt, decrypt, extract pages, write new PDFs. Built on [Poppler](https://poppler.freedesktop.org/) (parsing/rendering), [Tesseract](https://github.com/tesseract-ocr/tesseract) (OCR for scanned documents), [qpdf](https://qpdf.sourceforge.io/) (document surgery), and [libharu](https://github.com/libharu/libharu) (native PDF writing) — all in the DuckDB process, no external tools required at runtime.
+**Everything PDF, in SQL.** A DuckDB community extension (`pdf`) that turns PDFs into tables and tables into PDFs: read text at every grain (page, line, word, layout element, retrieval chunk), inspect metadata / outlines / attachments / form fields / annotations / revisions / digital signatures, and do the everyday document operations people open Adobe Acrobat for — merge, split, rotate, compress, encrypt, decrypt, extract pages, write new PDFs. Built on [Poppler](https://poppler.freedesktop.org/) (parsing/rendering), [Tesseract](https://github.com/tesseract-ocr/tesseract) (OCR for scanned documents), [qpdf](https://qpdf.sourceforge.io/) (document surgery), and [libharu](https://github.com/libharu/libharu) (native PDF writing) — in the DuckDB process. Office conversion through `to_pdf` additionally requires LibreOffice at runtime.
 
-Every function accepts a single path **or a glob**, so the natural unit of work is a folder of PDFs:
+The table readers accept a single path **or a glob**, so the natural unit of work is a folder of PDFs:
 
 ```sql
 INSTALL pdf FROM community; LOAD pdf;
@@ -52,12 +52,18 @@ Existing result schemas and strict/`ignore_errors` behavior remain unchanged.
 
 ### Community (signed)
 
+The community descriptor reviewed on 2026-10-26 publishes version **0.8.0**
+from commit `6535c81`, while this README describes current `main` for DuckDB
+2.0. The community artifact can therefore differ in functionality and host
+compatibility. Check the registry build for your DuckDB version; do not assume
+that source changes in this README have already been released.
+
 ```sql
 INSTALL pdf FROM community;
 LOAD pdf;
 ```
 
-Requires **DuckDB v2.0.0**. Or:
+For this source tree, use **DuckDB v2.0.0**. Registry artifacts depend on their published build. Or:
 
 ```sql
 INSTALL pdf FROM 'https://community-extensions.duckdb.org';
@@ -113,7 +119,7 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 
 ### `read_pdf` — one row per page
 
-Columns: `filename`, `page`, `page_count`, `text`, `width`, `height` (page size in PDF points), `has_text_layer` (native embedded text is non-blank), `used_ocr` (Tesseract produced the returned text), `ocr_confidence` (Tess MeanTextConf 0–100 when `used_ocr`, else NULL), `label` (printed page label, or NULL).
+Columns: `filename`, `page`, `page_count`, `text`, `width`, `height` (page size in PDF points), `has_text_layer` (native embedded text is non-blank), `used_ocr` (Tesseract produced the returned text), `ocr_confidence` (Tess MeanTextConf 0–100 when `used_ocr`, else NULL), `label` (printed page label, or NULL). OCR and native word boxes use the same top-down page coordinates. OCR preprocessing does not deskew positioned-word or searchable-layer outputs, so their coordinates remain aligned with the original page.
 
 `has_text_layer` describes the PDF itself (true even when `ocr:=true` forced a re-OCR of a text page). `used_ocr` is true when the page had no extractable text and auto-OCR ran, or when `ocr:=true` forced OCR and the engine returned text. Together they make image-only vs embedded-text detection first-class:
 
@@ -127,7 +133,7 @@ SELECT filename, page, text FROM read_pdf('docs/*.pdf')
 WHERE used_ocr;
 ```
 
-The multi-file scan is **parallel**: each worker thread takes whole files, so a glob over a folder uses all your cores. (On Windows the scan runs serially — Poppler is not thread-safe across documents there.)
+The multi-file scan can process files and pages in parallel. On Windows, Poppler operations are protected by a shared mutex; OCR work can overlap outside those critical sections.
 
 By default one corrupt or password-protected file aborts the whole scan. Pass `ignore_errors := true` (also on `read_pdf_meta`) to skip unopenable files and keep the good ones; the skipped set stays recoverable in SQL:
 
@@ -170,7 +176,7 @@ WHERE text ILIKE '%total due%';
 
 ### `read_pdf_words` — one row per word, with bounding boxes
 
-Columns: `filename`, `page`, `word`, `x0`, `y0`, `x1`, `y1` (PDF points; poppler-cpp `text_list` y is top-down on typical pages — smaller `y0` is higher on the page), `font_name`, `font_size`, `source`, `confidence`, **`line`** (1-based geometric line id within the page), **`page_width`** / **`page_height`** (crop-box size in points for that page — same numbers as `read_pdf.width` / `height`), `label` (printed page label, or NULL).
+Columns: `filename`, `page`, `word`, `x0`, `y0`, `x1`, `y1` (PDF points; poppler-cpp `text_list` y is top-down on typical pages — smaller `y0` is higher on the page), `font_name`, `font_size`, `source`, `confidence`, **`line`** (1-based geometric line id within the page), **`page_width`** / **`page_height`** (rotated display crop-box size in points — same numbers as `read_pdf.width` / `height`), `label` (printed page label, or NULL).
 
 `line` clusters words with the same vertical-overlap rule as `read_pdf_elements` (≥ 50% of the shorter word height). Use it to equi-join marks to line context or rebuild lines in one Poppler walk:
 
@@ -258,7 +264,7 @@ ORDER BY file, page_number, element_idx;
 Deterministic chunking rules (no ML, no tokenizers):
 
 1. Elements pack into a chunk in reading order until the next one would push the chunk past `chunk_size`.
-2. An element is never split across chunks — unless it alone exceeds `chunk_size`, in which case it splits at the last whitespace before the limit (repeatedly for very long elements).
+2. An element is never split across chunks — unless it alone exceeds `chunk_size`, in which case it splits at whitespace or a UTF-8 codepoint boundary. A codepoint larger than the byte budget is emitted whole.
 3. A `heading` never ends a chunk: it glues forward to start the next one, keeping headers attached to their section.
 4. Each chunk after the first is prefixed with the trailing `overlap` characters of the previous chunk's text, trimmed to a whitespace boundary so no word is cut.
 
@@ -434,7 +440,7 @@ WHERE subtype = 'Link';
 
 PDFs are append-only: editing a file with most tools adds an *incremental update* (a new body + xref + `%%EOF`) after the original bytes, leaving every earlier revision intact and recoverable. `pdf_revisions` enumerates those revisions by parsing the raw bytes (`startxref` / `%%EOF` markers and the trailer `/Prev` chain — classic xref tables and xref streams alike), oldest first.
 
-One row per revision. Columns: `revision_index` (0 = original document), `startxref_offset`, `eof_offset` (byte offset just past this revision's `%%EOF`), `size_bytes` (bytes this revision added), `is_incremental` (`false` only for revision 0).
+One row per revision. Columns: `revision_index` (0 = original document), `startxref_offset`, `eof_offset` (byte offset just past this revision's `%%EOF`), `size_bytes` (bytes this revision added), `is_incremental` (`false` only for revision 0), and `filename`.
 
 ```sql
 -- Has this contract been modified after it was first written?
@@ -618,9 +624,9 @@ The signature covers the whole file via a `/ByteRange` around a fixed-size `/Con
 
 ### `pdf_redact` — true (raster) redaction
 
-`pdf_redact(input, output, redactions [, dpi := 200, password := '...'])` performs **true removal**, not a black box drawn over live text. Every page carrying at least one redaction box is re-rendered to an RGB raster, the boxes are painted **solid black in the pixels**, and the page is rebuilt as an **image-only page** whose entire content is that raster. Because the page no longer contains any text object, the redacted text is **permanently unextractable** — `read_pdf` returns nothing for it, and there is no hidden text layer to recover (unlike a vector rectangle drawn on top of still-selectable text). Pages with no boxes are copied through byte-for-byte and keep their live text. It returns one row per output page: `page INTEGER`, `redacted BOOLEAN`, `boxes_applied INTEGER`.
+`pdf_redact(input, output, redactions [, dpi := 200, password := '...'])` performs **true removal**, not a black box drawn over live text. Every page carrying at least one redaction box is re-rendered to an RGB raster, the boxes are painted **solid black in the pixels**, and the page is rebuilt as an **image-only page** whose entire content is that raster. Because the page no longer contains any text object, the redacted text is **permanently unextractable** — `read_pdf` returns nothing for it, and there is no hidden text layer to recover (unlike a vector rectangle drawn on top of still-selectable text). Pages with no boxes retain their live text. When at least one page is redacted, the output has a fresh document catalog and annotations, forms, attachments, outlines, encryption, and document metadata are removed from the entire output; preserve the original separately if those features are needed. Redaction does not sanitize content on unredacted pages or hidden resources they reference; treat the output as sensitive unless those pages have also been reviewed. It returns one row per output page: `page INTEGER`, `redacted BOOLEAN`, `boxes_applied INTEGER`.
 
-`redactions` is a `LIST(STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE))`. **Coordinate convention:** all values are in **PDF points** (1 pt = 1/72 in) with the **origin at the page's bottom-left corner** (standard PDF user space). `(x, y)` is the **lower-left corner** of the box; `w`/`h` are its width and height. `page` is **1-based**. A box that runs off the page is clamped to the raster.
+`redactions` is a `LIST(STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE))`. **Coordinate convention:** all values are in **PDF points** (1 pt = 1/72 in) with the **origin at the page's bottom-left corner** (standard PDF user space). `(x, y)` is the **lower-left corner** of the box; `w`/`h` are its width and height. `page` is **1-based**. A box that runs off the CropBox is clamped to the visible page; a box with no intersection is rejected. Coordinates refer to unrotated PDF user space and are mapped through the CropBox and page rotation.
 
 `dpi` (default 200) sets the render resolution of the rebuilt pages: higher dpi preserves more visual fidelity of the surrounding (unredacted) content but produces a larger output file; lower dpi is smaller but coarser. It does not affect the redaction guarantee — the covered text is gone at any dpi. Because redacted pages become images, their text is no longer selectable or searchable; leave unredacted pages untouched to preserve their text layer.
 
@@ -1002,7 +1008,7 @@ All dependencies (Poppler, Tesseract, Leptonica, qpdf, libharu, and their transi
 | `pdf_attachments(files)` | Table | One row per embedded file, bytes as `BLOB`. |
 | `pdf_form_fields(files)` | Table | One row per AcroForm field with type and value. |
 | `pdf_annotations(files)` | Table | One row per annotation; `WHERE subtype = 'Link'` extracts hyperlinks. |
-| `pdf_revisions(file)` | Table | One row per incremental-update revision, oldest first. |
+| `pdf_revisions(file)` | Table | One row per incremental-update revision, oldest first, including the source filename. |
 | `pdf_signatures(files)` | Table | One row per digital signature: metadata + OpenSSL CMS verification. |
 | `pdf_images(files)` | Table | One row per embedded image XObject; `data` is JPEG/JP2/PNG/raw bytes per `format`. |
 | `pdf_page_images(files)` | Table | One row per page with a rendered PNG (`png` BLOB); `dpi` / page-range / `password`. No `pdftoppm`. |

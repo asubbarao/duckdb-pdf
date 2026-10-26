@@ -78,7 +78,7 @@ void ClosePlugin(PluginHandle &h) {
 }
 
 PluginHandle LoadPlugin(const std::string &path) {
-	std::lock_guard<std::mutex> guard(PluginMutex());
+	// Caller holds PluginMutex through recognition and plugin-owned cleanup.
 	auto &cached = CachedPlugin();
 	if (cached.lib && cached.path == path && cached.recognize) {
 		return cached; // shallow copy of function pointers is fine
@@ -163,6 +163,7 @@ TextResult RecognizeExternal(const unsigned char *data, int width, int height, i
 		}
 		throw std::runtime_error(msg);
 	}
+	std::lock_guard<std::mutex> guard(PluginMutex());
 	PluginHandle plugin = LoadPlugin(opt.external_plugin);
 	char *text_ptr = nullptr;
 	int conf = -1;
@@ -314,7 +315,7 @@ Pix *BufferToPix(const unsigned char *base, int w, int h, int bpr, ImageFormat f
 //   2. deskew (if |angle| > 0.3°)
 //   3. binarize (Otsu)
 //   4. despeckle (light 2x2 close-open at >=300 dpi)
-Pix *PreprocessPixForOcr(Pix *pixs, int dpi) {
+Pix *PreprocessPixForOcr(Pix *pixs, int dpi, bool deskew = true) {
 	if (!pixs) {
 		return nullptr;
 	}
@@ -337,7 +338,7 @@ Pix *PreprocessPixForOcr(Pix *pixs, int dpi) {
 		return nullptr;
 	}
 
-	Pix *pixskew = pixThresholdToBinary(pixg, 130);
+	Pix *pixskew = deskew ? pixThresholdToBinary(pixg, 130) : nullptr;
 	if (pixskew) {
 		l_float32 angle = 0.0f;
 		l_float32 conf = 0.0f;
@@ -582,9 +583,9 @@ bool EnsureTesseract(const Options &opt) {
 }
 
 void SetOcrImage(tesseract::TessBaseAPI &api, const unsigned char *data, int width, int height, int bytes_per_row,
-                 ImageFormat format, int dpi, bool preprocess, Pix *&base, Pix *&processed) {
+                 ImageFormat format, int dpi, bool preprocess, Pix *&base, Pix *&processed, bool deskew = true) {
 	base = preprocess ? BufferToPix(data, width, height, bytes_per_row, format) : nullptr;
-	processed = base ? PreprocessPixForOcr(base, dpi) : nullptr;
+	processed = base ? PreprocessPixForOcr(base, dpi, deskew) : nullptr;
 	Pix *use = processed ? processed : base;
 	if (use) {
 		api.SetImage(use);
@@ -663,7 +664,7 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
-	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed);
+	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed, false);
 
 	int rec = api.Recognize(0);
 	if (rec != 0) {
@@ -699,6 +700,7 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 				out.words.push_back(std::move(w));
 			}
 		} while (ri->Next(tesseract::RIL_WORD));
+		delete ri;
 	}
 	api.Clear();
 	DestroyPixPair(processed, base);
@@ -801,7 +803,7 @@ PdfResult RenderSearchablePdf(const unsigned char *data, int width, int height, 
 	auto &api = TlsTess().api;
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
-	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed);
+	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed, false);
 	const bool rendered = RenderTesseractPdf(api, output_base, datadir);
 	if (!rendered) {
 		api.Clear();
@@ -819,6 +821,7 @@ PdfResult RenderSearchablePdf(const unsigned char *data, int width, int height, 
 				out.words++;
 			}
 		} while (ri->Next(tesseract::RIL_WORD));
+		delete ri;
 	}
 	api.Clear();
 	DestroyPixPair(processed, base);

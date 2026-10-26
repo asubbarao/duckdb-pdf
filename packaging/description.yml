@@ -1,6 +1,8 @@
 # Community-extensions submission descriptor for the `pdf` extension.
 #
 # Staging copy for https://duckdb.org/community_extensions/extensions/pdf
+# Not the live registry descriptor: as reviewed on 2026-10-26, the live
+# 0.8.0 descriptor points to 6535c81, not this staging ref.
 # Live file: extensions/pdf/description.yml in duckdb/community-extensions.
 # To publish:
 #   1. Fork/branch duckdb/community-extensions

@@ -117,3 +117,10 @@ SELECT * FROM pdf_sign('test/data/hello.pdf', 'test/data/hello.pdf',
                        'test/data/sign_cert.pem', 'test/data/sign_key.pem');
 ----
 must differ
+
+# Existing signatures cannot survive a full rewrite; reject a second signing.
+statement error
+SELECT * FROM pdf_sign('__TEST_DIR__/signed_basic.pdf', '__TEST_DIR__/signed_twice.pdf',
+                       'test/data/sign_cert.pem', 'test/data/sign_key.pem', field_name := 'SecondSig');
+----
+already-signed

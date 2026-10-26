@@ -33,10 +33,10 @@ SELECT count(*) > 0 FROM pdf_chunks('__TEST_DIR__/ocr_scanned.pdf');
 true
 
 # The word text and x positions round-trip. OCR source coordinates use the
-# reader's bottom-up convention, while Poppler's native boxes are top-down.
+# reader and Poppler native boxes both use top-down coordinates.
 query I
 WITH src AS (
-  SELECT row_number() OVER (ORDER BY round(x0, 1), page_height - y1, word) AS rn, word, x0, y1, page_height
+  SELECT row_number() OVER (ORDER BY round(x0, 1), y0, word) AS rn, word, x0, y0
   FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_retry := false)
 ), dst AS (
   SELECT row_number() OVER (ORDER BY round(x0, 1), y0, word) AS rn, word, x0, y0, source
@@ -46,7 +46,7 @@ SELECT count(*) = 12
    AND bool_and(src.word = dst.word)
    AND bool_and(dst.source = 'text')
    AND max(abs(src.x0 - dst.x0)) < 1
-   AND max(abs(dst.y0 - (src.page_height - src.y1))) < 10
+   AND max(abs(dst.y0 - src.y0)) < 10
 FROM src JOIN dst USING (rn);
 ----
 true
@@ -88,5 +88,46 @@ true
 query I
 SELECT bool_and(ocr_applied) FROM pdf_ocr('test/data/hello.pdf', '__TEST_DIR__/ocr_forced.pdf', force := true,
                                            ocr_retry := false);
+----
+true
+
+# Searchable text must be placed inside an offset CropBox.
+statement ok
+SELECT * FROM pdf_ocr('test/data/ocr_cropped_scan.pdf', '__TEST_DIR__/ocr_cropped.pdf');
+
+query I
+SELECT count(*) > 0 FROM read_pdf('__TEST_DIR__/ocr_cropped.pdf', auto_ocr := false)
+WHERE contains(upper(text), 'SECRET');
+----
+true
+
+# Password must be retained through the final qpdf reopen.
+statement ok
+SELECT pdf_encrypt('test/data/scanned.pdf', '__TEST_DIR__/ocr_encrypted_input.pdf', 'secret');
+
+query I
+SELECT bool_and(ocr_applied) FROM pdf_ocr('__TEST_DIR__/ocr_encrypted_input.pdf',
+                                         '__TEST_DIR__/ocr_encrypted_output.pdf', password := 'secret');
+----
+true
+
+query I
+SELECT count(*) > 0 FROM read_pdf_words('__TEST_DIR__/ocr_encrypted_output.pdf',
+                                        password := 'secret', auto_ocr := false);
+----
+true
+
+# OCR word coordinates and native overlay coordinates share the rotated frame.
+statement ok
+SELECT * FROM pdf_ocr('test/data/ocr_cropped_90.pdf', '__TEST_DIR__/ocr_cropped_90.pdf', ocr_retry := false);
+
+query I
+WITH src AS (
+ SELECT word, x0, y0 FROM read_pdf_words('test/data/ocr_cropped_90.pdf', ocr := true, ocr_retry := false)
+), dst AS (
+ SELECT word, x0, y0 FROM read_pdf_words('__TEST_DIR__/ocr_cropped_90.pdf', auto_ocr := false)
+)
+SELECT count(*) > 0 AND bool_and(abs(src.x0 - dst.x0) < 10 AND abs(src.y0 - dst.y0) < 10)
+FROM src JOIN dst USING (word);
 ----
 true

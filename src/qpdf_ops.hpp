@@ -58,7 +58,8 @@ void Compress(const std::string &input, const std::string &output);
 
 // Appends each non-empty text-only PDF page in `layers` to the corresponding
 // source page, copying its font resources into the source document.
-void AddTextLayers(const std::string &input, const std::string &output, const std::vector<std::string> &layers);
+void AddTextLayers(const std::string &input, const std::string &output, const std::vector<std::string> &layers,
+                   const std::string &password);
 
 // AES-256 (R6) with all permissions allowed; the caller has already resolved
 // an empty owner password to the user password.
@@ -259,14 +260,20 @@ void SignDetached(const std::string &input, const std::string &output, const std
                   const std::string &location, const std::string &signer_name, const std::string &field_name,
                   const std::string &password);
 
+struct RedactGeometry {
+    double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    int rotation = 0;
+};
+std::vector<RedactGeometry> ReadRedactGeometry(const std::string &input, const std::string &password);
+
 // One output page for pdf_redact. When `redacted` is true, the page is REPLACED
 // by an image-only page whose sole content is a single DeviceRGB image XObject
 // (8 bits/component) drawn to fill a MediaBox of `media_w` x `media_h` points —
 // there is no text object left on the page, so text under the redaction boxes
 // becomes permanently unextractable. `rgb` holds width*height*3 bytes, row-major,
 // TOP-DOWN (row 0 is the visual top of the page), already flipped/painted by the
-// caller. When `redacted` is false the original page is copied through untouched
-// and the image fields are ignored.
+// caller. When `redacted` is false the page content is retained, while document
+// metadata and interactive annotations are removed when any page is redacted.
 struct RebuiltPage {
 	bool redacted = false;
 	int width = 0;      // raster pixel width  (redacted pages only)
@@ -278,8 +285,8 @@ struct RebuiltPage {
 
 // Compose `output` from `input`: every page flagged `redacted` in `pages` has its
 // content, resources, annotations and rotation replaced by a single full-page
-// FlateDecode DeviceRGB image (see RebuiltPage); every unflagged page is carried
-// over verbatim. `pages.size()` MUST equal the input's page count (the caller
+// FlateDecode DeviceRGB image (see RebuiltPage); unflagged page contents are retained.
+// A fresh catalog omits document metadata, forms, annotations, and attachments. `pages.size()` MUST equal the input's page count (the caller
 // enforces this). `password` may be empty (unencrypted / owner-open). The caller
 // validates paths and that input != output; a bad password or unreadable file
 // surfaces via the error contract (thrown std::exception). Runs under QpdfMutex.

@@ -47,6 +47,18 @@
 // nor poppler, so it is safe in this TU.
 #include <zlib.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -138,6 +150,40 @@ void Rotate(const std::string &input, const std::string &output, int degrees, bo
 	writer.write();
 }
 
+// Each split page is staged beside its destination so failed writes do not
+// truncate existing files or a source reached through an alias.
+class SplitStagedOutput {
+public:
+    explicit SplitStagedOutput(const std::string &target) : destination(target) {
+        auto pattern = target + ".tmp-XXXXXX";
+        std::vector<char> name(pattern.begin(), pattern.end()); name.push_back('\0');
+#ifdef _WIN32
+        if (_mktemp_s(name.data(), name.size()) != 0) throw std::runtime_error("could not create split temporary name");
+        int fd = _open(name.data(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE);
+        if (fd < 0) throw std::runtime_error("could not create split temporary file");
+        _close(fd);
+#else
+        int fd = mkstemp(name.data());
+        if (fd < 0) throw std::runtime_error("could not create split temporary file");
+        close(fd);
+#endif
+        path = name.data();
+    }
+    ~SplitStagedOutput() { if (!path.empty()) std::remove(path.c_str()); }
+    const std::string &temp() const { return path; }
+    void commit() {
+#ifdef _WIN32
+        if (!MoveFileExA(path.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING))
+#else
+        if (std::rename(path.c_str(), destination.c_str()) != 0)
+#endif
+            throw std::runtime_error("could not replace split output '" + destination + "'");
+        path.clear();
+    }
+private:
+    std::string destination, path;
+};
+
 void Split(const std::string &input, const std::string &output_dir, const std::string &stem,
            std::vector<std::pair<int, std::string>> &emitted) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
@@ -157,8 +203,12 @@ void Split(const std::string &input, const std::string &output_dir, const std::s
 		single.emptyPDF();
 		QPDFPageDocumentHelper single_pages(single);
 		single_pages.addPage(pages[page_idx], false);
-		QPDFWriter writer(single, out_path.c_str());
-		writer.write();
+		SplitStagedOutput staged(out_path);
+		{
+			QPDFWriter writer(single, staged.temp().c_str());
+			writer.write();
+		}
+		staged.commit();
 		emitted.emplace_back(page_idx + 1, out_path);
 	}
 }
@@ -192,8 +242,12 @@ void SplitRanges(const std::string &input, const std::string &output_dir, const 
 		for (int page_no = first; page_no <= last; page_no++) {
 			single_pages.addPage(pages[page_no - 1], false);
 		}
-		QPDFWriter writer(single, out_path.c_str());
-		writer.write();
+		SplitStagedOutput staged(out_path);
+		{
+			QPDFWriter writer(single, staged.temp().c_str());
+			writer.write();
+		}
+		staged.commit();
 		emitted.push_back(out_path);
 	}
 }
@@ -210,47 +264,11 @@ void Compress(const std::string &input, const std::string &output) {
 	writer.write();
 }
 
-namespace {
-
-void MergeLayerResources(QPDF &doc, QPDFPageObjectHelper &page, QPDFPageObjectHelper &layer) {
-	QPDFObjectHandle resources = QPDFObjectHandle::newDictionary();
-	QPDFObjectHandle original = page.getAttribute("/Resources", false);
-	if (original.isDictionary()) {
-		for (const auto &entry : original.getDictAsMap()) {
-			resources.replaceKey(entry.first, entry.second);
-		}
-	}
-	QPDFObjectHandle layer_resources = layer.getAttribute("/Resources", false);
-	if (!layer_resources.isDictionary()) {
-		page.getObjectHandle().replaceKey("/Resources", resources);
-		return;
-	}
-	for (const char *category : {"/ExtGState", "/ColorSpace", "/Pattern", "/Shading", "/XObject", "/Font"}) {
-		QPDFObjectHandle layer_dict = layer_resources.getKeyIfDict(category);
-		if (!layer_dict.isDictionary()) {
-			continue;
-		}
-		QPDFObjectHandle merged = QPDFObjectHandle::newDictionary();
-		QPDFObjectHandle original_dict = resources.getKeyIfDict(category);
-		if (original_dict.isDictionary()) {
-			for (const auto &entry : original_dict.getDictAsMap()) {
-				merged.replaceKey(entry.first, entry.second);
-			}
-		}
-		for (const auto &entry : layer_dict.getDictAsMap()) {
-			merged.replaceKey(entry.first, doc.copyForeignObject(entry.second));
-		}
-		resources.replaceKey(category, merged);
-	}
-	page.getObjectHandle().replaceKey("/Resources", resources);
-}
-
-} // namespace
-
-void AddTextLayers(const std::string &input, const std::string &output, const std::vector<std::string> &layers) {
+void AddTextLayers(const std::string &input, const std::string &output, const std::vector<std::string> &layers,
+                   const std::string &password) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	QPDF doc;
-	doc.processFile(input.c_str());
+	doc.processFile(input.c_str(), password.empty() ? nullptr : password.c_str());
 	QPDFPageDocumentHelper doc_pages(doc);
 	auto pages = doc_pages.getAllPages();
 	if (pages.size() != layers.size()) {
@@ -271,10 +289,28 @@ void AddTextLayers(const std::string &input, const std::string &output, const st
 			throw std::runtime_error("pdf_ocr: Tesseract returned a text layer with an unexpected page count");
 		}
 		QPDFPageObjectHelper layer_page = rendered_pages[0];
-		MergeLayerResources(doc, pages[i], layer_page);
-		for (auto &contents : layer_page.getPageContents()) {
-			pages[i].addPageContents(doc.copyForeignObject(contents), false);
-		}
+		auto form = layer_page.getFormXObjectForPage(false);
+		if (!form.isIndirect()) form = layer_doc->makeIndirectObject(form);
+		// Keep the OCR resources isolated in a form XObject: merging font names
+		// into the original page can silently replace the page's own fonts.
+		auto existing = pages[i].getAttribute("/Resources", false);
+		auto resources = QPDFObjectHandle::newDictionary();
+		if (existing.isDictionary()) for (const auto &entry : existing.getDictAsMap())
+			resources.replaceKey(entry.first, entry.second);
+		auto old_xobjects = resources.getKey("/XObject");
+		auto xobjects = QPDFObjectHandle::newDictionary();
+		if (old_xobjects.isDictionary()) for (const auto &entry : old_xobjects.getDictAsMap())
+			xobjects.replaceKey(entry.first, entry.second);
+		resources.replaceKey("/XObject", xobjects);
+		int suffix = 0;
+		auto name = resources.getUniqueResourceName("/PdfOCR", suffix);
+		xobjects.replaceKey(name, doc.copyForeignObject(form));
+		pages[i].getObjectHandle().replaceKey("/Resources", resources);
+		auto crop = pages[i].getCropBox().getArrayAsRectangle();
+		std::string placement = pages[i].placeFormXObject(form, name, crop, true, true, true);
+		// Isolate both the original content's graphics state and the OCR layer.
+		pages[i].addPageContents(QPDFObjectHandle::newStream(&doc, "q\n"), true);
+		pages[i].addPageContents(QPDFObjectHandle::newStream(&doc, "Q\n" + placement), false);
 		layer_docs.push_back(std::move(layer_doc));
 	}
 	QPDFWriter writer(doc, output.c_str());
@@ -466,7 +502,7 @@ bool IsStandardStructureRole(const std::string &role) {
 	return standard_roles.find(role) != standard_roles.end();
 }
 
-std::string StructureRole(const QPDFObjectHandle &role_map, const std::string &tag) {
+std::string StructureRole(QPDFObjectHandle role_map, const std::string &tag) {
 	std::string role = tag;
 	std::set<std::string> seen;
 	while (!IsStandardStructureRole(role) && seen.insert(role).second) {
@@ -491,7 +527,7 @@ std::string StructureRole(const QPDFObjectHandle &role_map, const std::string &t
 	return role;
 }
 
-int StructurePage(QPDF &doc, const std::map<QPDFObjGen, int> &page_numbers, const QPDFObjectHandle &page) {
+int StructurePage(QPDF &doc, const std::map<QPDFObjGen, int> &page_numbers, QPDFObjectHandle page) {
 	if (page.isNull()) {
 		return 0;
 	}
@@ -1699,6 +1735,15 @@ void SignDetached(const std::string &input, const std::string &output, const std
 		doc.processFile(input.c_str(), password.c_str());
 	}
 
+	QPDFAcroFormDocumentHelper existing_forms(doc);
+	if (existing_forms.hasAcroForm()) {
+		for (auto &field : existing_forms.getFormFields()) {
+			if (field.getFieldType() == "/Sig" && field.getValue().isDictionary()) {
+				throw std::runtime_error("pdf_sign: signing an already-signed PDF requires incremental writing, which is not supported");
+			}
+		}
+	}
+
 	// Build the signature value dictionary with wide placeholders.
 	auto sig_dict = QPDFObjectHandle::newDictionary();
 	sig_dict.replaceKey("/Type", QPDFObjectHandle::newName("/Sig"));
@@ -1854,6 +1899,17 @@ void SignDetached(const std::string &input, const std::string &output, const std
 	}
 	bytes.replace(c_lt + 1, hole_hex, filled);
 
+	// Do not report success for a malformed or unverified signature.
+	auto signatures = ReadSignatures(bytes, "");
+	bool verified = false;
+	for (const auto &signature : signatures) {
+		if (signature.field_name == field_name && signature.covers_whole_file && signature.has_verified && signature.verified) {
+			verified = true;
+			break;
+		}
+	}
+	if (!verified) throw std::runtime_error("pdf_sign: generated signature failed verification");
+
 	// Write the final signed bytes to the output path.
 	std::ofstream out(output, std::ios::binary | std::ios::trunc);
 	if (!out) {
@@ -1889,6 +1945,35 @@ static std::string PdfNum(double v) {
 	return std::string(buf);
 }
 
+std::vector<RedactGeometry> ReadRedactGeometry(const std::string &input, const std::string &password) {
+    std::lock_guard<std::recursive_mutex> guard(QpdfMutex());
+    QPDF doc;
+    doc.processFile(input.c_str(), password.empty() ? nullptr : password.c_str());
+    QPDFPageDocumentHelper helper(doc);
+    std::vector<RedactGeometry> result;
+    for (auto &page : helper.getAllPages()) {
+        auto crop = page.getCropBox();
+        if (!crop.isArray() || crop.getArrayNItems() != 4) throw std::runtime_error("pdf_redact: invalid CropBox");
+        RedactGeometry g;
+        auto a = crop.getArrayItem(0), b = crop.getArrayItem(1), c = crop.getArrayItem(2), d = crop.getArrayItem(3);
+        if (!a.isNumber() || !b.isNumber() || !c.isNumber() || !d.isNumber()) throw std::runtime_error("pdf_redact: nonnumeric CropBox");
+        g.x0 = std::min(a.getNumericValue(), c.getNumericValue());
+        g.x1 = std::max(a.getNumericValue(), c.getNumericValue());
+        g.y0 = std::min(b.getNumericValue(), d.getNumericValue());
+        g.y1 = std::max(b.getNumericValue(), d.getNumericValue());
+        if (!std::isfinite(g.x0) || !std::isfinite(g.y0) || !std::isfinite(g.x1) || !std::isfinite(g.y1) ||
+            !std::isfinite(g.x1 - g.x0) || !std::isfinite(g.y1 - g.y0) || g.x1 <= g.x0 || g.y1 <= g.y0)
+            throw std::runtime_error("pdf_redact: invalid CropBox");
+        auto rotate = page.getAttribute("/Rotate", false);
+        if (!rotate.isNull() && !rotate.isInteger()) throw std::runtime_error("pdf_redact: invalid page rotation");
+        if (rotate.isInteger()) g.rotation = static_cast<int>(rotate.getIntValue() % 360);
+        if (g.rotation < 0) g.rotation += 360;
+        if (g.rotation % 90 != 0) throw std::runtime_error("pdf_redact: unsupported page rotation");
+        result.push_back(g);
+    }
+    return result;
+}
+
 void RebuildPagesAsImages(const std::string &input, const std::string &output, const std::vector<RebuiltPage> &pages,
                           const std::string &password) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
@@ -1899,6 +1984,11 @@ void RebuildPagesAsImages(const std::string &input, const std::string &output, c
 	if (page_helpers.size() != pages.size()) {
 		throw std::runtime_error("pdf_redact: internal page-count mismatch (" + std::to_string(page_helpers.size()) +
 		                         " document pages vs " + std::to_string(pages.size()) + " rebuilt pages)");
+	}
+	if (std::none_of(pages.begin(), pages.end(), [](const RebuiltPage &p) { return p.redacted; })) {
+		QPDFWriter writer(doc, output.c_str());
+		writer.write();
+		return;
 	}
 	for (size_t i = 0; i < page_helpers.size(); ++i) {
 		const RebuiltPage &rp = pages[i];
@@ -1946,11 +2036,33 @@ void RebuildPagesAsImages(const std::string &input, const std::string &output, c
 		page.replaceKey("/Contents", contents_ind);
 		page.replaceKey("/Resources", resources);
 		page.replaceKey("/MediaBox", media_box);
-		page.removeKey("/Rotate");
-		page.removeKey("/CropBox");
-		page.removeKey("/Annots");
+		// The original page can carry arbitrary private or metadata keys that
+		// retain the sensitive content. Keep only the rebuilt page's essentials.
+		for (const auto &entry : page.getDictAsMap()) {
+			const auto &key = entry.first;
+			if (key != "/Type" && key != "/Parent" && key != "/MediaBox" &&
+			    key != "/Contents" && key != "/Resources") page.removeKey(key);
+		}
 	}
-	QPDFWriter writer(doc, output.c_str());
+	// Copy pages into a new document catalog. Retaining the original catalog can
+	// keep form field values, attachments, metadata and old redacted objects alive.
+	// Annotations on all pages are removed because widget parent trees can retain
+	// values from redacted pages even when the affected widget is gone.
+	QPDF clean;
+	clean.emptyPDF();
+	QPDFPageDocumentHelper clean_pages(clean);
+	for (auto &page_helper : page_helpers) {
+		auto page = page_helper.getObjectHandle();
+		page.removeKey("/Annots");
+		page.removeKey("/AA");
+		page.removeKey("/Metadata");
+		page.removeKey("/PieceInfo");
+		page.removeKey("/StructParents");
+		page.removeKey("/Thumb");
+		page.removeKey("/B");
+		clean_pages.addPage(page, false);
+	}
+	QPDFWriter writer(clean, output.c_str());
 	writer.write();
 }
 

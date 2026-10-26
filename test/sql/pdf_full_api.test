@@ -208,3 +208,15 @@ SELECT text = '' AND used_ocr = false
 FROM read_pdf('test/data/scanned.pdf', auto_ocr := true, ocr_backend := 'external');
 ----
 true
+
+# Metadata-only projection and full PNG projection must agree on page count.
+query I
+SELECT count(*) = 2 FROM pdf_page_images('test/data/two_pages.pdf');
+----
+true
+
+query I
+SELECT count(*) = 2 FROM pdf_page_images('test/data/two_pages.pdf')
+WHERE octet_length(png) > 0;
+----
+true

@@ -1,0 +1,35 @@
+# name: test/sql/pdf_external_access.test
+# description: PDF filesystem operations respect DuckDB external-access policy
+# group: [sql]
+
+require pdf
+
+statement ok
+SET allowed_paths = ['test/data/hello.pdf', '__TEST_DIR__/policy-allowed.pdf'];
+
+statement ok
+SET enable_external_access = false;
+
+statement ok
+SELECT pdf_compress('test/data/hello.pdf', '__TEST_DIR__/policy-allowed.pdf');
+
+statement error
+SELECT pdf_compress('test/data/hello.pdf', '__TEST_DIR__/policy-denied.pdf');
+----
+external access policy
+
+statement error
+SELECT write_pdf('secret', '__TEST_DIR__/policy-denied.pdf');
+----
+external access policy
+
+statement error
+SELECT * FROM pdf_split('test/data/hello.pdf', '__TEST_DIR__');
+----
+external access policy
+
+# File exceptions do not grant permission to launch a converter process.
+statement error
+SELECT to_pdf('test/data/hello.pdf', '__TEST_DIR__/policy-allowed.pdf');
+----
+process and plugin execution

@@ -18,6 +18,9 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/main/client_context_file_opener.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -61,6 +64,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -75,6 +79,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <utility>
 #include <vector>
 
@@ -83,10 +88,20 @@
 #ifdef _WIN32
 #include <io.h>
 #include <process.h>
+#include <direct.h>
+#include <fcntl.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #define popen  _popen
 #define pclose _pclose
 #else
-#include <unistd.h>
+ #include <unistd.h>
+#include <sys/wait.h>
+#include <poll.h>
+#include <signal.h>
+#include <ftw.h>
 #endif
 
 namespace duckdb {
@@ -1351,64 +1366,6 @@ static size_t AssignCellToColumn(const ProvCell &c, const std::vector<double> &c
 	return best;
 }
 
-// Merge sparse multi-line continuation rows into the previous row.
-static void MergeContinuationRows(std::vector<std::vector<string>> &grid, bool allow_dense_continuation = false) {
-	if (grid.size() < 2) {
-		return;
-	}
-	std::vector<std::vector<string>> out;
-	out.reserve(grid.size());
-	out.push_back(grid[0]);
-	for (size_t i = 1; i < grid.size(); ++i) {
-		const auto &prev = out.back();
-		const auto &cur = grid[i];
-		if (prev.size() != cur.size() || cur.empty()) {
-			out.push_back(cur);
-			continue;
-		}
-		int filled_cur = 0, filled_prev = 0;
-		int shared_nonempty = 0;
-		int only_cur = 0;
-		for (size_t c = 0; c < cur.size(); ++c) {
-			bool pc = !prev[c].empty();
-			bool cc = !cur[c].empty();
-			if (pc) {
-				filled_prev++;
-			}
-			if (cc) {
-				filled_cur++;
-			}
-			if (pc && cc) {
-				shared_nonempty++;
-			}
-			if (!pc && cc) {
-				only_cur++;
-			}
-		}
-		// Continuation: sparse row whose non-empty cells continue columns that
-		// already have text in the previous row (wrapped multi-line cell), and
-		// that does not introduce many brand-new columns.
-		bool sparse_enough =
-		    allow_dense_continuation ? filled_cur < filled_prev : filled_cur <= std::max(1, filled_prev / 2);
-		bool is_cont = filled_cur > 0 && filled_cur < filled_prev && shared_nonempty >= filled_cur && only_cur == 0 &&
-		               sparse_enough;
-		if (is_cont) {
-			for (size_t c = 0; c < cur.size(); ++c) {
-				if (cur[c].empty()) {
-					continue;
-				}
-				if (!out.back()[c].empty()) {
-					out.back()[c].push_back(' ');
-				}
-				out.back()[c] += cur[c];
-			}
-		} else {
-			out.push_back(cur);
-		}
-	}
-	grid = std::move(out);
-}
-
 static void MergeContinuationCells(std::vector<std::vector<ProvCell>> &grid, bool allow_dense_continuation = false) {
 	if (grid.size() < 2) {
 		return;
@@ -1816,7 +1773,7 @@ static std::vector<std::vector<string>> ReconstructPageGrid(std::vector<PdfWord>
 	// --- lattice path ---
 	if (rules && rules->Usable()) {
 		grid = ReconstructLatticeGrid(page_words, *rules);
-		MergeContinuationRows(grid);
+		// A horizontal rule defines a row boundary, including sparse rows.
 		if (!PassesTabularGate(grid, nullptr, 0.0, /*lattice=*/true)) {
 			grid.clear();
 		}
@@ -2068,6 +2025,28 @@ static pdf_ocr::ImageFormat PopplerFormatToOcr(poppler::image::format_enum fmt) 
 }
 
 //===--------------------------------------------------------------------===//
+// Apply the same allowed-path policy used by DuckDB's filesystem before
+// entering native libraries that open local paths themselves.
+static void PdfCheckAccess(ClientContext &context, const string &path, FileType type = FileType::FILE_TYPE_REGULAR) {
+	ClientContextFileOpener opener(context);
+	if (!DBConfig::GetConfig(context).CanAccessFile(path, type, &opener)) {
+		throw PermissionException("PDF operation cannot access path '%s' under the current external access policy", path);
+	}
+}
+static void PdfCheckProcessAccess(ClientContext &context) {
+	if (!Settings::Get<EnableExternalAccessSetting>(DBConfig::GetConfig(context)))
+		throw PermissionException("PDF process and plugin execution requires enable_external_access");
+}
+static void PdfCheckPairArgs(ClientContext &context, DataChunk &args) {
+	for (idx_t row = 0; row < args.size(); ++row) {
+		auto input = args.GetValue(0, row), output = args.GetValue(1, row);
+		if (!input.IsNull() && !output.IsNull()) {
+			PdfCheckAccess(context, StringValue::Get(input));
+			PdfCheckAccess(context, StringValue::Get(output));
+		}
+	}
+}
+
 // Common options bag (shared by read_pdf / read_pdf_words)
 //===--------------------------------------------------------------------===//
 struct PdfOptions {
@@ -2247,6 +2226,15 @@ static string OcrPage(poppler::page *page, const PdfOptions &po, bool best_effor
 	return OcrPageResult(page, po, best_effort).text;
 }
 
+// Poppler word boxes and rendered pixels follow the rotated display page.
+static std::pair<double, double> PageDisplayDimensions(poppler::page &page) {
+	auto rect = page.page_rect();
+	auto orientation = page.orientation();
+	if (orientation == poppler::page::landscape || orientation == poppler::page::seascape)
+		return {rect.height(), rect.width()};
+	return {rect.width(), rect.height()};
+}
+
 // Word-level OCR with the same preprocessing + confidence-retry semantics as
 // OcrPage. On retry the higher-confidence pass wins, so the returned words carry
 // the confidences of whichever attempt was kept.
@@ -2254,6 +2242,7 @@ static std::vector<OcrWord> OcrPageWords(poppler::page *page, const PdfOptions &
 	auto opt = MakeOcrOptions(po, best_effort);
 	const int dpi = po.ocr_dpi;
 	poppler::image img = RenderPageForOcr(page, dpi);
+	double raster_height_points = img.height() * 72.0 / dpi;
 	pdf_ocr::WordsResult first = OcrBitmapWords(img, opt);
 	if (po.ocr_retry && first.confidence < 55 && dpi < 400) {
 		auto opt2 = opt;
@@ -2262,6 +2251,7 @@ static std::vector<OcrWord> OcrPageWords(poppler::page *page, const PdfOptions &
 		pdf_ocr::WordsResult second = OcrBitmapWords(img2, opt2);
 		if (second.confidence > first.confidence) {
 			first = std::move(second);
+			raster_height_points = img2.height() * 72.0 / (dpi * 2);
 		}
 	}
 	std::vector<OcrWord> out;
@@ -2270,13 +2260,19 @@ static std::vector<OcrWord> OcrPageWords(poppler::page *page, const PdfOptions &
 		OcrWord ow;
 		ow.text = w.text;
 		ow.x0 = w.x0;
-		ow.y0 = w.y0;
+		ow.y0 = raster_height_points - w.y1;
 		ow.x1 = w.x1;
-		ow.y1 = w.y1;
+		ow.y1 = raster_height_points - w.y0;
 		ow.confidence = w.confidence;
 		out.push_back(std::move(ow));
 	}
 	return out;
+}
+
+static void PdfCheckOcrPaths(ClientContext &context, const PdfOptions &opt) {
+	if (!opt.ocr_plugin.empty()) { PdfCheckProcessAccess(context); PdfCheckAccess(context, opt.ocr_plugin); }
+	if (!opt.ocr_config.empty()) PdfCheckAccess(context, opt.ocr_config);
+	if (!opt.tessdata_dir.empty()) PdfCheckAccess(context, opt.tessdata_dir, FileType::FILE_TYPE_DIR);
 }
 
 static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
@@ -2525,7 +2521,8 @@ struct ReadPdfBindData : public TableFunctionData {
 // claims pages via next_page (intra-PDF parallelism).
 struct ReadPdfFileSlot {
 	string path;
-	string bytes; // immutable after load_done; shared by all workers on this file
+	string bytes; // fallback ownership when there is no native input buffer
+	const string *input_bytes = nullptr; // native reader owns its buffer for this scan's lifetime
 	int page_count = 0;
 	int first_page_0 = 0; // inclusive
 	int last_page_0 = 0;  // exclusive
@@ -2566,6 +2563,7 @@ static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctio
 	auto result = make_uniq<ReadPdfBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
+	PdfCheckOcrPaths(context, result->opt);
 
 	// has_text_layer: true when the native embedded text layer is non-blank.
 	// used_ocr: true when OCR produced (or replaced) the returned text.
@@ -2591,11 +2589,17 @@ static bool EnsureFileSlotLoaded(ClientContext &context, const ReadPdfBindData &
 		return !slot.load_failed.load(std::memory_order_relaxed);
 	}
 	try {
-		ReadAllBytes(context, slot.path, slot.bytes);
-		// Open solely to learn page_count / validate; discard doc — workers open their own.
-		auto probe = LoadDoc(slot.bytes, bind.opt.password, slot.path);
+		if (native_pdf_input && native_pdf_input->context == &context && native_pdf_input->path == slot.path) {
+			if (native_pdf_input->error) std::rethrow_exception(native_pdf_input->error);
+			slot.input_bytes = &native_pdf_input->bytes;
+		} else {
+			ReadAllBytes(context, slot.path, slot.bytes);
+			slot.input_bytes = &slot.bytes;
+		}
+		// The native reader outlives its decode state and every local worker.
+		auto probe = LoadDoc(*slot.input_bytes, bind.opt.password, slot.path);
 		slot.page_count = probe->pages();
-		slot.has_page_labels = pdf_qpdf::HasPageLabels(slot.bytes, bind.opt.password);
+		slot.has_page_labels = pdf_qpdf::HasPageLabels(*slot.input_bytes, bind.opt.password);
 		slot.first_page_0 = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
 		slot.last_page_0 =
 		    bind.opt.last_page < 0 ? slot.page_count : MinValue<int>(bind.opt.last_page, slot.page_count);
@@ -2641,8 +2645,8 @@ static bool ClaimNextPage(ClientContext &context, const ReadPdfBindData &bind, R
 		if (l.file_idx != fi || !l.doc) {
 			l.file_idx = fi;
 			l.current_file = slot.path;
-			// slot.bytes is stable for the scan lifetime (global state owns it).
-			l.doc = LoadDoc(slot.bytes, bind.opt.password, slot.path);
+			// The native reader owns the borrowed buffer for the scan lifetime.
+			l.doc = LoadDoc(*slot.input_bytes, bind.opt.password, slot.path);
 		}
 		l.page_idx = page;
 		l.page_count = slot.page_count;
@@ -2699,7 +2703,8 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 	auto layout = LayoutFromString(bind.opt.layout, bind.opt.parse_tables);
 
 	idx_t count = 0;
-	while (count < STANDARD_VECTOR_SIZE) {
+	while (count < (g.needs_ocr ? 1 : STANDARD_VECTOR_SIZE)) {
+		context.BlockingInterruptCheck();
 		if (!ClaimNextPage(context, bind, g, l)) {
 			break;
 		}
@@ -2726,9 +2731,9 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 			}
 			if (page) {
 				auto poppler_label = UStringToUtf8(page->label());
-				auto rect = page->page_rect();
-				width = rect.width();
-				height = rect.height();
+				auto dimensions = PageDisplayDimensions(*page);
+				width = dimensions.first;
+				height = dimensions.second;
 				if (g.slots[l.file_idx]->has_page_labels) {
 					page_label = std::move(poppler_label);
 				}
@@ -2834,6 +2839,7 @@ static unique_ptr<FunctionData> ReadPdfMetaBind(ClientContext &context, TableFun
 	auto result = make_uniq<ReadPdfMetaBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
+	PdfCheckOcrPaths(context, result->opt);
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
 	                LogicalType::VARCHAR, LogicalType::BOOLEAN};
@@ -2905,6 +2911,7 @@ static unique_ptr<FunctionData> PdfInspectBindCommon(ClientContext &context, Tab
 	auto result = make_uniq<PdfInspectBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
+	PdfCheckOcrPaths(context, result->opt);
 	return std::move(result);
 }
 
@@ -3675,6 +3682,7 @@ static vector<PdfRevisionRow> EnumeratePdfRevisions(const string &bytes) {
 }
 
 struct PdfRevisionsState : public GlobalTableFunctionState {
+	string current_file;
 	idx_t file_idx = 0;
 	idx_t row_idx = 0;
 	std::vector<PdfRevisionRow> rows;
@@ -3686,8 +3694,8 @@ struct PdfRevisionsState : public GlobalTableFunctionState {
 static unique_ptr<FunctionData> PdfRevisionsBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
-	                LogicalType::BOOLEAN};
-	names = {"revision_index", "startxref_offset", "eof_offset", "size_bytes", "is_incremental"};
+	                LogicalType::BOOLEAN, LogicalType::VARCHAR};
+	names = {"revision_index", "startxref_offset", "eof_offset", "size_bytes", "is_incremental", "filename"};
 	return PdfInspectBindCommon(context, input);
 }
 
@@ -3707,6 +3715,7 @@ static void PdfRevisionsScan(ClientContext &context, TableFunctionInput &data_p,
 			st.rows.clear();
 			st.row_idx = 0;
 			string path = bind.files[st.file_idx++];
+			st.current_file = path;
 			string bytes;
 			ReadAllBytes(context, path, bytes);
 			// Password is accepted for API parity; trailers sit outside encrypted
@@ -3733,6 +3742,7 @@ static void PdfRevisionsScan(ClientContext &context, TableFunctionInput &data_p,
 		OutInt64(output.data[2], count, row.eof_offset);
 		OutInt64(output.data[3], count, row.size_bytes);
 		OutBool(output.data[4], count, row.is_incremental);
+		OutString(output.data[5], count, st.current_file);
 		st.row_idx++;
 		count++;
 	}
@@ -3760,6 +3770,7 @@ static unique_ptr<FunctionData> ReadPdfWordsBind(ClientContext &context, TableFu
 	auto result = make_uniq<ReadPdfWordsBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
+	PdfCheckOcrPaths(context, result->opt);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::DOUBLE,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR,
 	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::INTEGER,
@@ -3900,10 +3911,10 @@ static bool WordsLoadPage(ReadPdfWordsState &g, const PdfOptions &opt) {
 	unique_ptr<poppler::page> page(g.doc->create_page(g.page_idx));
 	if (page) {
 		auto poppler_label = UStringToUtf8(page->label());
-		// Crop-box size in points — same default as read_pdf width/height.
-		auto rect = page->page_rect();
-		g.page_width = rect.width();
-		g.page_height = rect.height();
+		// Dimensions and word boxes both follow the rotated display page.
+		auto dimensions = PageDisplayDimensions(*page);
+		g.page_width = dimensions.first;
+		g.page_height = dimensions.second;
 		if (g.has_page_labels) {
 			g.page_label = std::move(poppler_label);
 		}
@@ -4008,6 +4019,7 @@ static unique_ptr<FunctionData> ReadPdfLinesBind(ClientContext &context, TableFu
 	auto result = make_uniq<ReadPdfLinesBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
+	PdfCheckOcrPaths(context, result->opt);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR};
 	names = {"filename", "page", "line", "text", "label"};
@@ -4070,6 +4082,11 @@ static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 		                                               page->text_list(poppler::page::text_list_include_font))),
 		                                           page->page_rect().width())
 		                          : UStringToUtf8(page->text(poppler::rectf(), layout));
+        bool has_native = pdf_ocr::HasGlyphs(text);
+        if (opt.force_ocr || (opt.auto_ocr && !has_native)) {
+            auto recognized = OcrPageResult(page.get(), opt, !opt.force_ocr || has_native);
+            if (pdf_ocr::HasGlyphs(recognized.text)) text = std::move(recognized.text);
+        }
 		size_t start = 0;
 		while (start <= text.size()) {
 			size_t nl = text.find('\n', start);
@@ -4715,7 +4732,8 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 		if (!page) {
 			continue;
 		}
-		page_h[p + 1] = page->page_rect().height();
+		auto dimensions = PageDisplayDimensions(*page);
+		page_h[p + 1] = dimensions.second;
 		std::vector<MergedTextBox> boxes;
 		std::vector<OcrWord> ocr_boxes;
 		bool page_is_ocr = LoadWordsForPage(page.get(), opt, boxes, ocr_boxes);
@@ -4754,7 +4772,7 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 			}
 		}
 		if (!words.empty()) {
-			page_lines.push_back({p + 1, ElemBuildLines(std::move(words), page->page_rect().width()), page_is_ocr});
+			page_lines.push_back({p + 1, ElemBuildLines(std::move(words), dimensions.first), page_is_ocr});
 		}
 	}
 	double body_size = ElemModalFontSize(doc_hist);
@@ -4795,6 +4813,7 @@ static unique_ptr<FunctionData> ReadPdfElementsBind(ClientContext &context, Tabl
 	// Preserve the legacy native-only default; OCR is opt-in for this reader.
 	result->opt.auto_ocr = false;
 	ParseNamed(input.named_parameters, result->opt);
+	PdfCheckOcrPaths(context, result->opt);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR};
@@ -4877,7 +4896,7 @@ static void ReadPdfElementsScan(ClientContext &context, TableFunctionInput &data
 //      pre-split at the last ASCII whitespace at or before the limit,
 //      repeatedly, into pieces each <= chunk_size bytes. A whitespace-free
 //      run longer than chunk_size is hard-cut at a UTF-8 codepoint
-//      boundary.
+//      boundary. If one codepoint exceeds the byte budget it is emitted whole.
 //  C3. HEADINGS GLUE FORWARD: a 'heading' element never ends a chunk. If
 //      packing would leave a heading last, the heading moves to the front
 //      of the next chunk instead. If the heading is the ONLY element in
@@ -4951,8 +4970,9 @@ static std::vector<string> ChunkSplitLongText(const string &text, size_t limit) 
 				cut--;
 			}
 			if (cut == pos) {
-				// limit smaller than one codepoint: split it rather than loop
-				cut = pos + limit;
+				// A codepoint may exceed the byte budget; emit it intact.
+				cut = pos + 1;
+				while (cut < text.size() && ((unsigned char)text[cut] & 0xC0) == 0x80) cut++;
 			}
 			pieces.push_back(text.substr(pos, cut - pos));
 			pos = cut;
@@ -5105,6 +5125,7 @@ static unique_ptr<FunctionData> PdfChunksBind(ClientContext &context, TableFunct
 	// Chunks inherit the element reader's legacy native-only default.
 	result->opt.auto_ocr = false;
 	ParseNamed(input.named_parameters, result->opt);
+	PdfCheckOcrPaths(context, result->opt);
 	int32_t chunk_size = CHUNK_DEFAULT_SIZE;
 	int32_t overlap = CHUNK_DEFAULT_OVERLAP;
 	for (auto &kv : input.named_parameters) {
@@ -5210,6 +5231,7 @@ static unique_ptr<FunctionData> ReadPdfTablesBind(ClientContext &context, TableF
 	auto result = make_uniq<ReadPdfTablesBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
+	PdfCheckOcrPaths(context, result->opt);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER,
 	                LogicalType::LIST(LogicalType::VARCHAR)};
 	names = {"filename", "page", "table_index", "row_index", "cells"};
@@ -5421,6 +5443,45 @@ struct TempFileGuard {
 		}
 		return *this;
 	}
+};
+
+// Stage outputs beside their destination and publish only after a successful
+// complete write. The same-directory rename avoids cross-filesystem failures.
+class AtomicPdfOutput {
+public:
+	explicit AtomicPdfOutput(const string &destination_p) : destination(destination_p) {
+		string pattern = destination + ".tmp-XXXXXX";
+		std::vector<char> name(pattern.begin(), pattern.end());
+		name.push_back('\0');
+#ifdef _WIN32
+		if (_mktemp_s(name.data(), name.size()) != 0) throw IOException("could not create temporary PDF path");
+		int fd = _open(name.data(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE);
+		if (fd < 0) throw IOException("could not create temporary PDF output");
+		_close(fd);
+#else
+		int fd = mkstemp(name.data());
+		if (fd < 0) throw IOException("could not create temporary PDF output beside '%s'", destination);
+		close(fd);
+#endif
+		path = name.data();
+	}
+	~AtomicPdfOutput() { if (!path.empty()) std::remove(path.c_str()); }
+	AtomicPdfOutput(const AtomicPdfOutput &) = delete;
+	AtomicPdfOutput &operator=(const AtomicPdfOutput &) = delete;
+	const string &TempPath() const { return path; }
+	void Commit() {
+#ifdef _WIN32
+		if (!MoveFileExA(path.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING))
+			throw IOException("could not replace PDF output '%s'", destination);
+#else
+		if (std::rename(path.c_str(), destination.c_str()) != 0)
+			throw IOException("could not replace PDF output '%s'", destination);
+#endif
+		path.clear();
+	}
+private:
+	string destination;
+	string path;
 };
 
 // Holds a poppler document and its VFS-backed byte buffer. load_from_raw_data
@@ -6024,6 +6085,8 @@ static void TesseractOcrDispatch(DataChunk &args, ExpressionState &state, Vector
 		}
 		string_t blob = StringValue::Get(blob_v);
 		auto opt = TesseractOcrOptionsFromArgs(args, i);
+		if (!opt.tessdata_dir.empty()) PdfCheckAccess(state.GetContext(), opt.tessdata_dir, FileType::FILE_TYPE_DIR);
+		if (!opt.config.empty()) PdfCheckAccess(state.GetContext(), opt.config);
 		out[i] = StringVector::AddString(result, RunTesseractOcrOnBlob(blob, opt));
 	}
 }
@@ -6108,6 +6171,8 @@ static unique_ptr<FunctionData> OcrImageBind(ClientContext &context, TableFuncti
 
 	return_types = {LogicalType::VARCHAR, LogicalType::DOUBLE, LogicalType::VARCHAR};
 	names = {"text", "confidence", "format"};
+	if (!result->opt.tessdata_dir.empty()) PdfCheckAccess(context, result->opt.tessdata_dir, FileType::FILE_TYPE_DIR);
+	if (!result->opt.config.empty()) PdfCheckAccess(context, result->opt.config);
 	return std::move(result);
 }
 
@@ -6149,35 +6214,56 @@ static void OcrImageScan(ClientContext &context, TableFunctionInput &data_p, Dat
 }
 
 //===--------------------------------------------------------------------===//
-// to_pdf(input_path[, output_path]) — convert an office/markup document
-// (docx, doc, odt, rtf, html, odp, pptx, xlsx, ...) to a PDF by shelling out AT
-// RUNTIME to LibreOffice's `soffice`.
+// to_pdf(input_path[, output_path]) converts office/markup documents by
+// spawning LibreOffice directly with literal arguments, without a shell.
 //
-// This is a RUNTIME process spawn (popen), NOT a build/link dependency: the
+// This is a runtime process, not a build/link dependency: the
 // extension compiles and CI stays green on machines with no converter
 // installed. If LibreOffice is absent at call time, we throw a clear, actionable
 // IOException (mirroring the graceful-require pattern the OCR path uses).
 //===--------------------------------------------------------------------===//
 
-// Removes a directory tree on scope exit (best-effort; never throws). Used for
-// the per-call LibreOffice user-profile dir and the temp output dir.
+// Remove only the temporary tree itself; never follow symbolic links and
+// never pass an environment-controlled path through a shell.
+#ifndef _WIN32
+static int PdfRemoveTempEntry(const char *path, const struct stat *, int, struct FTW *) {
+	return std::remove(path);
+}
+#else
+static void PdfRemoveTempTree(const string &path) {
+	WIN32_FIND_DATAA entry;
+	HANDLE find = FindFirstFileA((path + "\\*").c_str(), &entry);
+	if (find != INVALID_HANDLE_VALUE) {
+		do {
+			string name(entry.cFileName);
+			if (name == "." || name == "..") continue;
+			string child = path + "\\" + name;
+			if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+				if (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) RemoveDirectoryA(child.c_str());
+				else PdfRemoveTempTree(child);
+			} else DeleteFileA(child.c_str());
+		} while (FindNextFileA(find, &entry));
+		FindClose(find);
+	}
+	RemoveDirectoryA(path.c_str());
+}
+#endif
 struct TempDirGuard {
 	std::string path;
 	explicit TempDirGuard(std::string p) : path(std::move(p)) {
+#ifdef _WIN32
+		if (_mkdir(path.c_str()) != 0) throw IOException("to_pdf: failed to create temporary directory '%s'", path);
+#else
+		if (mkdir(path.c_str(), 0700) != 0) throw IOException("to_pdf: failed to create temporary directory '%s'", path);
+#endif
 	}
 	~TempDirGuard() {
-		if (path.empty()) {
-			return;
-		}
-		// Recursive remove via the OS shell — portable and dependency-free. Quote
-		// the path; best-effort, so ignore the result.
+		if (path.empty()) return;
 #ifdef _WIN32
-		string cmd = "rmdir /s /q \"" + path + "\" >nul 2>&1";
+		PdfRemoveTempTree(path);
 #else
-		string cmd = "rm -rf \"" + path + "\" >/dev/null 2>&1";
+		nftw(path.c_str(), PdfRemoveTempEntry, 32, FTW_DEPTH | FTW_PHYS);
 #endif
-		int rc = std::system(cmd.c_str());
-		(void)rc;
 	}
 	TempDirGuard(const TempDirGuard &) = delete;
 	TempDirGuard &operator=(const TempDirGuard &) = delete;
@@ -6280,20 +6366,107 @@ static void SplitPath(const string &path, string &dir, string &stem, string &ext
 	}
 }
 
-// Run a command line, capturing combined stdout+stderr, returning the child's
-// exit status. Uses popen/_popen — a runtime process spawn, not a linked lib.
-static int RunCapture(const string &cmd, string &output) {
+// Spawn without a shell: filenames are passed as literal arguments.
+static int RunCapture(const vector<string> &args, string &output) {
 	output.clear();
-	FILE *pipe = popen(cmd.c_str(), "r");
-	if (!pipe) {
-		throw IOException("to_pdf: failed to spawn the LibreOffice converter process");
+	const size_t limit = 65536;
+#ifdef _WIN32
+	// CreateProcess takes a single command line. Quote arguments according to
+	// the Microsoft CRT rules so spaces, quotes and backslashes stay literal.
+	auto quote = [](const string &arg) {
+		string result = "\""; size_t slashes = 0;
+		for (char c : arg) {
+			if (c == '\\') { ++slashes; continue; }
+			if (c == '"') { result.append(slashes * 2 + 1, '\\'); result += c; }
+			else { result.append(slashes, '\\'); result += c; }
+			slashes = 0;
+		}
+		result.append(slashes * 2, '\\'); result += '"'; return result;
+	};
+	string command;
+	for (const auto &arg : args) { if (!command.empty()) command += ' '; command += quote(arg); }
+	SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+	HANDLE read_pipe = nullptr, write_pipe = nullptr;
+	if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0)) throw IOException("to_pdf: failed to create process pipe");
+	SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+	STARTUPINFOA startup = {}; startup.cb = sizeof(startup); startup.dwFlags = STARTF_USESTDHANDLES;
+	startup.hStdOutput = write_pipe; startup.hStdError = write_pipe; startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+	PROCESS_INFORMATION process = {};
+	std::vector<char> mutable_command(command.begin(), command.end()); mutable_command.push_back('\0');
+	BOOL started = CreateProcessA(args[0].c_str(), mutable_command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+	                              nullptr, nullptr, &startup, &process);
+	CloseHandle(write_pipe);
+	if (!started) { CloseHandle(read_pipe); throw IOException("to_pdf: failed to spawn LibreOffice"); }
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);
+	char buf[4096]; DWORD status = STILL_ACTIVE;
+	while (status == STILL_ACTIVE) {
+		DWORD available = 0;
+		if (PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr) && available) {
+			DWORD n = 0;
+			if (ReadFile(read_pipe, buf, std::min<DWORD>(available, sizeof(buf)), &n, nullptr) && output.size() < limit)
+				output.append(buf, std::min(static_cast<size_t>(n), limit - output.size()));
+		}
+		GetExitCodeProcess(process.hProcess, &status);
+		if (std::chrono::steady_clock::now() >= deadline && status == STILL_ACTIVE) {
+			TerminateProcess(process.hProcess, 1); WaitForSingleObject(process.hProcess, INFINITE);
+			CloseHandle(read_pipe); CloseHandle(process.hThread); CloseHandle(process.hProcess);
+			throw IOException("to_pdf: LibreOffice conversion timed out after 120 seconds");
+		}
+		if (status == STILL_ACTIVE) WaitForSingleObject(process.hProcess, 20);
 	}
+	DWORD available = 0;
+	while (PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr) && available) {
+		DWORD n = 0;
+		if (!ReadFile(read_pipe, buf, std::min<DWORD>(available, sizeof(buf)), &n, nullptr) || !n) break;
+		if (output.size() < limit) output.append(buf, std::min(static_cast<size_t>(n), limit - output.size()));
+	}
+	CloseHandle(read_pipe); CloseHandle(process.hThread); CloseHandle(process.hProcess);
+	return static_cast<int>(status);
+#else
+	int fds[2];
+	if (pipe(fds) != 0) throw IOException("to_pdf: failed to create process pipe");
+	std::vector<char *> argv;
+	for (const auto &arg : args) argv.push_back(const_cast<char *>(arg.c_str()));
+	argv.push_back(nullptr);
+	pid_t child = fork();
+	if (child < 0) { close(fds[0]); close(fds[1]); throw IOException("to_pdf: failed to spawn LibreOffice"); }
+	if (child == 0) {
+		close(fds[0]);
+		dup2(fds[1], STDOUT_FILENO); dup2(fds[1], STDERR_FILENO); close(fds[1]);
+		execvp(argv[0], argv.data()); _exit(127);
+	}
+	close(fds[1]);
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);
 	char buf[4096];
-	size_t n;
-	while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) {
-		output.append(buf, n);
+	for (;;) {
+		if (std::chrono::steady_clock::now() >= deadline) {
+			kill(child, SIGKILL); while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
+			close(fds[0]); throw IOException("to_pdf: LibreOffice conversion timed out after 120 seconds");
+		}
+		struct pollfd pfd = {fds[0], POLLIN | POLLHUP, 0};
+		int ready = poll(&pfd, 1, 100);
+		if (ready < 0 && errno == EINTR) continue;
+		if (ready < 0) { kill(child, SIGKILL); waitpid(child, nullptr, 0); close(fds[0]); throw IOException("to_pdf: process output failed"); }
+		if (!ready) continue;
+		ssize_t n = read(fds[0], buf, sizeof(buf));
+		if (n < 0 && errno == EINTR) continue;
+		if (n <= 0) break;
+		if (output.size() < limit) output.append(buf, std::min(static_cast<size_t>(n), limit - output.size()));
 	}
-	return pclose(pipe);
+	close(fds[0]);
+	int status = 0;
+	for (;;) {
+		pid_t done = waitpid(child, &status, WNOHANG);
+		if (done == child) break;
+		if (done < 0 && errno != EINTR) throw IOException("to_pdf: failed waiting for LibreOffice");
+		if (std::chrono::steady_clock::now() >= deadline) {
+			kill(child, SIGKILL); while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
+			throw IOException("to_pdf: LibreOffice conversion timed out after 120 seconds");
+		}
+		poll(nullptr, 0, 50);
+	}
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
 }
 
 // Convert `input_path` to a PDF written at `output_path`, returning output_path.
@@ -6322,12 +6495,27 @@ static string ConvertToPdf(const string &input_path, const string &output_path) 
 	TempDirGuard profile_guard(profile_dir);
 	TempDirGuard out_guard(out_dir);
 
-	// Build the command. UserInstallation must be a file:// URL. Quote all paths.
-	// Capture combined output (2>&1) so a failure surfaces soffice's diagnostics.
-	string cmd = "\"" + soffice + "\" --headless -env:UserInstallation=file://" + profile_dir +
-	             " --convert-to pdf --outdir \"" + out_dir + "\" \"" + input_path + "\" 2>&1";
+	// Percent-encode the profile path for the file URI (including spaces).
+#ifdef _WIN32
+	string profile_uri = "file:///";
+#else
+	string profile_uri = "file://";
+#endif
+	const char *hex = "0123456789ABCDEF";
+	for (unsigned char c : profile_dir) {
+#ifdef _WIN32
+		if (c == '\\') { profile_uri += '/'; continue; }
+		if (c == ':') { profile_uri += ':'; continue; }
+#endif
+		if (std::isalnum(c) || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') profile_uri += c;
+		else { profile_uri += '%'; profile_uri += hex[c >> 4]; profile_uri += hex[c & 15]; }
+	}
+	vector<string> args {soffice, "--headless", "-env:UserInstallation=" + profile_uri,
+	                     "--convert-to", "pdf", "--outdir", out_dir, input_path};
 	string captured;
-	int rc = RunCapture(cmd, captured);
+	int rc = RunCapture(args, captured);
+	if (rc != 0) throw IOException("to_pdf: LibreOffice failed with exit status %d: %s", rc,
+	                              captured.empty() ? "(no output)" : captured);
 
 	// LibreOffice names the output <out_dir>/<input-stem>.pdf.
 	string in_dir, in_stem, in_ext;
@@ -6350,23 +6538,16 @@ static string ConvertToPdf(const string &input_path, const string &output_path) 
 		                  input_path);
 	}
 
-	// Move produced -> output_path. std::rename fails across filesystems, so fall
-	// back to a byte copy + remove of the source.
-	std::remove(output_path.c_str());
-	if (std::rename(produced.c_str(), output_path.c_str()) != 0) {
-		std::ifstream src(produced, std::ios::binary);
-		std::ofstream dst(output_path, std::ios::binary | std::ios::trunc);
-		if (!src || !dst) {
-			throw IOException("to_pdf: could not write the converted PDF to '%s'", output_path);
-		}
-		dst << src.rdbuf();
-		if (!dst.good()) {
-			throw IOException("to_pdf: failed while writing the converted PDF to '%s'", output_path);
-		}
-		src.close();
-		dst.close();
-		std::remove(produced.c_str());
-	}
+	// Copy into a same-directory staging file before atomically replacing the destination.
+	AtomicPdfOutput staged(output_path);
+	std::ifstream src(produced, std::ios::binary);
+	std::ofstream dst(staged.TempPath(), std::ios::binary | std::ios::trunc);
+	if (!src || !dst) throw IOException("to_pdf: could not write converted PDF to '%s'", output_path);
+	dst << src.rdbuf();
+	dst.close();
+	if (!dst || src.bad()) throw IOException("to_pdf: failed writing converted PDF to '%s'", output_path);
+	staged.Commit();
+
 	return output_path;
 }
 
@@ -6385,12 +6566,17 @@ static string DefaultPdfOutput(const string &input_path) {
 }
 
 static void ToPdfFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckProcessAccess(state.GetContext());
 	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t in) {
 		string input_path = in.GetString();
+		PdfCheckAccess(state.GetContext(), input_path);
+		PdfCheckAccess(state.GetContext(), DefaultPdfOutput(input_path));
 		return StringVector::AddString(result, ConvertToPdf(input_path, DefaultPdfOutput(input_path)));
 	});
 }
 static void ToPdfOutFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckProcessAccess(state.GetContext());
+	PdfCheckPairArgs(state.GetContext(), args);
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
 	    args.data[0], args.data[1], result, args.size(), [&](string_t in, string_t out) {
 		    return StringVector::AddString(result, ConvertToPdf(in.GetString(), out.GetString()));
@@ -6665,7 +6851,9 @@ static void RenderTextToPdf(const string &content, const string &output_path,
 }
 
 static string WritePdfImpl(const string &content, const string &output_path) {
-	RenderTextToPdf(content, output_path);
+	AtomicPdfOutput staged(output_path);
+	RenderTextToPdf(content, staged.TempPath());
+	staged.Commit();
 	return output_path;
 }
 
@@ -6678,6 +6866,7 @@ static void WritePdfFun(DataChunk &args, ExpressionState &state, Vector &result)
 #endif
 		string unique = BaseUUID::ToString(UUID::GenerateRandomUUID());
 		string tmp_path = TempDir() + sep + "write_pdf_" + unique + ".pdf";
+		PdfCheckAccess(state.GetContext(), tmp_path);
 		return StringVector::AddString(result, WritePdfImpl(content.GetString(), tmp_path));
 	});
 }
@@ -6685,6 +6874,7 @@ static void WritePdfFun(DataChunk &args, ExpressionState &state, Vector &result)
 static void WritePdfOutFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
 	    args.data[0], args.data[1], result, args.size(), [&](string_t content, string_t outpath) {
+		    PdfCheckAccess(state.GetContext(), outpath.GetString());
 		    return StringVector::AddString(result, WritePdfImpl(content.GetString(), outpath.GetString()));
 	    });
 }
@@ -6868,7 +7058,10 @@ static void PdfCopyFinalize(ClientContext &context, FunctionData &bind_data, Glo
 	if (path.empty()) {
 		throw IOException("COPY ... TO (FORMAT pdf): output file path is empty");
 	}
-	RenderTextToPdf(global.buffer, path, bind.write_opts);
+	PdfCheckAccess(context, path);
+	AtomicPdfOutput staged(path);
+	RenderTextToPdf(global.buffer, staged.TempPath(), bind.write_opts);
+	staged.Commit();
 }
 
 //===--------------------------------------------------------------------===//
@@ -7107,9 +7300,6 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 				med_h = 10.0;
 			}
 		}
-		// Still needed below: the tolerance that decides whether a row falls
-		// inside a detected table zone, and the paragraph-break gap.
-		const double row_tol = med_h * 0.5;
 		for (auto &r : rows) {
 			std::sort(r.begin(), r.end(), [](const MdWord &a, const MdWord &b) { return a.xMin < b.xMin; });
 		}
@@ -7119,94 +7309,102 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 		// internal x-gaps (column-like spacing >100pt). This lets ReconstructPageGrid
 		// see a clean >=3-row multi-col block even on mixed pages (prose sentences
 		// and title have gaps too but isolated or <3 rows after y cluster -> gate fails).
-		std::vector<PdfWord> pw_vec;
+		struct MarkdownTableBlock {
+			std::vector<PdfWord> words;
+			std::vector<std::vector<string>> grid;
+			bool emitted = false;
+		};
+		std::vector<MarkdownTableBlock> table_blocks;
 		std::vector<MdWord> cur_b;
-		int best_block_rows = 0;
-		for (size_t i = 0; i <= rows.size(); ++i) {
-			bool is_end = (i == rows.size());
-			bool is_cand = false;
-			if (!is_end) {
-				const auto &r = rows[i];
+		double previous_bottom = 0.0;
+		auto finish_block = [&]() {
+			if (cur_b.empty()) return;
+			std::vector<PdfWord> test_pw;
+			for (const auto &m : cur_b) {
+				PdfWord pw;
+				pw.xMin = m.xMin; pw.yMin = m.yMin; pw.xMax = m.xMax; pw.yMax = m.yMax; pw.text = m.text;
+				test_pw.push_back(std::move(pw));
+			}
+			auto test_g = ReconstructPageGrid(test_pw);
+			if (test_g.size() >= 3) {
+				MarkdownTableBlock block;
+				block.words = std::move(test_pw);
+				block.grid = std::move(test_g);
+				table_blocks.push_back(std::move(block));
+			}
+			cur_b.clear();
+		};
+		auto detect_tables = [&](const std::vector<std::vector<MdWord>> &candidate_rows) {
+			for (const auto &r : candidate_rows) {
+				bool is_cand = false;
 				if (r.size() >= 2) {
 					std::vector<double> xs;
-					for (const auto &w : r)
-						xs.push_back(w.xMin);
+					for (const auto &w : r) xs.push_back(w.xMin);
 					std::sort(xs.begin(), xs.end());
 					double mg = 0;
-					for (size_t j = 1; j < xs.size(); ++j)
-						mg = std::max(mg, xs[j] - xs[j - 1]);
-					if (mg > 100.0)
-						is_cand = true;
+					for (size_t j = 1; j < xs.size(); ++j) mg = std::max(mg, xs[j] - xs[j - 1]);
+					is_cand = mg > 100.0;
 				}
+				if (!is_cand) { finish_block(); continue; }
+				double row_top = r.front().yMin, row_bottom = r.front().yMax;
+				for (const auto &w : r) { row_top = std::min(row_top, w.yMin); row_bottom = std::max(row_bottom, w.yMax); }
+				if (!cur_b.empty() && (row_top - previous_bottom > 3.0 * med_h || row_top < previous_bottom - med_h))
+					finish_block();
+				cur_b.insert(cur_b.end(), r.begin(), r.end());
+				previous_bottom = row_bottom;
 			}
-			if (is_cand) {
-				cur_b.insert(cur_b.end(), rows[i].begin(), rows[i].end());
-			} else if (!cur_b.empty()) {
-				std::vector<PdfWord> test_pw;
-				for (const auto &m : cur_b) {
-					PdfWord pw;
-					pw.xMin = m.xMin;
-					pw.yMin = m.yMin;
-					pw.xMax = m.xMax;
-					pw.yMax = m.yMax;
-					pw.text = m.text;
-					test_pw.push_back(pw);
+			finish_block();
+		};
+		detect_tables(rows);
+		if (table_blocks.empty()) {
+			// A page made entirely of tables can be mistaken for separate
+			// newspaper columns. Retry with physical y-aligned rows.
+			auto physical = page_words;
+			std::sort(physical.begin(), physical.end(), [](const MdWord &a, const MdWord &b) {
+				return a.yMin == b.yMin ? a.xMin < b.xMin : a.yMin < b.yMin;
+			});
+			std::vector<std::vector<MdWord>> physical_rows;
+			double anchor = 0;
+			for (const auto &word : physical) {
+				if (physical_rows.empty() || std::fabs(word.yMin - anchor) > med_h * 0.5) {
+					physical_rows.emplace_back(); anchor = word.yMin;
 				}
-				auto test_g = ReconstructPageGrid(test_pw);
-				if ((int)test_g.size() > best_block_rows && (int)test_g.size() >= 3) {
-					best_block_rows = (int)test_g.size();
-					pw_vec = std::move(test_pw);
-				}
-				cur_b.clear();
+				physical_rows.back().push_back(word);
 			}
-		}
-		auto grid = ReconstructPageGrid(pw_vec);
-		std::vector<std::pair<double, double>> table_zones;
-		// geometric y-range from the words of the detected table block (pw_vec);
-		// a prose line is suppressed iff its y-interval overlaps a table zone.
-		// (no text-value matching of cell contents)
-		if (!pw_vec.empty()) {
-			double gy0 = 1e9, gy1 = -1e9;
-			for (const auto &w : pw_vec) {
-				gy0 = std::min(gy0, w.yMin);
-				gy1 = std::max(gy1, w.yMax);
-			}
-			if (gy0 < 1e8) {
-				table_zones.emplace_back(gy0, gy1);
-			}
+			detect_tables(physical_rows);
 		}
 
-		// per-row classification + emission
+		// Suppress only words actually consumed by the detected table. A
+		// y-only band would discard unrelated prose in a neighboring column.
 		string para_buf;
 		double prev_ymax = -1e9;
-		bool table_emitted = false;
-		for (const auto &row : rows) {
-			if (row.empty())
-				continue;
+		for (const auto &original_row : rows) {
+			std::vector<MdWord> row;
+			for (const auto &word : original_row) {
+				bool in_table = false;
+				for (auto &block : table_blocks) {
+					for (const auto &table_word : block.words) {
+						if (word.xMin == table_word.xMin && word.yMin == table_word.yMin &&
+						    word.xMax == table_word.xMax && word.yMax == table_word.yMax && word.text == table_word.text) {
+							in_table = true;
+							if (!block.emitted) {
+								if (!para_buf.empty()) { out += para_buf + "\n\n"; para_buf.clear(); }
+								emit_grid_table(block.grid, out);
+								block.emitted = true;
+								prev_ymax = -1e9;
+							}
+							break;
+						}
+					}
+					if (in_table) break;
+				}
+				if (!in_table) row.push_back(word);
+			}
+			if (row.empty()) continue;
 			double rymin = 1e9, rymax = -1e9;
 			for (const auto &w : row) {
 				rymin = std::min(rymin, w.yMin);
 				rymax = std::max(rymax, w.yMax);
-			}
-
-			bool suppressed = false;
-			for (const auto &z : table_zones) {
-				if (rymin >= z.first - row_tol && rymin <= z.second + row_tol) {
-					suppressed = true;
-					break;
-				}
-			}
-			if (suppressed) {
-				if (!para_buf.empty()) {
-					out += para_buf + "\n\n";
-					para_buf.clear();
-				}
-				if (!grid.empty() && !table_emitted) {
-					emit_grid_table(grid, out);
-					table_emitted = true;
-				}
-				prev_ymax = -1e9;
-				continue;
 			}
 
 			std::vector<double> fsr;
@@ -7347,6 +7545,33 @@ static void PdfOpsCheckOutputDir(const char *fn, const string &dir) {
 // Concatenates the inputs' pages in list order. Build the list in SQL — the
 // glob recipe is: SELECT list(DISTINCT filename ORDER BY filename) FROM
 // read_pdf_meta('dir/*.pdf').
+// Compare file identity, not just spelling: qpdf reads input lazily.
+static bool PdfSameFile(const string &a, const string &b) {
+ if (a == b) return true;
+#ifdef _WIN32
+ auto open_identity = [](const string &path) {
+  return CreateFileA(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+ };
+ HANDLE ah = open_identity(a), bh = open_identity(b);
+ BY_HANDLE_FILE_INFORMATION ai, bi;
+ bool same = ah != INVALID_HANDLE_VALUE && bh != INVALID_HANDLE_VALUE &&
+             GetFileInformationByHandle(ah, &ai) && GetFileInformationByHandle(bh, &bi) &&
+             ai.dwVolumeSerialNumber == bi.dwVolumeSerialNumber && ai.nFileIndexHigh == bi.nFileIndexHigh &&
+             ai.nFileIndexLow == bi.nFileIndexLow;
+ if (ah != INVALID_HANDLE_VALUE) CloseHandle(ah);
+ if (bh != INVALID_HANDLE_VALUE) CloseHandle(bh);
+ if (same) return true;
+ char ap[_MAX_PATH], bp[_MAX_PATH];
+ return _fullpath(ap, a.c_str(), _MAX_PATH) && _fullpath(bp, b.c_str(), _MAX_PATH) &&
+        _stricmp(ap, bp) == 0;
+#else
+ struct stat as, bs;
+ return stat(a.c_str(), &as) == 0 && stat(b.c_str(), &bs) == 0 &&
+        as.st_dev == bs.st_dev && as.st_ino == bs.st_ino;
+#endif
+}
+
 static string PdfMergeImpl(const vector<string> &inputs, const string &output) {
 	if (inputs.empty()) {
 		throw InvalidInputException("pdf_merge: input list is empty");
@@ -7355,13 +7580,15 @@ static string PdfMergeImpl(const vector<string> &inputs, const string &output) {
 		PdfOpsCheckInputExists("pdf_merge", in_path);
 		// Same contract as pdf_rotate / PdfOpsCheckInOut: qpdf pulls source
 		// objects lazily during write, and overwriting an input destroys it.
-		if (in_path == output) {
+		if (PdfSameFile(in_path, output)) {
 			throw InvalidInputException("pdf_merge: output path must differ from input path '%s'", output);
 		}
 	}
 	PdfOpsCheckOutputDir("pdf_merge", PdfOpsParentDir(output));
 	try {
-		pdf_qpdf::Merge(inputs, output);
+		AtomicPdfOutput staged(output);
+		pdf_qpdf::Merge(inputs, staged.TempPath());
+		staged.Commit();
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_merge: %s", string(e.what()));
 	}
@@ -7369,6 +7596,13 @@ static string PdfMergeImpl(const vector<string> &inputs, const string &output) {
 }
 
 static void PdfMergeFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); ++row) {
+		auto inputs = args.GetValue(0, row), output = args.GetValue(1, row);
+		if (inputs.IsNull() || output.IsNull()) continue;
+		PdfCheckAccess(state.GetContext(), StringValue::Get(output));
+		for (const auto &item : ListValue::GetChildren(inputs))
+			if (!item.IsNull()) PdfCheckAccess(state.GetContext(), StringValue::Get(item));
+	}
 	// Value-based row loop: this is a file operation executed a handful of
 	// times per query, not a hot path — clarity over vectorized throughput.
 	result.SetVectorType(VectorType::FLAT_VECTOR);
@@ -7400,7 +7634,7 @@ static string PdfRotateImpl(const string &input, const string &output, int32_t d
 	}
 	PdfOpsCheckInputExists("pdf_rotate", input);
 	PdfOpsCheckOutputDir("pdf_rotate", PdfOpsParentDir(output));
-	if (input == output) {
+	if (PdfSameFile(input, output)) {
 		// qpdf reads the source lazily during write; writing over it would corrupt.
 		throw InvalidInputException("pdf_rotate: output path must differ from input path '%s'", input);
 	}
@@ -7409,7 +7643,9 @@ static string PdfRotateImpl(const string &input, const string &output, int32_t d
 		// grammar, parsed inside pdf_qpdf::Rotate (throws with a descriptive
 		// message on malformed / out-of-range specs).
 		bool all_pages = StringUtil::Lower(pages_spec) == "all";
-		pdf_qpdf::Rotate(input, output, degrees, all_pages, pages_spec);
+		AtomicPdfOutput staged(output);
+		pdf_qpdf::Rotate(input, staged.TempPath(), degrees, all_pages, pages_spec);
+		staged.Commit();
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_rotate: %s", string(e.what()));
 	}
@@ -7433,10 +7669,12 @@ static void PdfRotateFunInternal(DataChunk &args, Vector &result, bool has_pages
 }
 
 static void PdfRotateFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckPairArgs(state.GetContext(), args);
 	PdfRotateFunInternal(args, result, false);
 }
 
 static void PdfRotatePagesFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckPairArgs(state.GetContext(), args);
 	PdfRotateFunInternal(args, result, true);
 }
 
@@ -7492,6 +7730,8 @@ static void PdfSplitScan(ClientContext &context, TableFunctionInput &data_p, Dat
 	auto &st = data_p.global_state->Cast<PdfSplitState>();
 	if (!st.executed) {
 		// Side effects happen at scan time (not bind), so EXPLAIN writes nothing.
+		PdfCheckAccess(context, bind.input);
+		PdfCheckAccess(context, bind.output_dir, FileType::FILE_TYPE_DIR);
 		PdfSplitExecute(bind.input, bind.output_dir, st.emitted);
 		st.executed = true;
 	}
@@ -7611,6 +7851,8 @@ static unique_ptr<GlobalTableFunctionState> PdfSplitBlankInit(ClientContext &, T
 // Detects separator pages, then delegates the actual file writing to qpdf.
 static void PdfSplitBlankExecute(ClientContext &context, const string &input, const string &output_dir,
                                  double blank_threshold, std::vector<PdfSplitBlankEmitted> &emitted) {
+	PdfCheckAccess(context, input);
+	PdfCheckAccess(context, output_dir, FileType::FILE_TYPE_DIR);
 	PdfOpsCheckInputExists("pdf_split_blank", input);
 	{
 		auto fs = FileSystem::CreateLocal();
@@ -7763,6 +8005,8 @@ static pdf_ocr::PdfResult RenderOcrLayer(poppler::page *page, const PdfOptions &
 
 static void PdfOcrExecute(ClientContext &context, const string &input, const string &output, const PdfOptions &po,
                           bool force, std::vector<PdfOcrRow> &rows) {
+	PdfCheckAccess(context, input);
+	PdfCheckAccess(context, output);
 	PdfOpsCheckInOut("pdf_ocr", input, output);
 	string bytes;
 	ReadPdfInput(context, "pdf_ocr", input, bytes);
@@ -7775,6 +8019,7 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 	std::vector<TempFileGuard> temp_files;
 	rows.reserve(static_cast<size_t>(doc->pages()));
 	for (int page_idx = 0; page_idx < doc->pages(); page_idx++) {
+		context.BlockingInterruptCheck();
 		unique_ptr<poppler::page> page;
 		double width = 0;
 		bool had_text_layer = false;
@@ -7832,18 +8077,21 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 	}
 
 	try {
-		pdf_qpdf::AddTextLayers(input, output, layers);
+		AtomicPdfOutput staged(output);
+		pdf_qpdf::AddTextLayers(input, staged.TempPath(), layers, po.password);
+		staged.Commit();
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_ocr: %s", string(e.what()));
 	}
 }
 
-static unique_ptr<FunctionData> PdfOcrBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> PdfOcrBind(ClientContext &context, TableFunctionBindInput &input,
                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfOcrBindData>();
 	result->input = StringValue::Get(input.inputs[0]);
 	result->output = StringValue::Get(input.inputs[1]);
 	ParseNamed(input.named_parameters, result->opt);
+	PdfCheckOcrPaths(context, result->opt);
 	for (auto &kv : input.named_parameters) {
 		if (StringUtil::Lower(kv.first.GetIdentifierName()) == "force") {
 			result->force = BooleanValue::Get(kv.second);
@@ -7889,7 +8137,7 @@ static void PdfOcrScan(ClientContext &context, TableFunctionInput &data_p, DataC
 static void PdfOpsCheckInOut(const char *fn, const string &input, const string &output) {
 	PdfOpsCheckInputExists(fn, input);
 	PdfOpsCheckOutputDir(fn, PdfOpsParentDir(output));
-	if (input == output) {
+	if (PdfSameFile(input, output)) {
 		// qpdf reads the source lazily during write; writing over it would corrupt.
 		throw InvalidInputException("%s: output path must differ from input path '%s'", fn, input);
 	}
@@ -7902,7 +8150,9 @@ static void PdfOpsCheckInOut(const char *fn, const string &input, const string &
 static string PdfCompressImpl(const string &input, const string &output) {
 	PdfOpsCheckInOut("pdf_compress", input, output);
 	try {
-		pdf_qpdf::Compress(input, output);
+		AtomicPdfOutput staged(output);
+		pdf_qpdf::Compress(input, staged.TempPath());
+		staged.Commit();
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_compress: %s", string(e.what()));
 	}
@@ -7910,6 +8160,7 @@ static string PdfCompressImpl(const string &input, const string &output) {
 }
 
 static void PdfCompressFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckPairArgs(state.GetContext(), args);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	for (idx_t row = 0; row < args.size(); row++) {
 		Value in_val = args.GetValue(0, row);
@@ -7932,7 +8183,9 @@ static string PdfEncryptImpl(const string &input, const string &output, const st
 	PdfOpsCheckInOut("pdf_encrypt", input, output);
 	const string &owner = owner_password.empty() ? user_password : owner_password;
 	try {
-		pdf_qpdf::Encrypt(input, output, user_password, owner);
+		AtomicPdfOutput staged(output);
+		pdf_qpdf::Encrypt(input, staged.TempPath(), user_password, owner);
+		staged.Commit();
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_encrypt: %s", string(e.what()));
 	}
@@ -7956,10 +8209,12 @@ static void PdfEncryptFunInternal(DataChunk &args, Vector &result, bool has_owne
 }
 
 static void PdfEncryptFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckPairArgs(state.GetContext(), args);
 	PdfEncryptFunInternal(args, result, false);
 }
 
 static void PdfEncryptOwnerFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckPairArgs(state.GetContext(), args);
 	PdfEncryptFunInternal(args, result, true);
 }
 
@@ -7969,7 +8224,9 @@ static void PdfEncryptOwnerFun(DataChunk &args, ExpressionState &state, Vector &
 static string PdfDecryptImpl(const string &input, const string &output, const string &password) {
 	PdfOpsCheckInOut("pdf_decrypt", input, output);
 	try {
-		pdf_qpdf::Decrypt(input, output, password);
+		AtomicPdfOutput staged(output);
+		pdf_qpdf::Decrypt(input, staged.TempPath(), password);
+		staged.Commit();
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_decrypt: %s", string(e.what()));
 	}
@@ -7977,6 +8234,7 @@ static string PdfDecryptImpl(const string &input, const string &output, const st
 }
 
 static void PdfDecryptFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckPairArgs(state.GetContext(), args);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	for (idx_t row = 0; row < args.size(); row++) {
 		Value in_val = args.GetValue(0, row);
@@ -7997,7 +8255,9 @@ static void PdfDecryptFun(DataChunk &args, ExpressionState &state, Vector &resul
 static string PdfPagesImpl(const string &input, const string &output, const string &ranges) {
 	PdfOpsCheckInOut("pdf_pages", input, output);
 	try {
-		pdf_qpdf::Pages(input, output, ranges);
+		AtomicPdfOutput staged(output);
+		pdf_qpdf::Pages(input, staged.TempPath(), ranges);
+		staged.Commit();
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_pages: %s", string(e.what()));
 	}
@@ -8005,6 +8265,7 @@ static string PdfPagesImpl(const string &input, const string &output, const stri
 }
 
 static void PdfPagesFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckPairArgs(state.GetContext(), args);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	for (idx_t row = 0; row < args.size(); row++) {
 		Value in_val = args.GetValue(0, row);
@@ -8029,7 +8290,9 @@ static string PdfWatermarkImpl(const string &input, const string &output, const 
 		throw InvalidInputException("pdf_watermark: opacity must be in (0, 1] (got %f)", opacity);
 	}
 	try {
-		pdf_qpdf::Watermark(input, output, text, opacity);
+		AtomicPdfOutput staged(output);
+		pdf_qpdf::Watermark(input, staged.TempPath(), text, opacity);
+		staged.Commit();
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_watermark: %s", string(e.what()));
 	}
@@ -8053,10 +8316,12 @@ static void PdfWatermarkFunInternal(DataChunk &args, Vector &result, bool has_op
 }
 
 static void PdfWatermarkFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckPairArgs(state.GetContext(), args);
 	PdfWatermarkFunInternal(args, result, false);
 }
 
 static void PdfWatermarkOpacityFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckPairArgs(state.GetContext(), args);
 	PdfWatermarkFunInternal(args, result, true);
 }
 
@@ -8066,7 +8331,9 @@ static void PdfWatermarkOpacityFun(DataChunk &args, ExpressionState &state, Vect
 static string PdfBatesImpl(const string &input, const string &output, const string &prefix, int64_t start_number) {
 	PdfOpsCheckInOut("pdf_bates", input, output);
 	try {
-		pdf_qpdf::Bates(input, output, prefix, static_cast<long long>(start_number), nullptr);
+		AtomicPdfOutput staged(output);
+		pdf_qpdf::Bates(input, staged.TempPath(), prefix, static_cast<long long>(start_number), nullptr);
+		staged.Commit();
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_bates: %s", string(e.what()));
 	}
@@ -8074,6 +8341,7 @@ static string PdfBatesImpl(const string &input, const string &output, const stri
 }
 
 static void PdfBatesFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckPairArgs(state.GetContext(), args);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	for (idx_t row = 0; row < args.size(); row++) {
 		Value in_val = args.GetValue(0, row);
@@ -8430,12 +8698,18 @@ static void PdfSignScan(ClientContext &context, TableFunctionInput &data_p, Data
 	auto &bind = data_p.bind_data->Cast<PdfSignBindData>();
 	auto &st = data_p.global_state->Cast<PdfQpdfRowsState>();
 	if (!st.executed) {
+		PdfCheckAccess(context, bind.input);
+		PdfCheckAccess(context, bind.output);
+		PdfCheckAccess(context, bind.cert_path);
+		PdfCheckAccess(context, bind.key_path);
 		PdfOpsCheckInOut("pdf_sign", bind.input, bind.output);
 		PdfOpsCheckInputExists("pdf_sign", bind.cert_path);
 		PdfOpsCheckInputExists("pdf_sign", bind.key_path);
 		try {
-			pdf_qpdf::SignDetached(bind.input, bind.output, bind.cert_path, bind.key_path, bind.key_password,
+			AtomicPdfOutput staged(bind.output);
+			pdf_qpdf::SignDetached(bind.input, staged.TempPath(), bind.cert_path, bind.key_path, bind.key_password,
 			                       bind.reason, bind.location, bind.signer_name, bind.field_name, bind.password);
+			staged.Commit();
 		} catch (const std::exception &e) {
 			throw InvalidInputException("pdf_sign: %s", string(e.what()));
 		}
@@ -8549,6 +8823,10 @@ static vector<RedactBox> ParseRedactBoxes(const Value &list_val) {
 		}
 		// Zero/negative extent is never a true redaction (was accepted but left
 		// secrets extractable). Reject so callers cannot think a w=0 box scrubbed text.
+		if (!std::isfinite(box.x) || !std::isfinite(box.y) || !std::isfinite(box.w) || !std::isfinite(box.h) ||
+		    !std::isfinite(box.x + box.w) || !std::isfinite(box.y + box.h)) {
+			throw InvalidInputException("pdf_redact: redaction coordinates must be finite");
+		}
 		if (!(box.w > 0.0) || !(box.h > 0.0)) {
 			throw InvalidInputException("pdf_redact: redaction box w and h must be > 0 (got w=%f h=%f on page %d)",
 			                            box.w, box.h, box.page);
@@ -8593,7 +8871,8 @@ static unique_ptr<GlobalTableFunctionState> PdfRedactInit(ClientContext &, Table
 // Render one page to RGB and paint the given boxes black. `boxes` are in PDF
 // points, origin bottom-left. Fills the RebuiltPage (top-down RGB, media dims).
 static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page_idx0, int dpi,
-                                                const vector<const RedactBox *> &boxes) {
+                                                const vector<const RedactBox *> &boxes,
+                                                const pdf_qpdf::RedactGeometry &geom) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	EnsurePopplerErrorCallback();
 	// Register base-14 *before* first render; re-run once if poppler still
@@ -8682,26 +8961,38 @@ static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page
 		}
 	}
 
-	// Paint each box solid black. Points -> pixels; flip y (PDF origin bottom-left,
-	// raster row 0 at top). Clamp to the raster so off-page boxes never overrun.
-	const double scale = dpi / 72.0;
-	auto clampi = [](int v, int lo, int hi) {
-		return v < lo ? lo : (v > hi ? hi : v);
+	// Map PDF user-space corners through CropBox and page rotation into the
+	// renderer's upright raster. Scaling by the actual raster dimensions also
+	// accounts for DPI rounding and /UserUnit scaling.
+	auto clamp_pixel = [](double v, int hi) { return std::max(0.0, std::min(static_cast<double>(hi), v)); };
+	const double cw = geom.x1 - geom.x0, ch = geom.y1 - geom.y0;
+	auto project = [&](double x, double y) -> std::pair<double, double> {
+		x -= geom.x0; y -= geom.y0;
+		switch (geom.rotation) {
+		case 90: return {y / ch * W, x / cw * H};
+		case 180: return {(cw - x) / cw * W, y / ch * H};
+		case 270: return {(ch - y) / ch * W, (cw - x) / cw * H};
+		default: return {x / cw * W, (ch - y) / ch * H};
+		}
 	};
 	for (const RedactBox *box : boxes) {
-		int px0 = clampi(static_cast<int>(std::floor(box->x * scale)), 0, W);
-		int px1 = clampi(static_cast<int>(std::ceil((box->x + box->w) * scale)), 0, W);
-		int ry0 = clampi(static_cast<int>(std::floor(H - (box->y + box->h) * scale)), 0, H);
-		int ry1 = clampi(static_cast<int>(std::ceil(H - box->y * scale)), 0, H);
-		for (int y = ry0; y < ry1; y++) {
-			for (int x = px0; x < px1; x++) {
-				size_t o = (static_cast<size_t>(y) * W + x) * 3;
-				out.rgb[o + 0] = 0;
-				out.rgb[o + 1] = 0;
-				out.rgb[o + 2] = 0;
-			}
+		double minx = W, maxx = 0, miny = H, maxy = 0;
+		for (int xi = 0; xi < 2; ++xi) for (int yi = 0; yi < 2; ++yi) {
+			auto pt = project(box->x + xi * box->w, box->y + yi * box->h);
+			minx = std::min(minx, pt.first); maxx = std::max(maxx, pt.first);
+			miny = std::min(miny, pt.second); maxy = std::max(maxy, pt.second);
+		}
+		int px0 = static_cast<int>(std::floor(clamp_pixel(minx, W)));
+		int px1 = static_cast<int>(std::ceil(clamp_pixel(maxx, W)));
+		int ry0 = static_cast<int>(std::floor(clamp_pixel(miny, H)));
+		int ry1 = static_cast<int>(std::ceil(clamp_pixel(maxy, H)));
+		if (px0 >= px1 || ry0 >= ry1) throw InvalidInputException("pdf_redact: box does not intersect page CropBox");
+		for (int y = ry0; y < ry1; y++) for (int x = px0; x < px1; x++) {
+			size_t o = (static_cast<size_t>(y) * W + x) * 3;
+			out.rgb[o] = out.rgb[o + 1] = out.rgb[o + 2] = 0;
 		}
 	}
+
 	return out;
 }
 
@@ -8710,9 +9001,11 @@ static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page
 static void PdfRedactExecuteFile(ClientContext &context, const string &input_path, const string &output_path,
                                  const string &password, int32_t dpi, const vector<RedactBox> &boxes,
                                  std::vector<std::vector<Value>> &rows) {
+	PdfCheckAccess(context, input_path);
+	PdfCheckAccess(context, output_path);
 	PdfOpsCheckInputExists("pdf_redact", input_path);
 	PdfOpsCheckOutputDir("pdf_redact", PdfOpsParentDir(output_path));
-	if (input_path == output_path) {
+	if (PdfSameFile(input_path, output_path)) {
 		throw InvalidInputException("pdf_redact: output path must differ from input path '%s'", input_path);
 	}
 
@@ -8728,6 +9021,8 @@ static void PdfRedactExecuteFile(ClientContext &context, const string &input_pat
 		}
 	}
 
+	auto geometry = pdf_qpdf::ReadRedactGeometry(input_path, password);
+	if (geometry.size() != static_cast<size_t>(page_count)) throw InvalidInputException("pdf_redact: geometry page count mismatch");
 	std::vector<pdf_qpdf::RebuiltPage> rebuilt(static_cast<size_t>(page_count));
 	std::vector<int> box_counts(static_cast<size_t>(page_count), 0);
 	for (int p = 1; p <= page_count; p++) {
@@ -8741,12 +9036,14 @@ static void PdfRedactExecuteFile(ClientContext &context, const string &input_pat
 			rebuilt[p - 1].redacted = false;
 			continue;
 		}
-		rebuilt[p - 1] = RenderRedactedPage(*doc, p - 1, dpi, page_boxes);
+		rebuilt[p - 1] = RenderRedactedPage(*doc, p - 1, dpi, page_boxes, geometry[p - 1]);
 		box_counts[p - 1] = static_cast<int>(page_boxes.size());
 	}
 
 	try {
-		pdf_qpdf::RebuildPagesAsImages(input_path, output_path, rebuilt, password);
+		AtomicPdfOutput staged(output_path);
+		pdf_qpdf::RebuildPagesAsImages(input_path, staged.TempPath(), rebuilt, password);
+		staged.Commit();
 	} catch (const std::exception &e) {
 		throw InvalidInputException("pdf_redact: %s", string(e.what()));
 	}
@@ -9264,8 +9561,20 @@ static void PdfPermissionsScan(ClientContext &context, TableFunctionInput &data_
 		OutBool(output.data[8], count, doc->has_permission(poppler::perm_fill_forms));
 		OutBool(output.data[9], count, doc->has_permission(poppler::perm_accessibility));
 		OutBool(output.data[10], count, doc->has_permission(poppler::perm_assemble));
+#if POPPLER_VERSION_MAJOR >= 25
 		OutBool(output.data[11], count, doc->has_javascript());
 		OutString(output.data[12], count, string(FormTypeName(static_cast<int>(doc->form_type()))));
+#else
+		bool javascript = false;
+		int form_type = 0;
+		if (PopplerLegacyDocumentFeatures(bytes, bind.opt.password, javascript, form_type)) {
+			OutBool(output.data[11], count, javascript);
+			OutString(output.data[12], count, string(FormTypeName(form_type)));
+		} else {
+			FlatVector::SetNull(output.data[11], count, true);
+			OutStringNull(output.data[12], count);
+		}
+#endif
 		OutBool(output.data[13], count, doc->is_linearized());
 		OutString(output.data[14], count, string(PageModeName(doc->page_mode())));
 		OutString(output.data[15], count, string(PageLayoutName(doc->page_layout())));
@@ -9479,14 +9788,16 @@ struct PdfPageImagesRow {
 };
 
 struct PdfPageImagesState : public GlobalTableFunctionState {
+	vector<column_t> column_ids;
+	bool needs_image = false;
 	idx_t file_idx = 0;
-	idx_t row_idx = 0;
 	string current_file;
+	string file_bytes;
+	unique_ptr<poppler::document> doc;
 	int page_count = 0;
-	std::vector<PdfPageImagesRow> rows;
-	idx_t MaxThreads() const override {
-		return 1;
-	}
+	int next_page = 0;
+	int last_page = 0;
+	idx_t MaxThreads() const override { return 1; }
 };
 
 static unique_ptr<FunctionData> PdfPageImagesBind(ClientContext &context, TableFunctionBindInput &input,
@@ -9494,6 +9805,7 @@ static unique_ptr<FunctionData> PdfPageImagesBind(ClientContext &context, TableF
 	auto result = make_uniq<PdfPageImagesBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	ParseNamed(input.named_parameters, result->opt);
+	PdfCheckOcrPaths(context, result->opt);
 	for (auto &kv : input.named_parameters) {
 		if (StringUtil::Lower(kv.first.GetIdentifierName()) == "dpi") {
 			result->dpi = IntegerValue::Get(kv.second);
@@ -9508,57 +9820,57 @@ static unique_ptr<FunctionData> PdfPageImagesBind(ClientContext &context, TableF
 	return std::move(result);
 }
 
-static unique_ptr<GlobalTableFunctionState> PdfPageImagesInit(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<PdfPageImagesState>();
+static unique_ptr<GlobalTableFunctionState> PdfPageImagesInit(ClientContext &, TableFunctionInitInput &input) {
+	auto state = make_uniq<PdfPageImagesState>();
+	state->column_ids = input.column_ids;
+	for (auto col : state->column_ids) if (col == 4 || col == 5 || col == 6) state->needs_image = true;
+	return std::move(state);
 }
 
 static void PdfPageImagesScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind = data_p.bind_data->Cast<PdfPageImagesBindData>();
 	auto &st = data_p.global_state->Cast<PdfPageImagesState>();
-	idx_t count = 0;
-	while (count < STANDARD_VECTOR_SIZE) {
-		if (st.row_idx >= st.rows.size()) {
-			if (st.file_idx >= bind.files.size()) {
-				break;
-			}
-			st.rows.clear();
-			st.row_idx = 0;
-			st.current_file = bind.files[st.file_idx++];
-			string bytes;
-			ReadAllBytes(context, st.current_file, bytes);
-			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
-			st.page_count = doc->pages();
-			int first = bind.opt.first_page > 0 ? bind.opt.first_page : 1;
-			int last = bind.opt.last_page < 0 ? st.page_count : MinValue<int>(bind.opt.last_page, st.page_count);
-			for (int p = first; p <= last; p++) {
-				PdfPageImagesRow row;
-				row.page = p;
-				row.png = RenderPageToPngBytes(*doc, p, bind.dpi, "pdf_page_images");
-				// Recover pixel dimensions from the PNG IHDR (bytes 16..23).
-				if (row.png.size() >= 24) {
-					auto u32be = [](const char *b) -> int {
-						return (static_cast<unsigned char>(b[0]) << 24) | (static_cast<unsigned char>(b[1]) << 16) |
-						       (static_cast<unsigned char>(b[2]) << 8) | (static_cast<unsigned char>(b[3]));
-					};
-					row.width = u32be(row.png.data() + 16);
-					row.height = u32be(row.png.data() + 20);
-				}
-				st.rows.push_back(std::move(row));
-			}
-			continue;
+	// PNG rendering is expensive: return a page promptly rather than filling a vector.
+	while (!st.doc || st.next_page > st.last_page) {
+		st.doc.reset();
+		if (st.file_idx >= bind.files.size()) {
+			output.SetChildCardinality(0);
+			return;
 		}
-		auto &row = st.rows[st.row_idx];
-		OutString(output.data[0], count, st.current_file);
-		OutInt32(output.data[1], count, row.page);
-		OutInt32(output.data[2], count, st.page_count);
-		OutInt32(output.data[3], count, bind.dpi);
-		OutInt32(output.data[4], count, row.width);
-		OutInt32(output.data[5], count, row.height);
-		OutBlob(output.data[6], count, row.png);
-		st.row_idx++;
-		count++;
+		st.current_file = bind.files[st.file_idx++];
+		ReadAllBytes(context, st.current_file, st.file_bytes);
+		st.doc = LoadDoc(st.file_bytes, bind.opt.password, st.current_file);
+		st.page_count = st.doc->pages();
+		st.next_page = bind.opt.first_page > 0 ? bind.opt.first_page : 1;
+		st.last_page = bind.opt.last_page < 0 ? st.page_count : MinValue<int>(bind.opt.last_page, st.page_count);
 	}
-	output.SetChildCardinality(count);
+	context.BlockingInterruptCheck();
+	const int page = st.next_page++;
+	string png;
+	if (st.needs_image) png = RenderPageToPngBytes(*st.doc, page, bind.dpi, "pdf_page_images");
+	int width = 0, height = 0;
+	if (png.size() >= 24) {
+		auto u32be = [](const char *b) -> int {
+			return (static_cast<unsigned char>(b[0]) << 24) | (static_cast<unsigned char>(b[1]) << 16) |
+			       (static_cast<unsigned char>(b[2]) << 8) | static_cast<unsigned char>(b[3]);
+		};
+		width = u32be(png.data() + 16);
+		height = u32be(png.data() + 20);
+	}
+	for (idx_t col = 0; col < st.column_ids.size(); ++col) {
+		auto &out = output.data[col];
+		switch (st.column_ids[col]) {
+		case 0: OutString(out, 0, st.current_file); break;
+		case 1: OutInt32(out, 0, page); break;
+		case 2: OutInt32(out, 0, st.page_count); break;
+		case 3: OutInt32(out, 0, bind.dpi); break;
+		case 4: OutInt32(out, 0, width); break;
+		case 5: OutInt32(out, 0, height); break;
+		case 6: OutBlob(out, 0, png); break;
+		default: out.SetValue(0, Value::BIGINT(page - 1)); break;
+		}
+	}
+	output.SetChildCardinality(1);
 }
 
 //---- pdf_write_page_images — render each page to on-disk PNG previews --------
@@ -9641,7 +9953,8 @@ static void PdfWritePageImagesCheckStemCollisions(const vector<string> &files) {
 }
 
 static void PdfWriteBytesToFile(const string &path, const string &bytes, const char *fn_name) {
-	std::ofstream of(path, std::ios::binary | std::ios::trunc);
+	AtomicPdfOutput staged(path);
+	std::ofstream of(staged.TempPath(), std::ios::binary | std::ios::trunc);
 	if (!of) {
 		throw IOException("%s: could not open '%s' for writing", fn_name, path);
 	}
@@ -9649,6 +9962,9 @@ static void PdfWriteBytesToFile(const string &path, const string &bytes, const c
 	if (!of) {
 		throw IOException("%s: short write to '%s'", fn_name, path);
 	}
+	of.close();
+	if (!of) throw IOException("%s: failed closing '%s'", fn_name, path);
+	staged.Commit();
 }
 
 static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, TableFunctionBindInput &input,
@@ -9675,6 +9991,7 @@ static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, T
 		throw InvalidInputException("pdf_write_page_images: out_dir must not be empty");
 	}
 	ParseNamed(input.named_parameters, result->opt);
+	PdfCheckOcrPaths(context, result->opt);
 	for (auto &kv : input.named_parameters) {
 		if (StringUtil::Lower(kv.first.GetIdentifierName()) == "dpi") {
 			result->dpi = IntegerValue::Get(kv.second);
@@ -9696,6 +10013,8 @@ static unique_ptr<GlobalTableFunctionState> PdfWritePageImagesInit(ClientContext
 
 static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePageImagesBindData &bind,
                                       std::vector<PdfWritePageImagesRow> &rows) {
+	PdfCheckAccess(context, bind.out_dir, FileType::FILE_TYPE_DIR);
+	for (const auto &file : bind.files) PdfCheckAccess(context, file);
 	auto fs = FileSystem::CreateLocal();
 	// Ensure the top-level preview root exists (create, don't require the caller
 	// to mkdir first — this is an export tree, not a surgical in-place write).
@@ -9921,11 +10240,14 @@ static void PdfJsonPathOnlyFun(DataChunk &args, ExpressionState &state, Vector &
 
 //---- pdf_repair (scalar) --------------------------------------------------
 static void PdfRepairFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckPairArgs(state.GetContext(), args);
 	TernaryExecutor::Execute<string_t, string_t, string_t, string_t>(
 	    args.data[0], args.data[1], args.data[2], result, args.size(),
 	    [&](string_t input, string_t output, string_t password) {
 		    try {
-			    pdf_qpdf::Repair(input.GetString(), output.GetString(), password.GetString());
+			    AtomicPdfOutput staged(output.GetString());
+			    pdf_qpdf::Repair(input.GetString(), staged.TempPath(), password.GetString());
+			    staged.Commit();
 			    return StringVector::AddString(result, output);
 		    } catch (const std::exception &e) {
 			    throw IOException("pdf_repair: %s", string(e.what()));
@@ -9934,10 +10256,13 @@ static void PdfRepairFun(DataChunk &args, ExpressionState &state, Vector &result
 }
 
 static void PdfRepairNoPwFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfCheckPairArgs(state.GetContext(), args);
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
 	    args.data[0], args.data[1], result, args.size(), [&](string_t input, string_t output) {
 		    try {
-			    pdf_qpdf::Repair(input.GetString(), output.GetString(), "");
+			    AtomicPdfOutput staged(output.GetString());
+			    pdf_qpdf::Repair(input.GetString(), staged.TempPath(), "");
+			    staged.Commit();
 			    return StringVector::AddString(result, output);
 		    } catch (const std::exception &e) {
 			    throw IOException("pdf_repair: %s", string(e.what()));
@@ -10101,6 +10426,9 @@ private:
 		}
 		if (!input.error) {
 			try {
+				if (bind.info.decode.name == "read_pdf" && file_size > NumericLimits<int32_t>::Maximum()) {
+					throw IOException("read_pdf: '%s' is too large (%lld bytes; max ~2 GiB)", input.path, (long long)file_size);
+				}
 				ReadPdfHandleBytes(context, *handle, input.path, file_size, input.bytes);
 			} catch (...) {
 				input.error = std::current_exception();
@@ -10228,10 +10556,22 @@ struct PdfLoader {
 	ExtensionLoader &loader;
 
 	void RegisterFunction(ScalarFunction function) {
+		if (function.GetSignature().GetParameterCount() > 0 &&
+		    function.GetSignature().GetParameter(0).GetType() == LogicalType::VARCHAR &&
+		    function.name.GetIdentifierName().compare(0, 7, "pdf_to_") == 0) {
+			function.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
+		}
 		function.SetFallible();
 		loader.RegisterFunction(std::move(function));
 	}
 	void RegisterFunction(ScalarFunctionSet functions) {
+		const bool path_converter = functions.name.GetIdentifierName().compare(0, 7, "pdf_to_") == 0;
+        functions.ApplyToFunctions([path_converter](ScalarFunction &function) {
+            if (path_converter && function.GetSignature().GetParameterCount() > 0 &&
+                function.GetSignature().GetParameter(0).GetType() == LogicalType::VARCHAR) {
+                function.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
+            }
+        });
 		functions.SetFallible();
 		loader.RegisterFunction(std::move(functions));
 	}
@@ -10597,6 +10937,7 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 
 	TableFunction pdf_page_images("pdf_page_images", {LogicalType::VARCHAR}, PdfPageImagesScan, PdfPageImagesBind,
 	                              PdfPageImagesInit);
+	pdf_page_images.projection_pushdown = true;
 	AddNamedParameter(pdf_page_images, "password", LogicalType::VARCHAR);
 	AddNamedParameter(pdf_page_images, "dpi", LogicalType::INTEGER);
 	AddNamedParameter(pdf_page_images, "first_page", LogicalType::INTEGER);

@@ -212,3 +212,10 @@ statement error
 SELECT * FROM pdf_chunks('test/data/no_such_file.pdf');
 ----
 <REGEX>:.*test[/\\]data[/\\]no_such_file\.pdf.*
+
+# A byte budget smaller than a UTF-8 codepoint emits the whole codepoint.
+query I
+SELECT count(*) = 3 AND bool_and(text = 'é')
+FROM pdf_chunks('test/data/chunks_utf8.pdf', chunk_size := 1, overlap := 0);
+----
+true
