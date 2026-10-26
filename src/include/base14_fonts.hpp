@@ -32,6 +32,7 @@ void EnsurePopplerErrorCallback();
 // Reset / read the missing-display-font flag set by the error callback.
 void ResetPopplerMissingDisplayFont();
 bool PopplerMissingDisplayFont();
-bool PopplerLegacyDocumentFeatures(const std::string &bytes, const std::string &password, bool &javascript, int &form_type);
+bool PopplerLegacyDocumentFeatures(const std::string &bytes, const std::string &password, bool &javascript,
+                                   int &form_type);
 
 } // namespace duckdb

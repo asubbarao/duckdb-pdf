@@ -1,4 +1,7 @@
+# name: test/sql/pdf_copy_finite.test
 # description: reject nonfinite PDF layout settings before invoking libharu
+# group: [sql]
+
 require pdf
 
 statement error

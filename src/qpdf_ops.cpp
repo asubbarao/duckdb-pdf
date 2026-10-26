@@ -154,34 +154,44 @@ void Rotate(const std::string &input, const std::string &output, int degrees, bo
 // truncate existing files or a source reached through an alias.
 class SplitStagedOutput {
 public:
-    explicit SplitStagedOutput(const std::string &target) : destination(target) {
-        auto pattern = target + ".tmp-XXXXXX";
-        std::vector<char> name(pattern.begin(), pattern.end()); name.push_back('\0');
+	explicit SplitStagedOutput(const std::string &target) : destination(target) {
+		auto pattern = target + ".tmp-XXXXXX";
+		std::vector<char> name(pattern.begin(), pattern.end());
+		name.push_back('\0');
 #ifdef _WIN32
-        if (_mktemp_s(name.data(), name.size()) != 0) throw std::runtime_error("could not create split temporary name");
-        int fd = _open(name.data(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE);
-        if (fd < 0) throw std::runtime_error("could not create split temporary file");
-        _close(fd);
+		if (_mktemp_s(name.data(), name.size()) != 0)
+			throw std::runtime_error("could not create split temporary name");
+		int fd = _open(name.data(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE);
+		if (fd < 0)
+			throw std::runtime_error("could not create split temporary file");
+		_close(fd);
 #else
-        int fd = mkstemp(name.data());
-        if (fd < 0) throw std::runtime_error("could not create split temporary file");
-        close(fd);
+		int fd = mkstemp(name.data());
+		if (fd < 0)
+			throw std::runtime_error("could not create split temporary file");
+		close(fd);
 #endif
-        path = name.data();
-    }
-    ~SplitStagedOutput() { if (!path.empty()) std::remove(path.c_str()); }
-    const std::string &temp() const { return path; }
-    void commit() {
+		path = name.data();
+	}
+	~SplitStagedOutput() {
+		if (!path.empty())
+			std::remove(path.c_str());
+	}
+	const std::string &temp() const {
+		return path;
+	}
+	void commit() {
 #ifdef _WIN32
-        if (!MoveFileExA(path.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING))
+		if (!MoveFileExA(path.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING))
 #else
-        if (std::rename(path.c_str(), destination.c_str()) != 0)
+		if (std::rename(path.c_str(), destination.c_str()) != 0)
 #endif
-            throw std::runtime_error("could not replace split output '" + destination + "'");
-        path.clear();
-    }
+			throw std::runtime_error("could not replace split output '" + destination + "'");
+		path.clear();
+	}
+
 private:
-    std::string destination, path;
+	std::string destination, path;
 };
 
 void Split(const std::string &input, const std::string &output_dir, const std::string &stem,
@@ -290,17 +300,20 @@ void AddTextLayers(const std::string &input, const std::string &output, const st
 		}
 		QPDFPageObjectHelper layer_page = rendered_pages[0];
 		auto form = layer_page.getFormXObjectForPage(false);
-		if (!form.isIndirect()) form = layer_doc->makeIndirectObject(form);
+		if (!form.isIndirect())
+			form = layer_doc->makeIndirectObject(form);
 		// Keep the OCR resources isolated in a form XObject: merging font names
 		// into the original page can silently replace the page's own fonts.
 		auto existing = pages[i].getAttribute("/Resources", false);
 		auto resources = QPDFObjectHandle::newDictionary();
-		if (existing.isDictionary()) for (const auto &entry : existing.getDictAsMap())
-			resources.replaceKey(entry.first, entry.second);
+		if (existing.isDictionary())
+			for (const auto &entry : existing.getDictAsMap())
+				resources.replaceKey(entry.first, entry.second);
 		auto old_xobjects = resources.getKey("/XObject");
 		auto xobjects = QPDFObjectHandle::newDictionary();
-		if (old_xobjects.isDictionary()) for (const auto &entry : old_xobjects.getDictAsMap())
-			xobjects.replaceKey(entry.first, entry.second);
+		if (old_xobjects.isDictionary())
+			for (const auto &entry : old_xobjects.getDictAsMap())
+				xobjects.replaceKey(entry.first, entry.second);
 		resources.replaceKey("/XObject", xobjects);
 		int suffix = 0;
 		auto name = resources.getUniqueResourceName("/PdfOCR", suffix);
@@ -1739,7 +1752,8 @@ void SignDetached(const std::string &input, const std::string &output, const std
 	if (existing_forms.hasAcroForm()) {
 		for (auto &field : existing_forms.getFormFields()) {
 			if (field.getFieldType() == "/Sig" && field.getValue().isDictionary()) {
-				throw std::runtime_error("pdf_sign: signing an already-signed PDF requires incremental writing, which is not supported");
+				throw std::runtime_error(
+				    "pdf_sign: signing an already-signed PDF requires incremental writing, which is not supported");
 			}
 		}
 	}
@@ -1903,12 +1917,14 @@ void SignDetached(const std::string &input, const std::string &output, const std
 	auto signatures = ReadSignatures(bytes, "");
 	bool verified = false;
 	for (const auto &signature : signatures) {
-		if (signature.field_name == field_name && signature.covers_whole_file && signature.has_verified && signature.verified) {
+		if (signature.field_name == field_name && signature.covers_whole_file && signature.has_verified &&
+		    signature.verified) {
 			verified = true;
 			break;
 		}
 	}
-	if (!verified) throw std::runtime_error("pdf_sign: generated signature failed verification");
+	if (!verified)
+		throw std::runtime_error("pdf_sign: generated signature failed verification");
 
 	// Write the final signed bytes to the output path.
 	std::ofstream out(output, std::ios::binary | std::ios::trunc);
@@ -1946,32 +1962,38 @@ static std::string PdfNum(double v) {
 }
 
 std::vector<RedactGeometry> ReadRedactGeometry(const std::string &input, const std::string &password) {
-    std::lock_guard<std::recursive_mutex> guard(QpdfMutex());
-    QPDF doc;
-    doc.processFile(input.c_str(), password.empty() ? nullptr : password.c_str());
-    QPDFPageDocumentHelper helper(doc);
-    std::vector<RedactGeometry> result;
-    for (auto &page : helper.getAllPages()) {
-        auto crop = page.getCropBox();
-        if (!crop.isArray() || crop.getArrayNItems() != 4) throw std::runtime_error("pdf_redact: invalid CropBox");
-        RedactGeometry g;
-        auto a = crop.getArrayItem(0), b = crop.getArrayItem(1), c = crop.getArrayItem(2), d = crop.getArrayItem(3);
-        if (!a.isNumber() || !b.isNumber() || !c.isNumber() || !d.isNumber()) throw std::runtime_error("pdf_redact: nonnumeric CropBox");
-        g.x0 = std::min(a.getNumericValue(), c.getNumericValue());
-        g.x1 = std::max(a.getNumericValue(), c.getNumericValue());
-        g.y0 = std::min(b.getNumericValue(), d.getNumericValue());
-        g.y1 = std::max(b.getNumericValue(), d.getNumericValue());
-        if (!std::isfinite(g.x0) || !std::isfinite(g.y0) || !std::isfinite(g.x1) || !std::isfinite(g.y1) ||
-            !std::isfinite(g.x1 - g.x0) || !std::isfinite(g.y1 - g.y0) || g.x1 <= g.x0 || g.y1 <= g.y0)
-            throw std::runtime_error("pdf_redact: invalid CropBox");
-        auto rotate = page.getAttribute("/Rotate", false);
-        if (!rotate.isNull() && !rotate.isInteger()) throw std::runtime_error("pdf_redact: invalid page rotation");
-        if (rotate.isInteger()) g.rotation = static_cast<int>(rotate.getIntValue() % 360);
-        if (g.rotation < 0) g.rotation += 360;
-        if (g.rotation % 90 != 0) throw std::runtime_error("pdf_redact: unsupported page rotation");
-        result.push_back(g);
-    }
-    return result;
+	std::lock_guard<std::recursive_mutex> guard(QpdfMutex());
+	QPDF doc;
+	doc.processFile(input.c_str(), password.empty() ? nullptr : password.c_str());
+	QPDFPageDocumentHelper helper(doc);
+	std::vector<RedactGeometry> result;
+	for (auto &page : helper.getAllPages()) {
+		auto crop = page.getCropBox();
+		if (!crop.isArray() || crop.getArrayNItems() != 4)
+			throw std::runtime_error("pdf_redact: invalid CropBox");
+		RedactGeometry g;
+		auto a = crop.getArrayItem(0), b = crop.getArrayItem(1), c = crop.getArrayItem(2), d = crop.getArrayItem(3);
+		if (!a.isNumber() || !b.isNumber() || !c.isNumber() || !d.isNumber())
+			throw std::runtime_error("pdf_redact: nonnumeric CropBox");
+		g.x0 = std::min(a.getNumericValue(), c.getNumericValue());
+		g.x1 = std::max(a.getNumericValue(), c.getNumericValue());
+		g.y0 = std::min(b.getNumericValue(), d.getNumericValue());
+		g.y1 = std::max(b.getNumericValue(), d.getNumericValue());
+		if (!std::isfinite(g.x0) || !std::isfinite(g.y0) || !std::isfinite(g.x1) || !std::isfinite(g.y1) ||
+		    !std::isfinite(g.x1 - g.x0) || !std::isfinite(g.y1 - g.y0) || g.x1 <= g.x0 || g.y1 <= g.y0)
+			throw std::runtime_error("pdf_redact: invalid CropBox");
+		auto rotate = page.getAttribute("/Rotate", false);
+		if (!rotate.isNull() && !rotate.isInteger())
+			throw std::runtime_error("pdf_redact: invalid page rotation");
+		if (rotate.isInteger())
+			g.rotation = static_cast<int>(rotate.getIntValue() % 360);
+		if (g.rotation < 0)
+			g.rotation += 360;
+		if (g.rotation % 90 != 0)
+			throw std::runtime_error("pdf_redact: unsupported page rotation");
+		result.push_back(g);
+	}
+	return result;
 }
 
 void RebuildPagesAsImages(const std::string &input, const std::string &output, const std::vector<RebuiltPage> &pages,
@@ -2040,8 +2062,8 @@ void RebuildPagesAsImages(const std::string &input, const std::string &output, c
 		// retain the sensitive content. Keep only the rebuilt page's essentials.
 		for (const auto &entry : page.getDictAsMap()) {
 			const auto &key = entry.first;
-			if (key != "/Type" && key != "/Parent" && key != "/MediaBox" &&
-			    key != "/Contents" && key != "/Resources") page.removeKey(key);
+			if (key != "/Type" && key != "/Parent" && key != "/MediaBox" && key != "/Contents" && key != "/Resources")
+				page.removeKey(key);
 		}
 	}
 	// Copy pages into a new document catalog. Retaining the original catalog can

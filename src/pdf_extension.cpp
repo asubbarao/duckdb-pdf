@@ -98,7 +98,7 @@
 #define popen  _popen
 #define pclose _pclose
 #else
- #include <unistd.h>
+#include <unistd.h>
 #include <sys/wait.h>
 #include <poll.h>
 #include <signal.h>
@@ -1635,7 +1635,8 @@ static std::vector<std::vector<string>> ReconstructLatticeGrid(const std::vector
 	for (const auto &w : page_words) {
 		double my = 0.5 * (w.yMin + w.yMax);
 		int r = row_of(my);
-		if (r < 0) continue; // A title outside the ruled rows is not table content.
+		if (r < 0)
+			continue; // A title outside the ruled rows is not table content.
 		// Decorative strokes can supply apparent column boundaries through a
 		// paragraph. A real separator must not cut through a word's glyph box.
 		for (size_t i = 1; i + 1 < rules.v_rules.size(); ++i) {
@@ -2039,7 +2040,8 @@ static pdf_ocr::ImageFormat PopplerFormatToOcr(poppler::image::format_enum fmt) 
 static void PdfCheckAccess(ClientContext &context, const string &path, FileType type = FileType::FILE_TYPE_REGULAR) {
 	ClientContextFileOpener opener(context);
 	if (!DBConfig::GetConfig(context).CanAccessFile(path, type, &opener)) {
-		throw PermissionException("PDF operation cannot access path '%s' under the current external access policy", path);
+		throw PermissionException("PDF operation cannot access path '%s' under the current external access policy",
+		                          path);
 	}
 }
 static void PdfCheckProcessAccess(ClientContext &context) {
@@ -2279,9 +2281,14 @@ static std::vector<OcrWord> OcrPageWords(poppler::page *page, const PdfOptions &
 }
 
 static void PdfCheckOcrPaths(ClientContext &context, const PdfOptions &opt) {
-	if (!opt.ocr_plugin.empty()) { PdfCheckProcessAccess(context); PdfCheckAccess(context, opt.ocr_plugin); }
-	if (!opt.ocr_config.empty()) PdfCheckAccess(context, opt.ocr_config);
-	if (!opt.tessdata_dir.empty()) PdfCheckAccess(context, opt.tessdata_dir, FileType::FILE_TYPE_DIR);
+	if (!opt.ocr_plugin.empty()) {
+		PdfCheckProcessAccess(context);
+		PdfCheckAccess(context, opt.ocr_plugin);
+	}
+	if (!opt.ocr_config.empty())
+		PdfCheckAccess(context, opt.ocr_config);
+	if (!opt.tessdata_dir.empty())
+		PdfCheckAccess(context, opt.tessdata_dir, FileType::FILE_TYPE_DIR);
 }
 
 static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
@@ -2530,7 +2537,7 @@ struct ReadPdfBindData : public TableFunctionData {
 // claims pages via next_page (intra-PDF parallelism).
 struct ReadPdfFileSlot {
 	string path;
-	string bytes; // fallback ownership when there is no native input buffer
+	string bytes;                        // fallback ownership when there is no native input buffer
 	const string *input_bytes = nullptr; // native reader owns its buffer for this scan's lifetime
 	int page_count = 0;
 	int first_page_0 = 0; // inclusive
@@ -2599,7 +2606,8 @@ static bool EnsureFileSlotLoaded(ClientContext &context, const ReadPdfBindData &
 	}
 	try {
 		if (native_pdf_input && native_pdf_input->context == &context && native_pdf_input->path == slot.path) {
-			if (native_pdf_input->error) std::rethrow_exception(native_pdf_input->error);
+			if (native_pdf_input->error)
+				std::rethrow_exception(native_pdf_input->error);
 			slot.input_bytes = &native_pdf_input->bytes;
 		} else {
 			ReadAllBytes(context, slot.path, slot.bytes);
@@ -2923,25 +2931,55 @@ struct PdfInfoState : public GlobalTableFunctionState {
 	bool needs_pdfa = false;
 	bool needs_features = false;
 	bool needs_ids = false;
-	idx_t MaxThreads() const override { return 1; }
+	idx_t MaxThreads() const override {
+		return 1;
+	}
 };
 
 static unique_ptr<FunctionData> PdfInfoBind(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP,
+	return_types = {LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP,
 	                LogicalType::TIMESTAMP, LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::VARCHAR, LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::BIGINT,
-	                LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
-	names = {"file", "title", "author", "subject", "keywords", "creator", "producer", "creation_date", "mod_date",
-	         "page_count", "is_encrypted", "is_linearized", "pdf_version", "width", "height", "file_size",
-	         "pdfa_part", "pdfa_conformance", "is_locked", "perm_print", "perm_print_high_resolution", "perm_change",
-	         "perm_copy", "perm_add_notes", "perm_fill_forms", "perm_accessibility", "perm_assemble",
-	         "has_javascript", "form_type", "page_mode", "page_layout", "permanent_id", "update_id"};
+	                LogicalType::VARCHAR,   LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BIGINT,
+	                LogicalType::INTEGER,   LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::BOOLEAN,   LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::BOOLEAN,   LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR};
+	names = {"file",
+	         "title",
+	         "author",
+	         "subject",
+	         "keywords",
+	         "creator",
+	         "producer",
+	         "creation_date",
+	         "mod_date",
+	         "page_count",
+	         "is_encrypted",
+	         "is_linearized",
+	         "pdf_version",
+	         "width",
+	         "height",
+	         "file_size",
+	         "pdfa_part",
+	         "pdfa_conformance",
+	         "is_locked",
+	         "perm_print",
+	         "perm_print_high_resolution",
+	         "perm_change",
+	         "perm_copy",
+	         "perm_add_notes",
+	         "perm_fill_forms",
+	         "perm_accessibility",
+	         "perm_assemble",
+	         "has_javascript",
+	         "form_type",
+	         "page_mode",
+	         "page_layout",
+	         "permanent_id",
+	         "update_id"};
 	return PdfInspectBindCommon(context, input);
 }
 
@@ -2972,7 +3010,8 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 			doc = LoadDoc(bytes, bind.opt.password, path);
 		} catch (const std::exception &) {
 			context.BlockingInterruptCheck();
-			if (!bind.opt.ignore_errors) throw;
+			if (!bind.opt.ignore_errors)
+				throw;
 			continue;
 		}
 		bool has_page_size = false, has_pdfa_part = false;
@@ -3003,7 +3042,8 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 			pdfa_conformance = ExtractPdfaId(xmp, "conformance");
 		}
 		std::string permanent_id, update_id;
-		if (st.needs_ids) doc->get_pdf_id(&permanent_id, &update_id);
+		if (st.needs_ids)
+			doc->get_pdf_id(&permanent_id, &update_id);
 		bool has_features = true, javascript = false;
 		int form_type = 0;
 		if (st.needs_features) {
@@ -3016,8 +3056,10 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 		}
 		static const char *metadata_keys[] = {"Title", "Author", "Subject", "Keywords", "Creator", "Producer"};
 		static const poppler::permission_enum permissions[] = {
-		    poppler::perm_print, poppler::perm_print_high_resolution, poppler::perm_change, poppler::perm_copy,
-		    poppler::perm_add_notes, poppler::perm_fill_forms, poppler::perm_accessibility, poppler::perm_assemble};
+		    poppler::perm_print,         poppler::perm_print_high_resolution,
+		    poppler::perm_change,        poppler::perm_copy,
+		    poppler::perm_add_notes,     poppler::perm_fill_forms,
+		    poppler::perm_accessibility, poppler::perm_assemble};
 		for (idx_t col = 0; col < st.column_ids.size(); ++col) {
 			auto &out = output.data[col];
 			auto id = st.column_ids[col];
@@ -3030,42 +3072,79 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 				continue;
 			}
 			switch (id) {
-			case 0: OutString(out, count, path); break;
-			case 7: OutDateOrNull(out, count, doc->info_date_t("CreationDate")); break;
-			case 8: OutDateOrNull(out, count, doc->info_date_t("ModDate")); break;
-			case 9: OutInt32(out, count, doc->pages()); break;
-			case 10: OutBool(out, count, doc->is_encrypted()); break;
-			case 11: OutBool(out, count, doc->is_linearized()); break;
+			case 0:
+				OutString(out, count, path);
+				break;
+			case 7:
+				OutDateOrNull(out, count, doc->info_date_t("CreationDate"));
+				break;
+			case 8:
+				OutDateOrNull(out, count, doc->info_date_t("ModDate"));
+				break;
+			case 9:
+				OutInt32(out, count, doc->pages());
+				break;
+			case 10:
+				OutBool(out, count, doc->is_encrypted());
+				break;
+			case 11:
+				OutBool(out, count, doc->is_linearized());
+				break;
 			case 12: {
 				int major = 0, minor = 0;
 				doc->get_pdf_version(&major, &minor);
 				OutString(out, count, to_string(major) + "." + to_string(minor));
 				break;
 			}
-			case 13: case 14:
-				if (has_page_size) OutDouble(out, count, id == 13 ? page_width : page_height);
-				else OutDoubleNull(out, count);
+			case 13:
+			case 14:
+				if (has_page_size)
+					OutDouble(out, count, id == 13 ? page_width : page_height);
+				else
+					OutDoubleNull(out, count);
 				break;
-			case 15: OutInt64(out, count, static_cast<int64_t>(bytes.size())); break;
+			case 15:
+				OutInt64(out, count, static_cast<int64_t>(bytes.size()));
+				break;
 			case 16:
-				if (has_pdfa_part) OutInt32(out, count, pdfa_part);
-				else OutInt32Null(out, count);
+				if (has_pdfa_part)
+					OutInt32(out, count, pdfa_part);
+				else
+					OutInt32Null(out, count);
 				break;
-			case 17: OutStringOrNull(out, count, pdfa_conformance); break;
-			case 18: OutBool(out, count, doc->is_locked()); break;
+			case 17:
+				OutStringOrNull(out, count, pdfa_conformance);
+				break;
+			case 18:
+				OutBool(out, count, doc->is_locked());
+				break;
 			case 27:
-				if (has_features) OutBool(out, count, javascript);
-				else FlatVector::SetNull(out, count, true);
+				if (has_features)
+					OutBool(out, count, javascript);
+				else
+					FlatVector::SetNull(out, count, true);
 				break;
 			case 28:
-				if (has_features) OutString(out, count, FormTypeName(form_type));
-				else OutStringNull(out, count);
+				if (has_features)
+					OutString(out, count, FormTypeName(form_type));
+				else
+					OutStringNull(out, count);
 				break;
-			case 29: OutString(out, count, PageModeName(doc->page_mode())); break;
-			case 30: OutString(out, count, PageLayoutName(doc->page_layout())); break;
-			case 31: OutStringOrNull(out, count, permanent_id); break;
-			case 32: OutStringOrNull(out, count, update_id); break;
-			default: out.SetValue(count, Value::BIGINT(st.idx - 1)); break;
+			case 29:
+				OutString(out, count, PageModeName(doc->page_mode()));
+				break;
+			case 30:
+				OutString(out, count, PageLayoutName(doc->page_layout()));
+				break;
+			case 31:
+				OutStringOrNull(out, count, permanent_id);
+				break;
+			case 32:
+				OutStringOrNull(out, count, update_id);
+				break;
+			default:
+				out.SetValue(count, Value::BIGINT(st.idx - 1));
+				break;
 			}
 		}
 		++count;
@@ -3684,8 +3763,8 @@ struct PdfRevisionsState : public GlobalTableFunctionState {
 
 static unique_ptr<FunctionData> PdfRevisionsBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
-	return_types = {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
-	                LogicalType::BOOLEAN, LogicalType::VARCHAR};
+	return_types = {LogicalType::INTEGER, LogicalType::BIGINT,  LogicalType::BIGINT,
+	                LogicalType::BIGINT,  LogicalType::BOOLEAN, LogicalType::VARCHAR};
 	names = {"revision_index", "startxref_offset", "eof_offset", "size_bytes", "is_incremental", "filename"};
 	return PdfInspectBindCommon(context, input);
 }
@@ -4064,11 +4143,12 @@ static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 		                                               page->text_list(poppler::page::text_list_include_font))),
 		                                           page->page_rect().width())
 		                          : UStringToUtf8(page->text(poppler::rectf(), layout));
-        bool has_native = pdf_ocr::HasGlyphs(text);
-        if (opt.force_ocr || (opt.auto_ocr && !has_native)) {
-            auto recognized = OcrPageResult(page.get(), opt, !opt.force_ocr || has_native);
-            if (pdf_ocr::HasGlyphs(recognized.text)) text = std::move(recognized.text);
-        }
+		bool has_native = pdf_ocr::HasGlyphs(text);
+		if (opt.force_ocr || (opt.auto_ocr && !has_native)) {
+			auto recognized = OcrPageResult(page.get(), opt, !opt.force_ocr || has_native);
+			if (pdf_ocr::HasGlyphs(recognized.text))
+				text = std::move(recognized.text);
+		}
 		size_t start = 0;
 		while (start <= text.size()) {
 			size_t nl = text.find('\n', start);
@@ -4954,7 +5034,8 @@ static std::vector<string> ChunkSplitLongText(const string &text, size_t limit) 
 			if (cut == pos) {
 				// A codepoint may exceed the byte budget; emit it intact.
 				cut = pos + 1;
-				while (cut < text.size() && ((unsigned char)text[cut] & 0xC0) == 0x80) cut++;
+				while (cut < text.size() && ((unsigned char)text[cut] & 0xC0) == 0x80)
+					cut++;
 			}
 			pieces.push_back(text.substr(pos, cut - pos));
 			pos = cut;
@@ -5436,21 +5517,29 @@ public:
 		std::vector<char> name(pattern.begin(), pattern.end());
 		name.push_back('\0');
 #ifdef _WIN32
-		if (_mktemp_s(name.data(), name.size()) != 0) throw IOException("could not create temporary PDF path");
+		if (_mktemp_s(name.data(), name.size()) != 0)
+			throw IOException("could not create temporary PDF path");
 		int fd = _open(name.data(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE);
-		if (fd < 0) throw IOException("could not create temporary PDF output");
+		if (fd < 0)
+			throw IOException("could not create temporary PDF output");
 		_close(fd);
 #else
 		int fd = mkstemp(name.data());
-		if (fd < 0) throw IOException("could not create temporary PDF output beside '%s'", destination);
+		if (fd < 0)
+			throw IOException("could not create temporary PDF output beside '%s'", destination);
 		close(fd);
 #endif
 		path = name.data();
 	}
-	~AtomicPdfOutput() { if (!path.empty()) std::remove(path.c_str()); }
+	~AtomicPdfOutput() {
+		if (!path.empty())
+			std::remove(path.c_str());
+	}
 	AtomicPdfOutput(const AtomicPdfOutput &) = delete;
 	AtomicPdfOutput &operator=(const AtomicPdfOutput &) = delete;
-	const string &TempPath() const { return path; }
+	const string &TempPath() const {
+		return path;
+	}
 	void Commit() {
 #ifdef _WIN32
 		if (!MoveFileExA(path.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING))
@@ -5461,6 +5550,7 @@ public:
 #endif
 		path.clear();
 	}
+
 private:
 	string destination;
 	string path;
@@ -6046,8 +6136,10 @@ static void TesseractOcrDispatch(DataChunk &args, ExpressionState &state, Vector
 		}
 		string_t blob = StringValue::Get(blob_v);
 		auto opt = TesseractOcrOptionsFromArgs(args, i);
-		if (!opt.tessdata_dir.empty()) PdfCheckAccess(state.GetContext(), opt.tessdata_dir, FileType::FILE_TYPE_DIR);
-		if (!opt.config.empty()) PdfCheckAccess(state.GetContext(), opt.config);
+		if (!opt.tessdata_dir.empty())
+			PdfCheckAccess(state.GetContext(), opt.tessdata_dir, FileType::FILE_TYPE_DIR);
+		if (!opt.config.empty())
+			PdfCheckAccess(state.GetContext(), opt.config);
 		out[i] = StringVector::AddString(result, RunTesseractOcrOnBlob(blob, opt));
 	}
 }
@@ -6132,8 +6224,10 @@ static unique_ptr<FunctionData> OcrImageBind(ClientContext &context, TableFuncti
 
 	return_types = {LogicalType::VARCHAR, LogicalType::DOUBLE, LogicalType::VARCHAR};
 	names = {"text", "confidence", "format"};
-	if (!result->opt.tessdata_dir.empty()) PdfCheckAccess(context, result->opt.tessdata_dir, FileType::FILE_TYPE_DIR);
-	if (!result->opt.config.empty()) PdfCheckAccess(context, result->opt.config);
+	if (!result->opt.tessdata_dir.empty())
+		PdfCheckAccess(context, result->opt.tessdata_dir, FileType::FILE_TYPE_DIR);
+	if (!result->opt.config.empty())
+		PdfCheckAccess(context, result->opt.config);
 	return std::move(result);
 }
 
@@ -6197,12 +6291,16 @@ static void PdfRemoveTempTree(const string &path) {
 	if (find != INVALID_HANDLE_VALUE) {
 		do {
 			string name(entry.cFileName);
-			if (name == "." || name == "..") continue;
+			if (name == "." || name == "..")
+				continue;
 			string child = path + "\\" + name;
 			if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-				if (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) RemoveDirectoryA(child.c_str());
-				else PdfRemoveTempTree(child);
-			} else DeleteFileA(child.c_str());
+				if (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+					RemoveDirectoryA(child.c_str());
+				else
+					PdfRemoveTempTree(child);
+			} else
+				DeleteFileA(child.c_str());
 		} while (FindNextFileA(find, &entry));
 		FindClose(find);
 	}
@@ -6213,13 +6311,16 @@ struct TempDirGuard {
 	std::string path;
 	explicit TempDirGuard(std::string p) : path(std::move(p)) {
 #ifdef _WIN32
-		if (_mkdir(path.c_str()) != 0) throw IOException("to_pdf: failed to create temporary directory '%s'", path);
+		if (_mkdir(path.c_str()) != 0)
+			throw IOException("to_pdf: failed to create temporary directory '%s'", path);
 #else
-		if (mkdir(path.c_str(), 0700) != 0) throw IOException("to_pdf: failed to create temporary directory '%s'", path);
+		if (mkdir(path.c_str(), 0700) != 0)
+			throw IOException("to_pdf: failed to create temporary directory '%s'", path);
 #endif
 	}
 	~TempDirGuard() {
-		if (path.empty()) return;
+		if (path.empty())
+			return;
 #ifdef _WIN32
 		PdfRemoveTempTree(path);
 #else
@@ -6335,31 +6436,56 @@ static int RunCapture(const vector<string> &args, string &output) {
 	// CreateProcess takes a single command line. Quote arguments according to
 	// the Microsoft CRT rules so spaces, quotes and backslashes stay literal.
 	auto quote = [](const string &arg) {
-		string result = "\""; size_t slashes = 0;
+		string result = "\"";
+		size_t slashes = 0;
 		for (char c : arg) {
-			if (c == '\\') { ++slashes; continue; }
-			if (c == '"') { result.append(slashes * 2 + 1, '\\'); result += c; }
-			else { result.append(slashes, '\\'); result += c; }
+			if (c == '\\') {
+				++slashes;
+				continue;
+			}
+			if (c == '"') {
+				result.append(slashes * 2 + 1, '\\');
+				result += c;
+			} else {
+				result.append(slashes, '\\');
+				result += c;
+			}
 			slashes = 0;
 		}
-		result.append(slashes * 2, '\\'); result += '"'; return result;
+		result.append(slashes * 2, '\\');
+		result += '"';
+		return result;
 	};
 	string command;
-	for (const auto &arg : args) { if (!command.empty()) command += ' '; command += quote(arg); }
+	for (const auto &arg : args) {
+		if (!command.empty())
+			command += ' ';
+		command += quote(arg);
+	}
 	SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
 	HANDLE read_pipe = nullptr, write_pipe = nullptr;
-	if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0)) throw IOException("to_pdf: failed to create process pipe");
+	if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0))
+		throw IOException("to_pdf: failed to create process pipe");
 	SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
-	STARTUPINFOA startup = {}; startup.cb = sizeof(startup); startup.dwFlags = STARTF_USESTDHANDLES;
-	startup.hStdOutput = write_pipe; startup.hStdError = write_pipe; startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+	STARTUPINFOA startup = {};
+	startup.cb = sizeof(startup);
+	startup.dwFlags = STARTF_USESTDHANDLES;
+	startup.hStdOutput = write_pipe;
+	startup.hStdError = write_pipe;
+	startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 	PROCESS_INFORMATION process = {};
-	std::vector<char> mutable_command(command.begin(), command.end()); mutable_command.push_back('\0');
+	std::vector<char> mutable_command(command.begin(), command.end());
+	mutable_command.push_back('\0');
 	BOOL started = CreateProcessA(args[0].c_str(), mutable_command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
 	                              nullptr, nullptr, &startup, &process);
 	CloseHandle(write_pipe);
-	if (!started) { CloseHandle(read_pipe); throw IOException("to_pdf: failed to spawn LibreOffice"); }
+	if (!started) {
+		CloseHandle(read_pipe);
+		throw IOException("to_pdf: failed to spawn LibreOffice");
+	}
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);
-	char buf[4096]; DWORD status = STILL_ACTIVE;
+	char buf[4096];
+	DWORD status = STILL_ACTIVE;
 	while (status == STILL_ACTIVE) {
 		DWORD available = 0;
 		if (PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr) && available) {
@@ -6369,59 +6495,93 @@ static int RunCapture(const vector<string> &args, string &output) {
 		}
 		GetExitCodeProcess(process.hProcess, &status);
 		if (std::chrono::steady_clock::now() >= deadline && status == STILL_ACTIVE) {
-			TerminateProcess(process.hProcess, 1); WaitForSingleObject(process.hProcess, INFINITE);
-			CloseHandle(read_pipe); CloseHandle(process.hThread); CloseHandle(process.hProcess);
+			TerminateProcess(process.hProcess, 1);
+			WaitForSingleObject(process.hProcess, INFINITE);
+			CloseHandle(read_pipe);
+			CloseHandle(process.hThread);
+			CloseHandle(process.hProcess);
 			throw IOException("to_pdf: LibreOffice conversion timed out after 120 seconds");
 		}
-		if (status == STILL_ACTIVE) WaitForSingleObject(process.hProcess, 20);
+		if (status == STILL_ACTIVE)
+			WaitForSingleObject(process.hProcess, 20);
 	}
 	DWORD available = 0;
 	while (PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr) && available) {
 		DWORD n = 0;
-		if (!ReadFile(read_pipe, buf, std::min<DWORD>(available, sizeof(buf)), &n, nullptr) || !n) break;
-		if (output.size() < limit) output.append(buf, std::min(static_cast<size_t>(n), limit - output.size()));
+		if (!ReadFile(read_pipe, buf, std::min<DWORD>(available, sizeof(buf)), &n, nullptr) || !n)
+			break;
+		if (output.size() < limit)
+			output.append(buf, std::min(static_cast<size_t>(n), limit - output.size()));
 	}
-	CloseHandle(read_pipe); CloseHandle(process.hThread); CloseHandle(process.hProcess);
+	CloseHandle(read_pipe);
+	CloseHandle(process.hThread);
+	CloseHandle(process.hProcess);
 	return static_cast<int>(status);
 #else
 	int fds[2];
-	if (pipe(fds) != 0) throw IOException("to_pdf: failed to create process pipe");
+	if (pipe(fds) != 0)
+		throw IOException("to_pdf: failed to create process pipe");
 	std::vector<char *> argv;
-	for (const auto &arg : args) argv.push_back(const_cast<char *>(arg.c_str()));
+	for (const auto &arg : args)
+		argv.push_back(const_cast<char *>(arg.c_str()));
 	argv.push_back(nullptr);
 	pid_t child = fork();
-	if (child < 0) { close(fds[0]); close(fds[1]); throw IOException("to_pdf: failed to spawn LibreOffice"); }
+	if (child < 0) {
+		close(fds[0]);
+		close(fds[1]);
+		throw IOException("to_pdf: failed to spawn LibreOffice");
+	}
 	if (child == 0) {
 		close(fds[0]);
-		dup2(fds[1], STDOUT_FILENO); dup2(fds[1], STDERR_FILENO); close(fds[1]);
-		execvp(argv[0], argv.data()); _exit(127);
+		dup2(fds[1], STDOUT_FILENO);
+		dup2(fds[1], STDERR_FILENO);
+		close(fds[1]);
+		execvp(argv[0], argv.data());
+		_exit(127);
 	}
 	close(fds[1]);
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);
 	char buf[4096];
 	for (;;) {
 		if (std::chrono::steady_clock::now() >= deadline) {
-			kill(child, SIGKILL); while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
-			close(fds[0]); throw IOException("to_pdf: LibreOffice conversion timed out after 120 seconds");
+			kill(child, SIGKILL);
+			while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+			}
+			close(fds[0]);
+			throw IOException("to_pdf: LibreOffice conversion timed out after 120 seconds");
 		}
 		struct pollfd pfd = {fds[0], POLLIN | POLLHUP, 0};
 		int ready = poll(&pfd, 1, 100);
-		if (ready < 0 && errno == EINTR) continue;
-		if (ready < 0) { kill(child, SIGKILL); waitpid(child, nullptr, 0); close(fds[0]); throw IOException("to_pdf: process output failed"); }
-		if (!ready) continue;
+		if (ready < 0 && errno == EINTR)
+			continue;
+		if (ready < 0) {
+			kill(child, SIGKILL);
+			waitpid(child, nullptr, 0);
+			close(fds[0]);
+			throw IOException("to_pdf: process output failed");
+		}
+		if (!ready)
+			continue;
 		ssize_t n = read(fds[0], buf, sizeof(buf));
-		if (n < 0 && errno == EINTR) continue;
-		if (n <= 0) break;
-		if (output.size() < limit) output.append(buf, std::min(static_cast<size_t>(n), limit - output.size()));
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		if (output.size() < limit)
+			output.append(buf, std::min(static_cast<size_t>(n), limit - output.size()));
 	}
 	close(fds[0]);
 	int status = 0;
 	for (;;) {
 		pid_t done = waitpid(child, &status, WNOHANG);
-		if (done == child) break;
-		if (done < 0 && errno != EINTR) throw IOException("to_pdf: failed waiting for LibreOffice");
+		if (done == child)
+			break;
+		if (done < 0 && errno != EINTR)
+			throw IOException("to_pdf: failed waiting for LibreOffice");
 		if (std::chrono::steady_clock::now() >= deadline) {
-			kill(child, SIGKILL); while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
+			kill(child, SIGKILL);
+			while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+			}
 			throw IOException("to_pdf: LibreOffice conversion timed out after 120 seconds");
 		}
 		poll(nullptr, 0, 50);
@@ -6465,18 +6625,31 @@ static string ConvertToPdf(const string &input_path, const string &output_path) 
 	const char *hex = "0123456789ABCDEF";
 	for (unsigned char c : profile_dir) {
 #ifdef _WIN32
-		if (c == '\\') { profile_uri += '/'; continue; }
-		if (c == ':') { profile_uri += ':'; continue; }
+		if (c == '\\') {
+			profile_uri += '/';
+			continue;
+		}
+		if (c == ':') {
+			profile_uri += ':';
+			continue;
+		}
 #endif
-		if (std::isalnum(c) || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') profile_uri += c;
-		else { profile_uri += '%'; profile_uri += hex[c >> 4]; profile_uri += hex[c & 15]; }
+		if (std::isalnum(c) || c == '/' || c == '-' || c == '_' || c == '.' || c == '~')
+			profile_uri += c;
+		else {
+			profile_uri += '%';
+			profile_uri += hex[c >> 4];
+			profile_uri += hex[c & 15];
+		}
 	}
-	vector<string> args {soffice, "--headless", "-env:UserInstallation=" + profile_uri,
-	                     "--convert-to", "pdf", "--outdir", out_dir, input_path};
+	vector<string> args {soffice,        "--headless", "-env:UserInstallation=" + profile_uri,
+	                     "--convert-to", "pdf",        "--outdir",
+	                     out_dir,        input_path};
 	string captured;
 	int rc = RunCapture(args, captured);
-	if (rc != 0) throw IOException("to_pdf: LibreOffice failed with exit status %d: %s", rc,
-	                              captured.empty() ? "(no output)" : captured);
+	if (rc != 0)
+		throw IOException("to_pdf: LibreOffice failed with exit status %d: %s", rc,
+		                  captured.empty() ? "(no output)" : captured);
 
 	// LibreOffice names the output <out_dir>/<input-stem>.pdf.
 	string in_dir, in_stem, in_ext;
@@ -6503,10 +6676,12 @@ static string ConvertToPdf(const string &input_path, const string &output_path) 
 	AtomicPdfOutput staged(output_path);
 	std::ifstream src(produced, std::ios::binary);
 	std::ofstream dst(staged.TempPath(), std::ios::binary | std::ios::trunc);
-	if (!src || !dst) throw IOException("to_pdf: could not write converted PDF to '%s'", output_path);
+	if (!src || !dst)
+		throw IOException("to_pdf: could not write converted PDF to '%s'", output_path);
 	dst << src.rdbuf();
 	dst.close();
-	if (!dst || src.bad()) throw IOException("to_pdf: failed writing converted PDF to '%s'", output_path);
+	if (!dst || src.bad())
+		throw IOException("to_pdf: failed writing converted PDF to '%s'", output_path);
 	staged.Commit();
 
 	return output_path;
@@ -7279,11 +7454,16 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 		std::vector<MdWord> cur_b;
 		double previous_bottom = 0.0;
 		auto finish_block = [&]() {
-			if (cur_b.empty()) return;
+			if (cur_b.empty())
+				return;
 			std::vector<PdfWord> test_pw;
 			for (const auto &m : cur_b) {
 				PdfWord pw;
-				pw.xMin = m.xMin; pw.yMin = m.yMin; pw.xMax = m.xMax; pw.yMax = m.yMax; pw.text = m.text;
+				pw.xMin = m.xMin;
+				pw.yMin = m.yMin;
+				pw.xMax = m.xMax;
+				pw.yMax = m.yMax;
+				pw.text = m.text;
 				test_pw.push_back(std::move(pw));
 			}
 			auto test_g = ReconstructPageGrid(test_pw);
@@ -7300,15 +7480,23 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 				bool is_cand = false;
 				if (r.size() >= 2) {
 					std::vector<double> xs;
-					for (const auto &w : r) xs.push_back(w.xMin);
+					for (const auto &w : r)
+						xs.push_back(w.xMin);
 					std::sort(xs.begin(), xs.end());
 					double mg = 0;
-					for (size_t j = 1; j < xs.size(); ++j) mg = std::max(mg, xs[j] - xs[j - 1]);
+					for (size_t j = 1; j < xs.size(); ++j)
+						mg = std::max(mg, xs[j] - xs[j - 1]);
 					is_cand = mg > 100.0;
 				}
-				if (!is_cand) { finish_block(); continue; }
+				if (!is_cand) {
+					finish_block();
+					continue;
+				}
 				double row_top = r.front().yMin, row_bottom = r.front().yMax;
-				for (const auto &w : r) { row_top = std::min(row_top, w.yMin); row_bottom = std::max(row_bottom, w.yMax); }
+				for (const auto &w : r) {
+					row_top = std::min(row_top, w.yMin);
+					row_bottom = std::max(row_bottom, w.yMax);
+				}
 				if (!cur_b.empty() && (row_top - previous_bottom > 3.0 * med_h || row_top < previous_bottom - med_h))
 					finish_block();
 				cur_b.insert(cur_b.end(), r.begin(), r.end());
@@ -7328,7 +7516,8 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 			double anchor = 0;
 			for (const auto &word : physical) {
 				if (physical_rows.empty() || std::fabs(word.yMin - anchor) > med_h * 0.5) {
-					physical_rows.emplace_back(); anchor = word.yMin;
+					physical_rows.emplace_back();
+					anchor = word.yMin;
 				}
 				physical_rows.back().push_back(word);
 			}
@@ -7346,10 +7535,14 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 				for (auto &block : table_blocks) {
 					for (const auto &table_word : block.words) {
 						if (word.xMin == table_word.xMin && word.yMin == table_word.yMin &&
-						    word.xMax == table_word.xMax && word.yMax == table_word.yMax && word.text == table_word.text) {
+						    word.xMax == table_word.xMax && word.yMax == table_word.yMax &&
+						    word.text == table_word.text) {
 							in_table = true;
 							if (!block.emitted) {
-								if (!para_buf.empty()) { out += para_buf + "\n\n"; para_buf.clear(); }
+								if (!para_buf.empty()) {
+									out += para_buf + "\n\n";
+									para_buf.clear();
+								}
 								emit_grid_table(block.grid, out);
 								block.emitted = true;
 								prev_ymax = -1e9;
@@ -7357,11 +7550,14 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 							break;
 						}
 					}
-					if (in_table) break;
+					if (in_table)
+						break;
 				}
-				if (!in_table) row.push_back(word);
+				if (!in_table)
+					row.push_back(word);
 			}
-			if (row.empty()) continue;
+			if (row.empty())
+				continue;
 			double rymin = 1e9, rymax = -1e9;
 			for (const auto &w : row) {
 				rymin = std::min(rymin, w.yMin);
@@ -7508,28 +7704,29 @@ static void PdfOpsCheckOutputDir(const char *fn, const string &dir) {
 // pdf_info('dir/*.pdf').
 // Compare file identity, not just spelling: qpdf reads input lazily.
 static bool PdfSameFile(const string &a, const string &b) {
- if (a == b) return true;
+	if (a == b)
+		return true;
 #ifdef _WIN32
- auto open_identity = [](const string &path) {
-  return CreateFileA(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                     nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
- };
- HANDLE ah = open_identity(a), bh = open_identity(b);
- BY_HANDLE_FILE_INFORMATION ai, bi;
- bool same = ah != INVALID_HANDLE_VALUE && bh != INVALID_HANDLE_VALUE &&
-             GetFileInformationByHandle(ah, &ai) && GetFileInformationByHandle(bh, &bi) &&
-             ai.dwVolumeSerialNumber == bi.dwVolumeSerialNumber && ai.nFileIndexHigh == bi.nFileIndexHigh &&
-             ai.nFileIndexLow == bi.nFileIndexLow;
- if (ah != INVALID_HANDLE_VALUE) CloseHandle(ah);
- if (bh != INVALID_HANDLE_VALUE) CloseHandle(bh);
- if (same) return true;
- char ap[_MAX_PATH], bp[_MAX_PATH];
- return _fullpath(ap, a.c_str(), _MAX_PATH) && _fullpath(bp, b.c_str(), _MAX_PATH) &&
-        _stricmp(ap, bp) == 0;
+	auto open_identity = [](const string &path) {
+		return CreateFileA(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		                   nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+	};
+	HANDLE ah = open_identity(a), bh = open_identity(b);
+	BY_HANDLE_FILE_INFORMATION ai, bi;
+	bool same = ah != INVALID_HANDLE_VALUE && bh != INVALID_HANDLE_VALUE && GetFileInformationByHandle(ah, &ai) &&
+	            GetFileInformationByHandle(bh, &bi) && ai.dwVolumeSerialNumber == bi.dwVolumeSerialNumber &&
+	            ai.nFileIndexHigh == bi.nFileIndexHigh && ai.nFileIndexLow == bi.nFileIndexLow;
+	if (ah != INVALID_HANDLE_VALUE)
+		CloseHandle(ah);
+	if (bh != INVALID_HANDLE_VALUE)
+		CloseHandle(bh);
+	if (same)
+		return true;
+	char ap[_MAX_PATH], bp[_MAX_PATH];
+	return _fullpath(ap, a.c_str(), _MAX_PATH) && _fullpath(bp, b.c_str(), _MAX_PATH) && _stricmp(ap, bp) == 0;
 #else
- struct stat as, bs;
- return stat(a.c_str(), &as) == 0 && stat(b.c_str(), &bs) == 0 &&
-        as.st_dev == bs.st_dev && as.st_ino == bs.st_ino;
+	struct stat as, bs;
+	return stat(a.c_str(), &as) == 0 && stat(b.c_str(), &bs) == 0 && as.st_dev == bs.st_dev && as.st_ino == bs.st_ino;
 #endif
 }
 
@@ -7559,10 +7756,12 @@ static string PdfMergeImpl(const vector<string> &inputs, const string &output) {
 static void PdfMergeFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); ++row) {
 		auto inputs = args.GetValue(0, row), output = args.GetValue(1, row);
-		if (inputs.IsNull() || output.IsNull()) continue;
+		if (inputs.IsNull() || output.IsNull())
+			continue;
 		PdfCheckAccess(state.GetContext(), StringValue::Get(output));
 		for (const auto &item : ListValue::GetChildren(inputs))
-			if (!item.IsNull()) PdfCheckAccess(state.GetContext(), StringValue::Get(item));
+			if (!item.IsNull())
+				PdfCheckAccess(state.GetContext(), StringValue::Get(item));
 	}
 	// Value-based row loop: this is a file operation executed a handful of
 	// times per query, not a hot path — clarity over vectorized throughput.
@@ -8905,33 +9104,45 @@ static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page
 	// Map PDF user-space corners through CropBox and page rotation into the
 	// renderer's upright raster. Scaling by the actual raster dimensions also
 	// accounts for DPI rounding and /UserUnit scaling.
-	auto clamp_pixel = [](double v, int hi) { return std::max(0.0, std::min(static_cast<double>(hi), v)); };
+	auto clamp_pixel = [](double v, int hi) {
+		return std::max(0.0, std::min(static_cast<double>(hi), v));
+	};
 	const double cw = geom.x1 - geom.x0, ch = geom.y1 - geom.y0;
 	auto project = [&](double x, double y) -> std::pair<double, double> {
-		x -= geom.x0; y -= geom.y0;
+		x -= geom.x0;
+		y -= geom.y0;
 		switch (geom.rotation) {
-		case 90: return {y / ch * W, x / cw * H};
-		case 180: return {(cw - x) / cw * W, y / ch * H};
-		case 270: return {(ch - y) / ch * W, (cw - x) / cw * H};
-		default: return {x / cw * W, (ch - y) / ch * H};
+		case 90:
+			return {y / ch * W, x / cw * H};
+		case 180:
+			return {(cw - x) / cw * W, y / ch * H};
+		case 270:
+			return {(ch - y) / ch * W, (cw - x) / cw * H};
+		default:
+			return {x / cw * W, (ch - y) / ch * H};
 		}
 	};
 	for (const RedactBox *box : boxes) {
 		double minx = W, maxx = 0, miny = H, maxy = 0;
-		for (int xi = 0; xi < 2; ++xi) for (int yi = 0; yi < 2; ++yi) {
-			auto pt = project(box->x + xi * box->w, box->y + yi * box->h);
-			minx = std::min(minx, pt.first); maxx = std::max(maxx, pt.first);
-			miny = std::min(miny, pt.second); maxy = std::max(maxy, pt.second);
-		}
+		for (int xi = 0; xi < 2; ++xi)
+			for (int yi = 0; yi < 2; ++yi) {
+				auto pt = project(box->x + xi * box->w, box->y + yi * box->h);
+				minx = std::min(minx, pt.first);
+				maxx = std::max(maxx, pt.first);
+				miny = std::min(miny, pt.second);
+				maxy = std::max(maxy, pt.second);
+			}
 		int px0 = static_cast<int>(std::floor(clamp_pixel(minx, W)));
 		int px1 = static_cast<int>(std::ceil(clamp_pixel(maxx, W)));
 		int ry0 = static_cast<int>(std::floor(clamp_pixel(miny, H)));
 		int ry1 = static_cast<int>(std::ceil(clamp_pixel(maxy, H)));
-		if (px0 >= px1 || ry0 >= ry1) throw InvalidInputException("pdf_redact: box does not intersect page CropBox");
-		for (int y = ry0; y < ry1; y++) for (int x = px0; x < px1; x++) {
-			size_t o = (static_cast<size_t>(y) * W + x) * 3;
-			out.rgb[o] = out.rgb[o + 1] = out.rgb[o + 2] = 0;
-		}
+		if (px0 >= px1 || ry0 >= ry1)
+			throw InvalidInputException("pdf_redact: box does not intersect page CropBox");
+		for (int y = ry0; y < ry1; y++)
+			for (int x = px0; x < px1; x++) {
+				size_t o = (static_cast<size_t>(y) * W + x) * 3;
+				out.rgb[o] = out.rgb[o + 1] = out.rgb[o + 2] = 0;
+			}
 	}
 
 	return out;
@@ -8963,7 +9174,8 @@ static void PdfRedactExecuteFile(ClientContext &context, const string &input_pat
 	}
 
 	auto geometry = pdf_qpdf::ReadRedactGeometry(input_path, password);
-	if (geometry.size() != static_cast<size_t>(page_count)) throw InvalidInputException("pdf_redact: geometry page count mismatch");
+	if (geometry.size() != static_cast<size_t>(page_count))
+		throw InvalidInputException("pdf_redact: geometry page count mismatch");
 	std::vector<pdf_qpdf::RebuiltPage> rebuilt(static_cast<size_t>(page_count));
 	std::vector<int> box_counts(static_cast<size_t>(page_count), 0);
 	for (int p = 1; p <= page_count; p++) {
@@ -9664,7 +9876,9 @@ struct PdfPageImagesState : public GlobalTableFunctionState {
 	int page_count = 0;
 	int next_page = 0;
 	int last_page = 0;
-	idx_t MaxThreads() const override { return 1; }
+	idx_t MaxThreads() const override {
+		return 1;
+	}
 };
 
 static unique_ptr<FunctionData> PdfPageImagesBind(ClientContext &context, TableFunctionBindInput &input,
@@ -9690,7 +9904,9 @@ static unique_ptr<FunctionData> PdfPageImagesBind(ClientContext &context, TableF
 static unique_ptr<GlobalTableFunctionState> PdfPageImagesInit(ClientContext &, TableFunctionInitInput &input) {
 	auto state = make_uniq<PdfPageImagesState>();
 	state->column_ids = input.column_ids;
-	for (auto col : state->column_ids) if (col == 4 || col == 5 || col == 6) state->needs_image = true;
+	for (auto col : state->column_ids)
+		if (col == 4 || col == 5 || col == 6)
+			state->needs_image = true;
 	return std::move(state);
 }
 
@@ -9714,7 +9930,8 @@ static void PdfPageImagesScan(ClientContext &context, TableFunctionInput &data_p
 	context.BlockingInterruptCheck();
 	const int page = st.next_page++;
 	string png;
-	if (st.needs_image) png = RenderPageToPngBytes(*st.doc, page, bind.dpi, "pdf_page_images");
+	if (st.needs_image)
+		png = RenderPageToPngBytes(*st.doc, page, bind.dpi, "pdf_page_images");
 	int width = 0, height = 0;
 	if (png.size() >= 24) {
 		auto u32be = [](const char *b) -> int {
@@ -9727,14 +9944,30 @@ static void PdfPageImagesScan(ClientContext &context, TableFunctionInput &data_p
 	for (idx_t col = 0; col < st.column_ids.size(); ++col) {
 		auto &out = output.data[col];
 		switch (st.column_ids[col]) {
-		case 0: OutString(out, 0, st.current_file); break;
-		case 1: OutInt32(out, 0, page); break;
-		case 2: OutInt32(out, 0, st.page_count); break;
-		case 3: OutInt32(out, 0, bind.dpi); break;
-		case 4: OutInt32(out, 0, width); break;
-		case 5: OutInt32(out, 0, height); break;
-		case 6: OutBlob(out, 0, png); break;
-		default: out.SetValue(0, Value::BIGINT(page - 1)); break;
+		case 0:
+			OutString(out, 0, st.current_file);
+			break;
+		case 1:
+			OutInt32(out, 0, page);
+			break;
+		case 2:
+			OutInt32(out, 0, st.page_count);
+			break;
+		case 3:
+			OutInt32(out, 0, bind.dpi);
+			break;
+		case 4:
+			OutInt32(out, 0, width);
+			break;
+		case 5:
+			OutInt32(out, 0, height);
+			break;
+		case 6:
+			OutBlob(out, 0, png);
+			break;
+		default:
+			out.SetValue(0, Value::BIGINT(page - 1));
+			break;
 		}
 	}
 	output.SetChildCardinality(1);
@@ -9830,7 +10063,8 @@ static void PdfWriteBytesToFile(const string &path, const string &bytes, const c
 		throw IOException("%s: short write to '%s'", fn_name, path);
 	}
 	of.close();
-	if (!of) throw IOException("%s: failed closing '%s'", fn_name, path);
+	if (!of)
+		throw IOException("%s: failed closing '%s'", fn_name, path);
 	staged.Commit();
 }
 
@@ -9881,7 +10115,8 @@ static unique_ptr<GlobalTableFunctionState> PdfWritePageImagesInit(ClientContext
 static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePageImagesBindData &bind,
                                       std::vector<PdfWritePageImagesRow> &rows) {
 	PdfCheckAccess(context, bind.out_dir, FileType::FILE_TYPE_DIR);
-	for (const auto &file : bind.files) PdfCheckAccess(context, file);
+	for (const auto &file : bind.files)
+		PdfCheckAccess(context, file);
 	auto fs = FileSystem::CreateLocal();
 	// Ensure the top-level preview root exists (create, don't require the caller
 	// to mkdir first — this is an export tree, not a surgical in-place write).
@@ -10294,7 +10529,8 @@ private:
 		if (!input.error) {
 			try {
 				if (bind.info.decode.name == "read_pdf" && file_size > NumericLimits<int32_t>::Maximum()) {
-					throw IOException("read_pdf: '%s' is too large (%lld bytes; max ~2 GiB)", input.path, (long long)file_size);
+					throw IOException("read_pdf: '%s' is too large (%lld bytes; max ~2 GiB)", input.path,
+					                  (long long)file_size);
 				}
 				ReadPdfHandleBytes(context, *handle, input.path, file_size, input.bytes);
 			} catch (...) {
@@ -10435,12 +10671,12 @@ struct PdfLoader {
 	}
 	void RegisterFunction(ScalarFunctionSet functions) {
 		const bool path_converter = functions.name.GetIdentifierName().compare(0, 7, "pdf_to_") == 0;
-        functions.ApplyToFunctions([path_converter](ScalarFunction &function) {
-            if (path_converter && function.GetSignature().GetParameterCount() > 0 &&
-                function.GetSignature().GetParameter(0).GetType() == LogicalType::VARCHAR) {
-                function.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
-            }
-        });
+		functions.ApplyToFunctions([path_converter](ScalarFunction &function) {
+			if (path_converter && function.GetSignature().GetParameterCount() > 0 &&
+			    function.GetSignature().GetParameter(0).GetType() == LogicalType::VARCHAR) {
+				function.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
+			}
+		});
 		functions.SetFallible();
 		CreateScalarFunctionInfo info(std::move(functions));
 		info.functions.ApplyToFunctions([&](ScalarFunction &overload) { AddPdfFunctionDocs(overload, info); });

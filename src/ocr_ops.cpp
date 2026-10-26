@@ -207,13 +207,16 @@ bool ModelExistsIn(const std::string &dir, const std::string &language) {
 	for (size_t start = 0; start <= language.size();) {
 		auto end = language.find('+', start);
 		auto model = language.substr(start, end == std::string::npos ? end : end - start);
-		if (model.empty()) return false;
+		if (model.empty())
+			return false;
 		if (model[0] != '~') {
 			selected = true;
 			std::ifstream file((prefix + model + ".traineddata").c_str());
-			if (!file.good()) return false;
+			if (!file.good())
+				return false;
 		}
-		if (end == std::string::npos) break;
+		if (end == std::string::npos)
+			break;
 		start = end + 1;
 	}
 	return selected;

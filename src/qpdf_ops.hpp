@@ -261,8 +261,8 @@ void SignDetached(const std::string &input, const std::string &output, const std
                   const std::string &password);
 
 struct RedactGeometry {
-    double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-    int rotation = 0;
+	double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+	int rotation = 0;
 };
 std::vector<RedactGeometry> ReadRedactGeometry(const std::string &input, const std::string &password);
 
@@ -286,10 +286,10 @@ struct RebuiltPage {
 // Compose `output` from `input`: every page flagged `redacted` in `pages` has its
 // content, resources, annotations and rotation replaced by a single full-page
 // FlateDecode DeviceRGB image (see RebuiltPage); unflagged page contents are retained.
-// A fresh catalog omits document metadata, forms, annotations, and attachments. `pages.size()` MUST equal the input's page count (the caller
-// enforces this). `password` may be empty (unencrypted / owner-open). The caller
-// validates paths and that input != output; a bad password or unreadable file
-// surfaces via the error contract (thrown std::exception). Runs under QpdfMutex.
+// A fresh catalog omits document metadata, forms, annotations, and attachments. `pages.size()` MUST equal the input's
+// page count (the caller enforces this). `password` may be empty (unencrypted / owner-open). The caller validates paths
+// and that input != output; a bad password or unreadable file surfaces via the error contract (thrown std::exception).
+// Runs under QpdfMutex.
 void RebuildPagesAsImages(const std::string &input, const std::string &output, const std::vector<RebuiltPage> &pages,
                           const std::string &password);
 
