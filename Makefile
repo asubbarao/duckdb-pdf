@@ -63,3 +63,16 @@ PDF_BUILT_VERSION = $(shell ./build/release/duckdb -unsigned -no-agent -noheader
 	"LOAD '$(PROJ_DIR)build/release/extension/$(EXT_NAME)/$(EXT_NAME).duckdb_extension'; \
 	 SELECT extension_version FROM duckdb_extensions() WHERE extension_name='$(EXT_NAME)';" 2>/dev/null | tail -1)
 export EXPECTED_EXT_VERSION = $(PDF_BUILT_VERSION)
+
+# Exercise format routing and backend failure behavior even without desktop apps.
+# Compile with the extension, while CI's compiler/container is still active.
+# The outside-container Linux pass deliberately skips all executable tests.
+ifneq ($(SKIP_TESTS),1)
+define OFFICE_CONVERSION_TEST
+test_$(1): office_conversion_test_$(1)
+office_conversion_test_$(1):
+	./build/$(1)/extension/pdf/pdf_office_conversion_test
+.PHONY: office_conversion_test_$(1)
+endef
+$(foreach config,release debug reldebug,$(eval $(call OFFICE_CONVERSION_TEST,$(config))))
+endif

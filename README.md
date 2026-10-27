@@ -1,6 +1,6 @@
 # duckdb-pdf
 
-**Everything PDF, in SQL.** A DuckDB community extension (`pdf`) that turns PDFs into tables and tables into PDFs: read text at every grain (page, line, word, layout element, retrieval chunk), inspect metadata / outlines / attachments / form fields / annotations / revisions / digital signatures, and do the everyday document operations people open Adobe Acrobat for — merge, split, rotate, compress, encrypt, decrypt, extract pages, write new PDFs. Built on [Poppler](https://poppler.freedesktop.org/) (parsing/rendering), [Tesseract](https://github.com/tesseract-ocr/tesseract) (OCR for scanned documents), [qpdf](https://qpdf.sourceforge.io/) (document surgery), and [libharu](https://github.com/libharu/libharu) (native PDF writing) — in the DuckDB process. Office conversion through `to_pdf` additionally requires LibreOffice at runtime.
+**Everything PDF, in SQL.** A DuckDB community extension (`pdf`) that turns PDFs into tables and tables into PDFs: read text at every grain (page, line, word, layout element, retrieval chunk), inspect metadata / outlines / attachments / form fields / annotations / revisions / digital signatures, and do the everyday document operations people open Adobe Acrobat for — merge, split, rotate, compress, encrypt, decrypt, extract pages, write new PDFs. Built on [Poppler](https://poppler.freedesktop.org/) (parsing/rendering), [Tesseract](https://github.com/tesseract-ocr/tesseract) (OCR for scanned documents), [qpdf](https://qpdf.sourceforge.io/) (document surgery), and [libharu](https://github.com/libharu/libharu) (native PDF writing) — in the DuckDB process. Office conversion through `to_pdf` uses installed Microsoft or Apple apps on macOS, with LibreOffice as a fallback.
 
 
 This branch consolidates the API into **19 canonical function families**.
@@ -48,7 +48,7 @@ names and field types, and execution checks which fields apply to the mode.
 | `pdf_redact_lateral` | In-out table | Raster redaction with per-row inputs. |
 | `pdf_sign` | Table | Apply a detached CMS signature. |
 | `write_pdf` | Scalar | Native text-to-PDF writer. |
-| `to_pdf` | Scalar | Office conversion through LibreOffice. |
+| `to_pdf` | Scalar | Office conversion through installed desktop apps or LibreOffice. |
 | `ocr_image` | Scalar and table | Image OCR as text or a row with confidence. |
 | `pdf_ocr` | Table | Persist searchable OCR layers. |
 | `poppler_version` | Scalar | Linked Poppler version. |
@@ -271,10 +271,21 @@ without a path it returns a temporary file path. `COPY ... (FORMAT pdf)`
 typesets query rows with TITLE, AUTHOR, HEADER, FOOTER, FONT_SIZE, PAGE_SIZE and
 MARGIN options. FONT_SIZE/MARGIN must be finite and pass their range checks.
 
-`to_pdf(input_path [, output_path])` invokes LibreOffice directly without a
-shell. It needs a LibreOffice runtime; omitted output replaces the input suffix
-with .pdf. Office conversion is the only authoring operation needing that
-external application.
+`to_pdf(input_path [, output_path])` converts through installed applications,
+without a shell. On macOS it tries Excel → Numbers → LibreOffice for spreadsheets,
+Word → Pages → LibreOffice for documents, and PowerPoint → Keynote → LibreOffice
+for presentations. Native `.numbers`, `.pages` and `.key` inputs go directly to
+their Apple application before LibreOffice; other formats and other platforms use
+LibreOffice. Missing applications and failed exports advance to the next backend.
+If all attempts fail, the error retains each backend's failure.
+
+macOS discovers apps by bundle identifier through Launch Services. Desktop export
+uses AppleScript and may require Automation permission and an interactive login.
+It opens a private input copy, closes only that copy, and never quits the app.
+Each native export has a 110-second AppleScript timeout and the converter process
+has a 120-second timeout. A valid PDF header is required before atomic publication.
+Omitted output replaces the input suffix with .pdf. PDF reading, rendering and
+native PDF writing do not require an Office application.
 
 ## OCR
 

@@ -15,6 +15,12 @@ install httpfs/quack into the build repository. To exercise Office conversion,
 set `LIBREOFFICE_PATH` to your LibreOffice executable. Inspect skipped-test
 reasons; a skipped dependency or zero selected cases is not validation.
 
+The normal `make test` targets also run `office_conversion_test.cpp`: simulated
+backends verify Microsoft → Apple → LibreOffice routing, stop-on-success and
+retention of all export errors without requiring desktop apps. These are routing
+tests, not evidence of real Excel/Word/PowerPoint or iWork exports. Those require
+installed applications, an interactive macOS session and Automation permission.
+
 The Makefile enables extension autoloading and `--fail-require-skip` in the
 DuckDB test runner. DuckDB 2.0 isolates each test's extension installation;
 companions must be available in the build repository. The build guard compares

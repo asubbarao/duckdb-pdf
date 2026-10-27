@@ -1,3 +1,7 @@
+#include "pdf_office_conversion.hpp"
+#ifdef __APPLE__
+#include <CoreServices/CoreServices.h>
+#endif
 #define DUCKDB_EXTENSION_MAIN
 
 #include "pdf_extension.hpp"
@@ -84,8 +88,7 @@
 #include <utility>
 #include <vector>
 
-// Process spawn + PATH probing for the runtime LibreOffice shell-out (to_pdf).
-// These are the ONLY new system headers; no new library is linked.
+// Process spawn + PATH probing for runtime Office converters (to_pdf).
 #ifdef _WIN32
 #include <io.h>
 #include <process.h>
@@ -5992,11 +5995,11 @@ static void OcrImageScan(ClientContext &context, TableFunctionInput &data_p, Dat
 
 //===--------------------------------------------------------------------===//
 // to_pdf(input_path[, output_path]) converts office/markup documents by
-// spawning LibreOffice directly with literal arguments, without a shell.
+// selecting native macOS applications, then LibreOffice, without a shell.
 //
 // This is a runtime process, not a build/link dependency: the
 // extension compiles and CI stays green on machines with no converter
-// installed. If LibreOffice is absent at call time, we throw a clear, actionable
+// installed. If every converter is unavailable, we throw a clear, actionable
 // IOException (mirroring the graceful-require pattern the OCR path uses).
 //===--------------------------------------------------------------------===//
 
@@ -6203,7 +6206,7 @@ static int RunCapture(const vector<string> &args, string &output) {
 	CloseHandle(write_pipe);
 	if (!started) {
 		CloseHandle(read_pipe);
-		throw IOException("to_pdf: failed to spawn LibreOffice");
+		throw IOException("to_pdf: failed to spawn converter");
 	}
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);
 	char buf[4096];
@@ -6222,7 +6225,7 @@ static int RunCapture(const vector<string> &args, string &output) {
 			CloseHandle(read_pipe);
 			CloseHandle(process.hThread);
 			CloseHandle(process.hProcess);
-			throw IOException("to_pdf: LibreOffice conversion timed out after 120 seconds");
+			throw IOException("to_pdf: converter conversion timed out after 120 seconds");
 		}
 		if (status == STILL_ACTIVE)
 			WaitForSingleObject(process.hProcess, 20);
@@ -6251,7 +6254,7 @@ static int RunCapture(const vector<string> &args, string &output) {
 	if (child < 0) {
 		close(fds[0]);
 		close(fds[1]);
-		throw IOException("to_pdf: failed to spawn LibreOffice");
+		throw IOException("to_pdf: failed to spawn converter");
 	}
 	if (child == 0) {
 		close(fds[0]);
@@ -6270,7 +6273,7 @@ static int RunCapture(const vector<string> &args, string &output) {
 			while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
 			}
 			close(fds[0]);
-			throw IOException("to_pdf: LibreOffice conversion timed out after 120 seconds");
+			throw IOException("to_pdf: converter conversion timed out after 120 seconds");
 		}
 		struct pollfd pfd = {fds[0], POLLIN | POLLHUP, 0};
 		int ready = poll(&pfd, 1, 100);
@@ -6299,12 +6302,12 @@ static int RunCapture(const vector<string> &args, string &output) {
 		if (done == child)
 			break;
 		if (done < 0 && errno != EINTR)
-			throw IOException("to_pdf: failed waiting for LibreOffice");
+			throw IOException("to_pdf: failed waiting for converter");
 		if (std::chrono::steady_clock::now() >= deadline) {
 			kill(child, SIGKILL);
 			while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
 			}
-			throw IOException("to_pdf: LibreOffice conversion timed out after 120 seconds");
+			throw IOException("to_pdf: converter conversion timed out after 120 seconds");
 		}
 		poll(nullptr, 0, 50);
 	}
@@ -6317,7 +6320,7 @@ static int RunCapture(const vector<string> &args, string &output) {
 // <outdir>/<input-stem>.pdf), so we convert into a unique temp outdir and then
 // move the produced file to `output_path`. A unique per-call user-profile dir
 // avoids the "another LibreOffice instance is running" lock.
-static string ConvertToPdf(const string &input_path, const string &output_path) {
+static string ConvertWithLibreOffice(const string &input_path, const string &output_path) {
 	{
 		std::ifstream input_check(input_path.c_str(), std::ios::binary);
 		if (!input_check.good()) {
@@ -6407,6 +6410,88 @@ static string ConvertToPdf(const string &input_path, const string &output_path) 
 	staged.Commit();
 
 	return output_path;
+}
+
+#ifdef __APPLE__
+static bool OfficeApplicationInstalled(const string &bundle_id) {
+	CFStringRef identifier = CFStringCreateWithCString(nullptr, bundle_id.c_str(), kCFStringEncodingUTF8);
+	if (!identifier)
+		return false;
+	CFArrayRef urls = LSCopyApplicationURLsForBundleIdentifier(identifier, nullptr);
+	CFRelease(identifier);
+	bool installed = false;
+	if (urls) {
+		for (CFIndex i = 0; i < CFArrayGetCount(urls); ++i) {
+			auto url = static_cast<CFURLRef>(CFArrayGetValueAtIndex(urls, i));
+			if (CFURLResourceIsReachable(url, nullptr)) {
+				installed = true;
+				break;
+			}
+		}
+	}
+	if (urls)
+		CFRelease(urls);
+	return installed;
+}
+
+static void ConvertWithMacApplication(const pdf_office::Application &app, const string &input_path,
+                                      const string &output_path) {
+	// Opening a private copy avoids touching or closing an existing user document.
+	string unique = BaseUUID::ToString(UUID::GenerateRandomUUID());
+	string workspace = TempDir() + "/to_pdf_native_" + unique;
+	TempDirGuard guard(workspace);
+	string dir, stem, ext;
+	SplitPath(input_path, dir, stem, ext);
+	string private_input = workspace + "/" + unique + ext;
+	string captured;
+	if (RunCapture({"/usr/bin/ditto", input_path, private_input}, captured) != 0)
+		throw IOException("could not copy conversion input: %s", captured);
+	string produced = workspace + "/export.pdf";
+	int rc = RunCapture({"/usr/bin/osascript", "-e", pdf_office::Script(app), "--", private_input, produced}, captured);
+	if (rc != 0)
+		throw IOException("export failed (status %d): %s", rc, captured);
+	std::ifstream src(produced, std::ios::binary);
+	char magic[5] = {};
+	src.read(magic, sizeof(magic));
+	if (!src || string(magic, sizeof(magic)) != "%PDF-")
+		throw IOException("export did not produce a PDF");
+	src.seekg(0);
+	AtomicPdfOutput staged(output_path);
+	std::ofstream dst(staged.TempPath(), std::ios::binary | std::ios::trunc);
+	if (!dst)
+		throw IOException("could not stage converted PDF");
+	dst << src.rdbuf();
+	dst.close();
+	if (!dst || src.bad())
+		throw IOException("failed writing converted PDF");
+	staged.Commit();
+}
+#endif
+
+static string ConvertToPdf(const string &input_path, const string &output_path) {
+#ifdef __APPLE__
+	struct stat info;
+	if (stat(input_path.c_str(), &info) != 0)
+		throw IOException("to_pdf: input file '%s' does not exist or is not readable", input_path);
+	string dir, stem, ext;
+	SplitPath(input_path, dir, stem, ext);
+	try {
+		pdf_office::Convert(
+		    pdf_office::Applications(ext),
+		    [&](const pdf_office::Application &app) {
+			    if (!OfficeApplicationInstalled(app.bundle_id))
+				    return false;
+			    ConvertWithMacApplication(app, input_path, output_path);
+			    return true;
+		    },
+		    [&]() { ConvertWithLibreOffice(input_path, output_path); });
+	} catch (const std::exception &error) {
+		throw IOException("to_pdf: conversion failed: %s", error.what());
+	}
+	return output_path;
+#else
+	return ConvertWithLibreOffice(input_path, output_path);
+#endif
 }
 
 // Default output path: the input path with its extension swapped to `.pdf`.

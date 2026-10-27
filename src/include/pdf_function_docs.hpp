@@ -89,7 +89,8 @@ static const PdfFunctionDoc PDF_FUNCTION_DOCS[] = {
      "Write text to PDF using the in-process writer. Omit output_path to create a temporary PDF and return its path.",
      "SELECT write_pdf('Hello', 'hello.pdf');"},
     {"to_pdf", "input_path,output_path",
-     "Convert a local Office document with LibreOffice. Omit output_path to replace the input extension with pdf. "
+     "Convert a local Office document. macOS tries the matching Microsoft app, then its Apple equivalent, then "
+     "LibreOffice; other platforms use LibreOffice. Omit output_path to replace the input extension with pdf. "
      "Requires external process access.",
      "SELECT to_pdf('document.docx', 'converted.pdf');"},
     {"ocr_image", "image_blob,options",

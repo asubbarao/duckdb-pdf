@@ -452,8 +452,30 @@ Helvetica only** (WinAnsi/Latin-1) — non-Latin scripts and many UTF-8 glyphs
 will not render; use `to_pdf` + HTML for international text. `FOOTER` supports a
 literal `{page}` placeholder; if you set `HEADER`/`FOOTER`, `MARGIN` must be
 ≥ 24 to fit the band. `to_pdf` is the **only** function that launches an external
-application at runtime (without a shell) — it needs LibreOffice installed (`brew install --cask libreoffice` /
-`apt-get install libreoffice`) and errors with an actionable message if absent.
+application at runtime (without a shell). On macOS it prefers the matching
+Microsoft app, then Numbers/Pages/Keynote, and finally LibreOffice. Other
+platforms use LibreOffice (`brew install --cask libreoffice` /
+`apt-get install libreoffice`). Failed exports fall back, with all backend errors
+retained if none succeeds. Native macOS apps require Automation permission.
+
+### Native document content with panduck
+
+For a newly typeset text PDF, compose panduck's native readers with `write_pdf`.
+This path needs no Office application. It extracts content rather than preserving
+the source document's pagination, fonts, images or spreadsheet/presentation layout.
+The native writer's character/font limitations above still apply.
+
+```sql
+INSTALL panduck FROM community;
+LOAD panduck;
+INSTALL duck_block_utils FROM community;
+LOAD duck_block_utils;
+SELECT write_pdf(doc_render('report.docx', 'text'), 'report-content.pdf');
+```
+
+The same composition works for panduck-supported ODT, RTF and EPUB inputs.
+Panduck is an optional companion, not a dependency of `pdf` or a rendering
+backend for `to_pdf`. It does not replace XLSX/PPTX conversion.
 
 ---
 
