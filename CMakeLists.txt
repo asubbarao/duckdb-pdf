@@ -8,6 +8,9 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
+add_executable(pdf_office_conversion_test EXCLUDE_FROM_ALL test/office_conversion_test.cpp)
+target_include_directories(pdf_office_conversion_test PRIVATE src/include)
+
 set(CMAKE_CXX_STANDARD
     "17"
     CACHE STRING "C++ standard to enforce")
@@ -110,6 +113,12 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+if(APPLE)
+  find_library(PDF_CORESERVICES CoreServices REQUIRED)
+  target_link_libraries(${EXTENSION_NAME} ${PDF_CORESERVICES})
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} ${PDF_CORESERVICES})
+endif()
 
 set_source_files_properties(${BASE14_FONT_GEN} PROPERTIES GENERATED TRUE)
 set_source_files_properties(${TESSDATA_GEN} PROPERTIES GENERATED TRUE)

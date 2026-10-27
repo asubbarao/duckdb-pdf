@@ -451,8 +451,11 @@ Helvetica only** (WinAnsi/Latin-1) — non-Latin scripts and many UTF-8 glyphs
 will not render; use `to_pdf` + HTML for international text. `FOOTER` supports a
 literal `{page}` placeholder; if you set `HEADER`/`FOOTER`, `MARGIN` must be
 ≥ 24 to fit the band. `to_pdf` is the **only** function that launches an external
-application at runtime (without a shell) — it needs LibreOffice installed (`brew install --cask libreoffice` /
-`apt-get install libreoffice`) and errors with an actionable message if absent.
+application at runtime (without a shell). On macOS it prefers the matching
+Microsoft app, then Numbers/Pages/Keynote, and finally LibreOffice. Other
+platforms use LibreOffice (`brew install --cask libreoffice` /
+`apt-get install libreoffice`). Failed exports fall back, with all backend errors
+retained if none succeeds. Native macOS apps require Automation permission.
 
 ---
 
