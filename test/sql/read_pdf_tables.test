@@ -275,3 +275,10 @@ true
 statement error
 SELECT * FROM read_pdf_tables('test/data/does_not_exist.pdf');
 ----
+
+# Explicit horizontal ruling separates a sparse row from its neighbors.
+query I
+SELECT count(*) = 1 FROM read_pdf_tables('test/data/ruled_sparse_table.pdf')
+WHERE cells[1] = 'SparseOnly' AND coalesce(cells[2], '') = '';
+----
+true

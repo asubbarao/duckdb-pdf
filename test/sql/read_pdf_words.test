@@ -4,6 +4,13 @@
 
 require pdf
 
+# The canonical word reader preserves the removed layout alias's page-range contract.
+query I
+SELECT bool_and(page = 2 AND x1 >= x0 AND y1 >= y0)
+FROM read_pdf_words('test/data/two_pages.pdf', first_page := 2, last_page := 2);
+----
+true
+
 statement ok
 PRAGMA enable_verification
 

@@ -1,5 +1,5 @@
 # name: test/sql/read_pdf_ignore_errors.test
-# description: ignore_errors folder-scan fault isolation for read_pdf / read_pdf_meta
+# description: ignore_errors folder-scan fault isolation for read_pdf / pdf_info
 # group: [sql]
 
 require pdf
@@ -19,7 +19,7 @@ SELECT * FROM read_pdf('test/data/mixed_glob/*.pdf');
 could not open
 
 statement error
-SELECT * FROM read_pdf_meta('test/data/mixed_glob/*.pdf');
+SELECT * FROM pdf_info('test/data/mixed_glob/*.pdf');
 ----
 could not open
 
@@ -58,9 +58,9 @@ WHERE contains(filename, 'bad_');
 ----
 0
 
-# read_pdf_meta: one row per good file (2), no error
+# pdf_info: one row per good file (2), no error
 query I
-SELECT COUNT(*) FROM read_pdf_meta('test/data/mixed_glob/*.pdf', ignore_errors := true);
+SELECT COUNT(*) FROM pdf_info('test/data/mixed_glob/*.pdf', ignore_errors := true);
 ----
 2
 

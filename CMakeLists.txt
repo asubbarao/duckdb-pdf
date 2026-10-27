@@ -294,6 +294,24 @@ if(NOT WIN32)
     # OpenSSL for pdf_signatures CMS/PKCS#7 verification (tier 2). Dynamic on
     # the shared path, so link the IMPORTED_TARGET explicitly.
     pkg_check_modules(OPENSSL REQUIRED IMPORTED_TARGET openssl)
+    # DuckDB 2.0 adds generated C sources to extension targets. Some system .pc
+    # files export a C++ standard flag; restrict it to C++ compilation.
+    foreach(_dep POPPLER_CPP POPPLER TESSERACT LEPTONICA LIBQPDF OPENSSL)
+      get_target_property(_options PkgConfig::${_dep} INTERFACE_COMPILE_OPTIONS)
+      if(_options)
+        set(_language_options "")
+        foreach(_option IN LISTS _options)
+          if(_option MATCHES "^-std=c\\+\\+")
+            list(APPEND _language_options
+                 "$<$<COMPILE_LANGUAGE:CXX>:${_option}>")
+          else()
+            list(APPEND _language_options "${_option}")
+          endif()
+        endforeach()
+        set_property(TARGET PkgConfig::${_dep}
+                     PROPERTY INTERFACE_COMPILE_OPTIONS "${_language_options}")
+      endif()
+    endforeach()
     include_directories(
       ${POPPLER_CPP_INCLUDE_DIRS} ${POPPLER_INCLUDE_DIRS}
       ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS}

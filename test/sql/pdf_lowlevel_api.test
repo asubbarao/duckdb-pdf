@@ -1,5 +1,5 @@
 # name: test/sql/pdf_lowlevel_api.test
-# description: Low-level: poppler_version, poppler_render_page, tesseract_ocr, ocr_image
+# description: Low-level: poppler_version, pdf_to_png, tesseract_ocr, ocr_image
 # group: [sql]
 
 require pdf
@@ -19,31 +19,31 @@ SELECT length(poppler_version()) > 0;
 ----
 true
 
-# ── poppler_render_page(blob, page, dpi) ────────────────────────────────────
+# ── pdf_to_png(blob, page, dpi) ────────────────────────────────────
 
 query I
-SELECT octet_length(poppler_render_page((SELECT content FROM read_blob('test/data/hello.pdf')), 1, 72)) > 100;
+SELECT octet_length(pdf_to_png((SELECT content FROM read_blob('test/data/hello.pdf')), 1, 72)) > 100;
 ----
 true
 
 query I
-SELECT poppler_render_page((SELECT content FROM read_blob('test/data/hello.pdf')), 1, 72)[1:4] = '\x89PNG'::BLOB;
+SELECT pdf_to_png((SELECT content FROM read_blob('test/data/hello.pdf')), 1, 72)[1:4] = '\x89PNG'::BLOB;
 ----
 true
 
 # page out of range (1-based, same style as pdf_to_png)
 statement error
-SELECT poppler_render_page((SELECT content FROM read_blob('test/data/hello.pdf')), 0, 72);
+SELECT pdf_to_png((SELECT content FROM read_blob('test/data/hello.pdf')), 0, 72);
 ----
 out of range
 
 statement error
-SELECT poppler_render_page((SELECT content FROM read_blob('test/data/hello.pdf')), 99, 72);
+SELECT pdf_to_png((SELECT content FROM read_blob('test/data/hello.pdf')), 99, 72);
 ----
 out of range
 
 statement error
-SELECT poppler_render_page((SELECT content FROM read_blob('test/data/hello.pdf')), 1, 0);
+SELECT pdf_to_png((SELECT content FROM read_blob('test/data/hello.pdf')), 1, 0);
 ----
 dpi must be between
 
@@ -52,7 +52,7 @@ dpi must be between
 
 query I
 SELECT length(tesseract_ocr(
-  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150)
+  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150)
 )) > 0;
 ----
 true
@@ -60,7 +60,7 @@ true
 # lang + psm overloads bind
 query I
 SELECT length(tesseract_ocr(
-  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
+  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
   'eng'
 )) > 0;
 ----
@@ -68,7 +68,7 @@ true
 
 query I
 SELECT length(tesseract_ocr(
-  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
+  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
   'eng',
   3
 )) > 0;
@@ -78,7 +78,7 @@ true
 # richer positional overloads: oem + tessdata_dir + preprocess + vars MAP
 query I
 SELECT length(tesseract_ocr(
-  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
+  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
   'eng', 3, 3, '', true,
   MAP {'tessedit_char_whitelist': 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,;:''"!?-'}
 )) > 0;
@@ -88,7 +88,7 @@ true
 # full arity including empty config path
 query I
 SELECT length(tesseract_ocr(
-  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
+  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
   'eng', 3, 3, '', true,
   MAP {},
   ''
@@ -99,7 +99,7 @@ true
 # bad psm / oem fail fast
 statement error
 SELECT tesseract_ocr(
-  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 72),
+  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 72),
   'eng', 99
 );
 ----
@@ -107,7 +107,7 @@ psm must be between
 
 statement error
 SELECT tesseract_ocr(
-  poppler_render_page((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 72),
+  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 72),
   'eng', 3, 9
 );
 ----
@@ -124,7 +124,7 @@ could not decode image BLOB
 
 statement ok
 SET VARIABLE ocr_png = (
-  SELECT poppler_render_page(content, 1, 150) FROM read_blob('test/data/scanned.pdf')
+  SELECT pdf_to_png(content, 1, 150) FROM read_blob('test/data/scanned.pdf')
 );
 
 query III

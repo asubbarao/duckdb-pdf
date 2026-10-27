@@ -203,3 +203,37 @@ SELECT * FROM pdf_redact('test/data/redact_secret.pdf', '__TEST_DIR__/zb.pdf',
                 [{'page': 2, 'x': 60.0, 'y': 590.0, 'w': 260.0, 'h': -1.0}]);
 ----
 w and h must be > 0
+
+# Form values must not survive through the document-level AcroForm tree.
+statement ok
+SELECT * FROM pdf_redact('test/data/redact_form_secret.pdf', '__TEST_DIR__/redacted_form.pdf',
+                         [{'page':1, 'x':0., 'y':0., 'w':612., 'h':792.}]);
+
+query I
+SELECT count(*) FROM pdf_form_fields('__TEST_DIR__/redacted_form.pdf');
+----
+0
+
+# Coordinates are in original user space even when CropBox is offset.
+statement ok
+SELECT * FROM pdf_redact('test/data/redact_cropped_secret.pdf', '__TEST_DIR__/redacted_crop.pdf',
+                         [{'page':1, 'x':140., 'y':590., 'w':260., 'h':60.}]);
+
+query I
+SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted_crop.pdf', ocr := true)
+WHERE contains(text, 'SECRET98765');
+----
+0
+
+# Invalid or fully outside rectangles cannot be reported as successful.
+statement error
+SELECT * FROM pdf_redact('test/data/redact_secret.pdf', '__TEST_DIR__/redact_invalid.pdf',
+                         [{'page':1, 'x':'nan'::DOUBLE, 'y':1., 'w':5., 'h':5.}]);
+----
+coordinates must be finite
+
+statement error
+SELECT * FROM pdf_redact('test/data/redact_secret.pdf', '__TEST_DIR__/redact_outside.pdf',
+                         [{'page':1, 'x':9999., 'y':9999., 'w':5., 'h':5.}]);
+----
+does not intersect

@@ -7,6 +7,14 @@
 #include "base14_fonts.hpp"
 
 #include "Error.h"
+#include <poppler-version.h>
+#if POPPLER_VERSION_MAJOR < 25
+#include "PDFDoc.h"
+#include "Catalog.h"
+#include "Stream.h"
+#include "goo/GooString.h"
+#include <optional>
+#endif
 
 #include <cctype>
 #include <cstdio>
@@ -64,6 +72,28 @@ void ResetPopplerMissingDisplayFont() {
 
 bool PopplerMissingDisplayFont() {
 	return g_poppler_missing_display_font;
+}
+
+bool PopplerLegacyDocumentFeatures(const std::string &bytes, const std::string &password, bool &javascript,
+                                   int &form_type) {
+#if POPPLER_VERSION_MAJOR < 25
+	std::optional<GooString> pw;
+	if (!password.empty())
+		pw.emplace(password);
+	auto stream = new MemStream(bytes.data(), 0, static_cast<Goffset>(bytes.size()), Object(objNull));
+	PDFDoc doc(stream, pw, pw);
+	if (!doc.isOk() || !doc.getCatalog())
+		return false;
+	javascript = doc.hasJavascript();
+	form_type = static_cast<int>(doc.getCatalog()->getFormType());
+	return true;
+#else
+	(void)bytes;
+	(void)password;
+	(void)javascript;
+	(void)form_type;
+	return false;
+#endif
 }
 
 } // namespace duckdb

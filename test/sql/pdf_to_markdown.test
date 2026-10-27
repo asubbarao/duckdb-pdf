@@ -104,3 +104,27 @@ true
 statement error
 SELECT pdf_to_markdown('test/data/does_not_exist.pdf');
 ----
+
+# Prose sharing the vertical span of a table must not be suppressed.
+query I
+SELECT contains(md, 'SENTINELALPHA') AND contains(md, 'SENTINELBETA')
+   AND contains(md, 'SENTINELGAMMA') AND contains(md, 'SENTINELDELTA')
+   AND contains(md, '|Apples|10|')
+FROM (SELECT pdf_to_markdown('test/data/markdown_prose_table.pdf') AS md);
+----
+true
+
+# Independent tables on the same page should both be emitted.
+query I
+SELECT contains(md, '|Almond|11|') AND contains(md, '|Orange|21|')
+   AND contains(md, 'Between tables')
+FROM (SELECT pdf_to_markdown('test/data/markdown_two_tables.pdf') AS md);
+----
+true
+
+query I
+SELECT contains(md, '|First|Count|') AND contains(md, '|Second|Count|')
+   AND contains(md, '|Almond|11|') AND contains(md, '|Orange|21|')
+FROM (SELECT pdf_to_markdown('test/data/markdown_two_tables_gap.pdf') AS md);
+----
+true

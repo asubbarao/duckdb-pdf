@@ -78,7 +78,7 @@ void ClosePlugin(PluginHandle &h) {
 }
 
 PluginHandle LoadPlugin(const std::string &path) {
-	std::lock_guard<std::mutex> guard(PluginMutex());
+	// Caller holds PluginMutex through recognition and plugin-owned cleanup.
 	auto &cached = CachedPlugin();
 	if (cached.lib && cached.path == path && cached.recognize) {
 		return cached; // shallow copy of function pointers is fine
@@ -163,6 +163,7 @@ TextResult RecognizeExternal(const unsigned char *data, int width, int height, i
 		}
 		throw std::runtime_error(msg);
 	}
+	std::lock_guard<std::mutex> guard(PluginMutex());
 	PluginHandle plugin = LoadPlugin(opt.external_plugin);
 	char *text_ptr = nullptr;
 	int conf = -1;
@@ -195,14 +196,30 @@ bool ModelExistsIn(const std::string &dir, const std::string &language) {
 	if (dir.empty()) {
 		return false;
 	}
-	std::string path = dir;
-	char sep = path.back();
+	std::string prefix = dir;
+	char sep = prefix.back();
 	if (sep != '/' && sep != '\\') {
-		path += '/';
+		prefix += '/';
 	}
-	path += language + ".traineddata";
-	std::ifstream f(path.c_str());
-	return f.good();
+	// Tesseract language expressions select separate models, e.g. eng+fra.
+	// A ~name component excludes a model and need not exist on disk.
+	bool selected = false;
+	for (size_t start = 0; start <= language.size();) {
+		auto end = language.find('+', start);
+		auto model = language.substr(start, end == std::string::npos ? end : end - start);
+		if (model.empty())
+			return false;
+		if (model[0] != '~') {
+			selected = true;
+			std::ifstream file((prefix + model + ".traineddata").c_str());
+			if (!file.good())
+				return false;
+		}
+		if (end == std::string::npos)
+			break;
+		start = end + 1;
+	}
+	return selected;
 }
 
 // True if <dir>/<lang>.traineddata OR <dir>/tessdata/<lang>.traineddata exists.
@@ -268,7 +285,9 @@ std::string ResolveTessdataDir(const std::string &language, const std::string &e
 		}
 	}
 	// Zero host install: eng.traineddata is compiled into the extension.
-	return EnsureBundledTessdataDir(language);
+	// The bundled directory can satisfy combinations of bundled models too.
+	auto bundled = EnsureBundledTessdataDir("eng");
+	return ModelExistsIn(bundled, language) ? bundled : std::string();
 }
 
 // Convert raw poppler-style pixels into a 32bpp leptonica Pix. Returns nullptr
@@ -314,7 +333,7 @@ Pix *BufferToPix(const unsigned char *base, int w, int h, int bpr, ImageFormat f
 //   2. deskew (if |angle| > 0.3°)
 //   3. binarize (Otsu)
 //   4. despeckle (light 2x2 close-open at >=300 dpi)
-Pix *PreprocessPixForOcr(Pix *pixs, int dpi) {
+Pix *PreprocessPixForOcr(Pix *pixs, int dpi, bool deskew = true) {
 	if (!pixs) {
 		return nullptr;
 	}
@@ -337,7 +356,7 @@ Pix *PreprocessPixForOcr(Pix *pixs, int dpi) {
 		return nullptr;
 	}
 
-	Pix *pixskew = pixThresholdToBinary(pixg, 130);
+	Pix *pixskew = deskew ? pixThresholdToBinary(pixg, 130) : nullptr;
 	if (pixskew) {
 		l_float32 angle = 0.0f;
 		l_float32 conf = 0.0f;
@@ -582,9 +601,9 @@ bool EnsureTesseract(const Options &opt) {
 }
 
 void SetOcrImage(tesseract::TessBaseAPI &api, const unsigned char *data, int width, int height, int bytes_per_row,
-                 ImageFormat format, int dpi, bool preprocess, Pix *&base, Pix *&processed) {
+                 ImageFormat format, int dpi, bool preprocess, Pix *&base, Pix *&processed, bool deskew = true) {
 	base = preprocess ? BufferToPix(data, width, height, bytes_per_row, format) : nullptr;
-	processed = base ? PreprocessPixForOcr(base, dpi) : nullptr;
+	processed = base ? PreprocessPixForOcr(base, dpi, deskew) : nullptr;
 	Pix *use = processed ? processed : base;
 	if (use) {
 		api.SetImage(use);
@@ -663,7 +682,7 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
-	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed);
+	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed, false);
 
 	int rec = api.Recognize(0);
 	if (rec != 0) {
@@ -699,6 +718,7 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 				out.words.push_back(std::move(w));
 			}
 		} while (ri->Next(tesseract::RIL_WORD));
+		delete ri;
 	}
 	api.Clear();
 	DestroyPixPair(processed, base);
@@ -801,7 +821,7 @@ PdfResult RenderSearchablePdf(const unsigned char *data, int width, int height, 
 	auto &api = TlsTess().api;
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
-	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed);
+	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed, false);
 	const bool rendered = RenderTesseractPdf(api, output_base, datadir);
 	if (!rendered) {
 		api.Clear();
@@ -819,6 +839,7 @@ PdfResult RenderSearchablePdf(const unsigned char *data, int width, int height, 
 				out.words++;
 			}
 		} while (ri->Next(tesseract::RIL_WORD));
+		delete ri;
 	}
 	api.Clear();
 	DestroyPixPair(processed, base);
@@ -857,7 +878,7 @@ TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Opti
 			return out;
 		}
 		throw std::runtime_error("could not decode image BLOB "
-		                         "(expected PNG/JPEG/etc. readable by leptonica, e.g. from poppler_render_page)");
+		                         "(expected PNG/JPEG/etc. readable by leptonica, e.g. from pdf_to_png)");
 	}
 
 	if (!EnsureTesseract(opt)) {

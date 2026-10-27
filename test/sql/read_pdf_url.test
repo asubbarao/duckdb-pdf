@@ -70,6 +70,15 @@ FROM read_pdf_tables('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-ka
 ----
 true
 
+# Decorative strokes on the legal-disclaimer page cut through words. They
+# must not turn its prose into a ruled table, while the sparse tables remain.
+query I
+SELECT len(coalesce(list(page), [])) = 0
+FROM read_pdf_tables('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf')
+WHERE page = 11;
+----
+true
+
 # ── "One Size Fits All" (ICDE 2015): a real two-column paper ────────────────
 #
 # PDF 1.3 out of Acrobat Distiller 5 — the oldest producer in the corpus, and
@@ -163,7 +172,7 @@ FROM pdf_outline('https://blobs.duckdb.org/docs/ducklake-docs.pdf');
 true
 
 query I
-SELECT page_mode = 'use_outlines' FROM pdf_permissions('https://blobs.duckdb.org/docs/ducklake-docs.pdf');
+SELECT page_mode = 'use_outlines' FROM pdf_info('https://blobs.duckdb.org/docs/ducklake-docs.pdf');
 ----
 true
 

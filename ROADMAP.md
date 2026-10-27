@@ -7,7 +7,8 @@ function reference.
 ## What it is
 
 `pdf` turns PDFs into tables and tables into PDFs, in SQL, in the DuckDB
-process — no `pdftotext`, no Python, no temp files. Every entry point answers
+process. Native readers do not invoke `pdftotext` or Python; writers and OCR
+can use temporary files, and Office conversion invokes LibreOffice. Every entry point answers
 one of six questions:
 
 - **What does this document say** — text, at whatever grain you need.
@@ -25,10 +26,9 @@ one of six questions:
 ### What does this document say
 
 - **Grain readers** — `read_pdf` (one row per page), `read_pdf_lines` (one row
-  per layout-preserving line), `read_pdf_words` / `read_pdf_layout` (one row
+  per layout-preserving line), `read_pdf_words` (one row
   per word: bbox, font, OCR source/confidence, geometric `line`,
-  `column_index`, `page_width`/`page_height` — `read_pdf_layout` is the same
-  bind/scan/init triple under a second name), `read_pdf_tables` (one row per
+  `column_index`, `page_width`/`page_height`), `read_pdf_tables` (one row per
   detected table row), `read_pdf_elements` (one row per layout element —
   heading/paragraph/list_item/other — in reading order), `pdf_chunks`
   (retrieval-ready chunks with section headings). OCR is not a separate step:
@@ -45,9 +45,9 @@ one of six questions:
 ### What is it
 
 - **Per-file census** — `pdf_info` (metadata, timestamps, dimensions, size,
-  encryption, PDF/A detection), `read_pdf_meta` (the original metadata
-  function, now a subset of `pdf_info`), `pdf_qpdf_info` (qpdf's own document
-  report: xref census, encryption bits, linearization), `pdf_permissions`.
+  encryption, PDF/A detection, permissions, forms/JavaScript features and IDs),
+  `pdf_qpdf_info` (qpdf's own document report: xref census, encryption bits,
+  linearization). `pdf_info` supports projection pushdown and `ignore_errors`.
 - **Per-page geometry** — `pdf_pages_info` (crop/media size, rotation,
   orientation, label per page).
 
@@ -70,8 +70,7 @@ one of six questions:
   pages.
 - **Single-page scalars** — `pdf_to_svg`, `pdf_to_png`, on paths, globs, and
   BLOBs.
-- **Rendering primitive** — `poppler_render_page` (one page of a PDF BLOB as
-  PNG bytes); `poppler_version()` reports the linked Poppler build.
+- **Runtime diagnostics** — `poppler_version()` reports the linked Poppler build.
 
 ### Make me a different PDF
 
@@ -99,64 +98,40 @@ one of six questions:
 - **Office conversion** — `to_pdf` (office/markup documents via a LibreOffice
   runtime shell-out).
 
-## 0.9.0 — in progress
+## Current consolidation: 52 to 48 names
 
-0.8.0 is live: the `duckdb/community-extensions` descriptor for `pdf` reads
-`version: 0.8.0`, `ref: 6535c81`, so `INSTALL pdf FROM community` matches what
-this section builds on.
+The branch removes `read_pdf_layout`, `poppler_render_page`,
+`read_pdf_meta`, and `pdf_permissions`. Their capabilities are provided by
+`read_pdf_words`, `pdf_to_png`, and the expanded `pdf_info`.
+The README migration table records changed column names, NULL semantics and
+options. These removals are breaking changes; old spellings are not aliases.
 
-1. **The layout engine** — `layout := 'auto'` as the default, so reading order
-   is correct on multi-column pages with no parameters; an unrecognised
-   `layout` value fails loudly instead of silently producing wrong text;
-   `read_pdf_words.column_index`; the DuckDB submodule bumped to v1.5.5.
-   **Done, pending merge** — [PR #21](https://github.com/asubbarao/duckdb-pdf/pull/21),
-   still a draft.
-2. **`FunctionDescription` on every registered function.** Today
-   `duckdb_functions()` reports `col0, col1, col2` and a NULL description for
-   every one of them — nothing in `LoadInternal` sets a description. This also
-   fixes the public registry page at duckdb.org, generated from a
-   `duckdb_functions()` diff, which currently reads "The function table
-   contains no parameter descriptions or examples."
-3. **`sniff_pdf(file)`** — modelled column-for-column on DuckDB core's own
-   `sniff_csv` (`Delimiter`, `Quote`, …, `UserArguments`, `Prompt`): a census
-   of the file (encrypted, form fields present, OCR needed, table-like content,
-   page count) plus a `UserArguments` column and a paste-ready `Prompt` column
-   suggesting which reader to call.
-4. **`pdf_help()`** — reads the same static description table as (2), so the
-   descriptions live in one place. A deliberate deviation from the rest of
-   DuckDB: nothing in core, and nothing in the community extensions installed
-   here, exposes a help function. The justification is that there is no
-   `COMMENT ON FUNCTION` for table functions, so there is nowhere else to put a
-   description a person can query.
+The 48 existing names expose descriptions, meaningful positional parameter
+names, typed named options and examples through `duckdb_functions()`.
+This describes branch behavior, not a claim that a release is published.
 
-Then: publish 0.9.0 as a one-file PR to `extensions/pdf/description.yml`,
-bumping `version` and `repo.ref`.
+## Broader consolidation proposal
 
-## 1.0.0 — the consolidation
+48 is an intermediate count, not a minimum. The earlier 19-family sketch below
+would combine readers by `grain`, inspection by `kind`, conversions by
+`format`, and related transforms by typed options. It is not implemented or
+approved by the four-name cleanup. It needs explicit decisions about dynamic
+result schemas, scalar versus table calls, BLOB inputs, passwords, projection,
+errors and output side effects. Changing a name alone does not solve those
+contracts.
 
-A breaking change: **50 registered function names collapse to 19** (21 scalar +
-29 table today, plus the `COPY ... TO ... (FORMAT pdf)` registration). The old
-version of this file was itself the symptom — its "Shipped" section was an
-inventory of every registered name, which is exactly the shape that lets the
-count climb unnoticed one function at a time. Nineteen names is a surface a
-person, or an agent, can hold in their head; fifty is not.
-
-Two of the fifty are not even distinct behaviour. `read_pdf_layout` is a second
-registration of `read_pdf_words`'s own bind/scan/init triple, and
-`poppler_render_page(BLOB, INTEGER, INTEGER)` is byte-for-byte `pdf_to_png`:
-both return the same 14,602 bytes for page 1 of the DuckLake docs at 72 dpi,
-and `poppler_render_page(b, 1, 72) = pdf_to_png(b, 1, 72)` is `true`. That is
-what the consolidation is fixing — not a reshuffle of names, but a surface that
-grew duplicates without anyone noticing.
+The sketch also proposes `sniff_pdf` and `pdf_help`, neither implemented.
+Catalog metadata already provides queryable help, so a separate help function
+needs evidence that it earns another public name.
 
 | 1.0.0 name | absorbs |
 | --- | --- |
-| `read_pdf(file, grain := 'page')` | `read_pdf_lines`, `read_pdf_elements`, `read_pdf_tables`, `pdf_chunks`, `read_pdf_layout` — `grain` chooses the schema at bind time |
+| `read_pdf(file, grain := 'page')` | `read_pdf_lines`, `read_pdf_elements`, `read_pdf_tables`, `pdf_chunks` — `grain` chooses the schema at bind time |
 | `read_pdf_words` | keeps its own name (the one grain with a genuinely different row shape) |
-| `pdf_info(file, detail := 'basic')` | `read_pdf_meta`, `pdf_permissions`, `pdf_qpdf_info` |
+| `pdf_info(file, detail := 'basic')` | `pdf_info`, `pdf_qpdf_info` |
 | `pdf_objects(file, kind := …)` | `pdf_outline`, `pdf_destinations`, `pdf_fonts`, `pdf_form_fields`, `pdf_annotations`, `pdf_attachments`, `pdf_images`, `pdf_signatures`, `pdf_revisions`, `pdf_pages_info` |
 | `pdf_text(src, format := 'text')` | `pdf_to_text`, `pdf_to_markdown`, `pdf_to_html`, `pdf_to_xml`, `pdf_json` |
-| `pdf_render(file, format := 'png', …)` | `pdf_to_png`, `pdf_to_svg`, `pdf_page_images`, `pdf_write_page_images`, `poppler_render_page` |
+| `pdf_render(file, format := 'png', …)` | `pdf_to_png`, `pdf_to_svg`, `pdf_page_images`, `pdf_write_page_images` |
 | `pdf_merge` | `pdf_merge` |
 | `pdf_pages` | `pdf_pages`, `pdf_rotate` |
 | `pdf_split` | `pdf_split`, `pdf_split_blank` |

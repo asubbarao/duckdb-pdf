@@ -1,0 +1,69 @@
+# name: test/sql/pdf_info_consolidated.test
+# description: consolidated document census, permissions and projection
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# Missing metadata uses the canonical NULL convention.
+query IIII
+SELECT title IS NULL, author IS NULL, page_count, is_encrypted
+FROM pdf_info('test/data/hello.pdf');
+----
+true	true	1	false
+
+# Permission fields share the same document row; arbitrary projection order
+# must still map the old permission fields to their declared output types.
+query TIIII
+SELECT form_type, perm_print, is_locked, has_javascript, perm_copy
+FROM pdf_info('test/data/hello.pdf');
+----
+none	true	false	false	true
+
+query ITT
+SELECT page_count, page_mode, page_layout FROM pdf_info('test/data/two_pages.pdf');
+----
+2	use_none	one_column
+
+# All 33 fields bind in a full scan. Keep a materialized relation to compare
+# its metadata against a projected scan without relying on column order.
+statement ok
+CREATE TABLE consolidated_info AS SELECT * FROM pdf_info('test/data/hello.pdf');
+
+query I
+SELECT len(list(column_name)) FROM duckdb_columns() WHERE table_name = 'consolidated_info';
+----
+33
+
+query I
+SELECT i.page_count = f.page_count AND i.perm_print = f.perm_print
+       AND i.form_type = f.form_type AND i.width = f.width AND i.pdf_version = f.pdf_version
+FROM pdf_info('test/data/hello.pdf') i JOIN consolidated_info f ON i.file = f.file;
+----
+true
+
+query I
+SELECT len(list(file)) FROM pdf_info('test/data/mixed_glob/*.pdf', ignore_errors := true);
+----
+2
+
+statement error
+SELECT page_count FROM pdf_info('test/data/mixed_glob/*.pdf');
+----
+
+# An unreadable single input is skipped only when explicitly requested.
+query I
+SELECT len(coalesce(list(file), [])) FROM pdf_info('test/data/does_not_exist.pdf', ignore_errors := true);
+----
+0
+
+statement ok
+SELECT pdf_encrypt('test/data/hello.pdf', '__TEST_DIR__/info_encrypted.pdf', 'secret');
+
+query III
+SELECT is_encrypted, is_locked, page_count
+FROM pdf_info('__TEST_DIR__/info_encrypted.pdf', password := 'secret');
+----
+true	false	1
