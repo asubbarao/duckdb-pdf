@@ -11,52 +11,52 @@ PRAGMA enable_verification
 
 # Returns non-empty text for hello.pdf
 query I
-SELECT length(pdf_to_text('test/data/hello.pdf')) > 0;
+SELECT length(pdf_text('test/data/hello.pdf')) > 0;
 ----
 true
 
 # Contains "Hello DuckDB" text
 query I
-SELECT contains(lower(pdf_to_text('test/data/hello.pdf')), 'hello duckdb');
+SELECT contains(lower(pdf_text('test/data/hello.pdf')), 'hello duckdb');
 ----
 true
 
 # table.pdf: physical layout should include column header words
 query I
-SELECT contains(lower(pdf_to_text('test/data/table.pdf', 'physical')), 'item');
+SELECT contains(lower(pdf_text('test/data/table.pdf', {layout: 'physical'})), 'item');
 ----
 true
 
 query I
-SELECT contains(lower(pdf_to_text('test/data/table.pdf', 'physical')), 'apples');
+SELECT contains(lower(pdf_text('test/data/table.pdf', {layout: 'physical'})), 'apples');
 ----
 true
 
 query I
-SELECT contains(lower(pdf_to_text('test/data/table.pdf', 'physical')), 'cherries');
+SELECT contains(lower(pdf_text('test/data/table.pdf', {layout: 'physical'})), 'cherries');
 ----
 true
 
 # reading layout also returns content
 query I
-SELECT contains(lower(pdf_to_text('test/data/hello.pdf', 'reading')), 'hello duckdb');
+SELECT contains(lower(pdf_text('test/data/hello.pdf', {layout: 'reading'})), 'hello duckdb');
 ----
 true
 
 # raw layout also returns content
 query I
-SELECT contains(lower(pdf_to_text('test/data/hello.pdf', 'raw')), 'hello duckdb');
+SELECT contains(lower(pdf_text('test/data/hello.pdf', {layout: 'raw'})), 'hello duckdb');
 ----
 true
 
 # two_pages.pdf: text contains content from both pages
 query I
-SELECT contains(lower(pdf_to_text('test/data/two_pages.pdf')), 'alpha');
+SELECT contains(lower(pdf_text('test/data/two_pages.pdf')), 'alpha');
 ----
 true
 
 query I
-SELECT contains(lower(pdf_to_text('test/data/two_pages.pdf')), 'beta');
+SELECT contains(lower(pdf_text('test/data/two_pages.pdf')), 'beta');
 ----
 true
 
@@ -64,19 +64,19 @@ true
 
 # pdftoxml-style document: per-page <page> elements wrapping <word> bboxes
 query I
-SELECT contains(pdf_to_xml('test/data/two_pages.pdf'), 'Alpha') AND contains(pdf_to_xml('test/data/two_pages.pdf'), '<page');
+SELECT contains(pdf_text('test/data/two_pages.pdf', {format: 'xml'}), 'Alpha') AND contains(pdf_text('test/data/two_pages.pdf', {format: 'xml'}), '<page');
 ----
 true
 
 # Beta content from the second page is present, and words carry bbox attrs
 query I
-SELECT contains(pdf_to_xml('test/data/two_pages.pdf'), 'Beta') AND contains(pdf_to_xml('test/data/two_pages.pdf'), 'xMin=');
+SELECT contains(pdf_text('test/data/two_pages.pdf', {format: 'xml'}), 'Beta') AND contains(pdf_text('test/data/two_pages.pdf', {format: 'xml'}), 'xMin=');
 ----
 true
 
 # Outer pdf2xml wrapper element is emitted
 query I
-SELECT contains(pdf_to_xml('test/data/two_pages.pdf'), '<pdf2xml>');
+SELECT contains(pdf_text('test/data/two_pages.pdf', {format: 'xml'}), '<pdf2xml>');
 ----
 true
 
@@ -84,13 +84,13 @@ true
 
 # Valid HTML document containing page content
 query I
-SELECT contains(pdf_to_html('test/data/two_pages.pdf'), 'Beta') AND contains(lower(pdf_to_html('test/data/two_pages.pdf')), '<html');
+SELECT contains(pdf_text('test/data/two_pages.pdf', {format: 'html'}), 'Beta') AND contains(lower(pdf_text('test/data/two_pages.pdf', {format: 'html'})), '<html');
 ----
 true
 
 # First-page content is present and the body/page structure is emitted
 query I
-SELECT contains(pdf_to_html('test/data/two_pages.pdf'), 'Alpha') AND contains(pdf_to_html('test/data/two_pages.pdf'), 'class="page"');
+SELECT contains(pdf_text('test/data/two_pages.pdf', {format: 'html'}), 'Alpha') AND contains(pdf_text('test/data/two_pages.pdf', {format: 'html'}), 'class="page"');
 ----
 true
 
@@ -98,49 +98,49 @@ true
 
 # A single page renders to an SVG document
 query I
-SELECT starts_with(trim(pdf_to_svg('test/data/two_pages.pdf', 1)), '<') AND contains(pdf_to_svg('test/data/two_pages.pdf', 1), '<svg');
+SELECT starts_with(trim(decode(pdf_render('test/data/two_pages.pdf', 1, {format: 'svg'}))), '<') AND contains(decode(pdf_render('test/data/two_pages.pdf', 1, {format: 'svg'})), '<svg');
 ----
 true
 
 # The page is embedded as a base64 PNG data URI (PNG magic bytes -> iVBORw0KGgo)
 query I
-SELECT contains(pdf_to_svg('test/data/two_pages.pdf', 1), 'data:image/png;base64,iVBORw0KGgo');
+SELECT contains(decode(pdf_render('test/data/two_pages.pdf', 1, {format: 'svg'})), 'data:image/png;base64,iVBORw0KGgo');
 ----
 true
 
 # Both pages render independently to valid PNG-embedded SVGs
 query I
-SELECT contains(pdf_to_svg('test/data/two_pages.pdf', 2), 'data:image/png;base64,iVBORw0KGgo');
+SELECT contains(decode(pdf_render('test/data/two_pages.pdf', 2, {format: 'svg'})), 'data:image/png;base64,iVBORw0KGgo');
 ----
 true
 
 # Optional dpi overload renders too (lower dpi -> smaller raster -> shorter output)
 query I
-SELECT contains(pdf_to_svg('test/data/two_pages.pdf', 1, 72), 'data:image/png;base64,iVBORw0KGgo')
-  AND length(pdf_to_svg('test/data/two_pages.pdf', 1, 72)) < length(pdf_to_svg('test/data/two_pages.pdf', 1, 150));
+SELECT contains(decode(pdf_render('test/data/two_pages.pdf', 1, {format: 'svg', dpi: 72})), 'data:image/png;base64,iVBORw0KGgo')
+  AND length(decode(pdf_render('test/data/two_pages.pdf', 1, {format: 'svg', dpi: 72}))) < length(decode(pdf_render('test/data/two_pages.pdf', 1, {format: 'svg', dpi: 150})));
 ----
 true
 
 # ── errors: missing file / out-of-range page ──────────────────────────────
 
 statement error
-SELECT pdf_to_xml('test/data/does_not_exist.pdf');
+SELECT pdf_text('test/data/does_not_exist.pdf', {format: 'xml'});
 ----
 
 statement error
-SELECT pdf_to_html('test/data/does_not_exist.pdf');
+SELECT pdf_text('test/data/does_not_exist.pdf', {format: 'html'});
 ----
 
 statement error
-SELECT pdf_to_svg('test/data/two_pages.pdf', 99);
+SELECT decode(pdf_render('test/data/two_pages.pdf', 99, {format: 'svg'}));
 ----
 
 statement error
-SELECT pdf_to_svg('test/data/two_pages.pdf', 0);
+SELECT decode(pdf_render('test/data/two_pages.pdf', 0, {format: 'svg'}));
 ----
 
 # ── error: missing file ───────────────────────────────────────────────────
 
 statement error
-SELECT pdf_to_text('test/data/does_not_exist.pdf');
+SELECT pdf_text('test/data/does_not_exist.pdf');
 ----

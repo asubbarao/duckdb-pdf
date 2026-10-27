@@ -11,14 +11,14 @@ PRAGMA enable_verification
 
 # At least one line returned
 query I
-SELECT COUNT(*) > 0 FROM read_pdf_lines('test/data/hello.pdf');
+SELECT COUNT(*) > 0 FROM read_pdf('test/data/hello.pdf', grain := 'line');
 ----
 true
 
 # Some line carries the expected content
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_lines('test/data/hello.pdf')
+FROM read_pdf('test/data/hello.pdf', grain := 'line')
 WHERE contains(lower(text), 'hello duckdb');
 ----
 true
@@ -26,7 +26,7 @@ true
 # filename column reflects the path
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_lines('test/data/hello.pdf')
+FROM read_pdf('test/data/hello.pdf', grain := 'line')
 WHERE NOT ends_with(lower(filename), 'hello.pdf');
 ----
 true
@@ -34,14 +34,14 @@ true
 # all lines on hello.pdf are page 1, and line numbers start at 1
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_lines('test/data/hello.pdf')
+FROM read_pdf('test/data/hello.pdf', grain := 'line')
 WHERE page != 1;
 ----
 true
 
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_lines('test/data/hello.pdf')
+FROM read_pdf('test/data/hello.pdf', grain := 'line')
 WHERE line = 1;
 ----
 true
@@ -50,14 +50,14 @@ true
 
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_lines('test/data/two_pages.pdf')
+FROM read_pdf('test/data/two_pages.pdf', grain := 'line')
 WHERE page = 1 AND contains(lower(text), 'alpha');
 ----
 true
 
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_lines('test/data/two_pages.pdf')
+FROM read_pdf('test/data/two_pages.pdf', grain := 'line')
 WHERE page = 2 AND contains(lower(text), 'beta');
 ----
 true
@@ -65,7 +65,7 @@ true
 # line numbering resets per page (line 1 exists on both pages)
 query I
 SELECT COUNT(DISTINCT page) = 2
-FROM read_pdf_lines('test/data/two_pages.pdf')
+FROM read_pdf('test/data/two_pages.pdf', grain := 'line')
 WHERE line = 1;
 ----
 true
@@ -74,7 +74,7 @@ true
 
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_lines('test/data/two_pages.pdf', first_page:=2)
+FROM read_pdf('test/data/two_pages.pdf', first_page:=2, grain := 'line')
 WHERE page = 1;
 ----
 true
@@ -82,5 +82,5 @@ true
 # ── error: missing file ───────────────────────────────────────────────────
 
 statement error
-SELECT * FROM read_pdf_lines('test/data/does_not_exist.pdf');
+SELECT * FROM read_pdf('test/data/does_not_exist.pdf', grain := 'line');
 ----

@@ -37,12 +37,12 @@ SELECT pdf_merge(['__TEST_DIR__/qm1.pdf'], NULL) IS NULL;
 true
 
 query I
-SELECT pdf_rotate(NULL, '__TEST_DIR__/nullrot.pdf', 90) IS NULL;
+SELECT pdf_pages(NULL, '__TEST_DIR__/nullrot.pdf', {rotate: 90}) IS NULL;
 ----
 true
 
 query I
-SELECT pdf_rotate('__TEST_DIR__/qm1.pdf', NULL, 90) IS NULL;
+SELECT pdf_pages('__TEST_DIR__/qm1.pdf', NULL, {rotate: 90}) IS NULL;
 ----
 true
 
@@ -128,7 +128,7 @@ true
 # ── pdf_rotate: multiples of 90 succeed, page count and text survive ─────────
 
 query I
-SELECT ends_with(pdf_rotate('__TEST_DIR__/qmerged.pdf', '__TEST_DIR__/qrot90.pdf', 90), 'qrot90.pdf');
+SELECT ends_with(pdf_pages('__TEST_DIR__/qmerged.pdf', '__TEST_DIR__/qrot90.pdf', {rotate: 90}), 'qrot90.pdf');
 ----
 true
 
@@ -144,7 +144,7 @@ true
 
 # explicit page range (qpdf-style numeric range string)
 query I
-SELECT ends_with(pdf_rotate('__TEST_DIR__/qmerged.pdf', '__TEST_DIR__/qrotsub.pdf', 180, '1-2'), 'qrotsub.pdf');
+SELECT ends_with(pdf_pages('__TEST_DIR__/qmerged.pdf', '__TEST_DIR__/qrotsub.pdf', {rotate: 180, rotate_pages: '1-2'}), 'qrotsub.pdf');
 ----
 true
 
@@ -155,7 +155,40 @@ SELECT max(page_count) FROM read_pdf('__TEST_DIR__/qrotsub.pdf');
 
 # negative multiples of 90 are fine too
 query I
-SELECT ends_with(pdf_rotate('__TEST_DIR__/qmerged.pdf', '__TEST_DIR__/qrotneg.pdf', -90, 'all'), 'qrotneg.pdf');
+SELECT ends_with(pdf_pages('__TEST_DIR__/qmerged.pdf', '__TEST_DIR__/qrotneg.pdf', {rotate: -90, rotate_pages: 'all'}), 'qrotneg.pdf');
+----
+true
+
+# Whole-document rotation keeps bookmarks and metadata. Range extraction has
+# its own contract and rotates the selected output pages.
+statement ok
+SELECT pdf_pages('test/data/outline.pdf', '__TEST_DIR__/rot_outline.pdf', {rotate: 90});
+
+query I
+SELECT list(title ORDER BY ord) = ['Root', 'Child', 'Action', 'Named']
+FROM pdf_objects('__TEST_DIR__/rot_outline.pdf', kind := 'outline');
+----
+true
+
+statement ok
+COPY (SELECT 'rotation metadata' AS body) TO '__TEST_DIR__/rot_metadata.pdf'
+  (FORMAT pdf, TITLE 'Keep this title', AUTHOR 'Keep this author', USE_TMP_FILE false);
+
+statement ok
+SELECT pdf_pages('__TEST_DIR__/rot_metadata.pdf', '__TEST_DIR__/rot_metadata_out.pdf', {rotate: 90});
+
+query I
+SELECT title = 'Keep this title' AND author = 'Keep this author'
+FROM pdf_info('__TEST_DIR__/rot_metadata_out.pdf');
+----
+true
+
+statement ok
+SELECT pdf_pages('test/data/two_pages.pdf', '__TEST_DIR__/extract_rot.pdf', '2', {rotate: 90});
+
+query I
+SELECT page_count = 1 AND rotation = 90
+FROM pdf_objects('__TEST_DIR__/extract_rot.pdf', kind := 'pages');
 ----
 true
 
@@ -163,7 +196,7 @@ true
 
 # non-multiple-of-90 rotation
 statement error
-SELECT pdf_rotate('__TEST_DIR__/qmerged.pdf', '__TEST_DIR__/qrot45.pdf', 45);
+SELECT pdf_pages('__TEST_DIR__/qmerged.pdf', '__TEST_DIR__/qrot45.pdf', {rotate: 45});
 ----
 degrees must be a multiple of 90
 
@@ -175,7 +208,7 @@ qpdf_no_such_input.pdf' does not exist
 
 # missing input file (rotate)
 statement error
-SELECT pdf_rotate('__TEST_DIR__/qpdf_no_such_input.pdf', '__TEST_DIR__/qnever.pdf', 90);
+SELECT pdf_pages('__TEST_DIR__/qpdf_no_such_input.pdf', '__TEST_DIR__/qnever.pdf', {rotate: 90});
 ----
 qpdf_no_such_input.pdf' does not exist
 
@@ -222,6 +255,6 @@ output path must differ from input path
 
 # rotate in place is refused (qpdf reads the source lazily during write)
 statement error
-SELECT pdf_rotate('__TEST_DIR__/qrot90.pdf', '__TEST_DIR__/qrot90.pdf', 90);
+SELECT pdf_pages('__TEST_DIR__/qrot90.pdf', '__TEST_DIR__/qrot90.pdf', {rotate: 90});
 ----
 output path must differ from input path

@@ -22,109 +22,111 @@ true
 # ── pdf_to_png(blob, page, dpi) ────────────────────────────────────
 
 query I
-SELECT octet_length(pdf_to_png((SELECT content FROM read_blob('test/data/hello.pdf')), 1, 72)) > 100;
+SELECT octet_length(pdf_render((SELECT content FROM read_blob('test/data/hello.pdf')), 1, {dpi: 72})) > 100;
 ----
 true
 
 query I
-SELECT pdf_to_png((SELECT content FROM read_blob('test/data/hello.pdf')), 1, 72)[1:4] = '\x89PNG'::BLOB;
+SELECT pdf_render((SELECT content FROM read_blob('test/data/hello.pdf')), 1, {dpi: 72})[1:4] = '\x89PNG'::BLOB;
 ----
 true
 
 # page out of range (1-based, same style as pdf_to_png)
 statement error
-SELECT pdf_to_png((SELECT content FROM read_blob('test/data/hello.pdf')), 0, 72);
+SELECT pdf_render((SELECT content FROM read_blob('test/data/hello.pdf')), 0, {dpi: 72});
 ----
 out of range
 
 statement error
-SELECT pdf_to_png((SELECT content FROM read_blob('test/data/hello.pdf')), 99, 72);
+SELECT pdf_render((SELECT content FROM read_blob('test/data/hello.pdf')), 99, {dpi: 72});
 ----
 out of range
 
 statement error
-SELECT pdf_to_png((SELECT content FROM read_blob('test/data/hello.pdf')), 1, 0);
+SELECT pdf_render((SELECT content FROM read_blob('test/data/hello.pdf')), 1, {dpi: 0});
 ----
 dpi must be between
 
-# ── tesseract_ocr on rendered page (optional OCR path) ──────────────────────
+# ── Scalar OCR on rendered page ────────────────────────────────────────────
 # Render a scanned page then OCR the PNG BLOB. Bundled eng model must work.
 
+statement ok
+SET VARIABLE ocr_png = (SELECT pdf_render(content, 1, {dpi: 150}) FROM read_blob('test/data/scanned.pdf'));
+
 query I
-SELECT length(tesseract_ocr(
-  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150)
-)) > 0;
+SELECT length(ocr_image(pdf_render(content, 1, {dpi: 150}))) > 0 FROM read_blob('test/data/scanned.pdf');
 ----
 true
 
 # lang + psm overloads bind
 query I
-SELECT length(tesseract_ocr(
-  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
-  'eng'
-)) > 0;
+SELECT length(ocr_image(getvariable('ocr_png'), {language: 'eng'})) > 0;
 ----
 true
 
 query I
-SELECT length(tesseract_ocr(
-  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
-  'eng',
-  3
-)) > 0;
+SELECT length(ocr_image(getvariable('ocr_png'), {language: 'eng', psm: 3})) > 0;
 ----
 true
 
 # richer positional overloads: oem + tessdata_dir + preprocess + vars MAP
 query I
-SELECT length(tesseract_ocr(
-  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
-  'eng', 3, 3, '', true,
-  MAP {'tessedit_char_whitelist': 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,;:''"!?-'}
-)) > 0;
+SELECT length(ocr_image(getvariable('ocr_png'), {language: 'eng', psm: 3, oem: 3, tessdata_dir: '', preprocess: true, vars: MAP {'tessedit_char_whitelist': 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,;:''"!?-'}})) > 0;
 ----
 true
 
 # full arity including empty config path
 query I
-SELECT length(tesseract_ocr(
-  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 150),
-  'eng', 3, 3, '', true,
-  MAP {},
-  ''
-)) > 0;
+SELECT length(ocr_image(getvariable('ocr_png'), {language: 'eng', psm: 3, oem: 3, tessdata_dir: '', preprocess: true, vars: MAP {}, config: ''})) > 0;
 ----
 true
 
 # bad psm / oem fail fast
 statement error
-SELECT tesseract_ocr(
-  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 72),
-  'eng', 99
-);
+SELECT ocr_image(getvariable('ocr_png'), {language: 'eng', psm: 99});
 ----
 psm must be between
 
 statement error
-SELECT tesseract_ocr(
-  pdf_to_png((SELECT content FROM read_blob('test/data/scanned.pdf')), 1, 72),
-  'eng', 3, 9
-);
+SELECT ocr_image(getvariable('ocr_png'), {language: 'eng', psm: 3, oem: 9});
 ----
 oem must be between
 
 # garbage image BLOB fails
 statement error
-SELECT tesseract_ocr('\x00\x01\x02\x03'::BLOB);
+SELECT ocr_image('\x00\x01\x02\x03'::BLOB);
 ----
 could not decode image BLOB
 
+# A column of distinct PDF pages remains row-wise: the scalar OCR takes the
+# rendered image in each row. NULL image and NULL option fields propagate.
+query I
+WITH images AS (
+  SELECT pdf_render(content, 1, {dpi: 150}) AS image FROM read_blob('test/data/scanned.pdf')
+  UNION ALL
+  SELECT pdf_render(content, 1, {dpi: 150}) AS image FROM read_blob('test/data/hello.pdf')
+), recognised AS (SELECT ocr_image(image) AS text FROM images)
+SELECT count(*) = 2 AND count(DISTINCT text) = 2 AND bool_and(length(text) > 0) FROM recognised;
+----
+true
+
+query I
+SELECT ocr_image(NULL::BLOB) IS NULL
+   AND ocr_image(getvariable('ocr_png'), {psm: NULL}) = ocr_image(getvariable('ocr_png'));
+----
+true
+
+query I
+SELECT contains(ocr_image(getvariable('ocr_png'), {format: 'hocr'}), 'ocr_');
+----
+true
+
 # ── ocr_image TVF: named params + format text|hocr|tsv ─────────────────────
-# TVF args must be foldable (no subqueries) — SET VARIABLE then getvariable().
+# TVF args must be foldable (no subqueries); use the stored PNG above.
 
 statement ok
 SET VARIABLE ocr_png = (
-  SELECT pdf_to_png(content, 1, 150) FROM read_blob('test/data/scanned.pdf')
+  SELECT pdf_render(content, 1, {dpi: 150}) FROM read_blob('test/data/scanned.pdf')
 );
 
 query III

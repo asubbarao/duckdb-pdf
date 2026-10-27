@@ -11,10 +11,10 @@ statement ok
 SET enable_external_access = false;
 
 statement ok
-SELECT pdf_compress('test/data/hello.pdf', '__TEST_DIR__/policy-allowed.pdf');
+SELECT pdf_rewrite('test/data/hello.pdf', '__TEST_DIR__/policy-allowed.pdf', {mode: 'compress'});
 
 statement error
-SELECT pdf_compress('test/data/hello.pdf', '__TEST_DIR__/policy-denied.pdf');
+SELECT pdf_rewrite('test/data/hello.pdf', '__TEST_DIR__/policy-denied.pdf', {mode: 'compress'});
 ----
 external access policy
 

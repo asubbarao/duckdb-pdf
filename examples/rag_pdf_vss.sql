@@ -1,8 +1,8 @@
 -- =============================================================================
--- RAG over a folder of PDFs in three statements — pdf_chunks + core vss
+-- RAG over a folder of PDFs in three statements — chunk grain + core vss
 -- =============================================================================
 -- The pdf extension is a deterministic reader/writer: it does NOT embed and
--- does NOT call models. This recipe shows the composition: pdf_chunks makes
+-- does NOT call models. This recipe shows the composition: the chunk grain makes
 -- retrieval-ready, section-aware chunks; YOU bring the embedder (any local
 -- model, API, or DuckDB UDF that yields a FLOAT[N]); DuckDB's core vss
 -- extension does the nearest-neighbor search.
@@ -20,7 +20,7 @@ LOAD pdf;
 --   nearest preceding heading — citation context for free.
 -- -----------------------------------------------------------------------------
 CREATE TABLE chunks AS
-FROM pdf_chunks('docs/*.pdf', chunk_size := 1200, overlap := 150);
+FROM read_pdf('docs/*.pdf', grain := 'chunk', chunk_size := 1200, overlap := 150);
 
 -- Sanity peek: sections found and chunk sizes
 SELECT file, heading, COUNT(*) AS chunks, MAX(n_chars) AS max_chars

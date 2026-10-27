@@ -18,21 +18,27 @@ true
 query I
 SELECT parameters[1] = 'files' AND list_contains(parameters, 'first_page')
        AND list_contains(parameters, 'last_page') AND list_contains(parameters, 'ocr_language')
+       AND list_contains(parameters, 'grain')
 FROM duckdb_functions() WHERE function_name = 'read_pdf';
 ----
 true
 
 query I
-SELECT len(coalesce(list(function_name), [])) = 0
-FROM duckdb_functions()
-WHERE function_name IN ('read_pdf_layout', 'read_pdf_meta', 'pdf_permissions', 'poppler_render_page');
+WITH expected AS (SELECT unnest(['read_pdf', 'read_pdf_words', 'pdf_info', 'pdf_objects',
+ 'pdf_text', 'pdf_render', 'pdf_merge', 'pdf_pages', 'pdf_split', 'pdf_stamp',
+ 'pdf_rewrite', 'pdf_redact', 'pdf_redact_lateral', 'pdf_sign', 'write_pdf',
+ 'to_pdf', 'ocr_image', 'pdf_ocr', 'poppler_version']) AS name),
+actual AS (SELECT DISTINCT function_name AS name FROM duckdb_functions()
+ WHERE starts_with(function_name, 'pdf_') OR starts_with(function_name, 'read_pdf')
+    OR starts_with(function_name, 'poppler_')
+    OR function_name IN ('tesseract_ocr', 'ocr_image', 'to_pdf', 'write_pdf'))
+SELECT NOT EXISTS (SELECT name FROM actual EXCEPT SELECT name FROM expected)
+   AND NOT EXISTS (SELECT name FROM expected EXCEPT SELECT name FROM actual);
 ----
 true
 
 query I
-SELECT len(list(DISTINCT function_name)) FROM duckdb_functions()
-WHERE starts_with(function_name, 'pdf_') OR starts_with(function_name, 'read_pdf')
-   OR starts_with(function_name, 'poppler_')
-   OR function_name IN ('tesseract_ocr', 'ocr_image', 'to_pdf', 'write_pdf');
+SELECT list_sort(list(DISTINCT function_type)) = ['scalar', 'table']
+FROM duckdb_functions() WHERE function_name = 'pdf_render';
 ----
-48
+true

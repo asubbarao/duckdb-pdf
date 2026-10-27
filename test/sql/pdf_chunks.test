@@ -44,34 +44,34 @@ TO '__TEST_DIR__/chunks_long.pdf' (FORMAT pdf);
 
 query IIII
 SELECT chunk_idx, page_start, page_end, n_chars = length(text)
-FROM pdf_chunks('__TEST_DIR__/chunks_med.pdf');
+FROM read_pdf('__TEST_DIR__/chunks_med.pdf', grain := 'chunk');
 ----
 1	1	1	true
 
 # Default chunk has no overlap prefix and starts at the document start
 query I
 SELECT starts_with(text, 'alpha bravo charlie')
-FROM pdf_chunks('__TEST_DIR__/chunks_med.pdf');
+FROM read_pdf('__TEST_DIR__/chunks_med.pdf', grain := 'chunk');
 ----
 true
 
 # No heading anywhere in this fixture -> heading is NULL
 query I
-SELECT heading IS NULL FROM pdf_chunks('__TEST_DIR__/chunks_med.pdf');
+SELECT heading IS NULL FROM read_pdf('__TEST_DIR__/chunks_med.pdf', grain := 'chunk');
 ----
 true
 
 # ── single element exceeding chunk_size: split at whitespace ─────────────────
 
 query I
-SELECT COUNT(*) > 1 FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50);
+SELECT COUNT(*) > 1 FROM read_pdf('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50, grain := 'chunk');
 ----
 true
 
 # SIZE INVARIANT (contract C5): n_chars <= chunk_size + overlap + 1
 query I
 SELECT COUNT(*) = 0
-FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50)
+FROM read_pdf('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50, grain := 'chunk')
 WHERE n_chars > 200 + 50 + 1;
 ----
 true
@@ -79,7 +79,7 @@ true
 # n_chars is the length of the full emitted text, overlap included
 query I
 SELECT COUNT(*) = 0
-FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50)
+FROM read_pdf('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50, grain := 'chunk')
 WHERE n_chars != length(text);
 ----
 true
@@ -87,7 +87,7 @@ true
 # chunk_idx is dense from 1
 query I
 SELECT MIN(chunk_idx) = 1 AND MAX(chunk_idx) = COUNT(*)
-FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50);
+FROM read_pdf('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50, grain := 'chunk');
 ----
 true
 
@@ -96,7 +96,7 @@ true
 query I
 SELECT COUNT(*) = 0 FROM (
   SELECT split_part(split_part(text, chr(10), -1), ' ', -1) AS last_word
-  FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50)
+  FROM read_pdf('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50, grain := 'chunk')
 ) WHERE last_word NOT IN ('alpha', 'bravo', 'charlie', 'delta', 'echo');
 ----
 true
@@ -106,7 +106,7 @@ true
 query I
 SELECT COUNT(*) = 0 FROM (
   SELECT text, LAG(text) OVER (ORDER BY chunk_idx) AS prev_text
-  FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50)
+  FROM read_pdf('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 50, grain := 'chunk')
 ) WHERE prev_text IS NOT NULL
     AND NOT (ends_with(prev_text, split_part(text, chr(10), 1))
              AND length(split_part(text, chr(10), 1)) BETWEEN 1 AND 50);
@@ -116,7 +116,7 @@ true
 # overlap := 0 disables the prefix entirely (single-line chunks here)
 query I
 SELECT COUNT(*) = 0
-FROM pdf_chunks('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 0)
+FROM read_pdf('__TEST_DIR__/chunks_long.pdf', chunk_size := 200, overlap := 0, grain := 'chunk')
 WHERE contains(text, chr(10)) OR n_chars > 200;
 ----
 true
@@ -126,19 +126,19 @@ true
 # Default params: whole caps doc fits one chunk; the first element IS the
 # first heading, so it attributes.
 query I
-SELECT heading FROM pdf_chunks('__TEST_DIR__/chunks_caps.pdf');
+SELECT heading FROM read_pdf('__TEST_DIR__/chunks_caps.pdf', grain := 'chunk');
 ----
 PROFESSIONAL SUMMARY
 
 # Small chunks: each chunk reports the section it starts in
 query I
-SELECT heading FROM pdf_chunks('__TEST_DIR__/chunks_caps.pdf', chunk_size := 120, overlap := 0)
+SELECT heading FROM read_pdf('__TEST_DIR__/chunks_caps.pdf', chunk_size := 120, overlap := 0, grain := 'chunk')
 WHERE contains(text, 'First summary paragraph');
 ----
 PROFESSIONAL SUMMARY
 
 query I
-SELECT heading FROM pdf_chunks('__TEST_DIR__/chunks_caps.pdf', chunk_size := 120, overlap := 0)
+SELECT heading FROM read_pdf('__TEST_DIR__/chunks_caps.pdf', chunk_size := 120, overlap := 0, grain := 'chunk')
 WHERE contains(text, 'Shipped many systems');
 ----
 CAREER HIGHLIGHTS
@@ -147,14 +147,14 @@ CAREER HIGHLIGHTS
 # ends a chunk — 'CAREER HIGHLIGHTS' starts the chunk that holds its body.
 query I
 SELECT COUNT(*) = 0
-FROM pdf_chunks('__TEST_DIR__/chunks_caps.pdf', chunk_size := 120, overlap := 0)
+FROM read_pdf('__TEST_DIR__/chunks_caps.pdf', chunk_size := 120, overlap := 0, grain := 'chunk')
 WHERE ends_with(text, 'PROFESSIONAL SUMMARY') OR ends_with(text, 'CAREER HIGHLIGHTS');
 ----
 true
 
 query I
 SELECT starts_with(text, 'CAREER HIGHLIGHTS')
-FROM pdf_chunks('__TEST_DIR__/chunks_caps.pdf', chunk_size := 120, overlap := 0)
+FROM read_pdf('__TEST_DIR__/chunks_caps.pdf', chunk_size := 120, overlap := 0, grain := 'chunk')
 WHERE contains(text, 'Shipped many systems');
 ----
 true
@@ -163,20 +163,20 @@ true
 
 query I
 SELECT MIN(page_start) = 1 AND MAX(page_end) = 2
-FROM pdf_chunks('test/data/two_pages.pdf');
+FROM read_pdf('test/data/two_pages.pdf', grain := 'chunk');
 ----
 true
 
 query I
 SELECT MAX(page_end) = 1
-FROM pdf_chunks('test/data/two_pages.pdf', last_page := 1);
+FROM read_pdf('test/data/two_pages.pdf', last_page := 1, grain := 'chunk');
 ----
 true
 
 # OCR options flow through the shared element builder.
 query I
 SELECT count() > 0
-FROM pdf_chunks('test/data/scanned.pdf', ocr := true);
+FROM read_pdf('test/data/scanned.pdf', ocr := true, grain := 'chunk');
 ----
 true
 
@@ -192,30 +192,30 @@ TO '__TEST_DIR__/chunks_glob2.pdf' (FORMAT pdf);
 
 query II
 SELECT COUNT(DISTINCT file), COUNT(*) FILTER (chunk_idx = 1)
-FROM pdf_chunks('__TEST_DIR__/chunks_glob*.pdf');
+FROM read_pdf('__TEST_DIR__/chunks_glob*.pdf', grain := 'chunk');
 ----
 2	2
 
 # ── validation ───────────────────────────────────────────────────────────────
 
 statement error
-SELECT * FROM pdf_chunks('__TEST_DIR__/chunks_med.pdf', chunk_size := 0);
+SELECT * FROM read_pdf('__TEST_DIR__/chunks_med.pdf', chunk_size := 0, grain := 'chunk');
 ----
 chunk_size
 
 statement error
-SELECT * FROM pdf_chunks('__TEST_DIR__/chunks_med.pdf', chunk_size := 100, overlap := 100);
+SELECT * FROM read_pdf('__TEST_DIR__/chunks_med.pdf', chunk_size := 100, overlap := 100, grain := 'chunk');
 ----
 overlap
 
 statement error
-SELECT * FROM pdf_chunks('test/data/no_such_file.pdf');
+SELECT * FROM read_pdf('test/data/no_such_file.pdf', grain := 'chunk');
 ----
 <REGEX>:.*test[/\\]data[/\\]no_such_file\.pdf.*
 
 # A byte budget smaller than a UTF-8 codepoint emits the whole codepoint.
 query I
 SELECT count(*) = 3 AND bool_and(text = 'é')
-FROM pdf_chunks('test/data/chunks_utf8.pdf', chunk_size := 1, overlap := 0);
+FROM read_pdf('test/data/chunks_utf8.pdf', chunk_size := 1, overlap := 0, grain := 'chunk');
 ----
 true

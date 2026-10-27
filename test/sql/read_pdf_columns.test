@@ -41,8 +41,7 @@ PRAGMA enable_verification
 # The weekday header survives as one line, in order.
 query I
 SELECT COUNT(*) = 1
-FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
-                    first_page := 2, last_page := 2)
+FROM read_pdf('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', first_page := 2, last_page := 2, grain := 'line')
 WHERE text = 'MON TUE WED THU FRI SAT SUN';
 ----
 true
@@ -52,8 +51,7 @@ true
 # matters is that nothing was invented to fill the leading cells.
 query I
 SELECT COUNT(*) = 1
-FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
-                    first_page := 2, last_page := 2)
+FROM read_pdf('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', first_page := 2, last_page := 2, grain := 'line')
 WHERE text = '1 2 3 4';
 ----
 true
@@ -61,8 +59,7 @@ true
 # A full row is whole.
 query I
 SELECT COUNT(*) = 1
-FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
-                    first_page := 2, last_page := 2)
+FROM read_pdf('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', first_page := 2, last_page := 2, grain := 'line')
 WHERE text = '5 6 7 8 9 10 11';
 ----
 true
@@ -71,8 +68,7 @@ true
 # vertical band.
 query I
 SELECT COUNT(*) = 1
-FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
-                    first_page := 2, last_page := 2)
+FROM read_pdf('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', first_page := 2, last_page := 2, grain := 'line')
 WHERE text = 'Prefix aliases allow you to formulate queries by first specifying the alias';
 ----
 true
@@ -90,8 +86,7 @@ true
 query I
 SELECT max(line) FILTER (NOT grid) < min(line) FILTER (grid) FROM (
   SELECT line, text LIKE 'MON%' OR left(text, 1) BETWEEN '0' AND '9' AS grid
-  FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
-                      first_page := 2, last_page := 2)
+  FROM read_pdf('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', first_page := 2, last_page := 2, grain := 'line')
 );
 ----
 true
@@ -110,8 +105,7 @@ true
 # column, not a splice of the two columns' first lines.
 query I
 SELECT COUNT(*) = 1
-FROM read_pdf_lines('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf',
-                    first_page := 4, last_page := 4)
+FROM read_pdf('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf', first_page := 4, last_page := 4, grain := 'line')
 WHERE text = 'deliver such feeds. Financial institutions have a variety of';
 ----
 true
@@ -124,25 +118,24 @@ true
 # grid rows shatter into single tokens and the line count jumps.
 query I
 SELECT COUNT(*) = 20
-FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
-                    first_page := 2, last_page := 2);
+FROM read_pdf('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', first_page := 2, last_page := 2, grain := 'line');
 ----
 true
 
 # ── the escape hatches still reach poppler ──────────────────────────────────
 
 query I
-SELECT contains(pdf_to_text('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', 'physical'), 'MON');
+SELECT contains(pdf_text('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', {layout: 'physical'}), 'MON');
 ----
 true
 
 query I
-SELECT contains(pdf_to_text('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', 'raw'), 'MON');
+SELECT contains(pdf_text('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', {layout: 'raw'}), 'MON');
 ----
 true
 
 query I
-SELECT contains(pdf_to_text('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', 'reading'), 'MON');
+SELECT contains(pdf_text('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', {layout: 'reading'}), 'MON');
 ----
 true
 
@@ -153,8 +146,7 @@ true
 # split.
 query I
 SELECT COUNT(*) = 1
-FROM read_pdf_lines('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf',
-                    first_page := 1, last_page := 1)
+FROM read_pdf('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf', first_page := 1, last_page := 1, grain := 'line')
 WHERE text = '“One Size Fits All”: An Idea Whose Time Has Come and Gone';
 ----
 true
@@ -238,8 +230,7 @@ THU	[1, 8, 15, 22, 29]
 query I
 SELECT COUNT(*) = 12 FROM (
   SELECT page
-  FROM read_pdf_lines('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf',
-                      first_page := 2, last_page := 13)
+  FROM read_pdf('https://blobs.duckdb.org/merch/duckdb-friendly-sql-calendar-2026.pdf', first_page := 2, last_page := 13, grain := 'line')
   WHERE text = 'MON TUE WED THU FRI SAT SUN'
 );
 ----

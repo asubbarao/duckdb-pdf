@@ -32,12 +32,12 @@ SELECT ends_with(write_pdf('Hello from native libharu write_pdf.' || chr(10) || 
 true
 
 query I
-SELECT contains(pdf_to_text('__TEST_DIR__/wp_basic.pdf'), 'Hello from native libharu');
+SELECT contains(pdf_text('__TEST_DIR__/wp_basic.pdf'), 'Hello from native libharu');
 ----
 true
 
 query I
-SELECT contains(pdf_to_text('__TEST_DIR__/wp_basic.pdf'), 'Second line here');
+SELECT contains(pdf_text('__TEST_DIR__/wp_basic.pdf'), 'Second line here');
 ----
 true
 
@@ -61,8 +61,8 @@ SELECT write_pdf(
 
 # substring contains (per task: no case-insens substr op)
 query I
-SELECT contains(pdf_to_text('__TEST_DIR__/roundtrip.pdf'), 'DistinctiveMarkerOne')
-   AND contains(pdf_to_text('__TEST_DIR__/roundtrip.pdf'), 'DistinctiveMarkerTwo');
+SELECT contains(pdf_text('__TEST_DIR__/roundtrip.pdf'), 'DistinctiveMarkerOne')
+   AND contains(pdf_text('__TEST_DIR__/roundtrip.pdf'), 'DistinctiveMarkerTwo');
 ----
 true
 
@@ -95,7 +95,7 @@ true
 
 # the temp file can be read back immediately (path is returned and usable)
 query I
-SELECT contains(pdf_to_text((SELECT write_pdf('Temp one arg roundtrip marker.'))), 'Temp one arg roundtrip marker');
+SELECT contains(pdf_text((SELECT write_pdf('Temp one arg roundtrip marker.'))), 'Temp one arg roundtrip marker');
 ----
 true
 

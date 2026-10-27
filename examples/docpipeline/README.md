@@ -18,19 +18,19 @@ Not hardcoded to any domain. Point `folder` at legal, medical, invoices, or any 
 
 | Piece | Detail |
 |-------|--------|
-| Binary | `./build/release/duckdb` from the duckdb-read_pdf repo root (pdf extension + tesseract OCR linked) |
+| Binary | `./build/release/duckdb` from the duckdb-pdf repo root (pdf extension + tesseract OCR linked) |
 | Extensions | `fts`, `vss` (core). The `pdf` / `read_pdf` extension is linked into the custom binary (or `LOAD 'build/release/extension/pdf/pdf.duckdb_extension'`). |
-| OCR runtime | Tesseract language data (`eng` etc.) on the host (`brew install tesseract tesseract-lang`) |
+| OCR runtime | English model bundled; other languages need their selected tessdata models |
 | Embeddings | Real model via `llm` / UDF preferred; recipe ships a **documented stub** so HNSW + hybrid still run |
 
-This recipe lives under `examples/docpipeline/` in the duckdb-read_pdf tree (SQL + README only).
+This recipe lives under `examples/docpipeline/` in the duckdb-pdf tree (SQL + README only).
 
 ---
 
 ## Quick start
 
 ```bash
-# From the duckdb-read_pdf repo root (after a release build):
+# From the duckdb-pdf repo root (after a release build):
 DUCK=./build/release/duckdb
 
 # 1. Put PDFs in a folder (or use shipped fixtures)
@@ -70,8 +70,8 @@ $DUCK -c "
 ### 1. INGEST — `read_pdf` + `read_pdf_words`
 
 ```sql
-FROM read_pdf(folder || '/*.pdf', auto_ocr := true, ignore_errors := true)
-FROM read_pdf_words(folder || '/*.pdf', auto_ocr := true)
+SELECT * FROM read_pdf(getvariable('folder') || '/*.pdf', auto_ocr := true, ignore_errors := true);
+SELECT * FROM read_pdf_words(getvariable('folder') || '/*.pdf', auto_ocr := true);
 ```
 
 | Column | Meaning |
@@ -85,14 +85,15 @@ FROM read_pdf_words(folder || '/*.pdf', auto_ocr := true)
 
 - `auto_ocr := true` (default behavior in this recipe) OCRs **only** pages without a usable text layer.
 - `ocr := true` forces OCR on every page (slower; use for damaged text layers).
-- OCR needs tessdata at runtime (`tessdata_dir` param or `TESSDATA_PREFIX` or system paths).
+- English tessdata is bundled. Other languages need model files (`tessdata_dir`, `TESSDATA_PREFIX` or system paths).
 - Scanned OCR can misread glyphs (e.g. `Item` → `ltem`); FTS still matches OCR’d tokens as emitted.
 
 ### 2. FTS — BM25 keyword / PII search
 
 ```sql
 PRAGMA create_fts_index('pages', 'id', 'text', overwrite=1);
-SELECT ..., fts_main_pages.match_bm25(id, 'SECRET-CODE-42') AS score ...
+SELECT id, fts_main_pages.match_bm25(id, 'SECRET-CODE-42') AS score
+FROM pages ORDER BY score DESC;
 ```
 
 **When to use FTS**
@@ -110,7 +111,8 @@ Chunks are page-level by default (fine for short pages; sub-chunk long docs). Em
 
 ```sql
 CREATE INDEX chunks_hnsw ON chunks USING HNSW (embedding);
-ORDER BY array_distance(embedding, qemb) LIMIT k;
+SELECT * FROM chunks
+ORDER BY array_distance(embedding, getvariable('qemb')) LIMIT 10;
 ```
 
 **When to use vector search**
@@ -135,12 +137,12 @@ One SQL query fuses BM25 ranks and vector ranks at `(file, page)` grain via `FUL
 
 ```sql
 SELECT word, x0, y0, x1, y1, source, confidence,
-       struct_pack(page := page, x := x0, y := y0, w := x1-x0, h := y1-y0) AS redact_rect
+       struct_pack(page := page, x := x0, y := y0, w := x1-x0, h := y1-y0) AS highlight_rect
 FROM words
-WHERE lower(word) = lower(:term);
+WHERE lower(word) = lower(getvariable('q_ocr_term'));
 ```
 
-Join any matched term (from FTS/hybrid hit) back to word geometry. Rects are ready for `pdf_redact` or UI highlight overlays. Works for digital `source='text'` **and** OCR `source='ocr'` words.
+Join any matched term (from FTS/hybrid hit) back to word geometry. These rectangles use displayed-page coordinates with a top-left origin and are suitable for UI highlight overlays. They are not directly ready for `pdf_redact`, which needs original PDF user-space coordinates with a bottom-left origin; account for crop boxes and rotation before redacting. Works for digital `source='text'` **and** OCR `source='ocr'` words.
 
 ---
 
@@ -160,7 +162,7 @@ examples/docpipeline/
 
 ## Test corpus
 
-Assembled under `corpus/` from `duckdb-read_pdf/test/data/` fixtures (reproducible, no network):
+Assembled under `corpus/` from `duckdb-pdf/test/data/` fixtures (reproducible, no network):
 
 | File | Kind |
 |------|------|

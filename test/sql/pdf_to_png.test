@@ -10,70 +10,70 @@ PRAGMA enable_verification
 # ── basic render + size + magic ─────────────────────────────────────────────
 
 query I
-SELECT octet_length(pdf_to_png('test/data/hello.pdf', 1)) > 100;
+SELECT octet_length(pdf_render('test/data/hello.pdf', 1)) > 100;
 ----
 true
 
 # PNG magic via slice (no case-insens substr op anywhere in this file)
 query I
-SELECT pdf_to_png('test/data/hello.pdf', 1)[1:4] = '\x89PNG'::BLOB;
+SELECT pdf_render('test/data/hello.pdf', 1)[1:4] = '\x89PNG'::BLOB;
 ----
 true
 
 # ── dpi scaling changes size (higher dpi = more bytes) ──────────────────────
 
 query I
-SELECT octet_length(pdf_to_png('test/data/hello.pdf', 1, 300)) > octet_length(pdf_to_png('test/data/hello.pdf', 1, 50));
+SELECT octet_length(pdf_render('test/data/hello.pdf', 1, {dpi: 300})) > octet_length(pdf_render('test/data/hello.pdf', 1, {dpi: 50}));
 ----
 true
 
 # ── dpi validation (1..2400) ────────────────────────────────────────────────
 
 statement error
-SELECT pdf_to_png('test/data/hello.pdf', 1, 0);
+SELECT pdf_render('test/data/hello.pdf', 1, {dpi: 0});
 ----
 dpi must be between
 
 statement error
-SELECT pdf_to_png('test/data/hello.pdf', 1, 2401);
+SELECT pdf_render('test/data/hello.pdf', 1, {dpi: 2401});
 ----
 dpi must be between
 
 # ── page validation (1-based, in range) ─────────────────────────────────────
 
 statement error
-SELECT pdf_to_png('test/data/hello.pdf', 0);
+SELECT pdf_render('test/data/hello.pdf', 0);
 ----
 out of range
 
 statement error
-SELECT pdf_to_png('test/data/hello.pdf', 99);
+SELECT pdf_render('test/data/hello.pdf', 99);
 ----
 out of range
 
 # ── BLOB overload ───────────────────────────────────────────────────────────
 
 query I
-SELECT octet_length(pdf_to_png((SELECT content FROM read_blob('test/data/hello.pdf')), 1)) > 100;
+SELECT octet_length(pdf_render((SELECT content FROM read_blob('test/data/hello.pdf')), 1)) > 100;
 ----
 true
 
 # ── garbage input (not a PDF) ───────────────────────────────────────────────
 
 statement error
-SELECT pdf_to_png('test/data/text_as_pdf.pdf', 1);
+SELECT pdf_render('test/data/text_as_pdf.pdf', 1);
 ----
 could not open
 
 # ── NULL propagation ────────────────────────────────────────────────────────
 
 query I
-SELECT pdf_to_png(NULL, 1) IS NULL;
+SELECT pdf_render(NULL, 1) IS NULL;
 ----
 true
 
 query I
-SELECT pdf_to_png('test/data/hello.pdf', NULL) IS NULL;
+SELECT pdf_render('test/data/hello.pdf', NULL) IS NULL;
 ----
 true
 
@@ -90,9 +90,9 @@ PRAGMA disable_verification
 query I
 SELECT bool_and(p[1:4] = '\x89PNG'::BLOB)
 FROM (
-  SELECT pdf_to_png('test/data/hello.pdf', 1) AS p
+  SELECT pdf_render('test/data/hello.pdf', 1) AS p
   UNION ALL
-  SELECT pdf_to_png('test/data/two_pages.pdf', 2) AS p
+  SELECT pdf_render('test/data/two_pages.pdf', 2) AS p
 );
 ----
 true

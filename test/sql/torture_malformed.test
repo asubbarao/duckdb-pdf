@@ -20,7 +20,7 @@ SELECT * FROM read_pdf('__TEST_DIR__/zero.pdf');
 could not open
 
 statement error
-SELECT * FROM read_pdf_lines('__TEST_DIR__/zero.pdf');
+SELECT * FROM read_pdf('__TEST_DIR__/zero.pdf', grain := 'line');
 ----
 could not open
 
@@ -30,29 +30,29 @@ SELECT * FROM read_pdf_words('__TEST_DIR__/zero.pdf');
 could not open
 
 statement error
-SELECT * FROM read_pdf_tables('__TEST_DIR__/zero.pdf');
+SELECT * FROM read_pdf('__TEST_DIR__/zero.pdf', grain := 'table');
 ----
 could not open
 
 # ── zero-byte on scalars ────────────────────────────────────────────────────
 
 statement error
-SELECT pdf_to_text('__TEST_DIR__/zero.pdf');
+SELECT pdf_text('__TEST_DIR__/zero.pdf');
 ----
 could not open
 
 statement error
-SELECT pdf_to_html('__TEST_DIR__/zero.pdf');
+SELECT pdf_text('__TEST_DIR__/zero.pdf', {format: 'html'});
 ----
 could not open
 
 statement error
-SELECT pdf_to_xml('__TEST_DIR__/zero.pdf');
+SELECT pdf_text('__TEST_DIR__/zero.pdf', {format: 'xml'});
 ----
 could not open
 
 statement error
-SELECT pdf_to_svg('__TEST_DIR__/zero.pdf', 1);
+SELECT decode(pdf_render('__TEST_DIR__/zero.pdf', 1, {format: 'svg'}));
 ----
 could not open
 
@@ -69,7 +69,7 @@ SELECT * FROM read_pdf('test/data/text_as_pdf.pdf');
 could not open
 
 statement error
-SELECT * FROM read_pdf_lines('test/data/text_as_pdf.pdf');
+SELECT * FROM read_pdf('test/data/text_as_pdf.pdf', grain := 'line');
 ----
 could not open
 
@@ -79,27 +79,27 @@ SELECT count(*) FROM read_pdf_words('test/data/text_as_pdf.pdf');
 could not open
 
 statement error
-SELECT * FROM read_pdf_tables('test/data/text_as_pdf.pdf');
+SELECT * FROM read_pdf('test/data/text_as_pdf.pdf', grain := 'table');
 ----
 could not open
 
 statement error
-SELECT pdf_to_text('test/data/text_as_pdf.pdf');
+SELECT pdf_text('test/data/text_as_pdf.pdf');
 ----
 could not open
 
 statement error
-SELECT pdf_to_html('test/data/text_as_pdf.pdf');
+SELECT pdf_text('test/data/text_as_pdf.pdf', {format: 'html'});
 ----
 could not open
 
 statement error
-SELECT pdf_to_xml('test/data/text_as_pdf.pdf');
+SELECT pdf_text('test/data/text_as_pdf.pdf', {format: 'xml'});
 ----
 could not open
 
 statement error
-SELECT pdf_to_svg('test/data/text_as_pdf.pdf', 1);
+SELECT decode(pdf_render('test/data/text_as_pdf.pdf', 1, {format: 'svg'}));
 ----
 could not open
 
@@ -123,7 +123,7 @@ SELECT * FROM read_pdf('test/data/garbage_header.pdf');
 could not open
 
 statement error
-SELECT length(pdf_to_xml('test/data/garbage_header.pdf')) > 0;
+SELECT length(pdf_text('test/data/garbage_header.pdf', {format: 'xml'})) > 0;
 ----
 could not open
 
@@ -135,7 +135,7 @@ SELECT * FROM read_pdf('test/data/does_not_exist_98765.pdf');
 open file
 
 statement error
-SELECT * FROM read_pdf_lines('test/data/does_not_exist_98765.pdf');
+SELECT * FROM read_pdf('test/data/does_not_exist_98765.pdf', grain := 'line');
 ----
 open file
 
@@ -145,19 +145,19 @@ SELECT * FROM read_pdf_words('test/data/does_not_exist_98765.pdf');
 open file
 
 statement error
-SELECT * FROM read_pdf_tables('test/data/does_not_exist_98765.pdf');
+SELECT * FROM read_pdf('test/data/does_not_exist_98765.pdf', grain := 'table');
 ----
 open file
 
 statement error
-SELECT pdf_to_text('test/data/does_not_exist_98765.pdf');
+SELECT pdf_text('test/data/does_not_exist_98765.pdf');
 ----
 open file
 
 statement error
-SELECT pdf_to_svg('test/data/does_not_exist_98765.pdf', 1);
+SELECT decode(pdf_render('test/data/does_not_exist_98765.pdf', 1, {format: 'svg'}));
 ----
-could not open
+Cannot open file
 
 # ── directory as path ───────────────────────────────────────────────────────
 
@@ -167,7 +167,7 @@ SELECT * FROM read_pdf('test/data');
 <REGEX>:.*test[/\\]data.*
 
 statement error
-SELECT * FROM read_pdf_lines('test/data');
+SELECT * FROM read_pdf('test/data', grain := 'line');
 ----
 <REGEX>:.*test[/\\]data.*
 
@@ -177,16 +177,16 @@ SELECT count(*) FROM read_pdf_words('test/data');
 <REGEX>:.*test[/\\]data.*
 
 statement error
-SELECT * FROM read_pdf_tables('test/data');
+SELECT * FROM read_pdf('test/data', grain := 'table');
 ----
 <REGEX>:.*test[/\\]data.*
 
 statement error
-SELECT length(pdf_to_html('test/data')) > 0;
+SELECT length(pdf_text('test/data', {format: 'html'})) > 0;
 ----
-could not open
+<REGEX>:.*test[/\\\\]data.*
 
 statement error
-SELECT pdf_to_svg('test/data', 1);
+SELECT decode(pdf_render('test/data', 1, {format: 'svg'}));
 ----
-could not open
+<REGEX>:.*test[/\\\\]data.*

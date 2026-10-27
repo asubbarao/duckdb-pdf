@@ -34,13 +34,13 @@ true
 # and ensure pdf readers do not crash when result concatenated with unicode
 
 query I
-SELECT length(pdf_to_text('test/data/hello.pdf')) > 0
+SELECT length(pdf_text('test/data/hello.pdf')) > 0
    AND length( chr(20013) || chr(25991) || chr(128512) ) > 0;
 ----
 true
 
 query I
-SELECT contains( pdf_to_text('test/data/hello.pdf') || chr(0) || 'x' , 'Hello' );
+SELECT contains( pdf_text('test/data/hello.pdf') || chr(0) || 'x' , 'Hello' );
 ----
 true
 
@@ -77,7 +77,7 @@ true
 # ── NUL embedding in expressions with pdf result ────────────────────────────
 
 query I
-SELECT length( pdf_to_text('test/data/hello.pdf', 'raw') || chr(0) || 'After' ) > 0;
+SELECT length( pdf_text('test/data/hello.pdf', {layout: 'raw'}) || chr(0) || 'After' ) > 0;
 ----
 true
 
@@ -90,7 +90,7 @@ true
 
 # also exercise lines/words on fixture
 query I
-SELECT (SELECT COUNT(*) > 0 FROM read_pdf_lines('test/data/hello.pdf', auto_ocr := false))
+SELECT (SELECT COUNT(*) > 0 FROM read_pdf('test/data/hello.pdf', auto_ocr := false, grain := 'line'))
    AND (SELECT COUNT(*) > 0 FROM read_pdf_words('test/data/hello.pdf', auto_ocr := false));
 ----
 true

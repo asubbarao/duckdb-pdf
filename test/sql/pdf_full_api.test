@@ -47,19 +47,19 @@ SELECT page_count FROM pdf_info('__TEST_DIR__/full_multi.pdf');
 # ── pdf_pages_info: per-page geometry / orientation / label ───────────────
 
 query I
-SELECT count(*) FROM pdf_pages_info('__TEST_DIR__/full_multi.pdf');
+SELECT count(*) FROM pdf_objects('__TEST_DIR__/full_multi.pdf', kind := 'pages');
 ----
 2
 
 query I
 SELECT bool_and(width > 0 AND height > 0 AND media_width > 0 AND crop_width > 0
                 AND orientation IS NOT NULL AND rotation IN (0, 90, 180, 270))
-FROM pdf_pages_info('__TEST_DIR__/full_multi.pdf');
+FROM pdf_objects('__TEST_DIR__/full_multi.pdf', kind := 'pages');
 ----
 true
 
 query I
-SELECT page_count FROM pdf_pages_info('__TEST_DIR__/full_multi.pdf') LIMIT 1;
+SELECT page_count FROM pdf_objects('__TEST_DIR__/full_multi.pdf', kind := 'pages') LIMIT 1;
 ----
 2
 
@@ -75,48 +75,48 @@ true
 # ── pdf_fonts: embedded font inventory (writer embeds Helvetica-ish fonts) ─
 
 query I
-SELECT count(*) >= 1 FROM pdf_fonts('__TEST_DIR__/full_a.pdf');
+SELECT count(*) >= 1 FROM pdf_objects('__TEST_DIR__/full_a.pdf', kind := 'fonts');
 ----
 true
 
 query I
 SELECT bool_and(type IS NOT NULL AND name IS NOT NULL)
-FROM pdf_fonts('__TEST_DIR__/full_a.pdf');
+FROM pdf_objects('__TEST_DIR__/full_a.pdf', kind := 'fonts');
 ----
 true
 
 # ── pdf_destinations: zero rows is fine (no named dests in writer output) ─
 
 query I
-SELECT count(*) FROM pdf_destinations('__TEST_DIR__/full_a.pdf');
+SELECT count(*) FROM pdf_objects('__TEST_DIR__/full_a.pdf', kind := 'destinations');
 ----
 0
 
 statement ok
-SELECT file, name, type, page FROM pdf_destinations('test/data/two_pages.pdf');
+SELECT file, name, type, page FROM pdf_objects('test/data/two_pages.pdf', kind := 'destinations');
 
 # ── pdf_outline smoke (existing inspect path still works) ─────────────────
 
 statement ok
-SELECT file, ord, depth, title FROM pdf_outline('__TEST_DIR__/full_a.pdf');
+SELECT file, ord, depth, title FROM pdf_objects('__TEST_DIR__/full_a.pdf', kind := 'outline');
 
 # ── pdf_page_images: render path for external / vision-LLM OCR ────────────
 
 query I
-SELECT count(*) FROM pdf_page_images('__TEST_DIR__/full_multi.pdf', dpi := 72);
+SELECT count(*) FROM pdf_render('__TEST_DIR__/full_multi.pdf', dpi := 72);
 ----
 2
 
 query I
 SELECT bool_and(octet_length(png) > 100 AND width > 0 AND height > 0 AND dpi = 72)
-FROM pdf_page_images('__TEST_DIR__/full_a.pdf', dpi := 72);
+FROM pdf_render('__TEST_DIR__/full_a.pdf', dpi := 72);
 ----
 true
 
 # PNG magic bytes: 89 50 4E 47 ...
 query I
 SELECT starts_with(hex(png), '89504E47')
-FROM pdf_page_images('__TEST_DIR__/full_a.pdf', dpi := 72);
+FROM pdf_render('__TEST_DIR__/full_a.pdf', dpi := 72);
 ----
 true
 
@@ -126,13 +126,13 @@ query I
 SELECT page_count = 2 AND object_count > 0 AND xref_total > 0
        AND is_encrypted = false AND stream_method = 'none'
        AND is_linearized = false
-FROM pdf_qpdf_info('__TEST_DIR__/full_multi.pdf');
+FROM pdf_info('__TEST_DIR__/full_multi.pdf', detail := 'qpdf');
 ----
 true
 
 # encrypt then inspect encryption details
 query I
-SELECT ends_with(pdf_encrypt('__TEST_DIR__/full_multi.pdf', '__TEST_DIR__/full_enc.pdf', 'secret'),
+SELECT ends_with(pdf_rewrite('__TEST_DIR__/full_multi.pdf', '__TEST_DIR__/full_enc.pdf', {mode: 'encrypt', password: 'secret'}),
                  'full_enc.pdf');
 ----
 true
@@ -140,32 +140,32 @@ true
 query I
 SELECT is_encrypted = true AND enc_R >= 4 AND stream_method IN ('aes', 'aesv3', 'rc4')
        AND allow_extract = true
-FROM pdf_qpdf_info('__TEST_DIR__/full_enc.pdf', password := 'secret');
+FROM pdf_info('__TEST_DIR__/full_enc.pdf', password := 'secret', detail := 'qpdf');
 ----
 true
 
 # ── pdf_json: structural dump contains qpdf key ───────────────────────────
 
 query I
-SELECT contains(pdf_json('__TEST_DIR__/full_a.pdf'), 'qpdf');
+SELECT contains(pdf_text('__TEST_DIR__/full_a.pdf', {format: 'json'}), 'qpdf');
 ----
 true
 
 query I
-SELECT length(pdf_json('__TEST_DIR__/full_a.pdf')) > 50;
+SELECT length(pdf_text('__TEST_DIR__/full_a.pdf', {format: 'json'})) > 50;
 ----
 true
 
 # ── pdf_repair: rewrite round-trip preserves page count ───────────────────
 
 query I
-SELECT ends_with(pdf_repair('__TEST_DIR__/full_multi.pdf', '__TEST_DIR__/full_repaired.pdf'),
+SELECT ends_with(pdf_rewrite('__TEST_DIR__/full_multi.pdf', '__TEST_DIR__/full_repaired.pdf', {mode: 'repair'}),
                  'full_repaired.pdf');
 ----
 true
 
 query I
-SELECT page_count FROM pdf_qpdf_info('__TEST_DIR__/full_repaired.pdf');
+SELECT page_count FROM pdf_info('__TEST_DIR__/full_repaired.pdf', detail := 'qpdf');
 ----
 2
 
@@ -211,12 +211,12 @@ true
 
 # Metadata-only projection and full PNG projection must agree on page count.
 query I
-SELECT count(*) = 2 FROM pdf_page_images('test/data/two_pages.pdf');
+SELECT count(*) = 2 FROM pdf_render('test/data/two_pages.pdf');
 ----
 true
 
 query I
-SELECT count(*) = 2 FROM pdf_page_images('test/data/two_pages.pdf')
+SELECT count(*) = 2 FROM pdf_render('test/data/two_pages.pdf')
 WHERE octet_length(png) > 0;
 ----
 true

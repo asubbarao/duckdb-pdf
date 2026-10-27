@@ -9,7 +9,7 @@ PRAGMA enable_verification
 
 query IIII
 SELECT tag, role, depth, parent_ord
-FROM pdf_structure('test/data/structure.pdf')
+FROM pdf_objects('test/data/structure.pdf', kind := 'structure')
 ORDER BY ord;
 ----
 Document	Document	0	NULL
@@ -28,7 +28,7 @@ CustomP	P	1	1
 
 query IIII
 SELECT page, alt, actual_text, lang
-FROM pdf_structure('test/data/structure.pdf')
+FROM pdf_objects('test/data/structure.pdf', kind := 'structure')
 WHERE tag IN ('Figure', 'P', 'Document')
 ORDER BY ord;
 ----
@@ -38,7 +38,7 @@ NULL	NULL	NULL	en-US
 
 query I
 SELECT mcids
-FROM pdf_structure('test/data/structure.pdf')
+FROM pdf_objects('test/data/structure.pdf', kind := 'structure')
 ORDER BY ord;
 ----
 []
@@ -57,19 +57,19 @@ ORDER BY ord;
 
 query I
 SELECT count(*)
-FROM pdf_structure('test/data/structure.pdf', first_page := 2, last_page := 2)
+FROM pdf_objects('test/data/structure.pdf', first_page := 2, last_page := 2, kind := 'structure')
 WHERE page = 2;
 ----
 6
 
 query I
 SELECT count(*)
-FROM pdf_structure('test/data/hello.pdf');
+FROM pdf_objects('test/data/hello.pdf', kind := 'structure');
 ----
 0
 
 query I
 SELECT count(*) = 1 AND min(tag) = 'Document'
-FROM pdf_structure('test/data/structure_cycle.pdf');
+FROM pdf_objects('test/data/structure_cycle.pdf', kind := 'structure');
 ----
 true

@@ -73,7 +73,7 @@ SELECT count(*) FROM read_pdf('__TEST_DIR__/redacted.pdf') WHERE text LIKE '%PAG
 # Always-on non-OCR proof the rebuilt page is a non-trivial PNG (not blank).
 query I
 SELECT octet_length(png) > 2000 AND starts_with(hex(png), '89504E47')
-FROM pdf_page_images('__TEST_DIR__/redacted.pdf', dpi := 72, first_page := 2, last_page := 2);
+FROM pdf_render('__TEST_DIR__/redacted.pdf', dpi := 72, first_page := 2, last_page := 2);
 ----
 true
 
@@ -210,7 +210,7 @@ SELECT * FROM pdf_redact('test/data/redact_form_secret.pdf', '__TEST_DIR__/redac
                          [{'page':1, 'x':0., 'y':0., 'w':612., 'h':792.}]);
 
 query I
-SELECT count(*) FROM pdf_form_fields('__TEST_DIR__/redacted_form.pdf');
+SELECT count(*) FROM pdf_objects('__TEST_DIR__/redacted_form.pdf', kind := 'form_fields');
 ----
 0
 

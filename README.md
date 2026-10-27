@@ -2,107 +2,86 @@
 
 **Everything PDF, in SQL.** A DuckDB community extension (`pdf`) that turns PDFs into tables and tables into PDFs: read text at every grain (page, line, word, layout element, retrieval chunk), inspect metadata / outlines / attachments / form fields / annotations / revisions / digital signatures, and do the everyday document operations people open Adobe Acrobat for — merge, split, rotate, compress, encrypt, decrypt, extract pages, write new PDFs. Built on [Poppler](https://poppler.freedesktop.org/) (parsing/rendering), [Tesseract](https://github.com/tesseract-ocr/tesseract) (OCR for scanned documents), [qpdf](https://qpdf.sourceforge.io/) (document surgery), and [libharu](https://github.com/libharu/libharu) (native PDF writing) — in the DuckDB process. Office conversion through `to_pdf` additionally requires LibreOffice at runtime.
 
-The table readers accept a single path **or a glob**, so the natural unit of work is a folder of PDFs:
 
-```sql
-INSTALL pdf FROM community; LOAD pdf;
-
--- census a folder: producer, page count, size, encryption — one row per file
-SELECT file, producer, page_count, is_encrypted, file_size
-FROM pdf_info('docs/*.pdf') ORDER BY file_size DESC;
-
--- full-text search the folder, with page numbers
-SELECT filename, page, text FROM read_pdf('docs/*.pdf') WHERE text ILIKE '%revenue%';
-
--- merge the folder into one PDF, then structurally compress it
-SELECT pdf_compress(
-         pdf_merge(list(file ORDER BY file), 'combined.pdf'),
-         'combined_small.pdf')
-FROM pdf_info('docs/*.pdf');
-
--- chunk everything for retrieval — one statement, section-aware
-CREATE TABLE chunks AS FROM pdf_chunks('docs/*.pdf');
-```
-
-For scans, OCR once with `pdf_ocr`, then read the searchable output with the
-ordinary PDF readers.
-
-> **See [COOKBOOK.md](COOKBOOK.md) for task-oriented recipes** — RAG ingestion,
-> full-text search, scanned-invoice OCR, quarantining broken files, signature
-> forensics, bulk document surgery, thumbnails, and reporting. This README is the
-> function-by-function reference.
-
-## Installation
-
-The DuckDB 2.0 readers use the engine's native multi-file scan and async read-ahead
-machinery. File opening and byte reads use the `async_threads` pool; decoding runs
-on query workers. Read tasks report their byte sizes to native read-ahead admission.
-`async_threads = 0` or `read_ahead_depth = 0` selects the native synchronous path.
-Reads check DuckDB's native deadline between bounded byte reads and before further
-filesystem requests. An HTTP HEAD request already in flight still follows the
-selected DuckDB HTTP transport's timeout and retry settings, as with native readers.
-Page scans preserve parallel page claiming and projection avoids text extraction
-and OCR when only metadata columns are needed. Inspection, word, line, layout,
-chunk, table, form, signature and image readers share the same file scheduler.
-Existing result schemas and strict/`ignore_errors` behavior remain unchanged.
-
-### Supported DuckDB host
-
-**DuckDB v2.0.0** — linux_amd64/arm64, osx_amd64/arm64, windows_amd64.
-
-### Community (signed)
-
-The community descriptor reviewed on 2026-10-26 publishes version **0.8.0**
-from commit `6535c81`, while this README describes current `main` for DuckDB
-2.0. The community artifact can therefore differ in functionality and host
-compatibility. Check the registry build for your DuckDB version; do not assume
-that source changes in this README have already been released.
+This branch consolidates the API from 48 names to **19 public names**. The changes
+are breaking: retired names are removed rather than retained as aliases. The
+community registry and released binaries may lag this source tree.
 
 ```sql
 INSTALL pdf FROM community;
 LOAD pdf;
+
+SELECT filename, page, text FROM read_pdf('docs/*.pdf');
+SELECT * FROM read_pdf('report.pdf', grain := 'table');
+SELECT * FROM pdf_objects('report.pdf', kind := 'outline');
+SELECT pdf_text('report.pdf', {format: 'markdown'});
+SELECT pdf_render('report.pdf', 1, {format: 'png', dpi: 150});
+SELECT page, png FROM pdf_render('report.pdf', first_page := 1, last_page := 2);
 ```
 
-For this source tree, use **DuckDB v2.0.0**. Registry artifacts depend on their published build. Or:
+See [COOKBOOK.md](COOKBOOK.md) for complete task recipes.
 
-```sql
-INSTALL pdf FROM 'https://community-extensions.duckdb.org';
-LOAD pdf;
-```
+## Public API
 
-### GitHub Release (offline / unsigned)
+Selectors on table functions are constant named arguments, resolved at bind time.
+They select a typed schema before planning. Unknown selectors and options that do
+not apply to the selected mode fail rather than being silently ignored.
+Scalar options are dynamically shaped STRUCTs: the binder checks recognized field
+names and field types, and execution checks which fields apply to the mode.
 
-```text
-pdf-duckdb-v2.0.0-linux_amd64.duckdb_extension
-pdf-duckdb-v2.0.0-windows_amd64.duckdb_extension
-pdf-duckdb-v2.0.0-osx_arm64.duckdb_extension
-…
-```
+| Name | Form | Purpose |
+|---|---|---|
+| `read_pdf` | Table | Page, line, element, table or chunk grain. |
+| `read_pdf_words` | Table | Positioned words and OCR provenance. |
+| `pdf_info` | Table | Basic metadata/permissions or detailed qpdf statistics. |
+| `pdf_objects` | Table | Eleven kinds of typed document objects. |
+| `pdf_text` | Scalar | Text, Markdown, HTML, XML or qpdf JSON. |
+| `pdf_render` | Scalar and table | One encoded page, streamed pages, or page-image export. |
+| `pdf_merge` | Scalar | Concatenate documents in list order. |
+| `pdf_pages` | Scalar | Extract/reorder pages or rotate a document. |
+| `pdf_split` | Table | Split by page or blank separator. |
+| `pdf_stamp` | Scalar | Watermark or Bates numbering. |
+| `pdf_rewrite` | Scalar | Compress, repair, encrypt or decrypt. |
+| `pdf_redact` | Table | Raster redaction with constant boxes and named options. |
+| `pdf_redact_lateral` | In-out table | Raster redaction with per-row inputs. |
+| `pdf_sign` | Table | Apply a detached CMS signature. |
+| `write_pdf` | Scalar | Native text-to-PDF writer. |
+| `to_pdf` | Scalar | Office conversion through LibreOffice. |
+| `ocr_image` | Scalar and table | Image OCR as text or a row with confidence. |
+| `pdf_ocr` | Table | Persist searchable OCR layers. |
+| `poppler_version` | Scalar | Linked Poppler version. |
 
-```sh
-curl -fsSL -o pdf.duckdb_extension \
-  "https://github.com/asubbarao/duckdb-pdf/releases/download/<tag>/pdf-duckdb-v2.0.0-osx_arm64.duckdb_extension"
-duckdb -unsigned -c "LOAD '$(pwd)/pdf.duckdb_extension';"
-```
+`COPY ... TO ... (FORMAT pdf)` remains available in addition to these names.
 
-## Read & extract
+## Reading
 
-Six table functions read a PDF at six grains, plus scalar converters for whole-document output. All of them take a single path or a glob; the extraction never leaves the DuckDB process.
+`read_pdf(files, grain := 'page', ...)` accepts a path or glob through DuckDB
+filesystems and secrets. The default page schema and `first_page`/`last_page`
+contract remain intact. Existing grain-specific column names are preserved;
+this consolidation does not silently rename `file` to `filename` or
+`page_number` to `page`.
 
-`read_pdf` uses native projection pushdown: metadata-only queries skip text
-extraction and OCR. Selecting `text`, `used_ocr` or `ocr_confidence` runs the OCR
-path when requested; selecting `has_text_layer` inspects embedded text without
-running OCR. Files still use DuckDB's filesystem and secrets for remote access.
+| Selection | Columns |
+|---|---|
+| `page` | `filename` VARCHAR, `page` INTEGER, `page_count` INTEGER, `text` VARCHAR, `width` DOUBLE, `height` DOUBLE, `has_text_layer` BOOLEAN, `used_ocr` BOOLEAN, `ocr_confidence` DOUBLE, `label` VARCHAR |
+| `line` | `filename` VARCHAR, `page` INTEGER, `line` INTEGER, `text` VARCHAR, `label` VARCHAR |
+| `element` | `file` VARCHAR, `page_number` INTEGER, `element_idx` INTEGER, `element_type` VARCHAR, `text` VARCHAR, `font_size` DOUBLE, `bbox_x0` DOUBLE, `bbox_y0` DOUBLE, `bbox_x1` DOUBLE, `bbox_y1` DOUBLE, `font_name` VARCHAR |
+| `table` | `filename` VARCHAR, `page` INTEGER, `table_index` INTEGER, `row_index` INTEGER, `cells` VARCHAR[] |
+| `chunk` | `file` VARCHAR, `chunk_idx` INTEGER, `text` VARCHAR, `page_start` INTEGER, `page_end` INTEGER, `n_chars` INTEGER, `heading` VARCHAR |
+| `words` | `filename` VARCHAR, `page` INTEGER, `word` VARCHAR, `x0` DOUBLE, `y0` DOUBLE, `x1` DOUBLE, `y1` DOUBLE, `font_name` VARCHAR, `font_size` DOUBLE, `source` VARCHAR, `confidence` DOUBLE, `line` INTEGER, `column_index` INTEGER, `page_width` DOUBLE, `page_height` DOUBLE, `label` VARCHAR |
 
-Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and `read_pdf_tables`:
+The `words` row above belongs to the separate `read_pdf_words(files, ...)`
+function. Its boxes use displayed-page points with a top-left origin; its
+`line` and `column_index` fields group words geometrically. `label` is a
+printed page label, which can be NULL.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `password` | VARCHAR | — | Password for encrypted files. |
 | `first_page` / `last_page` | INTEGER | full document | 1-based inclusive page range. |
-| `layout` | VARCHAR | `'auto'` | `read_pdf` / `read_pdf_lines` only: geometry-based `'auto'`, or Poppler `'reading'`, `'physical'` (column-preserving), or `'raw'` (content-stream order). |
-| `parse_tables` | BOOLEAN | false | On `read_pdf`, select physical layout. Accepted for compatibility but ignored by other readers. Use `read_pdf_tables` for table cells. |
-| `force` | BOOLEAN | false | `read_pdf_tables` only: return whitespace grids that fail its confidence gate. |
+| `layout` | VARCHAR | `'auto'` | page/line grains only: geometry-based `'auto'`, or Poppler `'reading'`, `'physical'` (column-preserving), or `'raw'` (content-stream order). |
+| `parse_tables` | BOOLEAN | false | On `read_pdf`, select physical layout. Accepted for compatibility but ignored by other readers. Use `read_pdf(..., grain := 'table')` for table cells. |
+| `force` | BOOLEAN | false | table grain only: return whitespace grids that fail its confidence gate. |
 | `ocr` | BOOLEAN | false | Force OCR on every page, even pages with a text layer. |
 | `auto_ocr` | BOOLEAN | true | OCR pages that have no extractable text layer. |
 | `ocr_language` | VARCHAR | `'eng'` | Tesseract model or `+`-separated model combination, such as `'eng+fra'`; all selected models must exist in the resolved model directory. |
@@ -113,1021 +92,265 @@ Common named parameters for `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and 
 | `tessdata_dir` | VARCHAR | auto-detected | Explicit Tesseract model directory (see [OCR support](#ocr-support)). |
 | `ocr_vars` | MAP(VARCHAR, VARCHAR) | — | Tess `SetVariable` key/values applied after Init (same surface as CLI `-c name=value`). |
 | `ocr_config` | VARCHAR | — | Path or tessdata config name for `ReadConfigFile` (applied after Init, before `ocr_vars`). |
-| `ignore_errors` | BOOLEAN | false | `read_pdf`, `pdf_info`, `pdf_outline`, `pdf_structure`: skip files that fail their reader's guarded load/extraction stage. |
+| `ignore_errors` | BOOLEAN | false | page grain, basic census, outline and structure kinds: skip files that fail their reader's guarded load/extraction stage. |
 
-`read_pdf_elements` and `pdf_chunks` accept the OCR options above, plus `password`, `first_page`, and `last_page` (`pdf_chunks` also has `chunk_size` / `overlap`). Their legacy default remains native-only; set `auto_ocr := true` or `ocr := true` to include OCR words.
+Element and chunk grains accept the OCR options above, plus `password`, `first_page`, and `last_page` (chunk grain also has `chunk_size` / `overlap`). Their legacy default remains native-only; set `auto_ocr := true` or `ocr := true` to include OCR words.
 
-### `read_pdf` — one row per page
 
-Columns: `filename`, `page`, `page_count`, `text`, `width`, `height` (page size in PDF points), `has_text_layer` (native embedded text is non-blank), `used_ocr` (Tesseract produced the returned text), `ocr_confidence` (Tess MeanTextConf 0–100 when `used_ocr`, else NULL), `label` (printed page label, or NULL). OCR and native word boxes use the same top-down page coordinates. OCR preprocessing does not deskew positioned-word or searchable-layer outputs, so their coordinates remain aligned with the original page.
 
-`has_text_layer` describes the PDF itself (true even when `ocr:=true` forced a re-OCR of a text page). `used_ocr` is true when the page had no extractable text and auto-OCR ran, or when `ocr:=true` forced OCR and the engine returned text. Together they make image-only vs embedded-text detection first-class:
+Grain selection keeps each reader's behavior. Page/line/word/table readers can
+auto-OCR blank text layers by default; element/chunk OCR is opt-in.
+`chunk_size` (default 1200) and `overlap` (default 150) are byte budgets;
+`n_chars` counts UTF-8 codepoints. Table extraction combines ruling-line and
+word-spacing heuristics; `force` bypasses its whitespace-table confidence gate.
+Element types are heading, paragraph, list_item and other.
+
+The DuckDB 2.0 native multi-file scan opens and reads files through async
+read-ahead, then decodes on query workers. Projection on the page reader and
+basic census skips unnecessary work. `async_threads = 0` or
+`read_ahead_depth = 0` selects synchronous reading. Interrupted reads check the
+native deadline between bounded byte reads; an in-flight HTTP request follows
+its transport timeout and retries. Windows serializes Poppler critical sections.
+
+## Inspection
+
+`pdf_info(files, detail := 'basic', password := '', ignore_errors := false)`
+returns the 33-column census. Missing metadata is NULL, and basic projection
+only inspects requested fields:
+
+```text
+file, title, author, subject, keywords, creator, producer, creation_date, mod_date,
+page_count, is_encrypted, is_linearized, pdf_version, width, height, file_size,
+pdfa_part, pdfa_conformance, is_locked, perm_print, perm_print_high_resolution,
+perm_change, perm_copy, perm_add_notes, perm_fill_forms, perm_accessibility,
+perm_assemble, has_javascript, form_type, page_mode, page_layout, permanent_id, update_id
+```
+
+`detail := 'qpdf'` returns qpdf's document statistics: page/object/xref counts,
+encryption methods and permission flags, password match flags, linearization
+checks and warning count. It accepts `password`; it rejects `ignore_errors`,
+which this implementation does not support.
+
+`pdf_objects(files, kind := ...)` requires one of the following kinds.
+All use native file scheduling and retain the prior object-specific schema:
+
+| Selection | Columns |
+|---|---|
+| `outline` | `file` VARCHAR, `ord` INTEGER, `depth` INTEGER, `title` VARCHAR, `page` INTEGER |
+| `structure` | `file` VARCHAR, `ord` INTEGER, `depth` INTEGER, `parent_ord` INTEGER, `tag` VARCHAR, `role` VARCHAR, `page` INTEGER, `alt` VARCHAR, `actual_text` VARCHAR, `lang` VARCHAR, `mcids` INTEGER[] |
+| `destinations` | `file` VARCHAR, `name` VARCHAR, `type` VARCHAR, `page` INTEGER, `left` DOUBLE, `bottom` DOUBLE, `right` DOUBLE, `top` DOUBLE, `zoom` DOUBLE, `change_left` BOOLEAN, `change_top` BOOLEAN, `change_zoom` BOOLEAN |
+| `fonts` | `file` VARCHAR, `page` INTEGER, `name` VARCHAR, `type` VARCHAR, `embedded` BOOLEAN, `subset` BOOLEAN, `font_file` VARCHAR |
+| `form_fields` | `file` VARCHAR, `page` INTEGER, `field_name` VARCHAR, `field_type` VARCHAR, `value` VARCHAR, `is_required` BOOLEAN |
+| `annotations` | `file` VARCHAR, `page` INTEGER, `subtype` VARCHAR, `contents` VARCHAR, `uri` VARCHAR, `rect_x0` DOUBLE, `rect_y0` DOUBLE, `rect_x1` DOUBLE, `rect_y1` DOUBLE |
+| `attachments` | `file` VARCHAR, `name` VARCHAR, `description` VARCHAR, `size` BIGINT, `mime_type` VARCHAR, `data` BLOB |
+| `images` | `file` VARCHAR, `page` INTEGER, `image_index` INTEGER, `name` VARCHAR, `width` INTEGER, `height` INTEGER, `bits_per_component` INTEGER, `colorspace` VARCHAR, `format` VARCHAR, `data` BLOB |
+| `signatures` | `file` VARCHAR, `field_name` VARCHAR, `subfilter` VARCHAR, `signing_time` TIMESTAMP, `signer_name` VARCHAR, `reason` VARCHAR, `location` VARCHAR, `covers_whole_file` BOOLEAN, `verified` BOOLEAN |
+| `revisions` | `revision_index` INTEGER, `startxref_offset` BIGINT, `eof_offset` BIGINT, `size_bytes` BIGINT, `is_incremental` BOOLEAN, `filename` VARCHAR |
+| `pages` | `file` VARCHAR, `page` INTEGER, `page_count` INTEGER, `width` DOUBLE, `height` DOUBLE, `media_width` DOUBLE, `media_height` DOUBLE, `crop_width` DOUBLE, `crop_height` DOUBLE, `rotation` INTEGER, `orientation` VARCHAR, `label` VARCHAR, `duration` DOUBLE |
+
+Password is supported for outline, structure, destinations, fonts, attachments,
+images, signatures, revisions and pages. Outline/structure accept `ignore_errors`;
+structure also accepts page bounds. Annotations and form_fields currently do not
+accept a password. A missing form value or widget page is NULL.
+`verified` checks CMS integrity, not certificate trust; whole-file coverage is
+reported separately. Revisions run oldest first. Image `format` describes the
+encoded or raw `data`; page rendering is a different operation.
+
+## Scalar conversion and rendering
 
 ```sql
--- Find scanned / image-only pages across a folder
-SELECT filename, page FROM read_pdf('docs/*.pdf', auto_ocr:=false)
-WHERE NOT has_text_layer;
-
--- Same pages, with OCR text filled in
-SELECT filename, page, text FROM read_pdf('docs/*.pdf')
-WHERE used_ocr;
+SELECT pdf_text('document.pdf');
+SELECT pdf_text(content, {format: 'text', layout: 'physical'}) FROM read_blob('document.pdf');
+SELECT pdf_text('document.pdf', {format: 'markdown'});
+SELECT pdf_text('document.pdf', {format: 'json', password: 'secret'});
+SELECT pdf_render('document.pdf', 1, {dpi: 200});
+SELECT decode(pdf_render('document.pdf', 1, {format: 'svg'}));
 ```
 
-The multi-file scan can process files and pages in parallel. On Windows, Poppler operations are protected by a shared mutex; OCR work can overlap outside those critical sections.
+`pdf_text(input [, options]) -> VARCHAR` accepts paths and BLOBs. The default
+format is text, with layout reading. Text layout accepts auto, reading, physical
+or raw. HTML/XML/JSON also accept password; layout is text-only. Markdown uses
+font/table geometry, performs no OCR and currently requires a path without a
+password option.
 
-By default one corrupt or password-protected file aborts the whole scan. Pass `ignore_errors := true` (also on `pdf_info`) to skip unopenable files and keep the good ones; the skipped set stays recoverable in SQL:
+`pdf_render(input, page [, options]) -> BLOB` accepts paths or BLOBs. Pages are
+one-based; options are `format` (png or svg, default png) and `dpi` (1–2400,
+default 150). Both formats return encoded bytes. SVG embeds a raster PNG rather
+than vector page operators; `decode(...)` turns those UTF-8 SVG bytes into text.
+
+The table form uses the same public name:
 
 ```sql
--- Which files were skipped?
-SELECT file FROM glob('docs/*.pdf')
-EXCEPT
-SELECT DISTINCT filename FROM read_pdf('docs/*.pdf', ignore_errors := true);
+SELECT page, png FROM pdf_render('docs/*.pdf', dpi := 150);
+SELECT page, svg FROM pdf_render('document.pdf', format := 'svg');
+SELECT * FROM pdf_render(['a.pdf', 'b.pdf'], output_dir := 'previews', format := 'png');
 ```
+
+In-memory rows contain `file, page, page_count, dpi, width, height, png`
+(`png BLOB`), or a final `svg VARCHAR` column for SVG. Page bounds and
+password are supported. Projection skips rendering if only page metadata is
+selected, and rendered rows stream one page at a time.
+
+With `output_dir`, rows are `file, page, out_path, width, height, bytes`.
+Output is written beneath `output_dir/<stem>/pN.png` or `pN.svg`; missing
+directories are created and duplicate input stems are rejected. The list input
+overload requires `output_dir`. Export side effects run during execution, so
+EXPLAIN does not write files. Width/height report raster pixels.
+
+## Document operations
+
+Writers act on local paths, check external-access permissions and publish each
+output atomically. Required NULL scalar arguments propagate NULL. A scalar
+option field set to NULL also propagates NULL after its name/mode is checked,
+except image OCR optional NULL fields retain their default behavior.
 
 ```sql
--- Read all pages of a single PDF
-SELECT page, text FROM read_pdf('report.pdf');
-
--- Search a folder of PDFs — parallel across files
-SELECT filename, page, text
-FROM read_pdf('docs/*.pdf')
-WHERE text ILIKE '%revenue%';
-
--- Count pages across a set of files
-SELECT filename, count(*) AS page_count
-FROM read_pdf('invoices/*.pdf')
-GROUP BY filename;
+SELECT pdf_merge(['a.pdf', 'b.pdf'], 'merged.pdf');
+SELECT pdf_pages('merged.pdf', 'excerpt.pdf', '1-3,7');
+SELECT pdf_pages('document.pdf', 'rotated.pdf', {rotate: 90});
+SELECT pdf_pages('document.pdf', 'part.pdf', '1-3', {rotate: 90, rotate_pages: '1'});
+SELECT * FROM pdf_split('document.pdf', 'pages');
+SELECT * FROM pdf_split('batch.pdf', 'parts', mode := 'blank', blank_threshold := 0.995);
+SELECT pdf_stamp('document.pdf', 'draft.pdf', {mode: 'watermark', text: 'DRAFT', opacity: 0.3});
+SELECT pdf_stamp('document.pdf', 'numbered.pdf', {mode: 'bates', prefix: 'DOC-', start: 1});
+SELECT pdf_rewrite('document.pdf', 'small.pdf', {mode: 'compress'});
+SELECT pdf_rewrite('document.pdf', 'locked.pdf', {mode: 'encrypt', password: 'reader', owner_password: 'owner'});
+SELECT pdf_rewrite('locked.pdf', 'plain.pdf', {mode: 'decrypt', password: 'reader'});
+SELECT pdf_rewrite('damaged.pdf', 'repaired.pdf', {mode: 'repair'});
 ```
 
-### `read_pdf_lines` — one row per line
+Whole-document `pdf_pages(input, output, {rotate: ...})` preserves the original
+document catalog, metadata and bookmarks. Optional `rotate_pages` defaults to
+all. The ranges overload extracts/reorders pages and then applies any rotation
+in the extracted output's page coordinates. Rotation must be a multiple of 90.
+Ranges use qpdf syntax, including `z` for the last page and `r2` for the
+second-to-last page.
 
-Columns: `filename`, `page`, `line` (1-based, reset per page), `text`, `label` (printed page label, or NULL). A PDF-aware analog of `read_lines`: grep a PDF the way you'd grep a text file, keeping page + line context.
+Page splitting returns `page, file`; blank splitting omits separators and
+returns `document, first_page, last_page, page_count, file`. The output
+directory must exist. Blank threshold must be in (0, 1].
+Compression is structural, without image downsampling. Encryption uses AES-256.
+Repair accepts an optional password. Watermark opacity defaults to 0.30 and must
+be in (0, 1]. Bates identifiers use a prefix and at least six decimal digits.
+
+`pdf_redact(input, output, boxes, dpi := 200, password := '')` accepts a list of
+`{page, x, y, w, h}` boxes in original PDF user-space points with a bottom-left
+origin. This differs from word-reader coordinates. It replaces affected pages
+with raster content and removes their underlying text; any redaction also drops
+forms, annotations, attachments, encryption and document metadata. It is not a
+content-stream redaction/sanitization engine. `pdf_redact_lateral` supports
+per-row inputs with fixed dpi 200 and empty password. Both return per-page rows.
+
+`pdf_sign(input, output, certificate, key, ...)` uses PEM files and supports
+`key_password, reason, location, signer_name, field_name, password`. Existing
+signed documents are rejected because incremental signing is not implemented.
+
+`write_pdf(content [, output_path])` typesets text in-process with libharu;
+without a path it returns a temporary file path. `COPY ... (FORMAT pdf)`
+typesets query rows with TITLE, AUTHOR, HEADER, FOOTER, FONT_SIZE, PAGE_SIZE and
+MARGIN options. FONT_SIZE/MARGIN must be finite and pass their range checks.
+
+`to_pdf(input_path [, output_path])` invokes LibreOffice directly without a
+shell. It needs a LibreOffice runtime; omitted output replaces the input suffix
+with .pdf. Office conversion is the only authoring operation needing that
+external application.
+
+## OCR
+
+`ocr_image(image_blob [, options]) -> VARCHAR` is the scalar form for per-row
+OCR. Options are language (eng), psm, oem, tessdata_dir, preprocess (true), vars
+(a MAP(VARCHAR,VARCHAR)), config, dpi (300), and format (text, hocr or tsv).
+The table form `ocr_image(image_blob, language := 'eng', ...)` returns one row
+`text, confidence, format` and accepts named options, including its existing
+lang/ocr_language and ocr_* spellings. Its input must be foldable; use the scalar
+form when the BLOB comes from a row.
 
 ```sql
-SELECT page, line, text
-FROM read_pdf_lines('report.pdf')
-ORDER BY page, line;
-
--- Grep across a directory of PDFs, keeping line context
-SELECT filename, page, line, text
-FROM read_pdf_lines('invoices/*.pdf')
-WHERE text ILIKE '%total due%';
+SELECT ocr_image(content, {language: 'eng', psm: 6}) FROM read_blob('scan.png');
+SELECT * FROM pdf_ocr('scan.pdf', 'searchable.pdf', first_page := 2, last_page := 5);
 ```
 
-### `read_pdf_words` — one row per word, with bounding boxes
+English tessdata is bundled. Resolution is explicit tessdata_dir, then
+TESSDATA_PREFIX, package-manager paths, and bundled English. An invalid explicit
+directory does not fall back. Combined languages such as eng+fra need every
+selected model. Explicit OCR fails when its model is missing; implicit reader
+auto-OCR is best-effort. Other languages need installed models.
 
-Columns: `filename`, `page`, `word`, `x0`, `y0`, `x1`, `y1` (PDF points; poppler-cpp `text_list` y is top-down on typical pages — smaller `y0` is higher on the page), `font_name`, `font_size`, `source`, `confidence`, **`line`** (1-based geometric line id within the page), **`page_width`** / **`page_height`** (rotated display crop-box size in points — same numbers as `read_pdf.width` / `height`), `label` (printed page label, or NULL).
+Reader OCR uses preprocessing and a low-confidence retry. Positioned-word and
+persisted text layers avoid deskew so coordinates remain aligned with the page.
+`ocr_vars` overrides Tesseract settings after config loading; unknown variables
+are ignored by Tesseract. `ocr_endpoint` is reserved and sends no HTTP request.
 
-The schema also includes `column_index`, the geometric column grouping within
-the page. The schema includes the printed page `label`.
+`pdf_ocr` honors page bounds but returns one status row per document page.
+Existing text pages are skipped unless force is true. Force adds another layer
+alongside original text and can produce duplicated extracted text. It requires
+Tesseract; reader compatibility knobs ocr, auto_ocr and parse_tables do not
+control this writer. Its output is a rewrite, not an incremental byte update.
 
-`line` clusters words with the same vertical-overlap rule as `read_pdf_elements` (≥ 50% of the shorter word height). Use it to equi-join marks to line context or rebuild lines in one Poppler walk:
+## Migration from 48 names
+
+| Previous names | Replacement |
+|---|---|
+| `read_pdf_lines`, `read_pdf_elements`, `read_pdf_tables`, `pdf_chunks` | `read_pdf(..., grain := 'line'/'element'/'table'/'chunk')` |
+| `pdf_qpdf_info` | `pdf_info(..., detail := 'qpdf')` |
+| `pdf_outline`, `pdf_structure`, `pdf_destinations`, `pdf_fonts`, `pdf_form_fields`, `pdf_annotations`, `pdf_attachments`, `pdf_images`, `pdf_signatures`, `pdf_revisions`, `pdf_pages_info` | `pdf_objects(..., kind := ...)`; see the kind/schema table. |
+| `pdf_to_text`, `pdf_to_markdown`, `pdf_to_html`, `pdf_to_xml`, `pdf_json` | `pdf_text(input, {format: ...})`; BLOB support retained except Markdown. |
+| `pdf_to_png`, `pdf_to_svg` | Scalar `pdf_render(input, page, {format: ... , dpi: ...})`; SVG now returns BLOB bytes, so use decode for VARCHAR. |
+| `pdf_page_images`, `pdf_write_page_images` | Table `pdf_render(files, ...)`; export directory is now the named output_dir option. |
+| `pdf_rotate` | `pdf_pages(input, output, {rotate: degrees, rotate_pages: range})` |
+| `pdf_split_blank` | `pdf_split(..., mode := 'blank')` |
+| `pdf_watermark`, `pdf_bates` | `pdf_stamp(input, output, {mode: ... , ...})` |
+| `pdf_compress`, `pdf_repair`, `pdf_encrypt`, `pdf_decrypt` | `pdf_rewrite(input, output, {mode: ... , ...})` |
+| `tesseract_ocr` | Scalar `ocr_image(blob, {language: ... , ...})` |
+
+The preceding 52-to-48 change also removed read_pdf_layout (use read_pdf_words),
+poppler_render_page (use scalar pdf_render), and read_pdf_meta/pdf_permissions
+(use pdf_info). For read_pdf_meta callers: filename became file, pages became
+page_count, encrypted became is_encrypted, and absent metadata became NULL.
+
+No sniff_pdf or pdf_help was added. Queryable help is already in the catalog:
 
 ```sql
--- Line grain derived from the word pin (no second read_pdf_lines walk)
-SELECT filename, page, line,
-       string_agg(word, ' ' ORDER BY x0) AS text
-FROM read_pdf_words('docs/*.pdf')
-GROUP BY filename, page, line
-ORDER BY filename, page, line;
+SELECT function_name, function_type, parameters, parameter_types,
+       return_type, description, examples
+FROM duckdb_functions()
+WHERE function_name IN ('read_pdf', 'read_pdf_words', 'pdf_info', 'pdf_objects', 'pdf_text', 'pdf_render', 'pdf_merge', 'pdf_pages', 'pdf_split', 'pdf_stamp', 'pdf_rewrite', 'pdf_redact', 'pdf_redact_lateral', 'pdf_sign', 'write_pdf', 'to_pdf', 'ocr_image', 'pdf_ocr', 'poppler_version')
+ORDER BY function_name, function_type, len(parameters);
 ```
 
-`page_width` / `page_height` remove the common max-bbox geometry hack (`max(x1)`, `max(y1)`). For page-only census without extracting words, prefer `pdf_pages_info` (media/crop/rotation/label) or `read_pdf` / `pdf_info`.
+Each registered overload has named positional parameters, descriptions and
+examples. Table options are typed catalog parameters. Scalar STRUCT fields are
+validated but are not expanded into individual catalog parameters.
 
-For scanned/image-only pages the words come from Tesseract's word-level iterator: `source` is `'ocr'` (vs `'text'` for native words) and `confidence` is a value in `[0, 100]` (`NULL` for native words). OCR words have `NULL` `font_name`/`font_size` — there is no font metadata in an image. OCR words also get `line` / page size.
+## Installation and building
 
-```sql
--- All words with coordinates + line association
-SELECT page, line, word, x0, y0, x1, y1, page_width, page_height
-FROM read_pdf_words('report.pdf')
-ORDER BY page, line, x0;
-
--- Words on the first geometric line of each page
-SELECT page, word, x0
-FROM read_pdf_words('report.pdf')
-WHERE line = 1
-ORDER BY page, x0;
-
--- OCR word boxes from a scanned document
-SELECT word, x0, y0, x1, y1, confidence, line
-FROM read_pdf_words('scan.pdf')
-WHERE source = 'ocr'
-ORDER BY page, line, x0;
-```
-
-> **Note:** `read_pdf_lines` uses geometry-based text under `layout := 'auto'`; other layouts split Poppler `page->text()` on newlines. Geometric `line` on words is the join key for bbox work; the line numbers may differ on multi-column or unusually spaced pages. Prefer words (+ optional `string_agg` lines) when you need both grains. Under `'auto'`, a line ending in a hyphen is joined to the next line of its column with the hyphen dropped, as `'reading'` does (the last line of a column or page keeps its hyphen); the words keep the split.
-
-### `read_pdf_tables` — structured table extraction
-
-Columns: `filename`, `page`, `table_index`, `row_index`, `cells` (a `VARCHAR[]` of the row's cells). Works on scanned PDFs too, via the OCR word layer.
-
-Two detectors run per page:
-
-- **Lattice (ruled) tables** — horizontal/vertical rule segments are collected from the page content streams and, when they form a usable grid, used as authoritative cell separators. Bordered tables are cut exactly along their lines, including cells whose text alignment alone would mis-cluster.
-- **Unruled tables** — a precision-first geometric heuristic (word bounding-box column clustering with a regularity gate, plus document-wide column-edge voting so **right-aligned numeric columns** cluster correctly). It favors not emitting spurious tables from prose over catching every table.
-
-By default, `read_pdf_tables` emits only whitespace grids that pass the confidence gate. Pass `force := true` to return the best-effort grid for an ambiguous page as well.
-
-Merged cells and borderless/sparse tables remain out of scope — see [Scope](#scope).
-
-```sql
--- Extract all tables from a PDF
-SELECT * FROM read_pdf_tables('financial_report.pdf');
-
--- Combine tables across a folder
-SELECT filename, page, table_index, row_index, cells
-FROM read_pdf_tables('docs/*.pdf')
-ORDER BY filename, page, table_index, row_index;
-```
-
-### `read_pdf_elements` — layout elements in reading order
-
-Columns: `file`, `page_number` (1-based), `element_idx` (1-based within page), `element_type`, `text`, `font_size` (dominant size of the element, `NULL` when the PDF carries no font info), `bbox_x0`, `bbox_y0`, `bbox_x1`, `bbox_y1`.
-
-Elements are built by deterministic geometry over the shared Poppler/Tesseract positioned word list — words cluster into lines by vertical overlap, lines into blocks by vertical gap (> 0.6× median line height), font-size (or OCR box-height) change (> 15%), or a list marker starting a line. Classification: `heading` = dominant font/box-height ≥ 1.15× the document/page body size and < 200 chars, OR a short ALL-CAPS block at any size; `list_item` = first line starts with a bullet glyph (`• – ▪ ● ○ ◦ ∙ ‣ ⁃ · ▸`, or `- ` / `* `) or an `N.` / `N)` marker (zero-width format chars after the marker — Google Docs `●<ZWSP>` / `1.<ZWSP>` — are skipped); `paragraph` = any other block of ≥ 3 words; `other` = the rest (page numbers, isolated fragments, and **running headers/footers**). A heading instance that sits in the top or bottom 12% of the page is demoted to `other` when the same text occupies that band on ≥ 5 pages (even/odd running titles). A mid-page cover byline with the same words stays a heading. OCR elements report `NULL` for `font_size` and `font_name`; table detection remains the job of `read_pdf_tables`.
-
-```sql
--- Document outline: just the headings
-SELECT page_number, text, font_size
-FROM read_pdf_elements('report.pdf')
-WHERE element_type = 'heading'
-ORDER BY page_number, element_idx;
-
--- Paragraph-grain extraction across a folder, keeping position
-SELECT file, page_number, element_idx, text, bbox_y0
-FROM read_pdf_elements('docs/*.pdf')
-WHERE element_type IN ('paragraph', 'list_item')
-ORDER BY file, page_number, element_idx;
-```
-
-### `pdf_chunks` — retrieval-ready chunking
-
-`pdf_chunks(files, chunk_size := 1200, overlap := 150)` packs the `read_pdf_elements` grain into retrieval-ready chunks. Columns: `file`, `chunk_idx` (1-based per file), `text`, `page_start`, `page_end`, `n_chars` (length of the emitted text, overlap included), and `heading` (text of the nearest preceding `heading` element — every chunk carries its section context; `NULL` before the first heading).
-
-Deterministic chunking rules (no ML, no tokenizers):
-
-1. Elements pack into a chunk in reading order until the next one would push the chunk past `chunk_size`.
-2. An element is never split across chunks — unless it alone exceeds `chunk_size`, in which case it splits at whitespace or a UTF-8 codepoint boundary. A codepoint larger than the byte budget is emitted whole.
-3. A `heading` never ends a chunk: it glues forward to start the next one, keeping headers attached to their section.
-4. Each chunk after the first is prefixed with up to `overlap` bytes of the previous chunk's text, trimmed to a whitespace boundary so no word is cut. `chunk_size` also budgets bytes; `n_chars` counts UTF-8 codepoints.
-
-```sql
--- One statement from a folder of PDFs to a chunk table
-CREATE TABLE chunks AS FROM pdf_chunks('docs/*.pdf');
-
--- Every chunk knows its section
-SELECT heading, chunk_idx, n_chars, text[:80]
-FROM pdf_chunks('report.pdf', chunk_size := 800, overlap := 100);
-```
-
-### Whole-document scalars: `pdf_to_text` / `markdown` / `html` / `xml` / `svg` / `png`
-
-Scalar converters return the whole document (or one rendered page) as a single value — useful in expressions, joins, and `COPY` pipelines.
-
-| Function | Signature | Returns |
-|---|---|---|
-| `pdf_to_text` | `(path_or_blob [, layout])` | Plain text; `layout` is `'reading'`, `'physical'`, or `'raw'`. |
-| `pdf_to_markdown` | `(path)` | GitHub-flavoured Markdown (headings, bold, bullets, pipe tables) — see below. Path form only. |
-| `pdf_to_html` | `(path_or_blob)` | Absolutely-positioned HTML. |
-| `pdf_to_xml` | `(path_or_blob)` | pdftoxml-style XML with per-word bounding boxes. |
-| `pdf_to_svg` | `(path_or_blob, page [, dpi])` | SVG embedding a base64 PNG raster of the page. Default DPI 150, range 1–2400. |
-| `pdf_to_png` | `(path_or_blob, page [, dpi])` | Raw PNG bytes as a `BLOB`. Same raster and DPI rules as `pdf_to_svg`. |
-| `pdf_write_page_images` | `(path_or_glob, out_dir [, dpi, first_page, last_page, password])` | **Table** — write each page as a PNG under `out_dir/<stem>/p{N}.png` (1-based, no zero-pad). Returns `(file, page, out_path, width, height, bytes)`. Same raster + bundled base-14 fonts as `pdf_page_images` / `pdf_to_png`. |
-
-**Paths go through DuckDB's FileSystem**, so `pdf_to_text('s3://...')` or `pdf_to_html('https://...')` work when `httpfs` (or another VFS) is loaded. **BLOB overloads** take the raw bytes directly — no filesystem involved:
-
-```sql
--- Full text of a PDF as one value
-SELECT pdf_to_text('report.pdf') AS full_text;
-
--- Physical layout preserves column alignment
-SELECT pdf_to_text('report.pdf', 'physical');
-
--- Materialize a folder into a text table
-CREATE TABLE doc_texts AS
-SELECT file, pdf_to_text(file) AS body
-FROM glob('docs/*.pdf');
-
--- BLOB roundtrip: bytes in, text out, no temp files
-SELECT pdf_to_text(content) FROM read_blob('report.pdf');
-
--- Render page 1 as a PNG; DPI controls raster size
-SELECT octet_length(pdf_to_png('report.pdf', 1))      AS png_150dpi,
-       octet_length(pdf_to_png('report.pdf', 1, 300)) AS png_300dpi;
-
--- Write page previews to disk (replaces pdftoppm loops): pages/report/p1.png, …
-SELECT file, page, out_path, width, height, bytes
-FROM pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100);
-```
-
-`pdf_to_markdown` converts using only Poppler's word-level geometry — no AI, no external tools, fully deterministic and local. It detects **headings** (font ≥ 1.15× body size, level by descending size rank), **tables** (aligned word columns emitted as GitHub pipe tables), **bold spans** (font name contains "Bold"), **lists** (same marker set as `read_pdf_elements`: `-` / `*` / `• – ▪ ● ○ ◦ ∙ ‣ ⁃ · ▸` / `N.` / `N)`, with Google Docs ZWSP skipped; unicode bullets emit as `- `), and **paragraphs** (consecutive same-indent lines merged). Pages are joined with `\n\n`; `NULL` input → `NULL` output; missing or encrypted files raise an error.
-
-```sql
-SELECT pdf_to_markdown('report.pdf') AS md;
-```
-
-### `pdf_page_images` — every page as a PNG BLOB (no `pdftoppm`)
-
-Table function for **in-process page previews**: one row per page with a rendered PNG, so vision / llm pipelines and thumbnails never need the Poppler CLI (`pdftoppm`) or a shell loop. Path or glob; named parameters `password`, `dpi` (default 150, range 1–2400), `first_page`, `last_page`.
-
-Columns: `file`, `page` (1-based), `page_count`, `dpi`, `width`, `height` (pixels from the PNG IHDR), `png` (`BLOB`).
-
-```sql
--- BLOB per page — handoff to a vision model / llm extension
-SELECT file, page, png FROM pdf_page_images('docs/*.pdf', dpi := 100);
-
--- Or the scalar for a single page
-SELECT pdf_to_png('a.pdf', 1, 100);
-```
-
-**Static file trees** (`pages/<stem>/pN.png` for Closure-style UIs): use `pdf_write_page_images` (pdf ≥ 0.7.7) — writes the whole tree in one call, creates `out_dir` + stem dirs, same raster/fonts as above. See [COOKBOOK §7](COOKBOOK.md#7-pdf--images-and-thumbnails-no-pdftoppm).
-
-```sql
-SELECT file, page, out_path, width, height, bytes
-FROM pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100);
--- → pages/report/p1.png, pages/report/p2.png, …
-```
-
-**Fonts (pdf ≥ 0.7.3):** community binaries bundle URW **base-14** substitute fonts (Helvetica / Times / Courier / Symbol / ZapfDingbats) and register them with Poppler at load, so page rasters should not come back blank on hosts without fontconfig/system display fonts. Same path powers `pdf_redact`, OCR rendering, and `pdf_write_page_images`.
-
-## Inspect
-
-These table functions answer "what is in this file?" without extracting body text. All take a path or glob; `password := '...'` is accepted by `pdf_info`, `pdf_outline`, `pdf_attachments`, `pdf_revisions`, `pdf_signatures`, and `pdf_images`.
-
-### `pdf_info` — full per-file census
-
-One row per file: identity metadata plus structural facts. Unset metadata keys and dates are `NULL`, never `''`. `width`/`height` are the first-page media box in points; `file_size` is bytes on disk.
-
-Columns: `file`, `title`, `author`, `subject`, `keywords`, `creator`, `producer`, `creation_date` (`TIMESTAMP`), `mod_date` (`TIMESTAMP`), `page_count`, `is_encrypted`, `is_linearized`, `pdf_version`, `width`, `height`, `file_size`, `pdfa_part` (`INTEGER`), `pdfa_conformance` (`VARCHAR`).
-
-`pdfa_part` and `pdfa_conformance` are read straight from the `pdfaid:part` / `pdfaid:conformance` claims in the document's XMP metadata packet — this is **detection only**, not validation. A file that merely declares `pdfaid:part=2, conformance=B` will report those values even if it does not actually conform to PDF/A. Both columns are `NULL` when the XMP packet is absent or carries no `pdfaid` claim.
-
-```sql
--- Census a folder of PDFs
-SELECT file, title, author, page_count, pdf_version, file_size
-FROM pdf_info('docs/*.pdf')
-ORDER BY file_size DESC;
-
--- Which tool produced what, and when
-SELECT producer, count(*) AS n, min(creation_date) AS earliest
-FROM pdf_info('docs/*.pdf')
-GROUP BY producer;
-```
-
-### `pdf_pages_info` — per-page geometry
-
-One row per page (not just first-page like `pdf_info.width`/`height`). Columns: `file`, `page`, `page_count`, `width`, `height` (crop box), `media_width`, `media_height`, `crop_width`, `crop_height`, `rotation` (0/90/180/270), `orientation`, `label`, `duration`. Prefer this when you need page size without extracting words; when you already pin `read_pdf_words`, use its `page_width`/`page_height` instead of a second open.
-
-```sql
-SELECT file, page, width, height, rotation, orientation
-FROM pdf_pages_info('docs/*.pdf')
-ORDER BY file, page;
-```
-
-### Migrating from the previous API
-
-This release removes four redundant function names; they are not kept as aliases.
-
-| Removed name | Replacement | Migration details |
-|---|---|---|
-| `read_pdf_layout(files, ...)` | `read_pdf_words(files, ...)` | Same 16 columns and options. |
-| `poppler_render_page(blob, page, dpi)` | `pdf_to_png(blob, page, dpi)` | Same PNG rendering; errors name `pdf_to_png`. |
-| `read_pdf_meta(files, ...)` | `pdf_info(files, ...)` | `filename` becomes `file`, `pages` becomes `page_count`, `encrypted` becomes `is_encrypted`; missing metadata is NULL. `ignore_errors` is supported. |
-| `pdf_permissions(files, ...)` | `pdf_info(files, ...)` | Select the same permission/document-feature fields from the expanded census. |
-
-`pdf_info` keeps its original 18 columns first and appends 15 fields:
-`is_locked`, `perm_print`, `perm_print_high_resolution`, `perm_change`,
-`perm_copy`, `perm_add_notes`, `perm_fill_forms`, `perm_accessibility`,
-`perm_assemble`, `has_javascript`, `form_type`, `page_mode`, `page_layout`,
-`permanent_id`, and `update_id`. It now accepts
-`pdf_info(files, password := '', ignore_errors := false)`.
-
-Projection pushdown inspects only requested fields. Metadata-only queries do
-not inspect JavaScript/forms, IDs, XMP or page geometry unless selected.
-`ignore_errors := true` skips files that fail opening; cancellation still
-interrupts the query.
-
-```sql
--- Preserve the former metadata projection explicitly when migrating.
-SELECT file AS filename, coalesce(title, '') AS title,
-       coalesce(author, '') AS author, page_count AS pages,
-       is_encrypted AS encrypted
-FROM pdf_info('docs/*.pdf', ignore_errors := true);
-
-SELECT file, perm_copy, perm_print, has_javascript, form_type
-FROM pdf_info('docs/*.pdf');
-```
-
-### `pdf_outline` — bookmarks / table of contents
-
-One row per bookmark, in depth-first document order. Files without an outline yield zero rows (not an error). Columns: `file`, `ord` (1-based document order), `depth` (1 = top level), `title`.
-
-```sql
--- Table of contents with indentation
-SELECT file, ord, repeat('  ', depth - 1) || title AS entry
-FROM pdf_outline('manual.pdf')
-ORDER BY ord;
-```
-
-### `pdf_attachments` — embedded files
-
-One row per embedded file; zero rows when there are none. `data` carries the attachment bytes as a `BLOB`; `size` is `NULL` when the PDF does not declare it. Columns: `file`, `name`, `description`, `size`, `mime_type`, `data`.
-
-```sql
--- What is embedded across a folder?
-SELECT file, name, mime_type, size
-FROM pdf_attachments('invoices/*.pdf');
-```
-
-### `pdf_form_fields` — AcroForm fields
-
-One row per form field. Columns: `file`, `page` (`NULL` if the field has no widget on any page), `field_name` (fully qualified), `field_type` (`'text'`/`'button'`/`'choice'`/`'signature'`, else qpdf's raw type name), `value` (`NULL` if unset), `is_required`.
-
-```sql
--- Every field in a folder of forms
-SELECT file, field_name, field_type, value, is_required
-FROM pdf_form_fields('forms/*.pdf');
-```
-
-### `pdf_annotations` — annotations and hyperlinks
-
-One row per page annotation. Columns: `file`, `page`, `subtype` (`Link`, `Highlight`, `Text`, `FreeText`, ...), `contents` (`NULL` if none), `uri` (populated for Link annotations with an `/A` `/URI` action), `rect_x0`, `rect_y0`, `rect_x1`, `rect_y1`.
-
-```sql
-SELECT page, subtype, contents FROM pdf_annotations('forms/*.pdf');
-
--- The hyperlink-extraction recipe
-SELECT file, page, uri
-FROM pdf_annotations('forms/*.pdf')
-WHERE subtype = 'Link';
-```
-
-### `pdf_revisions` — incremental-update forensics
-
-PDFs are append-only: editing a file with most tools adds an *incremental update* (a new body + xref + `%%EOF`) after the original bytes, leaving every earlier revision intact and recoverable. `pdf_revisions` enumerates those revisions by parsing the raw bytes (`startxref` / `%%EOF` markers and the trailer `/Prev` chain — classic xref tables and xref streams alike), oldest first.
-
-One row per revision. Columns: `revision_index` (0 = original document), `startxref_offset`, `eof_offset` (byte offset just past this revision's `%%EOF`), `size_bytes` (bytes this revision added), `is_incremental` (`false` only for revision 0), and `filename`.
-
-```sql
--- Has this contract been modified after it was first written?
-SELECT count(*) - 1 AS updates_after_original
-FROM pdf_revisions('contract.pdf');
-
--- Timeline of what each edit added
-SELECT revision_index, size_bytes, eof_offset
-FROM pdf_revisions('contract.pdf')
-ORDER BY revision_index;
-```
-
-A single-revision file yields exactly one row. Truncating a file at any earlier `eof_offset` reconstructs that revision — useful for "what did this document say before the last edit?" forensics.
-
-### `pdf_signatures` — digital signatures: detect + verify
-
-One row per filled AcroForm signature field (unsigned files and empty signature fields yield zero rows, not an error). Columns: `file`, `field_name`, `subfilter` (e.g. `adbe.pkcs7.detached`), `signing_time` (`TIMESTAMP`), `signer_name`, `reason`, `location`, `covers_whole_file`, `verified`.
-
-`verified` is a real cryptographic check: the detached CMS/PKCS#7 blob (`/Contents`) is verified with OpenSSL over the exact `/ByteRange` spans it signs. It attests **integrity** — the signed bytes have not been altered — but does not validate certificate-chain trust (no CA store is consulted). `covers_whole_file = false` means the file was extended after signing (see `pdf_revisions`): the signature can still verify over its own range while later revisions changed the visible document.
-
-```sql
--- Are these contracts signed, by whom, and are the signatures intact?
-SELECT file, signer_name, signing_time, verified, covers_whole_file
-FROM pdf_signatures('contracts/*.pdf');
-
--- Signed-then-modified documents (signature valid but not covering the file)
-SELECT file, field_name
-FROM pdf_signatures('contracts/*.pdf')
-WHERE verified AND NOT covers_whole_file;
-```
-
-### `pdf_images` — extract embedded raster images
-
-One row per embedded image XObject per page — the **actual stored raster** (the JPEG a scanner wrote, the bitmap an editor placed), not a render of the page. Files with no images yield zero rows, not an error. Columns: `file`, `page` (1-based), `image_index` (1-based within page), `name` (resource name, e.g. `Im0`), `width`, `height`, `bits_per_component`, `colorspace` (raw PDF name, e.g. `DeviceRGB`), `format`, `data` (`BLOB`).
-
-`format` tells you what `data` holds, and every value is directly usable:
-
-| `format` | Source filter | `data` contents |
-| --- | --- | --- |
-| `jpeg` | `/DCTDecode` | Raw JPEG (JFIF) bytes, passed through (any earlier `/FlateDecode` is undone, the JPEG layer preserved). |
-| `jp2` | `/JPXDecode` | Raw JPEG-2000 codestream. |
-| `ccitt` | `/CCITTFaxDecode` | Raw fax-encoded bytes (qpdf does not decode CCITT). |
-| `png` | `/FlateDecode`, `/RunLengthDecode`, `/LZWDecode`, none | Fully decoded samples re-wrapped as a PNG. Applies to `DeviceGray`/`CalGray` (1- or 8-bit) and `DeviceRGB`/`CalRGB` (8-bit). |
-| `raw` | any of the above decodable filters | Decoded sample bytes with no container, used when the colorspace/bit depth can't be losslessly wrapped as PNG (`DeviceCMYK`, `Indexed`, `ICCBased`, image masks, exotic depths). |
-
-```sql
--- Inventory every embedded image across a folder
-SELECT file, page, image_index, width, height, colorspace, format,
-       octet_length(data) AS bytes
-FROM pdf_images('scans/*.pdf')
-ORDER BY file, page, image_index;
-
--- Dump each image to its own file (extension follows the format)
-COPY (
-  SELECT data,
-         format('extracted/{}_p{}_i{}.{}', regexp_replace(file, '.*/', ''),
-                page, image_index,
-                CASE format WHEN 'jpeg' THEN 'jpg' WHEN 'jp2' THEN 'jp2'
-                            WHEN 'png' THEN 'png' ELSE 'bin' END) AS path
-  FROM pdf_images('scans/invoice.pdf')
-) TO 'extracted' (FORMAT parquet);  -- or iterate rows and write_blob(path, data)
-```
-
-The `png`/`jpeg` rows drop straight into DuckDB's image tooling or any downstream writer; `raw` rows need the `colorspace`/`bits_per_component`/`width`/`height` columns to interpret the sample bytes.
-
-## Transform & write
-
-Document-level operations powered by qpdf are content-preserving structural transforms — no rasterization, no re-typesetting; page content streams are carried over byte-identically. Conventions shared by all of them: **local filesystem paths exactly as given**; an existing output file is overwritten (`COPY TO` semantics); a missing output *directory* is an error, never created; in-place operation (`input == output`) is refused because qpdf reads the source lazily during the write. Scalars return the output path, which makes them composable — the output of one is the input of the next.
-
-### `pdf_merge` / `pdf_split` / `pdf_rotate` / `pdf_pages`
-
-```sql
--- merge: pages concatenate in list order
-SELECT pdf_merge(['a.pdf', 'b.pdf', 'c.pdf'], 'combined.pdf');
-
--- the glob recipe: build the input list in SQL
-SELECT pdf_merge(list(DISTINCT filename ORDER BY filename), 'combined.pdf')
-FROM read_pdf('docs/*.pdf');
-
--- split: one single-page PDF per page -> out/<stem>_p<N>.pdf (N zero-padded
--- to the page-count width); returns one row per emitted file
-SELECT page, file FROM pdf_split('combined.pdf', 'out');
-
--- rotate: degrees must be a multiple of 90 (added to each page's existing
--- rotation); pages is 'all' (default) or a qpdf-style range ('1-3,7', 'z' = last)
-SELECT pdf_rotate('scan.pdf', 'upright.pdf', 90);
-SELECT pdf_rotate('scan.pdf', 'upright2.pdf', -90, '1');
-
--- pages: extract a subset into a new document, in range order (qpdf range
--- grammar: '1-3,7', 'z' = last page, 'r2' = second-to-last; repeats allowed)
-SELECT pdf_pages('report.pdf', 'summary.pdf', '1');
-```
-
-### `pdf_split_blank` — mailroom batch splitting on blank-page separators
-
-An office scanner often produces ONE PDF that is really N documents separated by blank sheets dropped in as dividers. `pdf_split_blank` detects those separator pages (no extractable text **and** a (near-)white raster — text-empty alone would false-positive on a full-page-image scan) and writes each logical document to its own file, dropping the separators.
-
-```sql
--- batch.pdf = [invoice A (2pp), blank, invoice B (1pp), blank, blank, invoice C (1pp)]
--- -> 3 documents written to out/<stem>_doc<K>.pdf; separators are dropped, never emitted as empty docs
-SELECT document, first_page, last_page, page_count, file
-FROM pdf_split_blank('batch.pdf', 'out');
-
--- tune sensitivity: raise blank_threshold to require an even purer white page
--- before treating it as a separator (default 0.995 = 99.5% near-white pixels)
-SELECT * FROM pdf_split_blank('batch.pdf', 'out', blank_threshold := 0.999);
-```
-
-### `pdf_compress` / `pdf_encrypt` / `pdf_decrypt`
-
-```sql
--- compress: object-stream generation + stream recompression + linearization
--- ("fast web view"). This optimizes document STRUCTURE and stream encoding;
--- it does NOT downsample or re-encode images — a scan-heavy PDF will not
--- shrink much.
-SELECT pdf_compress('report.pdf', 'report_small.pdf');
-
--- encrypt: AES-256 (R6, the only password scheme the PDF 2.0 spec still
--- endorses), all permissions allowed. Omitted owner password falls back to
--- the user password. Uses qpdf's built-in crypto — no external library.
-SELECT pdf_encrypt('report.pdf', 'report_locked.pdf', 'user-secret');
-SELECT pdf_encrypt('report.pdf', 'report_locked2.pdf', 'user-secret', 'owner-secret');
-
--- decrypt: open with the (user or owner) password, write a plain copy.
--- A wrong password raises an Invalid Input error ("invalid password").
-SELECT pdf_decrypt('report_locked.pdf', 'report_plain.pdf', 'user-secret');
-```
-
-Encrypted files stay readable in place, too — every reader takes `password := '...'`:
-
-```sql
-SELECT page, text FROM read_pdf('report_locked.pdf', password := 'user-secret');
-```
-
-### `pdf_watermark` / `pdf_bates`
-
-Both stamp **real, selectable text** on top of every page (a Helvetica text run appended to each page's content stream), so the stamp survives into the extracted text layer and is searchable — not a flattened raster. Each page is sized and positioned from its own MediaBox, so mixed-size documents stamp correctly.
-
-```sql
--- watermark: a large 45° diagonal gray "DRAFT" centered across every page.
--- 3-arg form uses the default opacity (0.30); the 4-arg form takes an explicit
--- fill alpha in (0, 1].
-SELECT pdf_watermark('report.pdf', 'report_draft.pdf', 'DRAFT');
-SELECT pdf_watermark('report.pdf', 'report_faint.pdf', 'CONFIDENTIAL', 0.15);
-
--- bates: legal-style Bates numbering — prefix + a zero-padded (min 6 digits)
--- sequential number at the bottom-right of each page, incrementing per page.
--- Page 1 -> ACME000100, page 2 -> ACME000101, ...
-SELECT pdf_bates('deposition.pdf', 'deposition_stamped.pdf', 'ACME', 100);
-```
-
-### `pdf_sign` — apply a digital signature
-
-`pdf_sign(input, output, cert_path, key_path)` adds an `adbe.pkcs7.detached` PKCS#7/CMS signature and writes the signed document to `output`. It is the inverse of `pdf_signatures` (above): the two form a closed loop — anything `pdf_sign` writes verifies back through `pdf_signatures` with `covers_whole_file = true` and `verified = true`. It is a single-row table function returning `{output, field_name}`.
-
-`cert_path` and `key_path` are **PEM** files — an X.509 certificate and its RSA/EC private key (PKCS#8 or PKCS#1). A self-signed pair is fine; the signature attests integrity, not certificate-chain trust (mirroring what `pdf_signatures` checks). Generate one with:
-
-```sh
-openssl genrsa -out key.pem 2048
-openssl req -new -x509 -key key.pem -out cert.pem -days 3650 -subj '/CN=Your Name'
-```
-
-Named options: `key_password` (decrypts an encrypted private key), `reason`, `location`, `signer_name` (populate the `/Reason` `/Location` `/Name` dictionary keys), `field_name` (the signature field name, default `'Signature1'`), and `password` (open an encrypted input PDF).
-
-```sql
--- sign, then verify the closed loop with pdf_signatures
-SELECT output FROM pdf_sign('contract.pdf', 'contract_signed.pdf', 'cert.pem', 'key.pem',
-                            reason := 'I approve this document', location := 'San Francisco',
-                            signer_name := 'Jane Doe');
-
-SELECT field_name, signer_name, reason, covers_whole_file, verified
-FROM pdf_signatures('contract_signed.pdf');
---   Signature1 | Jane Doe | I approve this document | true | true
-
--- encrypted private key: supply its passphrase
-SELECT output FROM pdf_sign('contract.pdf', 'contract_signed.pdf', 'cert.pem', 'enc_key.pem',
-                            key_password := 'secret');
-```
-
-The signature covers the whole file via a `/ByteRange` around a fixed-size `/Contents` hole (8 KB of DER — ample for RSA-2048); an oversized signature raises an Invalid Input error. Standard `pdf_encrypt`/`pdf_decrypt` conventions apply: local paths, output overwritten, `input == output` refused.
-
-### `pdf_redact` — true (raster) redaction
-
-`pdf_redact(input, output, redactions [, dpi := 200, password := '...'])` performs **true removal**, not a black box drawn over live text. Every page carrying at least one redaction box is re-rendered to an RGB raster, the boxes are painted **solid black in the pixels**, and the page is rebuilt as an **image-only page** whose entire content is that raster. Because the page no longer contains any text object, the redacted text is **permanently unextractable** — `read_pdf` returns nothing for it, and there is no hidden text layer to recover (unlike a vector rectangle drawn on top of still-selectable text). Pages with no boxes retain their live text. When at least one page is redacted, the output has a fresh document catalog and annotations, forms, attachments, outlines, encryption, and document metadata are removed from the entire output; preserve the original separately if those features are needed. Redaction does not sanitize content on unredacted pages or hidden resources they reference; treat the output as sensitive unless those pages have also been reviewed. It returns one row per output page: `page INTEGER`, `redacted BOOLEAN`, `boxes_applied INTEGER`.
-
-`redactions` is a `LIST(STRUCT(page INTEGER, x DOUBLE, y DOUBLE, w DOUBLE, h DOUBLE))`. **Coordinate convention:** all values are in **PDF points** (1 pt = 1/72 in) with the **origin at the page's bottom-left corner** (standard PDF user space). `(x, y)` is the **lower-left corner** of the box; `w`/`h` are its width and height. `page` is **1-based**. A box that runs off the CropBox is clamped to the visible page; a box with no intersection is rejected. Coordinates refer to unrotated PDF user space and are mapped through the CropBox and page rotation.
-
-`dpi` (default 200) sets the render resolution of the rebuilt pages: higher dpi preserves more visual fidelity of the surrounding (unredacted) content but produces a larger output file; lower dpi is smaller but coarser. It does not affect the redaction guarantee — the covered text is gone at any dpi. Because redacted pages become images, their text is no longer selectable or searchable; leave unredacted pages untouched to preserve their text layer.
-
-**Column-ref / row-mode:** use the separate pure in-out function `pdf_redact_lateral` (same two-name pattern as `read_lines` / `read_lines_lateral`). `input`, `output`, and `redactions` are **column references** (one set of values per outer row). A plain dependent join expands each document to its per-page result rows — no `format()` / `query()` string-building:
-
-```sql
-SELECT d.id, r.page, r.redacted, r.boxes_applied
-FROM documents d
-CROSS JOIN pdf_redact_lateral(d.source_path, d.out_path, d.boxes) r;
-```
-
-`pdf_redact` remains the classic constant-arg form with named parameters `dpi` / `password`. Named parameters do not work on in-out functions; `pdf_redact_lateral` is positional-only and uses defaults `dpi = 200` and `password = ''`.
-
-```sql
--- Redact one box over sensitive text on page 2 (origin bottom-left, points).
--- Page 2 becomes an image; pages 1 and 3 keep their selectable text.
-SELECT page, redacted, boxes_applied
-FROM pdf_redact('statement.pdf', 'statement_redacted.pdf',
-                [{'page': 2, 'x': 72.0, 'y': 590.0, 'w': 260.0, 'h': 40.0}]);
--- ┌──────┬──────────┬───────────────┐
--- │ page │ redacted │ boxes_applied │
--- ├──────┼──────────┼───────────────┤
--- │    1 │ false    │             0 │
--- │    2 │ true     │             1 │
--- │    3 │ false    │             0 │
--- └──────┴──────────┴───────────────┘
-
--- The redacted text is gone — this returns 0 rows:
-SELECT * FROM read_pdf('statement_redacted.pdf') WHERE text LIKE '%account number%';
-```
-
-### `write_pdf` — native text-to-PDF (no LibreOffice)
-
-`write_pdf(content [, output_path])` is a purely native, in-process scalar that authors a PDF from a VARCHAR using libharu — no external tools, no shell-out, always available once the extension is loaded. The 1-arg form writes to a temp file (platform `TMPDIR`/`TMP`/`TEMP` or `/tmp` + UUID); both forms return the output path.
-
-```sql
--- 1-arg: temp file; 2-arg: explicit path
-SELECT write_pdf('Line one.' || chr(10) || 'Line two.');
-SELECT write_pdf('Hello native PDF from DuckDB.', 'out.pdf');
-
--- NULLs propagate
-SELECT write_pdf(NULL);        -- NULL
-SELECT write_pdf('x', NULL);   -- NULL
-
--- Self-contained roundtrip: read -> edit in SQL -> write -> read, all in-process
-SELECT write_pdf(replace(pdf_to_text('report.pdf'), 'Q3', 'Q4'), 'report_q4.pdf');
-SELECT page, text FROM read_pdf('report_q4.pdf');
-```
-
-Behavior and limits: Letter page size, 0.75 in margins, Helvetica 10 pt; splits on `\n`, expands tabs, word-wraps each logical line, auto-paginates; empty content produces a single blank (but valid) page. Only Base-14 Helvetica (WinAnsi/Latin-1 encoding) — non-Latin scripts and many UTF-8 glyphs will not render; use `to_pdf` + rich HTML for international text. The output path must be writable; failures raise a clear `IOException`.
-
-### `COPY ... TO ... (FORMAT pdf)`
-
-Write any query result directly to a PDF. Each result row is emitted as one text line with columns space-separated, typeset exactly as `write_pdf` (word-wrapped, paginated); row order is preserved (the copy runs serially).
-
-```sql
-COPY (SELECT page, text FROM read_pdf('report.pdf')) TO 'copy_out.pdf' (FORMAT pdf);
-SELECT page, text FROM read_pdf('copy_out.pdf');
-```
-
-Supported options (case-insensitive; unknown options raise a binder error):
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `TITLE` | VARCHAR | (none) | PDF document metadata Title. |
-| `AUTHOR` | VARCHAR | (none) | PDF document metadata Author. |
-| `FONT_SIZE` | DOUBLE | 10 | Body font size in points (4–72). |
-| `PAGE_SIZE` | VARCHAR | `'letter'` | `'letter'`, `'a4'`, or `'legal'`. |
-| `MARGIN` | DOUBLE | 54 | Margin in points (0–216). |
-| `HEADER` | VARCHAR | (none) | Centered line in the top margin band of every page (font_size−2, min 6). |
-| `FOOTER` | VARCHAR | (none) | Centered line in the bottom margin band; supports a literal `{page}` placeholder. |
-
-If `HEADER` or `FOOTER` is supplied, `MARGIN` must be ≥ 24 (to fit the band).
-
-```sql
-COPY (SELECT file, page_count, file_size FROM pdf_info('docs/*.pdf') ORDER BY file)
-TO 'census.pdf' (FORMAT pdf,
-                 TITLE 'Folder census',
-                 AUTHOR 'duckdb-pdf',
-                 PAGE_SIZE 'a4',
-                 FONT_SIZE 11,
-                 HEADER 'Internal',
-                 FOOTER 'confidential - page {page}');
-```
-
-### `to_pdf` — office documents to PDF (LibreOffice)
-
-`to_pdf(input_path [, output_path])` converts a rich document (`docx`, `odt`, `rtf`, `html`, `pptx`, `xlsx`, ...) to PDF and returns the output path. Unlike everything else in this extension, **`to_pdf` shells out to LibreOffice at runtime** — it is not a build/link dependency, so the extension installs and loads fine without LibreOffice; the function errors with an actionable message only when called with no converter present. The 1-arg form writes next to the input with the extension swapped to `.pdf`.
-
-```bash
-# Install LibreOffice once
-brew install --cask libreoffice                 # macOS
-sudo apt-get install libreoffice                # Debian / Ubuntu
-# Windows: https://www.libreoffice.org/download
-```
-
-```sql
--- Convert next to the input; returns the new path
-SELECT to_pdf('resume.docx');           -- -> 'resume.pdf'
-
--- ... then read the produced PDF straight back
-SELECT page, text FROM read_pdf('resume.pdf');
-```
-
-The `soffice`/`libreoffice` binary is resolved in this order: **`LIBREOFFICE_PATH` env var → `soffice` on `$PATH` → `libreoffice` on `$PATH` → the macOS app bundle** (`/Applications/LibreOffice.app/Contents/MacOS/soffice`). `NULL` input yields `NULL` output.
-
-## Recipes
-
-### Folder census, one line
-
-```sql
-SELECT file, page_count, is_encrypted, file_size FROM pdf_info('docs/*.pdf');
-```
-
-### RAG over a folder of PDFs in three statements
-
-The extension stays a deterministic reader/writer — **it ships no ML, does not embed, and does not call models**. But `pdf_chunks` plus DuckDB's core [`vss`](https://duckdb.org/docs/stable/core_extensions/vss) extension is a complete local RAG substrate; you bring the embedder. The full runnable recipe lives in [`examples/rag_pdf_vss.sql`](examples/rag_pdf_vss.sql).
-
-```sql
--- 1. chunk every PDF in the folder (deterministic, section-aware)
-CREATE TABLE rag_chunks AS FROM pdf_chunks('docs/*.pdf');
-
--- 2. add an embedding column and populate it with YOUR embedder of choice
---    (this is the shape, not the call — fill it from your embedding pipeline)
-ALTER TABLE rag_chunks ADD COLUMN embedding FLOAT[384];
--- UPDATE rag_chunks SET embedding = <your_embedder>(text);
-
--- 3. index and search with the core vss extension
-INSTALL vss; LOAD vss;
-SET hnsw_enable_experimental_persistence = true;
-CREATE INDEX chunks_hnsw ON rag_chunks USING HNSW (embedding);
-
-SELECT file, heading, page_start, text
-FROM rag_chunks
-ORDER BY array_distance(embedding, [/* query embedding */]::FLOAT[384])
-LIMIT 5;
-```
-
-Every hit comes back with its `file`, `page_start`/`page_end`, and the `heading` of the section it came from — citation-ready without a second lookup.
-
-### Every form field from a folder of scanned government forms
-
-Digital forms answer directly from the AcroForm dictionary; scanned (flattened) forms fall back to OCR word geometry:
-
-```sql
--- digital forms: the fields are structured data
-SELECT file, field_name, field_type, value
-FROM pdf_form_fields('forms/*.pdf');
-
--- scanned forms: recover label/value words with positions via OCR
-SELECT filename, page, word, x0, y0, confidence
-FROM read_pdf_words('forms/*.pdf', ocr := true)
-WHERE source = 'ocr'
-ORDER BY filename, page, y1 DESC, x0;
-```
-
-### Search, extract, and shrink to email size
-
-Find the pages that matter across a folder, pull just those pages into a new document, and compress it:
-
-```sql
--- 1. find which page of which file mentions the contract
-CREATE TABLE hits AS
-SELECT filename, page
-FROM read_pdf('docs/*.pdf')
-WHERE text ILIKE '%revenue%';
-
--- 2. extract exactly those pages from the first matching file
-SELECT pdf_pages(filename, 'excerpt.pdf', string_agg(page, ',' ORDER BY page))
-FROM hits
-GROUP BY filename
-LIMIT 1;
-
--- 3. shrink it for email
-SELECT pdf_compress('excerpt.pdf', 'excerpt_small.pdf');
-```
-
-## OCR support
-
-Pages with no extractable text layer are OCR'd automatically (`auto_ocr`, on by default). Pass `ocr := true` to force OCR on every page, even ones that already have text. OCR applies to `read_pdf`, `read_pdf_lines`, `read_pdf_words`, and `read_pdf_tables`.
-
-**English (eng) is bundled** into the community binary (tessdata_fast, extracted
-to a temp dir on first OCR). For the default language you do **not** need
-`brew install tesseract-lang` / apt eng models / `TESSDATA_PREFIX`.
-
-Other languages still need a model on disk. Install the usual way and the
-extension auto-detects standard package-manager paths:
-
-```bash
-# Optional — only for non-English languages (or to override the bundled eng)
-# macOS
-brew install tesseract-lang
-
-# Debian / Ubuntu
-sudo apt-get install tesseract-ocr-deu   # German, etc.
-
-# Windows — UB Mannheim installer puts models under
-#   C:\Program Files\Tesseract-OCR\tessdata (auto-detected)
-```
-
-**Connecting an existing / non-standard install.** Point at it per query:
-
-```sql
-SELECT page, text
-FROM read_pdf('scan.pdf', ocr := true, tessdata_dir := '/opt/models/tessdata');
-```
-
-Resolution order: **`tessdata_dir` → `TESSDATA_PREFIX` → standard install paths → bundled eng.**
-An *explicit* `tessdata_dir` is sticky (a broken path does **not** fall through
-to the bundled model). If no model is found, *explicit* OCR (`ocr := true`)
-raises a clear error; *implicit* `auto_ocr` is best-effort (empty text for that
-page) so blank pages never fail the whole read.
-
-Select the language with the `ocr_language` parameter (default `eng`), and tune the OCR path with `ocr_dpi` (default 300), `ocr_psm`, and `ocr_oem`:
-
-```sql
-SELECT page, text
-FROM read_pdf('scan.pdf', ocr := true, ocr_language := 'eng', ocr_dpi := 300);
-```
-
-### Preprocessing and confidence retry
-
-Real-world scans are rarely clean — pages come in skewed, grayscale-noisy, or lightly speckled. Before handing a rendered page to Tesseract, the extension runs a conservative [Leptonica](http://www.leptonica.org/) preprocessing pipeline (on by default via `ocr_preprocess := true`):
-
-1. **Grayscale** — convert the rendered page to 8-bit gray (`pixConvertRGBToGray`) if it isn't already.
-2. **Deskew** — measure the page's skew angle (`pixFindSkewSweepAndSearch`); if it exceeds 0.3°, rotate the page back with area-map interpolation and a white background so text baselines are level.
-3. **Binarize** — apply an Otsu adaptive threshold (`pixOtsuAdaptiveThreshold`) to separate ink from paper.
-4. **Despeckle** — at ≥ 300 DPI renders only (where strokes are several pixels wide and 1-pixel specks are safe to drop), a light 2×2 close-open morphological pass removes isolated noise.
-
-Every step is null-guarded: if any Leptonica call fails — or the image is too small to preprocess safely — the pipeline falls back to the unprocessed image rather than erroring, so preprocessing never turns a readable page into a failure. Set `ocr_preprocess := false` to feed Tesseract the raw render.
-
-The extension also retries low-confidence pages at higher resolution (on by default via `ocr_retry := true`): if a page's mean OCR confidence comes back below 55 **and** it was rendered below 400 DPI, the page is re-rendered at 2× DPI, re-preprocessed, and re-OCR'd; whichever pass scored higher wins. This is silent, self-tuning quality — retried pages report the text (and, for `read_pdf_words`, the per-word confidences) of the kept pass. Set `ocr_retry := false` to disable the second pass.
-
-```sql
--- deskew + binarize a batch of crooked scans, with the low-confidence retry on
-SELECT filename, page, text
-FROM read_pdf('scans/*.pdf', ocr := true, ocr_preprocess := true, ocr_retry := true);
-```
-
-### Expert OCR knobs (`ocr_vars` / `ocr_config` / `ocr_image`) + shellfs
-
-Prefer **more parameters on existing functions**, not a pile of new SQL surfaces.
-In-process Tess knobs that experts already know from the CLI:
-
-```sql
--- Whitelist digits only (invoice total lines, etc.)
-SELECT page, text, ocr_confidence
-FROM read_pdf('scan.pdf', ocr := true,
-  ocr_vars := MAP {'tessedit_char_whitelist': '0123456789.$'});
-
--- Config file (tessdata/configs name or absolute path), then -c-style overrides
-SELECT page, text
-FROM read_pdf('scan.pdf', ocr := true,
-  ocr_config := 'digits',
-  ocr_vars := MAP {'classify_bln_numeric_mode': '1'});
-```
-
-**`ocr_image(blob, …)`** — table function with **named** params (scalars cannot take
-named maps). Returns one row: `text`, `confidence` (MeanTextConf 0–100), `format`.
-`format := 'text' | 'hocr' | 'tsv'` maps to Tess `GetUTF8Text` / `GetHOCRText` /
-`GetTSVText` in-process:
-
-```sql
--- TVF first arg must be foldable (no subqueries) — SET VARIABLE is the usual path.
-SET VARIABLE page_png = (
-  SELECT pdf_to_png(content, 1, 200) FROM read_blob('scan.pdf')
-);
-SELECT text, confidence, format
-FROM ocr_image(
-  getvariable('page_png'),
-  language := 'eng',
-  psm := 6,
-  vars := MAP {'tessedit_char_whitelist': '0123456789'},
-  format := 'hocr'   -- or 'text' (default), 'tsv'
-);
-```
-
-Low-level scalar **`tesseract_ocr`** remains for one-line text (positional only):
-
-```sql
--- blob | lang | psm | oem | tessdata_dir | preprocess | vars | config
-SELECT tesseract_ocr(
-  pdf_to_png(content, 1, 200),
-  'eng', 6, 3, '', true,
-  MAP {'tessedit_char_whitelist': '0123456789'},
-  ''
-)
-FROM read_blob('scan.pdf');
-```
-
-**Shellfs escape hatch** (full Tesseract CLI / `TESSDATA_PREFIX` before in-process
-parity, or any flag the extension has not lifted yet). Requires a DuckDB build
-with [shellfs](https://github.com/query-farm/shellfs) (or equivalent `cmd |`
-reader). Shape is one SQL pipe — no sidecar script:
-
-```sql
--- Full CLI: env + tessdata + config + stdout as rows
-SELECT *
-FROM read_csv(
-  'TESSDATA_PREFIX=/opt/models tesseract /tmp/page.png stdout -l eng --psm 6 -c tessedit_char_whitelist=0123456789 |',
-  header := false, columns := {'text': 'VARCHAR'}
-);
-
--- One-shot text blob
-SELECT * FROM read_text(
-  'tesseract /tmp/page.png stdout -l eng --tessdata-dir /opt/models/tessdata |'
-);
-```
-
-Render in-process (or export a PNG path yourself), then OCR out-of-process when
-you need a flag we have not wired:
-
-```sql
--- Assume /tmp/page.png already exists (e.g. written from pdf_to_png BLOB)
-SELECT * FROM read_text(
-  'TESSDATA_PREFIX=/usr/share/tesseract-ocr/5 tesseract /tmp/page.png stdout -l eng |'
-);
-```
-
-## Scope
-
-This extension targets the everyday PDF operations — reading at every grain, inspection, and document surgery — deterministically, using Poppler, Tesseract, qpdf, and libharu. It deliberately does **not** attempt ML-based layout analysis or table-structure recognition: table extraction combines ruled-line (lattice) detection with a precision-first geometric heuristic, so merged cells and borderless/sparse tables are out of scope. For state-of-the-art document understanding (complex tables, reading-order models), reach for purpose-built tools such as [docling](https://github.com/docling-project/docling), [marker](https://github.com/VikParuchuri/marker), or a cloud Document AI service. A Poppler/Tesseract expert can extend this extension's heuristics (e.g. Leptonica preprocessing) from the same building blocks it already exposes.
-
-## Building from source
-
-### Dependencies
-
-```bash
-# macOS
-brew install poppler tesseract leptonica libharu qpdf openssl
-
-# Ubuntu / Debian
-sudo apt-get install libpoppler-dev libtesseract-dev libleptonica-dev libhpdf-dev libqpdf-dev libssl-dev
-```
-
-### Build
+Build this tree with **DuckDB v2.0.0**. Signed community artifacts depend on the
+registry's published version and can expose an older API. Unsigned source builds:
 
 ```bash
 git clone --recurse-submodules https://github.com/asubbarao/duckdb-pdf.git
 cd duckdb-pdf
 make release
+make test
 ```
-
-On Windows, dependencies are resolved through vcpkg (MSVC toolchain); see `.github/workflows/MainDistributionPipeline.yml` for the exact build configuration.
-
-The compiled extension will be at `build/release/extension/pdf/pdf.duckdb_extension`:
 
 ```sql
 LOAD 'build/release/extension/pdf/pdf.duckdb_extension';
 ```
 
-## Platform support
+macOS dependencies: poppler, tesseract, leptonica, libharu, qpdf, openssl.
+Linux packages: libpoppler-dev, libpoppler-cpp-dev, libtesseract-dev,
+libleptonica-dev, libhpdf-dev, libqpdf-dev, libssl-dev. CI distribution builds
+use vcpkg for native dependencies and static linking. Supported build targets
+are linux_amd64/arm64, osx_amd64/arm64 and windows_amd64 (MSVC).
+WebAssembly, mingw/rtools and Windows ARM64 are not supported targets.
 
-| Platform | Supported |
-|---|---|
-| Linux (x86_64, arm64) | Yes |
-| macOS (x86_64, arm64) | Yes |
-| Windows x64 (MSVC) | Yes |
-| Windows (mingw, rtools, arm64) | No — see note |
-| WebAssembly (all) | No — see note |
+## Scope and license
 
-Published binaries resolve dependencies (Poppler, Tesseract, Leptonica, qpdf,
-libharu, and their transitive native libraries) through **vcpkg** and link them
-statically. Local builds can use shared system libraries. Linux, macOS, and
-Windows x64 (MSVC) are supported build targets. The **mingw/rtools** variants use
-a different toolchain, **windows_arm64** is untested, and **WebAssembly** cannot
-link Poppler/Tesseract; those targets are excluded. On Windows, Poppler calls are
-serialized by a shared mutex while file I/O and OCR can overlap.
+This extension provides deterministic extraction, rendering, OCR and document
+operations. It does not provide ML layout understanding, reliable merged-cell or
+complex borderless-table reconstruction, PDF/A conformance validation, or
+content-stream redaction. PDF/A metadata detection is not validation.
 
-## Function reference
-
-### Recommended entry points
-
-The catalog has 48 distinct public SQL function names, including specialist operations. Start
-with the function matching the data grain or result you need:
-
-| Task | Primary API | Why keep the alternatives? |
-|---|---|---|
-| Page text | `read_pdf` | `read_pdf_lines` is convenient for line context; `pdf_to_text` supports scalar path/BLOB expressions. |
-| Positioned words | `read_pdf_words` | One canonical word geometry API, including column/line grouping and labels. |
-| Tables, blocks, retrieval chunks | `read_pdf_tables`, `read_pdf_elements`, `pdf_chunks` | These return different grains and cannot be substituted by renaming columns. |
-| Document metadata and permissions | `pdf_info` | One census with NULL metadata, permission fields and opt-in error skipping. |
-| Page rendering | `pdf_page_images` for batches; `pdf_to_png` for scalar/BLOB input | `pdf_to_svg` embeds a raster PNG, not vector page content. |
-| OCR | `ocr_image` for image results; `pdf_ocr` for a searchable PDF | `tesseract_ocr` is the scalar text-only interface for per-row expressions. |
-| Authoring | `write_pdf` for text; `to_pdf` for Office conversion | Native text writing and LibreOffice document conversion are different operations. |
-
-The detailed inspection functions return separate relations: pages, fonts,
-annotations, form fields, attachments, destinations, signatures and revisions.
-Document transforms retain explicit operation names (`pdf_rotate`, `pdf_pages`,
-`pdf_merge`, etc.) so output behavior stays visible in SQL. The migration table
-above lists the four names removed in this consolidation.
-
-### Catalog discovery
-
-After `LOAD pdf`, discover the loaded extension's public functions and overloads
-through DuckDB's catalog. Descriptions, positional parameter names, typed named
-options and examples are registered with the functions:
-
-```sql
-SELECT function_name, function_type, parameters, parameter_types,
-       return_type, description, examples, alias_of
-FROM duckdb_functions()
-WHERE function_name IN ('read_pdf', 'read_pdf_words', 'pdf_info',
-                       'pdf_ocr', 'pdf_redact', 'write_pdf')
-ORDER BY function_name, len(parameters);
-```
-
-Examples use placeholder paths; reading catalog metadata does not execute them.
-`read_pdf_words` exposes 16 columns, including `column_index` and `label`.
-For all PDF APIs, include names beginning
-with `pdf_`, `read_pdf`, `poppler_`, plus `ocr_image`, `tesseract_ocr`, `to_pdf`
-and `write_pdf`. These names are only present after loading the extension.
-
-`pdf_ocr` honors `first_page` / `last_page` for OCR selection while returning a
-status row for every page. `force` adds OCR even when a text layer already exists;
-the original text remains and extracted text can contain duplicates. Otherwise,
-pages with existing text are skipped. On this writer,
-the reader compatibility options `ocr`, `auto_ocr` and `parse_tables` have no
-effect on this writer. It requires the Tesseract backend; `ocr_plugin` and
-`ocr_endpoint` do not supply a searchable-PDF renderer. For readers,
-`ocr_endpoint` is reserved and makes no HTTP request. Unknown `ocr_vars` names
-are ignored by Tesseract. `pdf_ocr` rewrites the PDF and preserves unselected
-page content; the output is not a byte-identical incremental update.
-
-| Function | Type | Description |
-|---|---|---|
-| `read_pdf(files)` | Table | One row per page: text, dimensions, printed page `label`, `has_text_layer`, `used_ocr`, **`ocr_confidence`** (NULL if no OCR). Parallel multi-file scan; `ignore_errors` skips bad files. Named OCR knobs include `ocr_vars` MAP + `ocr_config`. |
-| `read_pdf_lines(files)` | Table | One row per layout-preserving line with the printed page `label`. |
-| `read_pdf_words(files)` | Table | One row per word: bbox, font, OCR source/confidence, geometric `line`, `page_width`/`page_height`, and printed page `label` on `read_pdf_words`. |
-| `read_pdf_tables(files)` | Table | One row per detected table row; cells as `VARCHAR[]`. |
-| `read_pdf_elements(files)` | Table | One row per layout element with bbox, OCR support, and dominant font name. |
-| `pdf_chunks(files)` | Table | Retrieval-ready chunks with section headings and OCR support; `chunk_size`/`overlap` knobs. |
-| `pdf_info(files, password := '', ignore_errors := false)` | Table | One 33-column document census: metadata, dates, dimensions, size, encryption, permissions, form/JavaScript features, display modes and IDs. |
-| `pdf_pages_info(files)` | Table | One row per page: crop/media size, rotation, orientation, label, duration. |
-| `pdf_outline(files)` | Table | One row per bookmark, depth-first: `file`, `ord`, `depth`, `title`, `page`. |
-| `pdf_structure(files)` | Table | One row per tagged structure element, depth-first, with resolved role and direct MCIDs. |
-| `pdf_attachments(files)` | Table | One row per embedded file, bytes as `BLOB`. |
-| `pdf_form_fields(files)` | Table | One row per AcroForm field with type and value. |
-| `pdf_annotations(files)` | Table | One row per annotation; `WHERE subtype = 'Link'` extracts hyperlinks. |
-| `pdf_revisions(file)` | Table | One row per incremental-update revision, oldest first, including the source filename. |
-| `pdf_signatures(files)` | Table | One row per digital signature: metadata + OpenSSL CMS verification. |
-| `pdf_images(files)` | Table | One row per embedded image XObject; `data` is JPEG/JP2/PNG/raw bytes per `format`. |
-| `pdf_page_images(files)` | Table | One row per page with a rendered PNG (`png` BLOB); `dpi` / page-range / `password`. No `pdftoppm`. |
-| `pdf_write_page_images(files, out_dir)` | Table | Write page PNGs to `out_dir/<stem>/p{N}.png` (1-based, no pad); `(file, page, out_path, width, height, bytes)`. |
-| `pdf_split(file, dir)` | Table | One single-page PDF per page; one row per emitted file. |
-| `pdf_split_blank(file, dir, blank_threshold := 0.995)` | Table | Splits on blank-page separators (mailroom batches); one row per emitted document. |
-| `pdf_redact(in, out, boxes, dpi := 200, password := '')` | Table | True raster redaction: replace boxed pages with image-only pages (text removed, not covered); one row per output page. |
-| `pdf_ocr(src, dst, force := false, first_page := 1, last_page := -1)` | Table | Persist an invisible Tesseract text layer on selected pages; one receipt row per document page. |
-| `pdf_redact_lateral(in, out, boxes)` | Table (in-out) | Column-ref / dependent-join form of `pdf_redact` (positional only; dpi=200, password=''). |
-| `pdf_to_text(src [, layout])` | Scalar | Whole document as plain text. Path or `BLOB`. |
-| `pdf_to_markdown(path)` | Scalar | Whole document as GitHub-flavoured Markdown. |
-| `pdf_to_html(src)` | Scalar | Whole document as positioned HTML. Path or `BLOB`. |
-| `pdf_to_xml(src)` | Scalar | Whole document as per-word-bbox XML. Path or `BLOB`. |
-| `pdf_to_svg(src, page [, dpi])` | Scalar | One page as SVG (embedded PNG raster). Path or `BLOB`. |
-| `pdf_to_png(src, page [, dpi])` | Scalar | One page as PNG bytes (`BLOB`). Path or `BLOB`. |
-| `poppler_version()` | Scalar | Linked Poppler version string. |
-| `tesseract_ocr(blob[, …])` | Scalar | In-process OCR text from image BLOB (positional overloads: lang, psm, oem, tessdata_dir, preprocess, vars MAP, config). |
-| `ocr_image(blob, …)` | Table | Named-param image OCR: one row `(text, confidence, format)`. `format` = `text`\|`hocr`\|`tsv`; same knobs as readers (`language`, `psm`, `vars`, …). TVF arg must be foldable (use `SET VARIABLE` / `getvariable`). |
-| `pdf_merge(files[], out)` | Scalar | Concatenate PDFs in list order. |
-| `pdf_rotate(in, out, deg [, pages])` | Scalar | Rotate pages by multiples of 90°. |
-| `pdf_pages(in, out, range)` | Scalar | Extract a page subset (`'1-3,7'`, `'z'`, `'r2'`). |
-| `pdf_watermark(in, out, text [, opacity])` | Scalar | Stamp a diagonal gray text watermark on every page (real text; default opacity 0.30). |
-| `pdf_bates(in, out, prefix, start)` | Scalar | Bates numbering: `prefix` + zero-padded sequential number, bottom-right of each page. |
-| `pdf_compress(in, out)` | Scalar | Structural compression + linearization. |
-| `pdf_encrypt(in, out, userpw [, ownerpw])` | Scalar | AES-256 password protection. |
-| `pdf_decrypt(in, out, pw)` | Scalar | Remove password protection. |
-| `pdf_sign(in, out, cert, key)` | Table | Apply an `adbe.pkcs7.detached` CMS signature (PEM cert+key); verifies via `pdf_signatures`. |
-| `write_pdf(text [, out])` | Scalar | Native text-to-PDF via libharu. |
-| `to_pdf(in [, out])` | Scalar | Office/markup document to PDF via LibreOffice (runtime shell-out). |
-| `COPY ... (FORMAT pdf)` | Copy | Query result to a typeset PDF; `TITLE`/`AUTHOR`/`HEADER`/`FOOTER`/`FONT_SIZE`/`PAGE_SIZE`/`MARGIN`. |
-
-## License
-
-This extension is licensed under the **GNU General Public License v2.0 or later (GPL-2.0-or-later)**.
-
-It statically links [Poppler](https://poppler.freedesktop.org/), which is distributed under the GPL-2.0 license. Any binary distribution of this extension is therefore subject to the GPL-2.0 terms: you must make the corresponding source code available to recipients.
-
-See the [LICENSE](LICENSE) file for the full license text.
+GPL-2.0-or-later. Distribution of binaries linked with Poppler must provide the
+corresponding source. See [LICENSE](LICENSE).

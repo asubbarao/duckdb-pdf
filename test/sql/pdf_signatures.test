@@ -10,39 +10,39 @@ PRAGMA enable_verification
 # ── unsigned fixtures emit zero rows (not an error) ──
 
 query I
-SELECT count(*) FROM pdf_signatures('test/data/hello.pdf');
+SELECT count(*) FROM pdf_objects('test/data/hello.pdf', kind := 'signatures');
 ----
 0
 
 query I
-SELECT count(*) FROM pdf_signatures('test/data/form_annots.pdf');
+SELECT count(*) FROM pdf_objects('test/data/form_annots.pdf', kind := 'signatures');
 ----
 0
 
 # ── signed.pdf: one adbe.pkcs7.detached signature covering the whole file ──
 
 query I
-SELECT count(*) FROM pdf_signatures('test/data/signed.pdf');
+SELECT count(*) FROM pdf_objects('test/data/signed.pdf', kind := 'signatures');
 ----
 1
 
 query IIII
 SELECT field_name, subfilter, covers_whole_file, verified
-FROM pdf_signatures('test/data/signed.pdf');
+FROM pdf_objects('test/data/signed.pdf', kind := 'signatures');
 ----
 Signature1	adbe.pkcs7.detached	true	true
 
 # dictionary metadata from /M /Name /Reason /Location
 query IIII
 SELECT signer_name, reason, location, signing_time IS NOT NULL
-FROM pdf_signatures('test/data/signed.pdf');
+FROM pdf_objects('test/data/signed.pdf', kind := 'signatures');
 ----
 Test Signer	Fixture signature	Test Suite	true
 
 # signing_time parses the PDF date D:20240615120000+00'00'
 query I
 SELECT signing_time = TIMESTAMP '2024-06-15 12:00:00'
-FROM pdf_signatures('test/data/signed.pdf');
+FROM pdf_objects('test/data/signed.pdf', kind := 'signatures');
 ----
 true
 
@@ -53,7 +53,7 @@ true
 
 query II
 SELECT covers_whole_file, verified
-FROM pdf_signatures('test/data/signed_tampered.pdf');
+FROM pdf_objects('test/data/signed_tampered.pdf', kind := 'signatures');
 ----
 false	true
 
@@ -64,19 +64,19 @@ false	true
 
 query II
 SELECT covers_whole_file, verified
-FROM pdf_signatures('test/data/sig_der_trailing_nul.pdf');
+FROM pdf_objects('test/data/sig_der_trailing_nul.pdf', kind := 'signatures');
 ----
 true	true
 
 # ── glob: both fixtures, one row each ──
 
 query I
-SELECT count(*) FROM pdf_signatures('test/data/signed*.pdf');
+SELECT count(*) FROM pdf_objects('test/data/signed*.pdf', kind := 'signatures');
 ----
 2
 
 # ── failure contract: missing file throws ──
 
 statement error
-SELECT * FROM pdf_signatures('test/data/does_not_exist_sig.pdf');
+SELECT * FROM pdf_objects('test/data/does_not_exist_sig.pdf', kind := 'signatures');
 ----

@@ -16,7 +16,7 @@ SELECT page, label FROM read_pdf('test/data/page_labels.pdf') ORDER BY page;
 4	2
 
 query II
-SELECT page, label FROM read_pdf_lines('test/data/page_labels.pdf')
+SELECT page, label FROM read_pdf('test/data/page_labels.pdf', grain := 'line')
 GROUP BY page, label ORDER BY page;
 ----
 1	i
@@ -36,15 +36,15 @@ GROUP BY page, label ORDER BY page;
 query I
 SELECT count(*) = 0
 FROM (SELECT DISTINCT page, label FROM read_pdf('test/data/page_labels.pdf')) r
-JOIN pdf_pages_info('test/data/page_labels.pdf') p USING (page)
+JOIN pdf_objects('test/data/page_labels.pdf', kind := 'pages') p USING (page)
 WHERE r.label IS DISTINCT FROM nullif(p.label, '');
 ----
 true
 
 query I
 SELECT count(*) = 0
-FROM (SELECT DISTINCT page, label FROM read_pdf_lines('test/data/page_labels.pdf')) r
-JOIN pdf_pages_info('test/data/page_labels.pdf') p USING (page)
+FROM (SELECT DISTINCT page, label FROM read_pdf('test/data/page_labels.pdf', grain := 'line')) r
+JOIN pdf_objects('test/data/page_labels.pdf', kind := 'pages') p USING (page)
 WHERE r.label IS DISTINCT FROM nullif(p.label, '');
 ----
 true
@@ -52,7 +52,7 @@ true
 query I
 SELECT count(*) = 0
 FROM (SELECT DISTINCT page, label FROM read_pdf_words('test/data/page_labels.pdf')) r
-JOIN pdf_pages_info('test/data/page_labels.pdf') p USING (page)
+JOIN pdf_objects('test/data/page_labels.pdf', kind := 'pages') p USING (page)
 WHERE r.label IS DISTINCT FROM nullif(p.label, '');
 ----
 true
@@ -65,7 +65,7 @@ true
 
 query I
 SELECT count(*) > 0 AND bool_and(label IS NULL)
-FROM read_pdf_lines('test/data/hello.pdf');
+FROM read_pdf('test/data/hello.pdf', grain := 'line');
 ----
 true
 

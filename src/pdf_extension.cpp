@@ -5456,27 +5456,6 @@ static string DocToText(poppler::document &doc, const string &layout_str) {
 	return out;
 }
 
-static string DocToTextPath(ClientContext &ctx, const string &path, const string &layout_str) {
-	string bytes;
-	ReadAllBytes(ctx, path, bytes);
-	auto doc = LoadDoc(bytes, "", path);
-	return DocToText(*doc, layout_str);
-}
-
-static void PdfToTextFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
-		return StringVector::AddString(result, DocToTextPath(context, path.GetString(), "reading"));
-	});
-}
-static void PdfToTextLayoutFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t path, string_t layout) {
-		    return StringVector::AddString(result, DocToTextPath(context, path.GetString(), layout.GetString()));
-	    });
-}
-
 //===--------------------------------------------------------------------===//
 // pdf_to_html / pdf_to_xml / pdf_to_svg
 //
@@ -5603,27 +5582,6 @@ static PdfDocHandle LoadRenderDoc(const string &fn, const string &path, ClientCo
 }
 
 // BLOB overloads: pure in-memory open (no disk). Same validation as LoadRenderDoc.
-static PdfDocHandle LoadBlobDoc(const string &fn, const char *data, idx_t size) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-	if (size > (idx_t)NumericLimits<int>::Maximum()) {
-		throw InvalidInputException("%s: BLOB input is too large (%llu bytes; max ~2 GiB)", fn,
-		                            (unsigned long long)size);
-	}
-	string bytes(data, size);
-	auto doc =
-	    unique_ptr<poppler::document>(poppler::document::load_from_raw_data(bytes.data(), (int)bytes.size(), "", ""));
-	if (!doc) {
-		throw InvalidInputException("%s: input BLOB is not a valid PDF (%llu bytes)", fn, (unsigned long long)size);
-	}
-	if (doc->is_locked() || doc->is_encrypted()) {
-		throw InvalidInputException("%s: BLOB input is encrypted (cannot decrypt without a password)", fn);
-	}
-	if (doc->pages() <= 0) {
-		throw InvalidInputException("%s: BLOB input has no readable pages", fn);
-	}
-	EnsurePdfBase14Fonts();
-	return PdfDocHandle {std::move(bytes), std::move(doc)};
-}
 
 // Escape the five predefined XML entities. Also used for HTML (a strict superset
 // for text/attribute contexts of the characters we emit).
@@ -5686,18 +5644,6 @@ static string DocToXml(poppler::document &doc) {
 	return out;
 }
 
-static string DocToXml(ClientContext &ctx, const string &path) {
-	auto handle = LoadRenderDoc("pdf_to_xml", path, ctx);
-	return DocToXml(*handle.doc);
-}
-
-static void PdfToXmlFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
-		return StringVector::AddString(result, DocToXml(context, path.GetString()));
-	});
-}
-
 //===--------------------------------------------------------------------===//
 // pdf_to_html(path) — one absolutely-positioned <div class="page"> per page,
 // each word an absolutely-positioned <span> at its bbox (PDF points -> px).
@@ -5727,18 +5673,6 @@ static string DocToHtml(poppler::document &doc) {
 	}
 	out += "</body>\n</html>\n";
 	return out;
-}
-
-static string DocToHtml(ClientContext &ctx, const string &path) {
-	auto handle = LoadRenderDoc("pdf_to_html", path, ctx);
-	return DocToHtml(*handle.doc);
-}
-
-static void PdfToHtmlFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
-		return StringVector::AddString(result, DocToHtml(context, path.GetString()));
-	});
 }
 
 //===--------------------------------------------------------------------===//
@@ -5832,19 +5766,8 @@ static string RenderPageToPngBytes(poppler::document &doc, int32_t page_no, int3
 	return png;
 }
 
-static string DocToSvg(poppler::document &doc, int32_t page_no, int32_t dpi) {
+static string PngToSvg(poppler::document &doc, int32_t page_no, const string &png) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-	int n = doc.pages();
-	if (page_no < 1 || page_no > n) {
-		throw IOException("pdf_to_svg: page %d is out of range (document has %d page%s)", (int)page_no, n,
-		                  n == 1 ? "" : "s");
-	}
-	if (dpi <= 0) {
-		throw InvalidInputException("pdf_to_svg: dpi must be positive (got %d)", (int)dpi);
-	}
-	// Delegate the actual raster + temp PNG + read bytes to the shared helper (no duplication).
-	string png = RenderPageToPngBytes(doc, page_no, dpi, "pdf_to_svg");
-
 	// Base64-encode the PNG via DuckDB's blob helper.
 	string b64 = Blob::ToBase64(string_t(png.data(), static_cast<uint32_t>(png.size())));
 
@@ -5864,33 +5787,20 @@ static string DocToSvg(poppler::document &doc, int32_t page_no, int32_t dpi) {
 	return out;
 }
 
-static string DocToSvg(ClientContext &ctx, const string &path, int32_t page_no, int32_t dpi) {
-	auto handle = LoadRenderDoc("pdf_to_svg", path, ctx);
-	int n = handle.doc->pages();
+static string DocToSvg(poppler::document &doc, int32_t page_no, int32_t dpi) {
+	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	int n = doc.pages();
 	if (page_no < 1 || page_no > n) {
-		throw IOException("pdf_to_svg: page %d is out of range for '%s' (document has %d page%s)", (int)page_no, path,
-		                  n, n == 1 ? "" : "s");
+		throw IOException("pdf_to_svg: page %d is out of range (document has %d page%s)", (int)page_no, n,
+		                  n == 1 ? "" : "s");
 	}
 	if (dpi <= 0) {
 		throw InvalidInputException("pdf_to_svg: dpi must be positive (got %d)", (int)dpi);
 	}
-	return DocToSvg(*handle.doc, page_no, dpi);
-}
+	// Delegate the actual raster + temp PNG + read bytes to the shared helper (no duplication).
+	string png = RenderPageToPngBytes(doc, page_no, dpi, "pdf_to_svg");
 
-static void PdfToSvgFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	BinaryExecutor::Execute<string_t, int32_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t path, int32_t page_no) {
-		    return StringVector::AddString(result, DocToSvg(context, path.GetString(), page_no, 150));
-	    });
-}
-static void PdfToSvgDpiFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	TernaryExecutor::Execute<string_t, int32_t, int32_t, string_t>(
-	    args.data[0], args.data[1], args.data[2], result, args.size(),
-	    [&](string_t path, int32_t page_no, int32_t dpi) {
-		    return StringVector::AddString(result, DocToSvg(context, path.GetString(), page_no, dpi));
-	    });
+	return PngToSvg(doc, page_no, png);
 }
 
 //===--------------------------------------------------------------------===//
@@ -5898,50 +5808,6 @@ static void PdfToSvgDpiFun(DataChunk &args, ExpressionState &state, Vector &resu
 // (no path, no VFS). They call LoadBlobDoc then the shared *core* DocToX(doc&, ...)
 // implementations so there is zero duplicated rendering logic.
 //===--------------------------------------------------------------------===//
-
-static void PdfToTextBlobFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t blob) {
-		auto handle = LoadBlobDoc("pdf_to_text", blob.GetDataUnsafe(), blob.GetSize());
-		return StringVector::AddString(result, DocToText(*handle.doc, "reading"));
-	});
-}
-static void PdfToTextBlobLayoutFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t blob, string_t layout) {
-		    auto handle = LoadBlobDoc("pdf_to_text", blob.GetDataUnsafe(), blob.GetSize());
-		    return StringVector::AddString(result, DocToText(*handle.doc, layout.GetString()));
-	    });
-}
-
-static void PdfToXmlBlobFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t blob) {
-		auto handle = LoadBlobDoc("pdf_to_xml", blob.GetDataUnsafe(), blob.GetSize());
-		return StringVector::AddString(result, DocToXml(*handle.doc));
-	});
-}
-
-static void PdfToHtmlBlobFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t blob) {
-		auto handle = LoadBlobDoc("pdf_to_html", blob.GetDataUnsafe(), blob.GetSize());
-		return StringVector::AddString(result, DocToHtml(*handle.doc));
-	});
-}
-
-static void PdfToSvgBlobFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	BinaryExecutor::Execute<string_t, int32_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t blob, int32_t page_no) {
-		    auto handle = LoadBlobDoc("pdf_to_svg", blob.GetDataUnsafe(), blob.GetSize());
-		    return StringVector::AddString(result, DocToSvg(*handle.doc, page_no, 150));
-	    });
-}
-static void PdfToSvgBlobDpiFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	TernaryExecutor::Execute<string_t, int32_t, int32_t, string_t>(
-	    args.data[0], args.data[1], args.data[2], result, args.size(),
-	    [&](string_t blob, int32_t page_no, int32_t dpi) {
-		    auto handle = LoadBlobDoc("pdf_to_svg", blob.GetDataUnsafe(), blob.GetSize());
-		    return StringVector::AddString(result, DocToSvg(*handle.doc, page_no, dpi));
-	    });
-}
 
 //===--------------------------------------------------------------------===//
 // pdf_to_png(path VARCHAR, page INTEGER[, dpi INTEGER]) -> BLOB
@@ -5966,55 +5832,6 @@ static string DocToPng(poppler::document &doc, int32_t page_no, int32_t dpi) {
 	return RenderPageToPngBytes(doc, page_no, dpi, "pdf_to_png");
 }
 
-static string DocToPng(ClientContext &ctx, const string &path, int32_t page_no, int32_t dpi) {
-	auto handle = LoadRenderDoc("pdf_to_png", path, ctx);
-	int n = handle.doc->pages();
-	if (page_no < 1 || page_no > n) {
-		throw IOException("pdf_to_png: page %d is out of range for '%s' (document has %d page%s)", (int)page_no, path,
-		                  n, n == 1 ? "" : "s");
-	}
-	if (dpi < 1 || dpi > 2400) {
-		throw InvalidInputException("pdf_to_png: dpi must be between 1 and 2400 (got %d)", (int)dpi);
-	}
-	return DocToPng(*handle.doc, page_no, dpi);
-}
-
-static void PdfToPngFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	BinaryExecutor::Execute<string_t, int32_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t path, int32_t page_no) {
-		    auto png = DocToPng(context, path.GetString(), page_no, 150);
-		    return StringVector::AddStringOrBlob(result, string_t(png.data(), static_cast<uint32_t>(png.size())));
-	    });
-}
-static void PdfToPngDpiFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	TernaryExecutor::Execute<string_t, int32_t, int32_t, string_t>(
-	    args.data[0], args.data[1], args.data[2], result, args.size(),
-	    [&](string_t path, int32_t page_no, int32_t dpi) {
-		    auto png = DocToPng(context, path.GetString(), page_no, dpi);
-		    return StringVector::AddStringOrBlob(result, string_t(png.data(), static_cast<uint32_t>(png.size())));
-	    });
-}
-
-static void PdfToPngBlobFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	BinaryExecutor::Execute<string_t, int32_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t blob, int32_t page_no) {
-		    auto handle = LoadBlobDoc("pdf_to_png", blob.GetDataUnsafe(), blob.GetSize());
-		    auto png = DocToPng(*handle.doc, page_no, 150);
-		    return StringVector::AddStringOrBlob(result, string_t(png.data(), static_cast<uint32_t>(png.size())));
-	    });
-}
-static void PdfToPngBlobDpiFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	TernaryExecutor::Execute<string_t, int32_t, int32_t, string_t>(
-	    args.data[0], args.data[1], args.data[2], result, args.size(),
-	    [&](string_t blob, int32_t page_no, int32_t dpi) {
-		    auto handle = LoadBlobDoc("pdf_to_png", blob.GetDataUnsafe(), blob.GetSize());
-		    auto png = DocToPng(*handle.doc, page_no, dpi);
-		    return StringVector::AddStringOrBlob(result, string_t(png.data(), static_cast<uint32_t>(png.size())));
-	    });
-}
-
 //===--------------------------------------------------------------------===//
 // Low-level building blocks (Gemini checklist):
 //   poppler_version() -> VARCHAR
@@ -6037,85 +5854,6 @@ static void PopplerVersionFun(DataChunk &args, ExpressionState &state, Vector &r
 	result.Reference(Value(poppler::version_string()), count_t(args.size()));
 }
 
-// Build Options from tesseract_ocr positional arity (ColumnCount):
-//   1 blob
-//   2 +lang
-//   3 +psm
-//   4 +oem
-//   5 +tessdata_dir
-//   6 +preprocess
-//   7 +vars MAP
-//   8 +config path
-static pdf_ocr::Options TesseractOcrOptionsFromArgs(DataChunk &args, idx_t row) {
-	pdf_ocr::Options opt;
-	opt.language = "eng";
-	opt.psm = 3;
-	opt.oem = 3;
-	opt.preprocess = true;
-	opt.best_effort = false;
-	opt.backend = pdf_ocr::Backend::Tesseract;
-	const idx_t n = args.ColumnCount();
-	if (n >= 2) {
-		auto v = args.GetValue(1, row);
-		if (!v.IsNull()) {
-			opt.language = StringValue::Get(v);
-			if (opt.language.empty()) {
-				opt.language = "eng";
-			}
-		}
-	}
-	if (n >= 3) {
-		auto v = args.GetValue(2, row);
-		if (!v.IsNull()) {
-			opt.psm = IntegerValue::Get(v);
-		}
-	}
-	if (n >= 4) {
-		auto v = args.GetValue(3, row);
-		if (!v.IsNull()) {
-			opt.oem = IntegerValue::Get(v);
-		}
-	}
-	if (n >= 5) {
-		auto v = args.GetValue(4, row);
-		if (!v.IsNull()) {
-			opt.tessdata_dir = StringValue::Get(v);
-		}
-	}
-	if (n >= 6) {
-		auto v = args.GetValue(5, row);
-		if (!v.IsNull()) {
-			opt.preprocess = BooleanValue::Get(v);
-		}
-	}
-	if (n >= 7) {
-		ParseStringMapValueStd(args.GetValue(6, row), opt.vars, "tesseract_ocr: vars");
-	}
-	if (n >= 8) {
-		auto v = args.GetValue(7, row);
-		if (!v.IsNull()) {
-			opt.config = StringValue::Get(v);
-		}
-	}
-	if (opt.psm < 0 || opt.psm > 13) {
-		throw InvalidInputException("tesseract_ocr: psm must be between 0 and 13 (got %d)", opt.psm);
-	}
-	if (opt.oem < 0 || opt.oem > 3) {
-		throw InvalidInputException("tesseract_ocr: oem must be between 0 and 3 (got %d)", opt.oem);
-	}
-	return opt;
-}
-
-static string RunTesseractOcrOnBlob(string_t image_blob, const pdf_ocr::Options &opt) {
-	try {
-		auto r = pdf_ocr::RecognizeImageBlob(reinterpret_cast<const unsigned char *>(image_blob.GetDataUnsafe()),
-		                                     image_blob.GetSize(), opt);
-		return r.text;
-	} catch (const std::exception &e) {
-		throw IOException("tesseract_ocr: %s", string(e.what()));
-	}
-}
-
 // Prefix IO errors for ocr_image; avoid double-prefix if message already has it.
 static void RethrowOcrImageError(const std::exception &e) {
 	string msg = e.what();
@@ -6127,26 +5865,6 @@ static void RethrowOcrImageError(const std::exception &e) {
 
 // Shared executor for every tesseract_ocr overload (arity via ColumnCount).
 // Flat GetValue loop so MAP / optional trailing args stay row-aligned.
-static void TesseractOcrDispatch(DataChunk &args, ExpressionState &state, Vector &result) {
-	(void)state;
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto out = FlatVector::GetDataMutable<string_t>(result);
-	auto &validity = FlatVector::ValidityMutable(result);
-	for (idx_t i = 0; i < args.size(); i++) {
-		auto blob_v = args.GetValue(0, i);
-		if (blob_v.IsNull()) {
-			validity.SetInvalid(i);
-			continue;
-		}
-		string_t blob = StringValue::Get(blob_v);
-		auto opt = TesseractOcrOptionsFromArgs(args, i);
-		if (!opt.tessdata_dir.empty())
-			PdfCheckAccess(state.GetContext(), opt.tessdata_dir, FileType::FILE_TYPE_DIR);
-		if (!opt.config.empty())
-			PdfCheckAccess(state.GetContext(), opt.config);
-		out[i] = StringVector::AddString(result, RunTesseractOcrOnBlob(blob, opt));
-	}
-}
 
 //===--------------------------------------------------------------------===//
 // ocr_image(blob, named…) — table-function image OCR with named params
@@ -7630,13 +7348,6 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 	return out;
 }
 
-static void PdfToMarkdownFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
-		return StringVector::AddString(result, DocToMarkdown(context, path.GetString()));
-	});
-}
-
 //===--------------------------------------------------------------------===//
 // Document-level operations via qpdf: pdf_merge / pdf_split / pdf_rotate
 //
@@ -7814,32 +7525,6 @@ static string PdfRotateImpl(const string &input, const string &output, int32_t d
 		throw InvalidInputException("pdf_rotate: %s", string(e.what()));
 	}
 	return output;
-}
-
-static void PdfRotateFunInternal(DataChunk &args, Vector &result, bool has_pages_arg) {
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	for (idx_t row = 0; row < args.size(); row++) {
-		Value in_val = args.GetValue(0, row);
-		Value out_val = args.GetValue(1, row);
-		Value deg_val = args.GetValue(2, row);
-		Value pages_val = has_pages_arg ? args.GetValue(3, row) : Value("all");
-		if (in_val.IsNull() || out_val.IsNull() || deg_val.IsNull() || pages_val.IsNull()) {
-			FlatVector::SetNull(result, row, true);
-			continue;
-		}
-		result.SetValue(row, Value(PdfRotateImpl(StringValue::Get(in_val), StringValue::Get(out_val),
-		                                         IntegerValue::Get(deg_val), StringValue::Get(pages_val))));
-	}
-}
-
-static void PdfRotateFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	PdfCheckPairArgs(state.GetContext(), args);
-	PdfRotateFunInternal(args, result, false);
-}
-
-static void PdfRotatePagesFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	PdfCheckPairArgs(state.GetContext(), args);
-	PdfRotateFunInternal(args, result, true);
 }
 
 // pdf_split(input, output_dir) -> TABLE(page INTEGER, file VARCHAR).
@@ -8330,20 +8015,6 @@ static string PdfCompressImpl(const string &input, const string &output) {
 	                          [&](const string &path) { pdf_qpdf::Compress(input, path); });
 }
 
-static void PdfCompressFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	PdfCheckPairArgs(state.GetContext(), args);
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	for (idx_t row = 0; row < args.size(); row++) {
-		Value in_val = args.GetValue(0, row);
-		Value out_val = args.GetValue(1, row);
-		if (in_val.IsNull() || out_val.IsNull()) {
-			FlatVector::SetNull(result, row, true);
-			continue;
-		}
-		result.SetValue(row, Value(PdfCompressImpl(StringValue::Get(in_val), StringValue::Get(out_val))));
-	}
-}
-
 // pdf_encrypt(input, output, user_password[, owner_password]) -> VARCHAR.
 // AES-256 (R6) — the only password scheme the PDF 2.0 spec still endorses;
 // qpdf's built-in native crypto provider implements it, so no external
@@ -8356,32 +8027,6 @@ static string PdfEncryptImpl(const string &input, const string &output, const st
 	                          [&](const string &path) { pdf_qpdf::Encrypt(input, path, user_password, owner); });
 }
 
-static void PdfEncryptFunInternal(DataChunk &args, Vector &result, bool has_owner_arg) {
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	for (idx_t row = 0; row < args.size(); row++) {
-		Value in_val = args.GetValue(0, row);
-		Value out_val = args.GetValue(1, row);
-		Value user_val = args.GetValue(2, row);
-		Value owner_val = has_owner_arg ? args.GetValue(3, row) : Value("");
-		if (in_val.IsNull() || out_val.IsNull() || user_val.IsNull() || owner_val.IsNull()) {
-			FlatVector::SetNull(result, row, true);
-			continue;
-		}
-		result.SetValue(row, Value(PdfEncryptImpl(StringValue::Get(in_val), StringValue::Get(out_val),
-		                                          StringValue::Get(user_val), StringValue::Get(owner_val))));
-	}
-}
-
-static void PdfEncryptFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	PdfCheckPairArgs(state.GetContext(), args);
-	PdfEncryptFunInternal(args, result, false);
-}
-
-static void PdfEncryptOwnerFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	PdfCheckPairArgs(state.GetContext(), args);
-	PdfEncryptFunInternal(args, result, true);
-}
-
 // pdf_decrypt(input, output, password) -> VARCHAR. Opens with the password
 // (user or owner) and writes an unencrypted copy. A wrong password surfaces
 // qpdf's "invalid password" as an InvalidInput error.
@@ -8390,44 +8035,12 @@ static string PdfDecryptImpl(const string &input, const string &output, const st
 	                          [&](const string &path) { pdf_qpdf::Decrypt(input, path, password); });
 }
 
-static void PdfDecryptFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	PdfCheckPairArgs(state.GetContext(), args);
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	for (idx_t row = 0; row < args.size(); row++) {
-		Value in_val = args.GetValue(0, row);
-		Value out_val = args.GetValue(1, row);
-		Value pw_val = args.GetValue(2, row);
-		if (in_val.IsNull() || out_val.IsNull() || pw_val.IsNull()) {
-			FlatVector::SetNull(result, row, true);
-			continue;
-		}
-		result.SetValue(
-		    row, Value(PdfDecryptImpl(StringValue::Get(in_val), StringValue::Get(out_val), StringValue::Get(pw_val))));
-	}
-}
-
 // pdf_pages(input, output, ranges) -> VARCHAR. Extracts the page subset
 // selected by a qpdf-style numeric range ('1-3,7' / 'z' = last / 'r2' =
 // second-to-last) into a new document, in range order (repeats allowed).
 static string PdfPagesImpl(const string &input, const string &output, const string &ranges) {
 	return PdfStagedOperation("pdf_pages", input, output,
 	                          [&](const string &path) { pdf_qpdf::Pages(input, path, ranges); });
-}
-
-static void PdfPagesFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	PdfCheckPairArgs(state.GetContext(), args);
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	for (idx_t row = 0; row < args.size(); row++) {
-		Value in_val = args.GetValue(0, row);
-		Value out_val = args.GetValue(1, row);
-		Value ranges_val = args.GetValue(2, row);
-		if (in_val.IsNull() || out_val.IsNull() || ranges_val.IsNull()) {
-			FlatVector::SetNull(result, row, true);
-			continue;
-		}
-		result.SetValue(row, Value(PdfPagesImpl(StringValue::Get(in_val), StringValue::Get(out_val),
-		                                        StringValue::Get(ranges_val))));
-	}
 }
 
 // pdf_watermark(input, output, text[, opacity]) -> VARCHAR (the output path).
@@ -8449,32 +8062,6 @@ static string PdfWatermarkImpl(const string &input, const string &output, const 
 	return output;
 }
 
-static void PdfWatermarkFunInternal(DataChunk &args, Vector &result, bool has_opacity_arg) {
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	for (idx_t row = 0; row < args.size(); row++) {
-		Value in_val = args.GetValue(0, row);
-		Value out_val = args.GetValue(1, row);
-		Value text_val = args.GetValue(2, row);
-		Value opacity_val = has_opacity_arg ? args.GetValue(3, row) : Value::DOUBLE(0.30);
-		if (in_val.IsNull() || out_val.IsNull() || text_val.IsNull() || opacity_val.IsNull()) {
-			FlatVector::SetNull(result, row, true);
-			continue;
-		}
-		result.SetValue(row, Value(PdfWatermarkImpl(StringValue::Get(in_val), StringValue::Get(out_val),
-		                                            StringValue::Get(text_val), DoubleValue::Get(opacity_val))));
-	}
-}
-
-static void PdfWatermarkFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	PdfCheckPairArgs(state.GetContext(), args);
-	PdfWatermarkFunInternal(args, result, false);
-}
-
-static void PdfWatermarkOpacityFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	PdfCheckPairArgs(state.GetContext(), args);
-	PdfWatermarkFunInternal(args, result, true);
-}
-
 // pdf_bates(input, output, prefix, start_number) -> VARCHAR (the output path).
 // Bates numbering: stamps prefix + a zero-padded (min 6 digits) sequential
 // number at the bottom-right of each page as real Helvetica text.
@@ -8482,23 +8069,6 @@ static string PdfBatesImpl(const string &input, const string &output, const stri
 	return PdfStagedOperation("pdf_bates", input, output, [&](const string &path) {
 		pdf_qpdf::Bates(input, path, prefix, static_cast<long long>(start_number), nullptr);
 	});
-}
-
-static void PdfBatesFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	PdfCheckPairArgs(state.GetContext(), args);
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	for (idx_t row = 0; row < args.size(); row++) {
-		Value in_val = args.GetValue(0, row);
-		Value out_val = args.GetValue(1, row);
-		Value prefix_val = args.GetValue(2, row);
-		Value start_val = args.GetValue(3, row);
-		if (in_val.IsNull() || out_val.IsNull() || prefix_val.IsNull() || start_val.IsNull()) {
-			FlatVector::SetNull(result, row, true);
-			continue;
-		}
-		result.SetValue(row, Value(PdfBatesImpl(StringValue::Get(in_val), StringValue::Get(out_val),
-		                                        StringValue::Get(prefix_val), BigIntValue::Get(start_val))));
-	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -9858,6 +9428,7 @@ static void PdfDestinationsScan(ClientContext &context, TableFunctionInput &data
 
 //---- pdf_page_images — render each page to PNG for SOTA / llm pipelines ----
 struct PdfPageImagesBindData : public TableFunctionData {
+	string format = "png";
 	vector<string> files;
 	PdfOptions opt;
 	int32_t dpi = 150;
@@ -9896,12 +9467,20 @@ static unique_ptr<FunctionData> PdfPageImagesBind(ClientContext &context, TableF
 			result->dpi = IntegerValue::Get(kv.second);
 		}
 	}
+	for (auto &kv : input.named_parameters) {
+		if (StringUtil::Lower(kv.first.GetIdentifierName()) == "format")
+			result->format = StringUtil::Lower(StringValue::Get(kv.second));
+	}
+	if (result->format != "png" && result->format != "svg")
+		throw BinderException("pdf_render: format must be png or svg");
 	if (result->dpi < 1 || result->dpi > 2400) {
 		throw InvalidInputException("pdf_page_images: dpi must be between 1 and 2400 (got %d)", result->dpi);
 	}
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER,
 	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BLOB};
-	names = {"file", "page", "page_count", "dpi", "width", "height", "png"};
+	names = {"file", "page", "page_count", "dpi", "width", "height", Identifier(result->format)};
+	if (result->format == "svg")
+		return_types[6] = LogicalType::VARCHAR;
 	return std::move(result);
 }
 
@@ -9945,6 +9524,9 @@ static void PdfPageImagesScan(ClientContext &context, TableFunctionInput &data_p
 		width = u32be(png.data() + 16);
 		height = u32be(png.data() + 20);
 	}
+	string encoded;
+	if (st.needs_image && bind.format == "svg")
+		encoded = PngToSvg(*st.doc, page, png);
 	for (idx_t col = 0; col < st.column_ids.size(); ++col) {
 		auto &out = output.data[col];
 		switch (st.column_ids[col]) {
@@ -9967,7 +9549,10 @@ static void PdfPageImagesScan(ClientContext &context, TableFunctionInput &data_p
 			OutInt32(out, 0, height);
 			break;
 		case 6:
-			OutBlob(out, 0, png);
+			if (bind.format == "svg")
+				OutString(out, 0, encoded);
+			else
+				OutBlob(out, 0, png);
 			break;
 		default:
 			out.SetValue(0, Value::BIGINT(page - 1));
@@ -9995,6 +9580,7 @@ static void PdfPageImagesScan(ClientContext &context, TableFunctionInput &data_p
 //                         [, password, dpi, first_page, last_page])
 //   -> TABLE(file, page, out_path, width, height, bytes)
 struct PdfWritePageImagesBindData : public TableFunctionData {
+	string format = "png";
 	vector<string> files;
 	string out_dir;
 	PdfOptions opt;
@@ -10102,6 +9688,12 @@ static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, T
 			result->dpi = IntegerValue::Get(kv.second);
 		}
 	}
+	for (auto &kv : input.named_parameters) {
+		if (StringUtil::Lower(kv.first.GetIdentifierName()) == "format")
+			result->format = StringUtil::Lower(StringValue::Get(kv.second));
+	}
+	if (result->format != "png" && result->format != "svg")
+		throw BinderException("pdf_render: format must be png or svg");
 	if (result->dpi < 1 || result->dpi > 2400) {
 		throw InvalidInputException("pdf_write_page_images: dpi must be between 1 and 2400 (got %d)", result->dpi);
 	}
@@ -10157,14 +9749,15 @@ static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePage
 
 		for (int p = first; p <= last; p++) {
 			string png = RenderPageToPngBytes(*doc, p, bind.dpi, "pdf_write_page_images");
-			string out_path = PdfWriteJoinPath(stem_dir, "p" + std::to_string(p) + ".png");
-			PdfWriteBytesToFile(out_path, png, "pdf_write_page_images");
+			string encoded = bind.format == "svg" ? PngToSvg(*doc, p, png) : png;
+			string out_path = PdfWriteJoinPath(stem_dir, "p" + std::to_string(p) + "." + bind.format);
+			PdfWriteBytesToFile(out_path, encoded, "pdf_render");
 
 			PdfWritePageImagesRow row;
 			row.file = path;
 			row.page = p;
 			row.out_path = out_path;
-			row.bytes = static_cast<int64_t>(png.size());
+			row.bytes = static_cast<int64_t>(encoded.size());
 			if (png.size() >= 24) {
 				auto u32be = [](const char *b) -> int {
 					return (static_cast<unsigned char>(b[0]) << 24) | (static_cast<unsigned char>(b[1]) << 16) |
@@ -10315,66 +9908,8 @@ static void PdfQpdfInfoScan(ClientContext &context, TableFunctionInput &data_p, 
 }
 
 //---- pdf_json (scalar) ----------------------------------------------------
-static void PdfJsonFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t path, string_t password) {
-		    try {
-			    string bytes;
-			    ReadPdfInput(context, "pdf_json", path.GetString(), bytes);
-			    auto json = pdf_qpdf::WriteJson(bytes, password.GetString(), 2);
-			    return StringVector::AddString(result, json);
-		    } catch (const std::exception &e) {
-			    throw IOException("pdf_json: %s", string(e.what()));
-		    }
-	    });
-}
-
-static void PdfJsonPathOnlyFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t path) {
-		try {
-			string bytes;
-			ReadPdfInput(context, "pdf_json", path.GetString(), bytes);
-			auto json = pdf_qpdf::WriteJson(bytes, "", 2);
-			return StringVector::AddString(result, json);
-		} catch (const std::exception &e) {
-			throw IOException("pdf_json: %s", string(e.what()));
-		}
-	});
-}
 
 //---- pdf_repair (scalar) --------------------------------------------------
-static void PdfRepairFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	PdfCheckPairArgs(state.GetContext(), args);
-	TernaryExecutor::Execute<string_t, string_t, string_t, string_t>(
-	    args.data[0], args.data[1], args.data[2], result, args.size(),
-	    [&](string_t input, string_t output, string_t password) {
-		    try {
-			    AtomicPdfOutput staged(output.GetString());
-			    pdf_qpdf::Repair(input.GetString(), staged.TempPath(), password.GetString());
-			    staged.Commit();
-			    return StringVector::AddString(result, output);
-		    } catch (const std::exception &e) {
-			    throw IOException("pdf_repair: %s", string(e.what()));
-		    }
-	    });
-}
-
-static void PdfRepairNoPwFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	PdfCheckPairArgs(state.GetContext(), args);
-	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t input, string_t output) {
-		    try {
-			    AtomicPdfOutput staged(output.GetString());
-			    pdf_qpdf::Repair(input.GetString(), staged.TempPath(), "");
-			    staged.Commit();
-			    return StringVector::AddString(result, output);
-		    } catch (const std::exception &e) {
-			    throw IOException("pdf_repair: %s", string(e.what()));
-		    }
-	    });
-}
 
 // DuckDB 2.0 turns an exception from a scalar that is not marked fallible into an INTERNAL
 // error. Every pdf scalar reads a path or blob that can be bad, so all of them are fallible.
@@ -10659,6 +10194,8 @@ static TableFunction NativePdfReader(TableFunction decode,
 	return native;
 }
 
+#include "pdf_family_tables.hpp"
+
 struct PdfLoader {
 	ExtensionLoader &loader;
 
@@ -10702,9 +10239,16 @@ struct PdfLoader {
 	}
 };
 
+#include "pdf_family_scalars.hpp"
+
 static void LoadInternal(ExtensionLoader &extension_loader) {
 	extension_loader.SetDescription("PDF text, layout, OCR, inspection, rendering and document operations.");
 	PdfLoader loader {extension_loader};
+	PdfTableFamily readers("read_pdf", "grain", "page");
+	PdfTableFamily census("pdf_info", "detail", "basic");
+	PdfTableFamily objects("pdf_objects", "kind", "");
+	PdfTableFamily render("pdf_render", "", "memory");
+	PdfTableFamily split("pdf_split", "mode", "page");
 	// Scalar PDF writers have observable filesystem side effects. Mark them
 	// volatile so constant expressions are executed instead of being folded.
 	auto register_volatile_scalar = [&loader](ScalarFunction function) {
@@ -10726,20 +10270,21 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	// Registered individually (not in AddCommonNamedParams) so it is only
 	// advertised on functions that actually implement the skip behavior.
 	AddNamedParameter(read_pdf, "ignore_errors", LogicalType::BOOLEAN);
-	loader.RegisterFunction(NativePdfReader<ReadPdfBindData>(
-	    read_pdf, []() -> unique_ptr<LocalTableFunctionState> { return make_uniq<ReadPdfLocalState>(); }));
+	readers.Add("page", NativePdfReader<ReadPdfBindData>(read_pdf, []() -> unique_ptr<LocalTableFunctionState> {
+		            return make_uniq<ReadPdfLocalState>();
+	            }));
 
 	// inspection suite — read-only, serial per file, password is the only knob
 	TableFunction pdf_info("pdf_info", {LogicalType::VARCHAR}, PdfInfoScan, PdfInfoBind, PdfInfoInit);
 	pdf_info.projection_pushdown = true;
 	AddNamedParameter(pdf_info, "password", LogicalType::VARCHAR);
 	AddNamedParameter(pdf_info, "ignore_errors", LogicalType::BOOLEAN);
-	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_info));
+	census.Add("basic", NativePdfReader<PdfInspectBindData>(pdf_info));
 
 	TableFunction pdf_outline("pdf_outline", {LogicalType::VARCHAR}, PdfOutlineScan, PdfOutlineBind, PdfOutlineInit);
 	AddNamedParameter(pdf_outline, "password", LogicalType::VARCHAR);
 	AddNamedParameter(pdf_outline, "ignore_errors", LogicalType::BOOLEAN);
-	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_outline));
+	objects.Add("outline", NativePdfReader<PdfInspectBindData>(pdf_outline));
 
 	TableFunction pdf_structure("pdf_structure", {LogicalType::VARCHAR}, PdfStructureScan, PdfStructureBind,
 	                            PdfStructureInit);
@@ -10747,18 +10292,18 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	AddNamedParameter(pdf_structure, "first_page", LogicalType::INTEGER);
 	AddNamedParameter(pdf_structure, "last_page", LogicalType::INTEGER);
 	AddNamedParameter(pdf_structure, "ignore_errors", LogicalType::BOOLEAN);
-	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_structure));
+	objects.Add("structure", NativePdfReader<PdfInspectBindData>(pdf_structure));
 
 	TableFunction pdf_attachments("pdf_attachments", {LogicalType::VARCHAR}, PdfAttachmentsScan, PdfAttachmentsBind,
 	                              PdfAttachmentsInit);
 	AddNamedParameter(pdf_attachments, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_attachments));
+	objects.Add("attachments", NativePdfReader<PdfInspectBindData>(pdf_attachments));
 
 	// Forensic incremental-update revisions (byte-level startxref / /Prev walk)
 	TableFunction pdf_revisions("pdf_revisions", {LogicalType::VARCHAR}, PdfRevisionsScan, PdfRevisionsBind,
 	                            PdfRevisionsInit);
 	AddNamedParameter(pdf_revisions, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_revisions));
+	objects.Add("revisions", NativePdfReader<PdfInspectBindData>(pdf_revisions));
 
 	TableFunction read_pdf_words("read_pdf_words", {LogicalType::VARCHAR}, ReadPdfWordsScan, ReadPdfWordsBind,
 	                             ReadPdfWordsInit);
@@ -10769,14 +10314,14 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	                             ReadPdfLinesInit);
 	AddCommonNamedParams(read_pdf_lines);
 	AddNamedParameter(read_pdf_lines, "layout", LogicalType::VARCHAR);
-	loader.RegisterFunction(NativePdfReader<ReadPdfLinesBindData>(read_pdf_lines));
+	readers.Add("line", NativePdfReader<ReadPdfLinesBindData>(read_pdf_lines));
 
 	// read_pdf_elements uses the same OCR/native word source and options as
 	// read_pdf_words; layout-specific knobs are intentionally not advertised.
 	TableFunction read_pdf_elements("read_pdf_elements", {LogicalType::VARCHAR}, ReadPdfElementsScan,
 	                                ReadPdfElementsBind, ReadPdfElementsInit);
 	AddOcrNamedParams(read_pdf_elements);
-	loader.RegisterFunction(NativePdfReader<ReadPdfElementsBindData>(read_pdf_elements));
+	readers.Add("element", NativePdfReader<ReadPdfElementsBindData>(read_pdf_elements));
 
 	// pdf_chunks packs the element grain into retrieval-ready chunks; it
 	// honors the same file handling + page-range/password params as
@@ -10785,88 +10330,19 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	AddOcrNamedParams(pdf_chunks);
 	AddNamedParameter(pdf_chunks, "chunk_size", LogicalType::INTEGER);
 	AddNamedParameter(pdf_chunks, "overlap", LogicalType::INTEGER);
-	loader.RegisterFunction(NativePdfReader<PdfChunksBindData>(pdf_chunks));
+	readers.Add("chunk", NativePdfReader<PdfChunksBindData>(pdf_chunks));
 
 	TableFunction read_pdf_tables("read_pdf_tables", {LogicalType::VARCHAR}, ReadPdfTablesScan, ReadPdfTablesBind,
 	                              ReadPdfTablesInit);
 	AddCommonNamedParams(read_pdf_tables);
 	AddNamedParameter(read_pdf_tables, "force", LogicalType::BOOLEAN);
-	loader.RegisterFunction(NativePdfReader<ReadPdfTablesBindData>(read_pdf_tables));
-
-	ScalarFunctionSet pdf_to_text_set("pdf_to_text");
-	pdf_to_text_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToTextFun));
-	pdf_to_text_set.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToTextLayoutFun));
-	pdf_to_text_set.AddFunction(ScalarFunction({LogicalType::BLOB}, LogicalType::VARCHAR, PdfToTextBlobFun));
-	pdf_to_text_set.AddFunction(
-	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToTextBlobLayoutFun));
-	loader.RegisterFunction(pdf_to_text_set);
-
-	ScalarFunctionSet pdf_to_html_set("pdf_to_html");
-	pdf_to_html_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToHtmlFun));
-	pdf_to_html_set.AddFunction(ScalarFunction({LogicalType::BLOB}, LogicalType::VARCHAR, PdfToHtmlBlobFun));
-	loader.RegisterFunction(pdf_to_html_set);
-
-	ScalarFunctionSet pdf_to_xml_set("pdf_to_xml");
-	pdf_to_xml_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToXmlFun));
-	pdf_to_xml_set.AddFunction(ScalarFunction({LogicalType::BLOB}, LogicalType::VARCHAR, PdfToXmlBlobFun));
-	loader.RegisterFunction(pdf_to_xml_set);
-
-	loader.RegisterFunction(
-	    ScalarFunction("pdf_to_markdown", {LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfToMarkdownFun));
-
-	ScalarFunctionSet pdf_to_svg_set("pdf_to_svg");
-	pdf_to_svg_set.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::VARCHAR, PdfToSvgFun));
-	pdf_to_svg_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER},
-	                                          LogicalType::VARCHAR, PdfToSvgDpiFun));
-	pdf_to_svg_set.AddFunction(
-	    ScalarFunction({LogicalType::BLOB, LogicalType::INTEGER}, LogicalType::VARCHAR, PdfToSvgBlobFun));
-	pdf_to_svg_set.AddFunction(ScalarFunction({LogicalType::BLOB, LogicalType::INTEGER, LogicalType::INTEGER},
-	                                          LogicalType::VARCHAR, PdfToSvgBlobDpiFun));
-	loader.RegisterFunction(pdf_to_svg_set);
-
-	ScalarFunctionSet pdf_to_png_set("pdf_to_png");
-	pdf_to_png_set.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::BLOB, PdfToPngFun));
-	pdf_to_png_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER},
-	                                          LogicalType::BLOB, PdfToPngDpiFun));
-	pdf_to_png_set.AddFunction(
-	    ScalarFunction({LogicalType::BLOB, LogicalType::INTEGER}, LogicalType::BLOB, PdfToPngBlobFun));
-	pdf_to_png_set.AddFunction(ScalarFunction({LogicalType::BLOB, LogicalType::INTEGER, LogicalType::INTEGER},
-	                                          LogicalType::BLOB, PdfToPngBlobDpiFun));
-	loader.RegisterFunction(pdf_to_png_set);
+	readers.Add("table", NativePdfReader<ReadPdfTablesBindData>(read_pdf_tables));
 
 	// Low-level engine surfaces (version / single-page PNG / image OCR).
 	loader.RegisterFunction(ScalarFunction("poppler_version", {}, LogicalType::VARCHAR, PopplerVersionFun));
 	// tesseract_ocr positional overloads (scalar has no named-param map):
 	// blob [, lang [, psm [, oem [, tessdata_dir [, preprocess [, vars [, config]]]]]]]
 	const auto map_vv = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
-	ScalarFunctionSet tesseract_ocr_set("tesseract_ocr");
-	tesseract_ocr_set.AddFunction(ScalarFunction({LogicalType::BLOB}, LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(
-	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR}, LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER},
-	                                             LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(
-	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER},
-	                   LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(ScalarFunction(
-	    {LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR},
-	    LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER,
-	                                              LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BOOLEAN},
-	                                             LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(
-	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
-	                    LogicalType::VARCHAR, LogicalType::BOOLEAN, map_vv},
-	                   LogicalType::VARCHAR, TesseractOcrDispatch));
-	tesseract_ocr_set.AddFunction(
-	    ScalarFunction({LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
-	                    LogicalType::VARCHAR, LogicalType::BOOLEAN, map_vv, LogicalType::VARCHAR},
-	                   LogicalType::VARCHAR, TesseractOcrDispatch));
-	loader.RegisterFunction(tesseract_ocr_set);
-
 	// Named-param image OCR (scalars cannot take named maps). format=text|hocr|tsv.
 	TableFunction ocr_image("ocr_image", {LogicalType::BLOB}, OcrImageScan, OcrImageBind, OcrImageInit);
 	AddNamedParameter(ocr_image, "language", LogicalType::VARCHAR);
@@ -10907,77 +10383,33 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	                                        {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
 	                                        LogicalType::VARCHAR, PdfMergeFun));
 
-	ScalarFunctionSet pdf_rotate_set("pdf_rotate");
-	pdf_rotate_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER},
-	                                          LogicalType::VARCHAR, PdfRotateFun));
-	pdf_rotate_set.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR},
-	                   LogicalType::VARCHAR, PdfRotatePagesFun));
-	mark_volatile_scalars(pdf_rotate_set);
-	loader.RegisterFunction(pdf_rotate_set);
-
 	TableFunction pdf_split("pdf_split", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfSplitScan, PdfSplitBind,
 	                        PdfSplitInit);
-	loader.RegisterFunction(pdf_split);
+	split.Add("page", pdf_split);
 
 	TableFunction pdf_split_blank("pdf_split_blank", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfSplitBlankScan,
 	                              PdfSplitBlankBind, PdfSplitBlankInit);
 	AddNamedParameter(pdf_split_blank, "blank_threshold", LogicalType::DOUBLE);
-	loader.RegisterFunction(pdf_split_blank);
-
-	// qpdf everyday suite
-	register_volatile_scalar(ScalarFunction("pdf_compress", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                        LogicalType::VARCHAR, PdfCompressFun));
-
-	ScalarFunctionSet pdf_encrypt_set("pdf_encrypt");
-	pdf_encrypt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                           LogicalType::VARCHAR, PdfEncryptFun));
-	pdf_encrypt_set.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                   LogicalType::VARCHAR, PdfEncryptOwnerFun));
-	mark_volatile_scalars(pdf_encrypt_set);
-	loader.RegisterFunction(pdf_encrypt_set);
-
-	register_volatile_scalar(ScalarFunction("pdf_decrypt",
-	                                        {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                        LogicalType::VARCHAR, PdfDecryptFun));
-
-	register_volatile_scalar(ScalarFunction("pdf_pages",
-	                                        {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                        LogicalType::VARCHAR, PdfPagesFun));
-
-	// pdf_watermark: 3-arg (default opacity 0.30) + 4-arg (explicit opacity).
-	ScalarFunctionSet pdf_watermark_set("pdf_watermark");
-	pdf_watermark_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                             LogicalType::VARCHAR, PdfWatermarkFun));
-	pdf_watermark_set.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::DOUBLE},
-	                   LogicalType::VARCHAR, PdfWatermarkOpacityFun));
-	mark_volatile_scalars(pdf_watermark_set);
-	loader.RegisterFunction(pdf_watermark_set);
-
-	register_volatile_scalar(ScalarFunction(
-	    "pdf_bates", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
-	    LogicalType::VARCHAR, PdfBatesFun));
+	split.Add("blank", pdf_split_blank);
 
 	TableFunction pdf_form_fields("pdf_form_fields", {LogicalType::VARCHAR}, PdfFormFieldsScan, PdfFormFieldsBind,
 	                              PdfQpdfRowsInit);
-	loader.RegisterFunction(NativePdfReader<PdfQpdfRowsBindData>(pdf_form_fields));
+	objects.Add("form_fields", NativePdfReader<PdfQpdfRowsBindData>(pdf_form_fields));
 
 	TableFunction pdf_annotations("pdf_annotations", {LogicalType::VARCHAR}, PdfAnnotationsScan, PdfAnnotationsBind,
 	                              PdfQpdfRowsInit);
-	loader.RegisterFunction(NativePdfReader<PdfQpdfRowsBindData>(pdf_annotations));
+	objects.Add("annotations", NativePdfReader<PdfQpdfRowsBindData>(pdf_annotations));
 
 	// pdf_signatures: detect + verify existing digital signatures (no signing).
 	TableFunction pdf_signatures("pdf_signatures", {LogicalType::VARCHAR}, PdfSignaturesScan, PdfSignaturesBind,
 	                             PdfQpdfRowsInit);
 	AddNamedParameter(pdf_signatures, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(NativePdfReader<PdfSignaturesBindData>(pdf_signatures));
+	objects.Add("signatures", NativePdfReader<PdfSignaturesBindData>(pdf_signatures));
 
 	// pdf_images: extract embedded raster image XObjects (stored JPEG/bitmap).
 	TableFunction pdf_images("pdf_images", {LogicalType::VARCHAR}, PdfImagesScan, PdfImagesBind, PdfQpdfRowsInit);
 	AddNamedParameter(pdf_images, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(NativePdfReader<PdfImagesBindData>(pdf_images));
+	objects.Add("images", NativePdfReader<PdfImagesBindData>(pdf_images));
 
 	// pdf_sign: create an adbe.pkcs7.detached CMS signature (inverse of
 	// pdf_signatures). Single-row table function so it can carry named options.
@@ -11025,16 +10457,16 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	TableFunction pdf_pages_info("pdf_pages_info", {LogicalType::VARCHAR}, PdfPagesInfoScan, PdfPagesInfoBind,
 	                             PdfPagesInfoInit);
 	AddNamedParameter(pdf_pages_info, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_pages_info));
+	objects.Add("pages", NativePdfReader<PdfInspectBindData>(pdf_pages_info));
 
 	TableFunction pdf_fonts("pdf_fonts", {LogicalType::VARCHAR}, PdfFontsScan, PdfFontsBind, PdfFontsInit);
 	AddNamedParameter(pdf_fonts, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_fonts));
+	objects.Add("fonts", NativePdfReader<PdfInspectBindData>(pdf_fonts));
 
 	TableFunction pdf_destinations("pdf_destinations", {LogicalType::VARCHAR}, PdfDestinationsScan, PdfDestinationsBind,
 	                               PdfDestinationsInit);
 	AddNamedParameter(pdf_destinations, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(NativePdfReader<PdfInspectBindData>(pdf_destinations));
+	objects.Add("destinations", NativePdfReader<PdfInspectBindData>(pdf_destinations));
 
 	TableFunction pdf_page_images("pdf_page_images", {LogicalType::VARCHAR}, PdfPageImagesScan, PdfPageImagesBind,
 	                              PdfPageImagesInit);
@@ -11043,11 +10475,12 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	AddNamedParameter(pdf_page_images, "dpi", LogicalType::INTEGER);
 	AddNamedParameter(pdf_page_images, "first_page", LogicalType::INTEGER);
 	AddNamedParameter(pdf_page_images, "last_page", LogicalType::INTEGER);
-	loader.RegisterFunction(NativePdfReader<PdfPageImagesBindData>(pdf_page_images));
+	AddNamedParameter(pdf_page_images, "format", LogicalType::VARCHAR);
+	render.Add("memory", NativePdfReader<PdfPageImagesBindData>(pdf_page_images));
 
 	// VARCHAR (path/glob) and LIST(VARCHAR) overloads — same bind/scan body.
 	// (Do not brace-init mixed LogicalTypeId + LogicalType — deduction fails on C++11 CI.)
-	TableFunctionSet pdf_write_page_images_set("pdf_write_page_images");
+
 	{
 		vector<LogicalType> path_types;
 		path_types.emplace_back(LogicalTypeId::VARCHAR);
@@ -11060,29 +10493,25 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 			AddNamedParameter(pdf_write_page_images, "dpi", LogicalType::INTEGER);
 			AddNamedParameter(pdf_write_page_images, "first_page", LogicalType::INTEGER);
 			AddNamedParameter(pdf_write_page_images, "last_page", LogicalType::INTEGER);
-			pdf_write_page_images_set.AddFunction(std::move(pdf_write_page_images));
+			AddNamedParameter(pdf_write_page_images, "format", LogicalType::VARCHAR);
+			render.Add("write", std::move(pdf_write_page_images));
 		}
 	}
-	loader.RegisterFunction(pdf_write_page_images_set);
 
 	TableFunction pdf_qpdf_info("pdf_qpdf_info", {LogicalType::VARCHAR}, PdfQpdfInfoScan, PdfQpdfInfoBind,
 	                            PdfQpdfInfoInit);
 	AddNamedParameter(pdf_qpdf_info, "password", LogicalType::VARCHAR);
-	loader.RegisterFunction(NativePdfReader<PdfQpdfInfoBindData>(pdf_qpdf_info));
+	census.Add("qpdf", NativePdfReader<PdfQpdfInfoBindData>(pdf_qpdf_info));
 
-	ScalarFunctionSet pdf_json_set("pdf_json");
-	pdf_json_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfJsonPathOnlyFun));
-	pdf_json_set.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfJsonFun));
-	loader.RegisterFunction(pdf_json_set);
-
-	ScalarFunctionSet pdf_repair_set("pdf_repair");
-	pdf_repair_set.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfRepairNoPwFun));
-	pdf_repair_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                          LogicalType::VARCHAR, PdfRepairFun));
-	mark_volatile_scalars(pdf_repair_set);
-	loader.RegisterFunction(pdf_repair_set);
+	loader.RegisterFunction(readers.Function({LogicalType::VARCHAR}));
+	loader.RegisterFunction(census.Function({LogicalType::VARCHAR}));
+	loader.RegisterFunction(objects.Function({LogicalType::VARCHAR}));
+	loader.RegisterFunction(split.Function({LogicalType::VARCHAR, LogicalType::VARCHAR}));
+	TableFunctionSet render_set("pdf_render");
+	render_set.AddFunction(render.Function({LogicalType::VARCHAR}));
+	render_set.AddFunction(render.Function({LogicalType::LIST(LogicalType::VARCHAR)}));
+	loader.RegisterFunction(std::move(render_set));
+	RegisterPdfFamilyScalars(loader);
 
 	// COPY TO pdf
 	CopyFunction pdf_copy("pdf");
