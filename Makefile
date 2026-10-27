@@ -65,11 +65,14 @@ PDF_BUILT_VERSION = $(shell ./build/release/duckdb -unsigned -no-agent -noheader
 export EXPECTED_EXT_VERSION = $(PDF_BUILT_VERSION)
 
 # Exercise format routing and backend failure behavior even without desktop apps.
+# Compile with the extension, while CI's compiler/container is still active.
+# The outside-container Linux pass deliberately skips all executable tests.
+ifneq ($(SKIP_TESTS),1)
 define OFFICE_CONVERSION_TEST
 test_$(1): office_conversion_test_$(1)
 office_conversion_test_$(1):
-	cmake --build build/$(1) --target pdf_office_conversion_test
 	./build/$(1)/extension/pdf/pdf_office_conversion_test
 .PHONY: office_conversion_test_$(1)
 endef
 $(foreach config,release debug reldebug,$(eval $(call OFFICE_CONVERSION_TEST,$(config))))
+endif
