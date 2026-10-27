@@ -5,7 +5,7 @@
 // companion font data. The OTFs live as embedded byte arrays (generated from
 // third_party/fonts/ by scripts/embed_base14_fonts.py) and are extracted to a
 // temp directory once, then registered with poppler GlobalParams::addFontFile
-// so page rasterization (pdf_redact, OCR, pdf_to_png, …) works without
+// so page rasterization (pdf_redact, OCR, pdf_render, …) works without
 // fontconfig or system display fonts.
 //
 // Private poppler headers (GlobalParams.h, Error.h) require C++20 on current

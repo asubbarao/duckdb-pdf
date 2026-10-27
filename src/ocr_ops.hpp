@@ -33,7 +33,7 @@
 //        This is how a Paddle/Surya/custom vision model plugs in without
 //        recompiling read_pdf.
 //     2. Otherwise return an empty result (best_effort) or throw with a
-//        message pointing at pdf_page_images / pdf_to_png + the DuckDB llm/ai
+//        message pointing at table/scalar pdf_render + the DuckDB llm/ai
 //        extension as the SQL pipeline for vision-LLM OCR.
 //
 // External plugin C ABI (stable, C linkage):
@@ -86,7 +86,7 @@ struct Options {
 	std::string external_plugin;
 	// Reserved for a future in-process HTTP client. Currently never contacted
 	// from this TU (no shell, no network). Callers that set it get a clearer
-	// error message pointing at the SQL pdf_page_images → llm pipeline instead
+	// error message pointing at the SQL pdf_render → llm pipeline instead
 	// of a silent empty OCR result when no plugin is loaded.
 	std::string external_endpoint;
 	// Tess SetVariable key/value pairs applied after Init (and after config).

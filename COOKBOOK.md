@@ -4,14 +4,17 @@ Task-oriented recipes for the `pdf` community extension. Each recipe is a real
 goal, a runnable SQL block, and the one gotcha that bites people. For the full
 per-function reference (every column, every parameter), see [README.md](README.md).
 
-Every recipe assumes the extension is loaded:
+These recipes target this source branch's 19-name API; released community binaries
+may expose the earlier API. Load the matching source build (see README), or use
+the following once the matching version is published:
 
 ```sql
 INSTALL pdf FROM community; LOAD pdf;
 ```
 
-Every function takes a single path **or a glob**, so the natural unit of work is
-a folder of PDFs. Recipes below use `docs/*.pdf`; substitute your own path.
+The multi-file readers accept a path or glob. Scalar readers consume one path
+or BLOB; document writers take individual paths or an explicit input list.
+Recipes below use `docs/*.pdf`; substitute your own path.
 
 ---
 
@@ -47,10 +50,10 @@ CREATE INDEX chunks_hnsw ON rag_chunks USING HNSW (embedding);
 ```
 
 **Gotcha:** the extension ships **no ML** — it does not embed or call models.
-`read_pdf(..., grain := 'chunk')` is deterministic (no tokenizer); it reads the native text layer
-only. For scanned/image-only PDFs it produces empty chunks — OCR those first
-(recipe 3) into a text column and chunk that instead. The full runnable RAG
-script is in [`examples/rag_pdf_vss.sql`](examples/rag_pdf_vss.sql).
+`read_pdf(..., grain := 'chunk')` is deterministic (no tokenizer); by default it
+reads the native text layer. Set `auto_ocr := true` to include image-only pages,
+or persist OCR first (recipe 11). The RAG template in
+[`examples/rag_pdf_vss.sql`](examples/rag_pdf_vss.sql) needs your embedder and query vector.
 
 ---
 
@@ -104,7 +107,7 @@ ORDER BY page, table_index, row_index;
 SELECT page, word, x0, y0, confidence
 FROM read_pdf_words('scanned.pdf', ocr := true)
 WHERE source = 'ocr'
-ORDER BY page, y1 DESC, x0;
+ORDER BY page, y0, x0;
 ```
 
 **English is bundled** (tessdata_fast eng, extracted on first OCR) — zero host
@@ -156,10 +159,9 @@ not a product `.sh`:
 
 ```sql
 -- After writing a page PNG to a path the host tesseract can see:
-SELECT column0 AS text
-FROM read_csv(
-  'TESSDATA_PREFIX=/opt/tessdata tesseract /tmp/page.png stdout -l eng --psm 4 -c load_system_dawg=0 |',
-  header := false
+SELECT content AS text
+FROM read_text(
+  'TESSDATA_PREFIX=/opt/tessdata tesseract /tmp/page.png stdout -l eng --psm 4 -c load_system_dawg=0 |'
 );
 
 SELECT * FROM read_text(
@@ -202,8 +204,8 @@ geometry.
 ```sql
 -- Single pin. line is geometric (the same rule as the element grain).
 CREATE TABLE pdf_words AS
-SELECT file_name(filename) AS filename, page AS page_no, line AS line_no,
-       word, (x0, y0, x1, y1) AS bbox, font_size,
+SELECT filename, page AS page_no, line AS line_no,
+       word, struct_pack(x0 := x0, y0 := y0, x1 := x1, y1 := y1) AS bbox, font_size,
        page_width AS width_pt, page_height AS height_pt
 FROM read_pdf_words('docs/*.pdf');
 
@@ -261,8 +263,8 @@ scan** (the default). `ignore_errors` is accepted by `read_pdf`,
 whether the signature itself is intact.
 
 ```sql
--- Was this file edited after it was first written? PDFs are append-only;
--- each edit adds an incremental-update revision (revision 0 = original).
+-- Count retained incremental updates (revision 0 = original).
+-- A full rewrite can remove revision history; not every PDF edit is append-only.
 SELECT count(*) - 1 AS updates_after_original
 FROM pdf_objects('contract.pdf', kind := 'revisions');
 
@@ -448,8 +450,8 @@ SELECT to_pdf('resume.docx');   -- -> 'resume.pdf'
 Helvetica only** (WinAnsi/Latin-1) — non-Latin scripts and many UTF-8 glyphs
 will not render; use `to_pdf` + HTML for international text. `FOOTER` supports a
 literal `{page}` placeholder; if you set `HEADER`/`FOOTER`, `MARGIN` must be
-≥ 24 to fit the band. `to_pdf` is the **only** function that shells out at
-runtime — it needs LibreOffice installed (`brew install --cask libreoffice` /
+≥ 24 to fit the band. `to_pdf` is the **only** function that launches an external
+application at runtime (without a shell) — it needs LibreOffice installed (`brew install --cask libreoffice` /
 `apt-get install libreoffice`) and errors with an actionable message if absent.
 
 ---

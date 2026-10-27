@@ -119,6 +119,13 @@ static void AddPdfFunctionDocs(FUNCTION &function, INFO &info) {
 		}
 		description.description = doc.description;
 		description.examples = {doc.example};
+		if (function.name == Identifier("pdf_pages") && parameters == "input,output,options") {
+			description.description =
+			    "Rotate a complete local PDF without extracting pages, preserving its catalog, "
+			    "metadata and bookmarks. STRUCT rotate is a multiple of 90; optional rotate_pages "
+			    "defaults to all and uses original document page numbers.";
+			description.examples = {"SELECT pdf_pages('document.pdf', 'rotated.pdf', {rotate: 90});"};
+		}
 		if (std::is_same<FUNCTION, TableFunction>::value) {
 			if (function.name == Identifier("pdf_render"))
 				description.examples = {"SELECT page, png FROM pdf_render('document.pdf', dpi := 150);"};

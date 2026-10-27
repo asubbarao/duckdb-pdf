@@ -86,10 +86,13 @@ printed page label, which can be NULL.
 | `auto_ocr` | BOOLEAN | true | OCR pages that have no extractable text layer. |
 | `ocr_language` | VARCHAR | `'eng'` | Tesseract model or `+`-separated model combination, such as `'eng+fra'`; all selected models must exist in the resolved model directory. |
 | `ocr_dpi` | INTEGER | 300 | Render DPI for the OCR raster (1–2400). |
-| `ocr_psm` / `ocr_oem` | INTEGER | Tesseract defaults | Page segmentation mode / OCR engine mode. |
+| `ocr_psm` / `ocr_oem` | INTEGER | 3 / 3 | Page segmentation mode (automatic) / OCR engine mode (default). |
+| `ocr_backend` | VARCHAR | `'tesseract'` | `'tesseract'` or `'external'`; external requires a plugin. Persisted `pdf_ocr` requires Tesseract. |
+| `ocr_plugin` | VARCHAR | — | External OCR shared library implementing the C ABI in `src/ocr_ops.hpp`. |
+| `ocr_endpoint` | VARCHAR | — | Reserved; does not send HTTP requests. |
 | `ocr_preprocess` | BOOLEAN | true | Run the Leptonica preprocessing pipeline (grayscale → deskew → binarize → despeckle) on the rendered page before OCR. |
 | `ocr_retry` | BOOLEAN | true | Re-render low-confidence pages (mean confidence < 55) at 2× DPI when the render was below 400 DPI, keeping whichever pass scores higher. |
-| `tessdata_dir` | VARCHAR | auto-detected | Explicit Tesseract model directory (see [OCR support](#ocr-support)). |
+| `tessdata_dir` | VARCHAR | auto-detected | Explicit Tesseract model directory (see [OCR](#ocr)). |
 | `ocr_vars` | MAP(VARCHAR, VARCHAR) | — | Tess `SetVariable` key/values applied after Init (same surface as CLI `-c name=value`). |
 | `ocr_config` | VARCHAR | — | Path or tessdata config name for `ReadConfigFile` (applied after Init, before `ocr_vars`). |
 | `ignore_errors` | BOOLEAN | false | page grain, basic census, outline and structure kinds: skip files that fail their reader's guarded load/extraction stage. |
@@ -130,6 +133,19 @@ perm_assemble, has_javascript, form_type, page_mode, page_layout, permanent_id, 
 encryption methods and permission flags, password match flags, linearization
 checks and warning count. It accepts `password`; it rejects `ignore_errors`,
 which this implementation does not support.
+
+The qpdf schema is:
+
+```text
+file VARCHAR, is_linearized BOOLEAN, linearized_ok BOOLEAN, page_count INTEGER,
+object_count BIGINT, xref_total BIGINT, xref_free BIGINT, is_encrypted BOOLEAN,
+enc_R INTEGER, enc_P INTEGER, stream_method VARCHAR, string_method VARCHAR,
+file_method VARCHAR, owner_password_matched BOOLEAN, user_password_matched BOOLEAN,
+allow_accessibility BOOLEAN, allow_extract BOOLEAN, allow_print_low BOOLEAN,
+allow_print_high BOOLEAN, allow_modify_assembly BOOLEAN, allow_modify_form BOOLEAN,
+allow_modify_annotation BOOLEAN, allow_modify_other BOOLEAN, allow_modify_all BOOLEAN,
+warning_count BIGINT
+```
 
 `pdf_objects(files, kind := ...)` requires one of the following kinds.
 All use native file scheduling and retain the prior object-specific schema:
@@ -200,7 +216,8 @@ EXPLAIN does not write files. Width/height report raster pixels.
 ## Document operations
 
 Writers act on local paths, check external-access permissions and publish each
-output atomically. Required NULL scalar arguments propagate NULL. A scalar
+output atomically for qpdf document operations, redaction, signing and persisted
+OCR. Native text/COPY authoring writes directly. Required NULL scalar arguments propagate NULL. A scalar
 option field set to NULL also propagates NULL after its name/mode is checked,
 except image OCR optional NULL fields retain their default behavior.
 
@@ -240,10 +257,12 @@ with raster content and removes their underlying text; any redaction also drops
 forms, annotations, attachments, encryption and document metadata. It is not a
 content-stream redaction/sanitization engine. `pdf_redact_lateral` supports
 per-row inputs with fixed dpi 200 and empty password. Both return per-page rows.
+Their columns are `page INTEGER, redacted BOOLEAN, boxes_applied INTEGER`.
 
 `pdf_sign(input, output, certificate, key, ...)` uses PEM files and supports
 `key_password, reason, location, signer_name, field_name, password`. Existing
 signed documents are rejected because incremental signing is not implemented.
+It returns `output VARCHAR, field_name VARCHAR`.
 
 `write_pdf(content [, output_path])` typesets text in-process with libharu;
 without a path it returns a temporary file path. `COPY ... (FORMAT pdf)`
@@ -286,6 +305,8 @@ Existing text pages are skipped unless force is true. Force adds another layer
 alongside original text and can produce duplicated extracted text. It requires
 Tesseract; reader compatibility knobs ocr, auto_ocr and parse_tables do not
 control this writer. Its output is a rewrite, not an incremental byte update.
+Its status schema is `page INTEGER, had_text_layer BOOLEAN, ocr_applied BOOLEAN,
+words INTEGER, mean_confidence DOUBLE, seconds DOUBLE, out_path VARCHAR`.
 
 ## Migration from 48 names
 
@@ -332,6 +353,13 @@ git clone --recurse-submodules https://github.com/asubbarao/duckdb-pdf.git
 cd duckdb-pdf
 make release
 make test
+```
+
+The built CLI links `pdf` into the process. When using a separate matching
+DuckDB CLI, enable unsigned extensions at startup and load the build explicitly:
+
+```bash
+duckdb -unsigned
 ```
 
 ```sql

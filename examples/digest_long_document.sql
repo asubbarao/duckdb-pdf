@@ -6,7 +6,8 @@
 --   lines BIGINT, chars BIGINT (size of the section), opening VARCHAR (its first line longer than 40
 --   characters, so page numbers and headers are skipped; NULL for a section with no such line).
 -- The outline rows include the physical page each bookmark points to.
-INSTALL pdf FROM community; LOAD pdf;
+-- Run with the matching source-build CLI; community artifacts may lag this API.
+LOAD pdf;
 INSTALL httpfs; LOAD httpfs;
 
 WITH words AS (
