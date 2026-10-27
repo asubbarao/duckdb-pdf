@@ -10183,13 +10183,13 @@ static TableFunction NativePdfReader(TableFunction decode,
 		for (auto &path : info.files(*decode_bind)) {
 			paths.emplace_back(path);
 		}
-		auto interface = make_uniq<PdfNativeMultiFileInfo>(info, std::move(decode_bind), types, names);
+		auto multi_file_interface = make_uniq<PdfNativeMultiFileInfo>(info, std::move(decode_bind), types, names);
 		MultiFileOptions options;
 		options.auto_detect_hive_partitioning = false;
 		return MultiFileFunction<PdfNativeMultiFileInfo>::MultiFileBindInternal(
 		    context, MultiFileReader::Create(input.table_function),
 		    make_shared_ptr<SimpleMultiFileList>(std::move(paths)), types, names, std::move(options),
-		    make_uniq<BaseFileReaderOptions>(), std::move(interface));
+		    make_uniq<BaseFileReaderOptions>(), std::move(multi_file_interface));
 	};
 	return native;
 }
