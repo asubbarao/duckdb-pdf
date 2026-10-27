@@ -95,6 +95,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+// DuckDB's FileSystem::CreateDirectory is not the Win32 API macro.
+#ifdef CreateDirectory
+#undef CreateDirectory
+#endif
 #define popen  _popen
 #define pclose _pclose
 #else
