@@ -66,7 +66,7 @@ export EXPECTED_EXT_VERSION = $(PDF_BUILT_VERSION)
 
 # Exercise format routing and backend failure behavior even without desktop apps.
 define OFFICE_CONVERSION_TEST
-test_$(1)_internal: office_conversion_test_$(1)
+test_$(1): office_conversion_test_$(1)
 office_conversion_test_$(1):
 	cmake --build build/$(1) --target pdf_office_conversion_test
 	./build/$(1)/extension/pdf/pdf_office_conversion_test
