@@ -74,15 +74,15 @@ SELECT count(DISTINCT file) FROM pdf_info('__TEST_DIR__/inspect_*.pdf');
 # glob NULL-safety pass below is the coverage.)
 
 query I
-SELECT count(*) FROM pdf_outline('__TEST_DIR__/inspect_a.pdf');
+SELECT count(*) FROM pdf_objects('__TEST_DIR__/inspect_a.pdf', kind := 'outline');
 ----
 0
 
 statement ok
-SELECT file, ord, depth, title FROM pdf_outline('__TEST_DIR__/inspect_*.pdf');
+SELECT file, ord, depth, title FROM pdf_objects('__TEST_DIR__/inspect_*.pdf', kind := 'outline');
 
 statement ok
-SELECT * FROM pdf_outline('test/data/two_pages.pdf');
+SELECT * FROM pdf_objects('test/data/two_pages.pdf', kind := 'outline');
 
 # A nested outline keeps poppler's title/depth order while qpdf resolves each
 # explicit, GoTo-action, and named destination to the physical page.
@@ -90,19 +90,19 @@ query I
 SELECT list(title ORDER BY ord) = ['Root', 'Child', 'Action', 'Named']
    AND list(depth ORDER BY ord) = [1, 2, 1, 1]
    AND list(page ORDER BY ord) = [1, 2, 3, 2]
-FROM pdf_outline('test/data/outline.pdf');
+FROM pdf_objects('test/data/outline.pdf', kind := 'outline');
 ----
 true
 
 # ── pdf_attachments: no embedded files — zero rows, not an error ──
 
 query I
-SELECT count(*) FROM pdf_attachments('__TEST_DIR__/inspect_*.pdf');
+SELECT count(*) FROM pdf_objects('__TEST_DIR__/inspect_*.pdf', kind := 'attachments');
 ----
 0
 
 statement ok
-SELECT file, name, description, size, mime_type, octet_length(data) FROM pdf_attachments('test/data/hello.pdf');
+SELECT file, name, description, size, mime_type, octet_length(data) FROM pdf_objects('test/data/hello.pdf', kind := 'attachments');
 
 # ── failure contract matches read_pdf: corrupt / missing files throw ──
 
@@ -116,19 +116,19 @@ SELECT * FROM pdf_info('test/data/does_not_exist_census.pdf');
 ----
 
 statement error
-SELECT * FROM pdf_outline('test/data/does_not_exist_census.pdf');
+SELECT * FROM pdf_objects('test/data/does_not_exist_census.pdf', kind := 'outline');
 ----
 
 query I
-SELECT count(*) FROM pdf_outline('test/data/truncated.pdf', ignore_errors := true);
+SELECT count(*) FROM pdf_objects('test/data/truncated.pdf', ignore_errors := true, kind := 'outline');
 ----
 0
 
 statement error
-SELECT * FROM pdf_outline('test/data/truncated.pdf', ignore_errors := false);
+SELECT * FROM pdf_objects('test/data/truncated.pdf', ignore_errors := false, kind := 'outline');
 ----
 could not open
 
 statement error
-SELECT * FROM pdf_attachments('test/data/does_not_exist_census.pdf');
+SELECT * FROM pdf_objects('test/data/does_not_exist_census.pdf', kind := 'attachments');
 ----

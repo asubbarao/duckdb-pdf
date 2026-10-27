@@ -19,7 +19,7 @@ hello	1
 world	1
 
 query I
-SELECT text FROM read_pdf_lines('test/data/ligature.pdf') ORDER BY page, line;
+SELECT text FROM read_pdf('test/data/ligature.pdf', grain := 'line') ORDER BY page, line;
 ----
 Profiling
 hello world

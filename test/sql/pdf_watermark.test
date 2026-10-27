@@ -33,27 +33,27 @@ SELECT count(DISTINCT round(height)) FROM read_pdf('__TEST_DIR__/wm_mixed.pdf');
 # ── NULL propagation ─────────────────────────────────────────────────────────
 
 query I
-SELECT pdf_watermark(NULL, '__TEST_DIR__/wmnull.pdf', 'DRAFT') IS NULL;
+SELECT pdf_stamp(NULL, '__TEST_DIR__/wmnull.pdf', {mode: 'watermark', text: 'DRAFT'}) IS NULL;
 ----
 true
 
 query I
-SELECT pdf_watermark('__TEST_DIR__/wm_src.pdf', NULL, 'DRAFT') IS NULL;
+SELECT pdf_stamp('__TEST_DIR__/wm_src.pdf', NULL, {mode: 'watermark', text: 'DRAFT'}) IS NULL;
 ----
 true
 
 query I
-SELECT pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wmnull.pdf', NULL) IS NULL;
+SELECT pdf_stamp('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wmnull.pdf', {mode: 'watermark', text: NULL}) IS NULL;
 ----
 true
 
 query I
-SELECT pdf_bates(NULL, '__TEST_DIR__/wmnull.pdf', 'ACME', 1) IS NULL;
+SELECT pdf_stamp(NULL, '__TEST_DIR__/wmnull.pdf', {mode: 'bates', prefix: 'ACME', start: 1}) IS NULL;
 ----
 true
 
 query I
-SELECT pdf_bates('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wmnull.pdf', 'ACME', NULL) IS NULL;
+SELECT pdf_stamp('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wmnull.pdf', {mode: 'bates', prefix: 'ACME', start: NULL}) IS NULL;
 ----
 true
 
@@ -61,7 +61,7 @@ true
 
 query I
 SELECT ends_with(
-  pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_draft.pdf', 'DRAFT'),
+  pdf_stamp('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_draft.pdf', {mode: 'watermark', text: 'DRAFT'}),
   'wm_draft.pdf');
 ----
 true
@@ -87,7 +87,7 @@ true
 
 query I
 SELECT ends_with(
-  pdf_watermark('test/data/two_pages.pdf', '__TEST_DIR__/wm_two.pdf', 'CONFIDENTIAL'),
+  pdf_stamp('test/data/two_pages.pdf', '__TEST_DIR__/wm_two.pdf', {mode: 'watermark', text: 'CONFIDENTIAL'}),
   'wm_two.pdf');
 ----
 true
@@ -115,7 +115,7 @@ ORDER BY page;
 
 query I
 SELECT ends_with(
-  pdf_watermark('__TEST_DIR__/wm_mixed.pdf', '__TEST_DIR__/wm_mixed_out.pdf', 'DRAFT'),
+  pdf_stamp('__TEST_DIR__/wm_mixed.pdf', '__TEST_DIR__/wm_mixed_out.pdf', {mode: 'watermark', text: 'DRAFT'}),
   'wm_mixed_out.pdf');
 ----
 true
@@ -137,7 +137,7 @@ ORDER BY page;
 
 query I
 SELECT ends_with(
-  pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_opacity.pdf', 'DRAFT', 0.5),
+  pdf_stamp('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_opacity.pdf', {mode: 'watermark', text: 'DRAFT', opacity: 0.5}),
   'wm_opacity.pdf');
 ----
 true
@@ -150,7 +150,7 @@ true
 # text with PDF-literal special characters (parens, backslash) is escaped safely
 query I
 SELECT ends_with(
-  pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_special.pdf', 'DRAFT (v1)\ COPY'),
+  pdf_stamp('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_special.pdf', {mode: 'watermark', text: 'DRAFT (v1)\ COPY'}),
   'wm_special.pdf');
 ----
 true
@@ -164,7 +164,7 @@ SELECT max(page_count) FROM read_pdf('__TEST_DIR__/wm_special.pdf');
 
 query I
 SELECT ends_with(
-  pdf_bates('test/data/two_pages.pdf', '__TEST_DIR__/wm_bates.pdf', 'ACME', 100),
+  pdf_stamp('test/data/two_pages.pdf', '__TEST_DIR__/wm_bates.pdf', {mode: 'bates', prefix: 'ACME', start: 100}),
   'wm_bates.pdf');
 ----
 true
@@ -195,7 +195,7 @@ ORDER BY page;
 # a large start number keeps all its digits (no truncation to 6)
 query I
 SELECT ends_with(
-  pdf_bates('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_bates_big.pdf', 'DOC-', 1234567),
+  pdf_stamp('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_bates_big.pdf', {mode: 'bates', prefix: 'DOC-', start: 1234567}),
   'wm_bates_big.pdf');
 ----
 true
@@ -209,42 +209,42 @@ true
 
 # missing input file (watermark)
 statement error
-SELECT pdf_watermark('__TEST_DIR__/wm_no_such_input.pdf', '__TEST_DIR__/wmnever.pdf', 'DRAFT');
+SELECT pdf_stamp('__TEST_DIR__/wm_no_such_input.pdf', '__TEST_DIR__/wmnever.pdf', {mode: 'watermark', text: 'DRAFT'});
 ----
 wm_no_such_input.pdf' does not exist
 
 # missing input file (bates)
 statement error
-SELECT pdf_bates('__TEST_DIR__/wm_no_such_input.pdf', '__TEST_DIR__/wmnever.pdf', 'ACME', 1);
+SELECT pdf_stamp('__TEST_DIR__/wm_no_such_input.pdf', '__TEST_DIR__/wmnever.pdf', {mode: 'bates', prefix: 'ACME', start: 1});
 ----
 wm_no_such_input.pdf' does not exist
 
 # opacity out of range: zero
 statement error
-SELECT pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wmbad.pdf', 'DRAFT', 0.0);
+SELECT pdf_stamp('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wmbad.pdf', {mode: 'watermark', text: 'DRAFT', opacity: 0.0});
 ----
 opacity must be in (0, 1]
 
 # opacity out of range: above 1
 statement error
-SELECT pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wmbad.pdf', 'DRAFT', 1.5);
+SELECT pdf_stamp('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wmbad.pdf', {mode: 'watermark', text: 'DRAFT', opacity: 1.5});
 ----
 opacity must be in (0, 1]
 
 # in-place operation refused (watermark)
 statement error
-SELECT pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_src.pdf', 'DRAFT');
+SELECT pdf_stamp('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_src.pdf', {mode: 'watermark', text: 'DRAFT'});
 ----
 must differ from input path
 
 # in-place operation refused (bates)
 statement error
-SELECT pdf_bates('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_src.pdf', 'ACME', 1);
+SELECT pdf_stamp('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_src.pdf', {mode: 'bates', prefix: 'ACME', start: 1});
 ----
 must differ from input path
 
 # nonexistent output directory (watermark)
 statement error
-SELECT pdf_watermark('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_no_such_dir/out.pdf', 'DRAFT');
+SELECT pdf_stamp('__TEST_DIR__/wm_src.pdf', '__TEST_DIR__/wm_no_such_dir/out.pdf', {mode: 'watermark', text: 'DRAFT'});
 ----
 wm_no_such_dir' does not exist

@@ -1,12 +1,13 @@
 -- Digest a long document: its contents, section by section (COOKBOOK.md recipe 10).
 -- Change the path (or URL); the document needs bookmarks. No bookmarks -> no rows: anchor on the
--- headings of read_pdf_elements instead.
+-- headings of read_pdf(..., grain := 'element') instead.
 -- Result: one row per bookmark in document order:
 --   contents VARCHAR (indented by depth), page INTEGER (the bookmark's page),
 --   lines BIGINT, chars BIGINT (size of the section), opening VARCHAR (its first line longer than 40
 --   characters, so page numbers and headers are skipped; NULL for a section with no such line).
--- Needs the pdf version that has pdf_outline.page.
-INSTALL pdf FROM community; LOAD pdf;
+-- The outline rows include the physical page each bookmark points to.
+-- Run with the matching source-build CLI; community artifacts may lag this API.
+LOAD pdf;
 INSTALL httpfs; LOAD httpfs;
 
 WITH words AS (
@@ -21,7 +22,7 @@ WITH words AS (
   SELECT page, line, text FROM lines ANTI JOIN furniture USING (text)
 ), anchors AS (     -- a bookmark starts at the line on its page that prints its title
   SELECT o.ord, o.depth, o.title, o.page, coalesce(min(b.line), 0) AS line
-  FROM pdf_outline('https://blobs.duckdb.org/docs/ducklake-docs.pdf') o
+  FROM pdf_objects('https://blobs.duckdb.org/docs/ducklake-docs.pdf', kind := 'outline') o
   LEFT JOIN body b ON b.page = o.page AND b.text = o.title
   GROUP BY o.ord, o.depth, o.title, o.page
 ), sections AS (    -- each line belongs to the deepest bookmark at or before it

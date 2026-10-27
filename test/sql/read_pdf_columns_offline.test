@@ -41,7 +41,7 @@ true
 # Every prose line is still one line, in reading order.
 query I
 SELECT count(*) = 14
-FROM read_pdf_lines('test/data/single_column_table.pdf')
+FROM read_pdf('test/data/single_column_table.pdf', grain := 'line')
 WHERE starts_with(text, 'Prose line') AND ends_with(text, 'never stops early.');
 ----
 true
@@ -49,14 +49,14 @@ true
 # A spanning line is one reading unit and divides the column runs at its y position.
 query I
 SELECT COUNT(*) = 1
-FROM read_pdf_lines('test/data/full_width_lines.pdf')
+FROM read_pdf('test/data/full_width_lines.pdf', grain := 'line')
 WHERE text = 'Full width title spans both columns';
 ----
 true
 
 query I
 SELECT COUNT(*) = 1
-FROM read_pdf_lines('test/data/full_width_lines.pdf')
+FROM read_pdf('test/data/full_width_lines.pdf', grain := 'line')
 WHERE text = 'Full width line separates column sections';
 ----
 true
@@ -72,6 +72,6 @@ SELECT min(line) FILTER (text = 'Full width title spans both columns') <
        min(line) FILTER (starts_with(text, 'left-section-two-line-')) AND
        max(line) FILTER (starts_with(text, 'left-section-two-line-')) <
        min(line) FILTER (starts_with(text, 'right-section-two-line-'))
-FROM read_pdf_lines('test/data/full_width_lines.pdf');
+FROM read_pdf('test/data/full_width_lines.pdf', grain := 'line');
 ----
 true

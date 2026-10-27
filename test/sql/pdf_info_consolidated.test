@@ -60,7 +60,7 @@ SELECT len(coalesce(list(file), [])) FROM pdf_info('test/data/does_not_exist.pdf
 0
 
 statement ok
-SELECT pdf_encrypt('test/data/hello.pdf', '__TEST_DIR__/info_encrypted.pdf', 'secret');
+SELECT pdf_rewrite('test/data/hello.pdf', '__TEST_DIR__/info_encrypted.pdf', {mode: 'encrypt', password: 'secret'});
 
 query III
 SELECT is_encrypted, is_locked, page_count

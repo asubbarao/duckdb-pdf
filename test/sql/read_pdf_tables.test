@@ -17,20 +17,20 @@ SELECT write_pdf(
 
 # At least one table row returned
 query I
-SELECT COUNT(*) > 0 FROM read_pdf_tables('test/data/table.pdf');
+SELECT COUNT(*) > 0 FROM read_pdf('test/data/table.pdf', grain := 'table');
 ----
 true
 
 # At least one table detected (table_index >= 0)
 query I
-SELECT COUNT(DISTINCT table_index) > 0 FROM read_pdf_tables('test/data/table.pdf');
+SELECT COUNT(DISTINCT table_index) > 0 FROM read_pdf('test/data/table.pdf', grain := 'table');
 ----
 true
 
 # All rows come from page 1
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_tables('test/data/table.pdf')
+FROM read_pdf('test/data/table.pdf', grain := 'table')
 WHERE page != 1;
 ----
 true
@@ -38,7 +38,7 @@ true
 # row_index increments from 0
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/table.pdf')
+FROM read_pdf('test/data/table.pdf', grain := 'table')
 WHERE row_index = 0;
 ----
 true
@@ -46,7 +46,7 @@ true
 # cells array is non-null and non-empty for all rows
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_tables('test/data/table.pdf')
+FROM read_pdf('test/data/table.pdf', grain := 'table')
 WHERE cells IS NULL OR len(cells) = 0;
 ----
 true
@@ -54,7 +54,7 @@ true
 # Each row has exactly 3 cells (3-column table)
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_tables('test/data/table.pdf')
+FROM read_pdf('test/data/table.pdf', grain := 'table')
 WHERE len(cells) != 3;
 ----
 true
@@ -62,7 +62,7 @@ true
 # Header row contains "Item" in the first cell
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/table.pdf')
+FROM read_pdf('test/data/table.pdf', grain := 'table')
 WHERE lower(cells[1]) = 'item';
 ----
 true
@@ -70,7 +70,7 @@ true
 # "Apples" appears as a cell value somewhere
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/table.pdf')
+FROM read_pdf('test/data/table.pdf', grain := 'table')
 WHERE list_contains(cells, 'Apples');
 ----
 true
@@ -78,7 +78,7 @@ true
 # "Bananas" appears as a cell value somewhere
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/table.pdf')
+FROM read_pdf('test/data/table.pdf', grain := 'table')
 WHERE list_contains(cells, 'Bananas');
 ----
 true
@@ -86,7 +86,7 @@ true
 # "Cherries" appears as a cell value somewhere
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/table.pdf')
+FROM read_pdf('test/data/table.pdf', grain := 'table')
 WHERE list_contains(cells, 'Cherries');
 ----
 true
@@ -94,7 +94,7 @@ true
 # Known price cell "9.99" or "Cherries" row: Qty = "100"
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/table.pdf')
+FROM read_pdf('test/data/table.pdf', grain := 'table')
 WHERE list_contains(cells, '100');
 ----
 true
@@ -103,7 +103,7 @@ true
 
 # Plain text-only PDF should return 0 rows (no tables detected)
 query I
-SELECT COUNT(*) = 0 FROM read_pdf_tables('test/data/two_pages.pdf');
+SELECT COUNT(*) = 0 FROM read_pdf('test/data/two_pages.pdf', grain := 'table');
 ----
 true
 
@@ -111,19 +111,19 @@ true
 
 query I
 SELECT COUNT(DISTINCT table_index) = 1
-FROM read_pdf_tables('test/data/mixed_prose_table.pdf');
+FROM read_pdf('test/data/mixed_prose_table.pdf', grain := 'table');
 ----
 true
 
 query I
 SELECT COUNT(*) = 4
-FROM read_pdf_tables('test/data/mixed_prose_table.pdf');
+FROM read_pdf('test/data/mixed_prose_table.pdf', grain := 'table');
 ----
 true
 
 query I
 SELECT COUNT(*) = 1
-FROM read_pdf_tables('test/data/mixed_prose_table.pdf')
+FROM read_pdf('test/data/mixed_prose_table.pdf', grain := 'table')
 WHERE list_contains(cells, 'Category')
   AND list_contains(cells, 'Considerations');
 ----
@@ -131,14 +131,14 @@ true
 
 query I
 SELECT COUNT(*) = 1
-FROM read_pdf_tables('test/data/mixed_prose_table.pdf')
+FROM read_pdf('test/data/mixed_prose_table.pdf', grain := 'table')
 WHERE contains(array_to_string(cells, ' | '), 'for natural conversation');
 ----
 true
 
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_tables('test/data/mixed_prose_table.pdf')
+FROM read_pdf('test/data/mixed_prose_table.pdf', grain := 'table')
 WHERE list_contains(cells, 'This paragraph explains the report before the data begins.')
    OR list_contains(cells, 'This paragraph follows the table and is not tabular data.');
 ----
@@ -147,7 +147,7 @@ true
 # A prose-only page is not a table.
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_tables('__TEST_DIR__/prose_only_table_control.pdf');
+FROM read_pdf('__TEST_DIR__/prose_only_table_control.pdf', grain := 'table');
 ----
 true
 
@@ -158,21 +158,21 @@ true
 # Detects a table with exactly 2 columns
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_tables('test/data/financial_right_aligned.pdf')
+FROM read_pdf('test/data/financial_right_aligned.pdf', grain := 'table')
 WHERE len(cells) != 2;
 ----
 true
 
 # At least 5 rows (header + 4 data rows)
 query I
-SELECT COUNT(*) >= 5 FROM read_pdf_tables('test/data/financial_right_aligned.pdf');
+SELECT COUNT(*) >= 5 FROM read_pdf('test/data/financial_right_aligned.pdf', grain := 'table');
 ----
 true
 
 # Header labels present
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/financial_right_aligned.pdf')
+FROM read_pdf('test/data/financial_right_aligned.pdf', grain := 'table')
 WHERE list_contains(list_transform(cells, lambda x: lower(x)), 'account')
    OR list_contains(list_transform(cells, lambda x: lower(x)), 'balance');
 ----
@@ -181,7 +181,7 @@ true
 # Right-aligned amounts survive as single cells (not shattered)
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/financial_right_aligned.pdf')
+FROM read_pdf('test/data/financial_right_aligned.pdf', grain := 'table')
 WHERE list_contains(cells, '1,234.56')
    OR list_contains(cells, '1234.56');
 ----
@@ -189,7 +189,7 @@ true
 
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/financial_right_aligned.pdf')
+FROM read_pdf('test/data/financial_right_aligned.pdf', grain := 'table')
 WHERE list_contains(cells, '12,500.75')
    OR list_contains(cells, '12500.75');
 ----
@@ -197,7 +197,7 @@ true
 
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/financial_right_aligned.pdf')
+FROM read_pdf('test/data/financial_right_aligned.pdf', grain := 'table')
 WHERE list_contains(cells, 'Cash');
 ----
 true
@@ -206,12 +206,12 @@ true
 # The fixture has no full-page ruling grid, so this exercises the whitespace
 # confidence gate rather than the border-driven lattice path.
 query I
-SELECT COUNT(*) = 0 FROM read_pdf_tables('test/data/card_layout.pdf');
+SELECT COUNT(*) = 0 FROM read_pdf('test/data/card_layout.pdf', grain := 'table');
 ----
 true
 
 query I
-SELECT COUNT(*) > 0 FROM read_pdf_tables('test/data/card_layout.pdf', force := true);
+SELECT COUNT(*) > 0 FROM read_pdf('test/data/card_layout.pdf', force := true, grain := 'table');
 ----
 true
 
@@ -222,28 +222,28 @@ true
 # Exactly 3 columns on every row
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_tables('test/data/ruled_lattice.pdf')
+FROM read_pdf('test/data/ruled_lattice.pdf', grain := 'table')
 WHERE len(cells) != 3;
 ----
 true
 
 # 4 rows (header + 3 data)
 query I
-SELECT COUNT(*) = 4 FROM read_pdf_tables('test/data/ruled_lattice.pdf');
+SELECT COUNT(*) = 4 FROM read_pdf('test/data/ruled_lattice.pdf', grain := 'table');
 ----
 true
 
 # Header cells
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/ruled_lattice.pdf')
+FROM read_pdf('test/data/ruled_lattice.pdf', grain := 'table')
 WHERE list_contains(cells, 'Region');
 ----
 true
 
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/ruled_lattice.pdf')
+FROM read_pdf('test/data/ruled_lattice.pdf', grain := 'table')
 WHERE list_contains(cells, 'Units');
 ----
 true
@@ -251,21 +251,21 @@ true
 # Data cells land in the lattice bands
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/ruled_lattice.pdf')
+FROM read_pdf('test/data/ruled_lattice.pdf', grain := 'table')
 WHERE list_contains(cells, 'North');
 ----
 true
 
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/ruled_lattice.pdf')
+FROM read_pdf('test/data/ruled_lattice.pdf', grain := 'table')
 WHERE list_contains(cells, '2500');
 ----
 true
 
 query I
 SELECT COUNT(*) > 0
-FROM read_pdf_tables('test/data/ruled_lattice.pdf')
+FROM read_pdf('test/data/ruled_lattice.pdf', grain := 'table')
 WHERE list_contains(cells, 'West');
 ----
 true
@@ -273,12 +273,12 @@ true
 # ── error: missing file ───────────────────────────────────────────────────
 
 statement error
-SELECT * FROM read_pdf_tables('test/data/does_not_exist.pdf');
+SELECT * FROM read_pdf('test/data/does_not_exist.pdf', grain := 'table');
 ----
 
 # Explicit horizontal ruling separates a sparse row from its neighbors.
 query I
-SELECT count(*) = 1 FROM read_pdf_tables('test/data/ruled_sparse_table.pdf')
+SELECT count(*) = 1 FROM read_pdf('test/data/ruled_sparse_table.pdf', grain := 'table')
 WHERE cells[1] = 'SparseOnly' AND coalesce(cells[2], '') = '';
 ----
 true

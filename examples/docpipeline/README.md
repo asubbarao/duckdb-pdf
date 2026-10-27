@@ -1,196 +1,72 @@
-# read_pdf document-intelligence pipeline
+# Document search and highlight pipeline
 
-**Generalizable, versioned reference recipe:** folder of PDFs → hybrid search + redaction coordinates, in pure DuckDB.
+This example composes the current source build's `read_pdf` and
+`read_pdf_words` with FTS, VSS and reciprocal rank fusion. It produces page
+text, word boxes, search results and UI highlight rectangles as Parquet files.
+The embedding is a deterministic hashed-token stub that exercises the vector
+pipeline; it does not provide semantic understanding.
 
-```
-read_pdf (digital + OCR)
-    → docs / words
-    → FTS (BM25)  +  VSS (HNSW over embeddings)
-    → hybrid RRF ranking
-    → term → pixel rectangles (redact / highlight)
-```
+## Run from the repository root
 
-Not hardcoded to any domain. Point `folder` at legal, medical, invoices, or any mixed corpus.
-
----
-
-## Requirements
-
-| Piece | Detail |
-|-------|--------|
-| Binary | `./build/release/duckdb` from the duckdb-read_pdf repo root (pdf extension + tesseract OCR linked) |
-| Extensions | `fts`, `vss` (core). The `pdf` / `read_pdf` extension is linked into the custom binary (or `LOAD 'build/release/extension/pdf/pdf.duckdb_extension'`). |
-| OCR runtime | Tesseract language data (`eng` etc.) on the host (`brew install tesseract tesseract-lang`) |
-| Embeddings | Real model via `llm` / UDF preferred; recipe ships a **documented stub** so HNSW + hybrid still run |
-
-This recipe lives under `examples/docpipeline/` in the duckdb-read_pdf tree (SQL + README only).
-
----
-
-## Quick start
+Build with `make release`, then prepare a small valid corpus and output directory.
+Do not point the default example at all of `test/data`: that directory includes
+deliberately malformed and encrypted regression fixtures.
 
 ```bash
-# From the duckdb-read_pdf repo root (after a release build):
-DUCK=./build/release/duckdb
-
-# 1. Put PDFs in a folder (or use shipped fixtures)
-ls test/data/*.pdf | head
-
-# 2. Run the full pipeline
-$DUCK -c ".read examples/docpipeline/pipeline.sql"
+mkdir -p build/docpipeline-corpus build/docpipeline-artifacts
+cp test/data/hello.pdf test/data/two_pages.pdf test/data/redact_secret.pdf \
+   test/data/scanned.pdf test/data/table.pdf build/docpipeline-corpus/
+./build/release/duckdb -bail -f examples/docpipeline/pipeline.sql
 ```
 
-### Point at ANY folder
+The built CLI links the PDF extension. The script installs and loads matching
+`fts` and `vss` artifacts, so first use needs network access. English OCR is
+bundled; other languages require the selected models on disk.
 
-Edit the parameter block at the top of `pipeline.sql`:
+Edit the parameter block in [pipeline.sql](pipeline.sql) to select another
+`folder`, an existing writable `out_dir`, and search terms. Values set before
+running the file are overwritten by that block. An unreadable file is skipped
+by the page reader's `ignore_errors`; the word reader still fails on it.
+Use a corpus whose files both readers can open.
 
-```sql
-SET VARIABLE folder = '/path/to/your/pdfs';   -- only required change for a new corpus
-SET VARIABLE q_keyword  = 'some-PII-or-ID';
-SET VARIABLE q_ocr_term = 'SomeName';
-SET VARIABLE q_semantic = 'natural language question about the corpus';
-SET VARIABLE q_hybrid   = 'mixed keyword + intent terms';
-```
+## Stages and outputs
 
-Or override from the CLI:
+| Stage | Result |
+|---|---|
+| Ingest | `docs` / `pages` hold text, page dimensions, OCR provenance and nested word boxes; `words` holds positioned words. |
+| FTS | `q_fts` / `q_fts_ocr` rank keyword hits using BM25. |
+| VSS | `chunks` contains page-sized text and normalized `FLOAT[32]` hashed-token vectors; `q_vss` ranks distances. |
+| Hybrid | `q_hybrid` combines keyword and vector ranks with reciprocal rank fusion, using k = 60. |
+| Highlight | `q_coords` and `highlight_payload` locate matched words for UI overlays. |
+| Export | Nine Parquet snapshots are written under `out_dir`; reruns replace them. |
 
-```bash
-$DUCK -c "
-  SET VARIABLE folder = '/data/contracts';
-  .read examples/docpipeline/pipeline.sql
-"
-```
+The script synthesizes `word_boxes` by joining the separate word reader onto
+page rows; `read_pdf` itself does not return a nested word-box column.
+Automatic OCR reads image-only pages, and `ocr := true` can force OCR when
+needed. Misrecognition remains possible; inspect confidence and source text.
 
-(`SET VARIABLE` before `.read` is overridden by the script’s own `SET` — for one-shot overrides, edit the script or factor the parameter block into `params.sql`.)
+FTS indexes are snapshots. This script uses `overwrite=1` when rebuilding.
+Page keys are assigned in file/page order. Hybrid fusion uses a full outer join,
+so a result can come from either ranking channel.
 
----
+## Coordinates
 
-## Pipeline stages
+`x0/y0/x1/y1`, `width_pt/height_pt` and `highlight_rect` use displayed-page
+**points with a top-left origin**. A viewer scales them by its pixels-per-point
+ratio. They are not directly valid `pdf_redact` inputs: that function expects
+original PDF user-space points with a bottom-left origin. Crop offsets and page
+rotation must also be handled before redaction. This example writes no redacted PDF.
 
-### 1. INGEST — `read_pdf` + `read_pdf_words`
+## Replace the embedding stub
 
-```sql
-FROM read_pdf(folder || '/*.pdf', auto_ocr := true, ignore_errors := true)
-FROM read_pdf_words(folder || '/*.pdf', auto_ocr := true)
-```
+Replace the chunk and query embedding computations together, keeping the
+dimension consistent in the `FLOAT[32]` casts and HNSW index. Supply real model
+vectors via your own UDF or an external batch joined by `chunk_id`.
+The script has no dependency on an `llm_embed` function or an external model.
+Token hashing is a demonstration of data flow, not a semantic retrieval benchmark.
 
-| Column | Meaning |
-|--------|---------|
-| `has_text_layer` | Page has a born-digital text layer |
-| `used_ocr` | Page was OCR’d (image-only / empty text layer) |
-| `word_boxes` | Nested list of `{word, x0, y0, x1, y1, source, confidence}` |
-| `source` on words | `'text'` (digital) or `'ocr'` |
+## Files and scope
 
-**OCR notes**
-
-- `auto_ocr := true` (default behavior in this recipe) OCRs **only** pages without a usable text layer.
-- `ocr := true` forces OCR on every page (slower; use for damaged text layers).
-- OCR needs tessdata at runtime (`tessdata_dir` param or `TESSDATA_PREFIX` or system paths).
-- Scanned OCR can misread glyphs (e.g. `Item` → `ltem`); FTS still matches OCR’d tokens as emitted.
-
-### 2. FTS — BM25 keyword / PII search
-
-```sql
-PRAGMA create_fts_index('pages', 'id', 'text', overwrite=1);
-SELECT ..., fts_main_pages.match_bm25(id, 'SECRET-CODE-42') AS score ...
-```
-
-**When to use FTS**
-
-- Exact or near-exact tokens: names, IDs, invoice numbers, code strings.
-- High precision on known strings; ranking is classical BM25.
-- Index is a **snapshot** — rebuild after re-ingesting pages.
-
-### 3. VSS — chunk + embed + HNSW
-
-Chunks are page-level by default (fine for short pages; sub-chunk long docs). Embeddings:
-
-1. **Preferred:** real model (`llm` extension, Python UDF, offline batch → `UPDATE`).
-2. **Shipped stub:** L2-normalized bag-of-token hashed into `FLOAT[32]` so the index and hybrid SQL are real end-to-end without a model.
-
-```sql
-CREATE INDEX chunks_hnsw ON chunks USING HNSW (embedding);
-ORDER BY array_distance(embedding, qemb) LIMIT k;
-```
-
-**When to use vector search**
-
-- Paraphrase / topical queries (“fruit line items”, “payment terms”).
-- Quality is dominated by the embedder — swap the stub for production.
-
-### 4. HYBRID — Reciprocal Rank Fusion (headline)
-
-```text
-RRF(d) = 1/(k + rank_fts(d)) + 1/(k + rank_vss(d))   with k = 60
-```
-
-One SQL query fuses BM25 ranks and vector ranks at `(file, page)` grain via `FULL OUTER JOIN`. Hits that only appear in one channel still score; hits in both rise to the top.
-
-**When to use hybrid**
-
-- Default retrieval mode for mixed corpora.
-- Keyword-ish queries lean FTS; vague queries lean VSS; RRF merges without score calibration.
-
-### 5. REDACTION-COORD JOIN
-
-```sql
-SELECT word, x0, y0, x1, y1, source, confidence,
-       struct_pack(page := page, x := x0, y := y0, w := x1-x0, h := y1-y0) AS redact_rect
-FROM words
-WHERE lower(word) = lower(:term);
-```
-
-Join any matched term (from FTS/hybrid hit) back to word geometry. Rects are ready for `pdf_redact` or UI highlight overlays. Works for digital `source='text'` **and** OCR `source='ocr'` words.
-
----
-
-## Layout
-
-```
-examples/docpipeline/
-  pipeline.sql          # parameterized, commented pipeline (this recipe)
-  README.md             # how it works (this file)
-  RECIPE.md             # results + yes/partial verdict from the test run
-  run_transcript.txt    # clean stage outputs from the end-to-end run
-  corpus/               # small mixed digital + scanned test set
-  artifacts/            # parquet snapshots (pages, words, chunks, query results)
-```
-
----
-
-## Test corpus
-
-Assembled under `corpus/` from `duckdb-read_pdf/test/data/` fixtures (reproducible, no network):
-
-| File | Kind |
-|------|------|
-| `01_hello_digital.pdf` | Born-digital |
-| `02_two_pages_digital.pdf` | Born-digital, 2 pages |
-| `03_redact_secret_digital.pdf` | Born-digital, contains `SECRET-CODE-42` |
-| `04_scanned_invoice_ocr.pdf` | **Image-only scan** → `used_ocr=true` |
-| `05_table_digital.pdf` | Born-digital table |
-
----
-
-## Swapping in a real embedder
-
-Replace the stub block in `pipeline.sql` (section 3) with e.g.:
-
-```sql
--- After LOAD llm (when http_request + model are available):
-UPDATE chunks SET embedding = llm_embed(chunk_text);  -- shape must match FLOAT[N]
--- or export chunks → external model → reimport parquet and JOIN on chunk_id
-```
-
-Keep dimension `N` consistent for query vectors and `CREATE INDEX ... HNSW (embedding)`.
-
----
-
-## Version
-
-| Field | Value |
-|-------|-------|
-| Recipe | `quackapi_docpipeline` |
-| Version | `1.0.0` |
-| DuckDB | v1.5.4 (read_pdf build) |
-| Date | 2026-07-19 |
+Only this README and `pipeline.sql` are tracked here. The quick start creates
+its corpus and snapshots under ignored `build/`; no stored test transcript or
+historical benchmark is shipped. The host baseline is DuckDB v2.0.0.

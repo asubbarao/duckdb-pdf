@@ -16,7 +16,7 @@ SELECT write_pdf(
 # kept, and so is a hyphen on the last line of the page: nothing continues it.
 query I
 SELECT text
-FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'auto', auto_ocr := false)
+FROM read_pdf('__TEST_DIR__/hyphen_join.pdf', layout := 'auto', auto_ocr := false, grain := 'line')
 ORDER BY line;
 ----
 The argument continues onto the next line.
@@ -28,10 +28,10 @@ The page ends on a well-
 query ITITTIT
 WITH auto AS (
   SELECT line, text
-  FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'auto', auto_ocr := false)
+  FROM read_pdf('__TEST_DIR__/hyphen_join.pdf', layout := 'auto', auto_ocr := false, grain := 'line')
 ), reading AS (
   SELECT line, text
-  FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'reading', auto_ocr := false)
+  FROM read_pdf('__TEST_DIR__/hyphen_join.pdf', layout := 'reading', auto_ocr := false, grain := 'line')
   WHERE trim(text) <> ''
 )
 SELECT coalesce(a.line, r.line), a.text, length(a.text), hex(a.text),
@@ -50,10 +50,10 @@ SELECT list(text ORDER BY line) FILTER (WHERE layout = 'auto')
      = list(text ORDER BY line) FILTER (WHERE layout = 'reading')
 FROM (
   SELECT 'auto' AS layout, line, text
-  FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'auto', auto_ocr := false)
+  FROM read_pdf('__TEST_DIR__/hyphen_join.pdf', layout := 'auto', auto_ocr := false, grain := 'line')
   UNION ALL
   SELECT 'reading' AS layout, line, text
-  FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'reading', auto_ocr := false)
+  FROM read_pdf('__TEST_DIR__/hyphen_join.pdf', layout := 'reading', auto_ocr := false, grain := 'line')
   WHERE trim(text) <> ''
 );
 ----
@@ -80,6 +80,6 @@ well-	5
 # poppler ends lines with CRLF on Windows; a line never carries the CR.
 query I
 SELECT bool_and(NOT contains(text, chr(13)))
-FROM read_pdf_lines('__TEST_DIR__/hyphen_join.pdf', layout := 'reading', auto_ocr := false);
+FROM read_pdf('__TEST_DIR__/hyphen_join.pdf', layout := 'reading', auto_ocr := false, grain := 'line');
 ----
 true

@@ -12,9 +12,9 @@ statement ok
 COPY (SELECT 'alpha_marker' AS a UNION ALL SELECT 'beta_marker' UNION ALL SELECT 'gamma_marker') TO '__TEST_DIR__/copy_out.pdf' (FORMAT pdf);
 
 query I
-SELECT contains(pdf_to_text('__TEST_DIR__/copy_out.pdf'), 'alpha_marker')
-   AND contains(pdf_to_text('__TEST_DIR__/copy_out.pdf'), 'beta_marker')
-   AND contains(pdf_to_text('__TEST_DIR__/copy_out.pdf'), 'gamma_marker');
+SELECT contains(pdf_text('__TEST_DIR__/copy_out.pdf'), 'alpha_marker')
+   AND contains(pdf_text('__TEST_DIR__/copy_out.pdf'), 'beta_marker')
+   AND contains(pdf_text('__TEST_DIR__/copy_out.pdf'), 'gamma_marker');
 ----
 true
 
@@ -24,7 +24,7 @@ COPY (SELECT i AS n, 'row'||i AS label FROM range(1,50) t(i)) TO '__TEST_DIR__/c
 
 query I
 SELECT (SELECT max(page_count) FROM read_pdf('__TEST_DIR__/copy_multi.pdf')) >= 1
-   AND contains(pdf_to_text('__TEST_DIR__/copy_multi.pdf'), 'row49');
+   AND contains(pdf_text('__TEST_DIR__/copy_multi.pdf'), 'row49');
 ----
 true
 

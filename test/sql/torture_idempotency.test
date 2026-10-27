@@ -10,7 +10,7 @@ PRAGMA enable_verification
 # ── scalar pdf_to_text called 50 times ──────────────────────────────────────
 
 query I
-SELECT count(*) FROM range(50) t, lateral (SELECT pdf_to_text(concat('test/data/hello', CASE WHEN t.range >= 0 THEN '' ELSE 'x' END, '.pdf')) AS x) s WHERE length(s.x) > 0;
+SELECT count(*) FROM range(50) t, lateral (SELECT pdf_text(concat('test/data/hello', CASE WHEN t.range >= 0 THEN '' ELSE 'x' END, '.pdf')) AS x) s WHERE length(s.x) > 0;
 ----
 50
 
@@ -39,7 +39,7 @@ true
 # ── pdf_to_xml 50 times (markdown analog) ───────────────────────────────────
 
 query I
-SELECT count(*) FROM range(50) t, lateral (SELECT pdf_to_xml(concat('test/data/hello', CASE WHEN t.range >= 0 THEN '' ELSE 'x' END, '.pdf')) AS m) s WHERE length(s.m) > 0;
+SELECT count(*) FROM range(50) t, lateral (SELECT pdf_text(concat('test/data/hello', CASE WHEN t.range >= 0 THEN '' ELSE 'x' END, '.pdf'), {format: 'xml'}) AS m) s WHERE length(s.m) > 0;
 ----
 50
 
@@ -53,15 +53,15 @@ SELECT count(*) FROM range(50) t, lateral (SELECT pdf_to_xml(concat('test/data/h
 query I
 SELECT l.dl = 3 AND l.nl = 27 AND w.dw = 3 AND w.nw = 117 FROM
   (SELECT count(DISTINCT filename) AS dl, count(*) AS nl FROM (
-    SELECT filename FROM read_pdf_lines('test/data/hello.pdf', auto_ocr := false)
-    UNION ALL SELECT filename FROM read_pdf_lines('test/data/two_pages.pdf', auto_ocr := false)
-    UNION ALL SELECT filename FROM read_pdf_lines('test/data/table.pdf', auto_ocr := false)
-    UNION ALL SELECT filename FROM read_pdf_lines('test/data/hello.pdf', auto_ocr := false)
-    UNION ALL SELECT filename FROM read_pdf_lines('test/data/two_pages.pdf', auto_ocr := false)
-    UNION ALL SELECT filename FROM read_pdf_lines('test/data/table.pdf', auto_ocr := false)
-    UNION ALL SELECT filename FROM read_pdf_lines('test/data/hello.pdf', auto_ocr := false)
-    UNION ALL SELECT filename FROM read_pdf_lines('test/data/two_pages.pdf', auto_ocr := false)
-    UNION ALL SELECT filename FROM read_pdf_lines('test/data/table.pdf', auto_ocr := false)
+    SELECT filename FROM read_pdf('test/data/hello.pdf', auto_ocr := false, grain := 'line')
+    UNION ALL SELECT filename FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false, grain := 'line')
+    UNION ALL SELECT filename FROM read_pdf('test/data/table.pdf', auto_ocr := false, grain := 'line')
+    UNION ALL SELECT filename FROM read_pdf('test/data/hello.pdf', auto_ocr := false, grain := 'line')
+    UNION ALL SELECT filename FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false, grain := 'line')
+    UNION ALL SELECT filename FROM read_pdf('test/data/table.pdf', auto_ocr := false, grain := 'line')
+    UNION ALL SELECT filename FROM read_pdf('test/data/hello.pdf', auto_ocr := false, grain := 'line')
+    UNION ALL SELECT filename FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false, grain := 'line')
+    UNION ALL SELECT filename FROM read_pdf('test/data/table.pdf', auto_ocr := false, grain := 'line')
   )) l,
   (SELECT count(DISTINCT filename) AS dw, count(*) AS nw FROM (
     SELECT filename FROM read_pdf_words('test/data/hello.pdf', auto_ocr := false)

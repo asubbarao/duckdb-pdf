@@ -55,8 +55,7 @@ true
 
 query II
 SELECT line, text
-FROM read_pdf_lines('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf',
-                    first_page := 1, last_page := 1)
+FROM read_pdf('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf', first_page := 1, last_page := 1, grain := 'line')
 WHERE line <= 2 ORDER BY line;
 ----
 1	KalDB: Log analytics with DuckDB
@@ -66,7 +65,7 @@ WHERE line <= 2 ORDER BY line;
 # exactly the shape that catches a table reader inventing structure.
 query I
 SELECT COUNT(*) = 6
-FROM read_pdf_tables('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf');
+FROM read_pdf('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf', grain := 'table');
 ----
 true
 
@@ -74,7 +73,7 @@ true
 # must not turn its prose into a ruled table, while the sparse tables remain.
 query I
 SELECT len(coalesce(list(page), [])) = 0
-FROM read_pdf_tables('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf')
+FROM read_pdf('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf', grain := 'table')
 WHERE page = 11;
 ----
 true
@@ -92,8 +91,7 @@ FROM pdf_info('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-
 
 query I
 SELECT COUNT(*) = 1
-FROM read_pdf_lines('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf',
-                    first_page := 1, last_page := 1)
+FROM read_pdf('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf', first_page := 1, last_page := 1, grain := 'line')
 WHERE text = '“One Size Fits All”: An Idea Whose Time Has Come and Gone';
 ----
 true
@@ -159,7 +157,7 @@ FROM pdf_info('https://blobs.duckdb.org/docs/ducklake-docs.pdf');
 DuckLake Documentation	false	1.5	true
 
 query I
-SELECT COUNT(*) > 20 FROM pdf_outline('https://blobs.duckdb.org/docs/ducklake-docs.pdf');
+SELECT COUNT(*) > 20 FROM pdf_objects('https://blobs.duckdb.org/docs/ducklake-docs.pdf', kind := 'outline');
 ----
 true
 
@@ -167,7 +165,7 @@ true
 # open on it.
 query I
 SELECT list_contains(list(DISTINCT depth), 1) AND list_contains(list(DISTINCT depth), 2)
-FROM pdf_outline('https://blobs.duckdb.org/docs/ducklake-docs.pdf');
+FROM pdf_objects('https://blobs.duckdb.org/docs/ducklake-docs.pdf', kind := 'outline');
 ----
 true
 
@@ -251,21 +249,21 @@ true
 # ── a URL is a file everywhere the API takes a file ─────────────────────────
 
 query I
-SELECT contains(pdf_to_text('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf'),
+SELECT contains(pdf_text('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf'),
                 'KalDB');
 ----
 true
 
 query I
 SELECT COUNT(*) = 12
-FROM pdf_pages_info('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf');
+FROM pdf_objects('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf', kind := 'pages');
 ----
 true
 
 # Rasterizing over https too. The paper renders without poppler diagnostics on
 # stderr, which the slide decks' gradient fills do not.
 query I
-SELECT octet_length(pdf_to_png('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf', 1, 36)) > 0;
+SELECT octet_length(pdf_render('https://blobs.duckdb.org/papers/stonebraker-centintemel-one-size-fits-all-icde-2015.pdf', 1, {dpi: 36})) > 0;
 ----
 true
 
@@ -273,18 +271,18 @@ true
 # file for them as well. These six read locally once, which is the whole defect.
 query II
 SELECT count(*), list(DISTINCT format)
-FROM pdf_images('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf');
+FROM pdf_objects('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf', kind := 'images');
 ----
 12	[jpeg]
 
 query I
 SELECT page_count = 12
-FROM pdf_qpdf_info('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf');
+FROM pdf_info('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf', detail := 'qpdf');
 ----
 true
 
 query I
-SELECT length(pdf_json('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf')) > 0;
+SELECT length(pdf_text('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf', {format: 'json'})) > 0;
 ----
 true
 
@@ -292,9 +290,9 @@ true
 # form fields or signatures, but page 7 carries one Link annotation (a citation
 # to the talk this deck is based on), so that column is 1, not 0.
 query III
-SELECT (SELECT count(*) FROM pdf_form_fields('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf')),
-       (SELECT count(*) FROM pdf_annotations('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf')),
-       (SELECT count(*) FROM pdf_signatures('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf'));
+SELECT (SELECT count(*) FROM pdf_objects('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf', kind := 'form_fields')),
+       (SELECT count(*) FROM pdf_objects('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf', kind := 'annotations')),
+       (SELECT count(*) FROM pdf_objects('https://blobs.duckdb.org/events/duckcon3/suman-karumuri-kaldb-log-analytics-with-duckdb.pdf', kind := 'signatures'));
 ----
 0	1	0
 
@@ -306,7 +304,7 @@ query I
 SELECT count(*) > 0
    AND count(*) FILTER (WHERE role = 'P') > 0
    AND count(*) FILTER (WHERE role = 'Sect') > 0
-FROM pdf_structure('https://blobs.duckdb.org/events/duckcon7/floyd-berndsen-ducklake-on-hetzner.pdf');
+FROM pdf_objects('https://blobs.duckdb.org/events/duckcon7/floyd-berndsen-ducklake-on-hetzner.pdf', kind := 'structure');
 ----
 true
 
@@ -314,13 +312,13 @@ query I
 SELECT count(*) > 0
    AND count(*) FILTER (WHERE role = 'P') > 0
    AND count(*) FILTER (WHERE role = 'H1') > 0
-FROM pdf_structure('https://blobs.duckdb.org/events/duckcon7/hannes-muehleisen-mark-raasveldt-duckcon7-state-of-the-duck.pdf');
+FROM pdf_objects('https://blobs.duckdb.org/events/duckcon7/hannes-muehleisen-mark-raasveldt-duckcon7-state-of-the-duck.pdf', kind := 'structure');
 ----
 true
 
 query I
 SELECT count(*) = 0
-FROM pdf_structure('https://blobs.duckdb.org/docs/ducklake-docs.pdf');
+FROM pdf_objects('https://blobs.duckdb.org/docs/ducklake-docs.pdf', kind := 'structure');
 ----
 true
 

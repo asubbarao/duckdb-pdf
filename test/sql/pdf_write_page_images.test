@@ -13,7 +13,7 @@ SELECT page,
        ends_with(out_path, 'p' || page || '.png') AND contains(out_path, 'two_pages'),
        width > 0 AND height > 0,
        bytes > 100
-FROM pdf_write_page_images('test/data/two_pages.pdf', '__TEST_DIR__/pages', dpi := 72)
+FROM pdf_render('test/data/two_pages.pdf', output_dir := '__TEST_DIR__/pages', dpi := 72)
 ORDER BY page;
 ----
 1	true	true	true
@@ -32,10 +32,32 @@ FROM read_blob('__TEST_DIR__/pages/two_pages/p2.png');
 ----
 true
 
+# SVG rendering works both as a table value and as a written page image.
+query II
+SELECT page, contains(svg, '<svg')
+FROM pdf_render('test/data/two_pages.pdf', format := 'svg', dpi := 72)
+ORDER BY page;
+----
+1	true
+2	true
+
+query III
+SELECT page, ends_with(out_path, 'p' || page || '.svg'), bytes > 100
+FROM pdf_render('test/data/two_pages.pdf', output_dir := '__TEST_DIR__/pages_svg', format := 'svg', dpi := 72)
+ORDER BY page;
+----
+1	true	true
+2	true	true
+
+query I
+SELECT contains(decode(content), '<svg') FROM read_blob('__TEST_DIR__/pages_svg/two_pages/p1.svg');
+----
+true
+
 # no zero-pad (p1.png / p2.png, not p01 / p-001)
 query I
 SELECT bool_and(ends_with(out_path, 'p' || page || '.png'))
-FROM pdf_write_page_images('test/data/two_pages.pdf', '__TEST_DIR__/pages_nopad', dpi := 50);
+FROM pdf_render('test/data/two_pages.pdf', output_dir := '__TEST_DIR__/pages_nopad', dpi := 50);
 ----
 true
 
@@ -43,8 +65,7 @@ true
 
 query I
 SELECT list(page ORDER BY page)
-FROM pdf_write_page_images('test/data/two_pages.pdf', '__TEST_DIR__/pages_range',
-                           dpi := 50, first_page := 2, last_page := 2);
+FROM pdf_render('test/data/two_pages.pdf', output_dir := '__TEST_DIR__/pages_range', dpi := 50, first_page := 2, last_page := 2);
 ----
 [2]
 
@@ -58,26 +79,26 @@ true
 
 query I
 SELECT ends_with(out_path, 'p1.png') AND contains(out_path, 'hello') AND bytes > 100
-FROM pdf_write_page_images('test/data/hello.pdf', '__TEST_DIR__/pages_hello', dpi := 72);
+FROM pdf_render('test/data/hello.pdf', output_dir := '__TEST_DIR__/pages_hello', dpi := 72);
 ----
 true
 
 # ── dpi validation ───────────────────────────────────────────────────────────
 
 statement error
-SELECT * FROM pdf_write_page_images('test/data/hello.pdf', '__TEST_DIR__/bad_dpi', dpi := 0);
+SELECT * FROM pdf_render('test/data/hello.pdf', output_dir := '__TEST_DIR__/bad_dpi', dpi := 0);
 ----
 dpi must be between
 
 statement error
-SELECT * FROM pdf_write_page_images('test/data/hello.pdf', '__TEST_DIR__/bad_dpi', dpi := 2401);
+SELECT * FROM pdf_render('test/data/hello.pdf', output_dir := '__TEST_DIR__/bad_dpi', dpi := 2401);
 ----
 dpi must be between
 
 # ── empty out_dir rejected ───────────────────────────────────────────────────
 
 statement error
-SELECT * FROM pdf_write_page_images('test/data/hello.pdf', '');
+SELECT * FROM pdf_render('test/data/hello.pdf', output_dir := '');
 ----
 out_dir must not be empty
 
@@ -85,7 +106,7 @@ out_dir must not be empty
 
 query I
 SELECT ends_with(out_path, 'p1.png') AND contains(out_path, 'hello') AND bytes > 100
-FROM pdf_write_page_images('test/data/hello.pdf', '__TEST_DIR__/pages_hello', dpi := 72);
+FROM pdf_render('test/data/hello.pdf', output_dir := '__TEST_DIR__/pages_hello', dpi := 72);
 ----
 true
 
@@ -99,14 +120,13 @@ true
 # Substring shared by Linux ("No such file or directory") and Windows
 # ("The system cannot find the file specified.").
 statement error
-SELECT * FROM pdf_write_page_images('test/data/does_not_exist.pdf', '__TEST_DIR__/w');
+SELECT * FROM pdf_render('test/data/does_not_exist.pdf', output_dir := '__TEST_DIR__/w');
 ----
 Cannot open file
 
 # ── multi-file glob ────────────────────────────────────────────────────────
 query I
-SELECT count(*) FROM pdf_write_page_images(['test/data/hello.pdf', 'test/data/two_pages.pdf'],
-                                           '__TEST_DIR__/multi', dpi := 50);
+SELECT count(*) FROM pdf_render(['test/data/hello.pdf', 'test/data/two_pages.pdf'], output_dir := '__TEST_DIR__/multi', dpi := 50);
 ----
 3
 
@@ -120,8 +140,7 @@ true
 # ── stem collision preflight: no silent overwrite of out_dir/<stem>/ ───────
 
 statement error
-SELECT * FROM pdf_write_page_images(['test/data/hello.pdf', 'test/data/hello.pdf'],
-                                    '__TEST_DIR__/collision', dpi := 50);
+SELECT * FROM pdf_render(['test/data/hello.pdf', 'test/data/hello.pdf'], output_dir := '__TEST_DIR__/collision', dpi := 50);
 ----
 output collision
 
@@ -136,7 +155,7 @@ statement ok
 COPY (SELECT 'dotdot stem fixture' AS t) TO '__TEST_DIR__/...pdf' (FORMAT pdf);
 
 statement error
-SELECT * FROM pdf_write_page_images('__TEST_DIR__/...pdf', '__TEST_DIR__/escape_out', dpi := 50);
+SELECT * FROM pdf_render('__TEST_DIR__/...pdf', output_dir := '__TEST_DIR__/escape_out', dpi := 50);
 ----
 refusing output stem
 

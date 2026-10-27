@@ -31,17 +31,17 @@ true
 # ── NULL propagation ─────────────────────────────────────────────────────────
 
 query I
-SELECT pdf_compress(NULL, '__TEST_DIR__/qsnull.pdf') IS NULL;
+SELECT pdf_rewrite(NULL, '__TEST_DIR__/qsnull.pdf', {mode: 'compress'}) IS NULL;
 ----
 true
 
 query I
-SELECT pdf_encrypt('__TEST_DIR__/qs1.pdf', NULL, 'pw') IS NULL;
+SELECT pdf_rewrite('__TEST_DIR__/qs1.pdf', NULL, {mode: 'encrypt', password: 'pw'}) IS NULL;
 ----
 true
 
 query I
-SELECT pdf_decrypt('__TEST_DIR__/qs1.pdf', '__TEST_DIR__/qsnull.pdf', NULL) IS NULL;
+SELECT pdf_rewrite('__TEST_DIR__/qs1.pdf', '__TEST_DIR__/qsnull.pdf', {mode: 'decrypt', password: NULL}) IS NULL;
 ----
 true
 
@@ -53,7 +53,7 @@ true
 # ── pdf_compress: round trip preserves page count and text ───────────────────
 
 query I
-SELECT ends_with(pdf_compress('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qscomp.pdf'), 'qscomp.pdf');
+SELECT ends_with(pdf_rewrite('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qscomp.pdf', {mode: 'compress'}), 'qscomp.pdf');
 ----
 true
 
@@ -73,7 +73,7 @@ true
 # ── pdf_encrypt → pdf_decrypt round trip (AES-256 / R6) ──────────────────────
 
 query I
-SELECT ends_with(pdf_encrypt('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qsenc.pdf', 'hunter2'), 'qsenc.pdf');
+SELECT ends_with(pdf_rewrite('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qsenc.pdf', {mode: 'encrypt', password: 'hunter2'}), 'qsenc.pdf');
 ----
 true
 
@@ -96,12 +96,12 @@ true
 
 # wrong password on decrypt: qpdf's stable "invalid password" message
 statement error
-SELECT pdf_decrypt('__TEST_DIR__/qsenc.pdf', '__TEST_DIR__/qswrong.pdf', 'wrongpw');
+SELECT pdf_rewrite('__TEST_DIR__/qsenc.pdf', '__TEST_DIR__/qswrong.pdf', {mode: 'decrypt', password: 'wrongpw'});
 ----
 invalid password
 
 query I
-SELECT ends_with(pdf_decrypt('__TEST_DIR__/qsenc.pdf', '__TEST_DIR__/qsdec.pdf', 'hunter2'), 'qsdec.pdf');
+SELECT ends_with(pdf_rewrite('__TEST_DIR__/qsenc.pdf', '__TEST_DIR__/qsdec.pdf', {mode: 'decrypt', password: 'hunter2'}), 'qsdec.pdf');
 ----
 true
 
@@ -120,12 +120,12 @@ true
 
 # distinct owner password also opens the document
 query I
-SELECT ends_with(pdf_encrypt('__TEST_DIR__/qs1.pdf', '__TEST_DIR__/qsenc2.pdf', 'userpw', 'ownerpw'), 'qsenc2.pdf');
+SELECT ends_with(pdf_rewrite('__TEST_DIR__/qs1.pdf', '__TEST_DIR__/qsenc2.pdf', {mode: 'encrypt', password: 'userpw', owner_password: 'ownerpw'}), 'qsenc2.pdf');
 ----
 true
 
 query I
-SELECT ends_with(pdf_decrypt('__TEST_DIR__/qsenc2.pdf', '__TEST_DIR__/qsdec2.pdf', 'ownerpw'), 'qsdec2.pdf');
+SELECT ends_with(pdf_rewrite('__TEST_DIR__/qsenc2.pdf', '__TEST_DIR__/qsdec2.pdf', {mode: 'decrypt', password: 'ownerpw'}), 'qsdec2.pdf');
 ----
 true
 
@@ -171,12 +171,12 @@ true
 # ── pdf_form_fields / pdf_annotations: zero rows on formless generated PDFs ──
 
 query I
-SELECT count(*) FROM pdf_form_fields('__TEST_DIR__/qs123.pdf');
+SELECT count(*) FROM pdf_objects('__TEST_DIR__/qs123.pdf', kind := 'form_fields');
 ----
 0
 
 query I
-SELECT count(*) FROM pdf_annotations('__TEST_DIR__/qs123.pdf');
+SELECT count(*) FROM pdf_objects('__TEST_DIR__/qs123.pdf', kind := 'annotations');
 ----
 0
 
@@ -185,13 +185,13 @@ SELECT count(*) FROM pdf_annotations('__TEST_DIR__/qs123.pdf');
 
 query IIIIII
 SELECT ends_with(file, 'form_annots.pdf'), page, field_name, field_type, value, is_required
-FROM pdf_form_fields('test/data/form_annots.pdf');
+FROM pdf_objects('test/data/form_annots.pdf', kind := 'form_fields');
 ----
 true	1	fixture_name	text	PrefilledValue	true
 
 query IIIII
 SELECT page, subtype, contents, uri, rect_x1 - rect_x0
-FROM pdf_annotations('test/data/form_annots.pdf')
+FROM pdf_objects('test/data/form_annots.pdf', kind := 'annotations')
 ORDER BY subtype;
 ----
 1	Link	NULL	http://example.com/duck	128.0
@@ -200,13 +200,13 @@ ORDER BY subtype;
 
 # the "extract hyperlinks" recipe
 query I
-SELECT uri FROM pdf_annotations('test/data/form_annots.pdf') WHERE subtype = 'Link';
+SELECT uri FROM pdf_objects('test/data/form_annots.pdf', kind := 'annotations') WHERE subtype = 'Link';
 ----
 http://example.com/duck
 
 # glob over the three formless single-pagers still yields zero rows
 query I
-SELECT count(*) FROM pdf_form_fields('__TEST_DIR__/qs?.pdf');
+SELECT count(*) FROM pdf_objects('__TEST_DIR__/qs?.pdf', kind := 'form_fields');
 ----
 0
 
@@ -214,28 +214,28 @@ SELECT count(*) FROM pdf_form_fields('__TEST_DIR__/qs?.pdf');
 
 # missing input file
 statement error
-SELECT pdf_compress('__TEST_DIR__/qs_no_such_input.pdf', '__TEST_DIR__/qsnever.pdf');
+SELECT pdf_rewrite('__TEST_DIR__/qs_no_such_input.pdf', '__TEST_DIR__/qsnever.pdf', {mode: 'compress'});
 ----
 qs_no_such_input.pdf' does not exist
 
 statement error
-SELECT pdf_encrypt('__TEST_DIR__/qs_no_such_input.pdf', '__TEST_DIR__/qsnever.pdf', 'pw');
+SELECT pdf_rewrite('__TEST_DIR__/qs_no_such_input.pdf', '__TEST_DIR__/qsnever.pdf', {mode: 'encrypt', password: 'pw'});
 ----
 qs_no_such_input.pdf' does not exist
 
 statement error
-SELECT * FROM pdf_form_fields('__TEST_DIR__/qs_no_such_input.pdf');
+SELECT * FROM pdf_objects('__TEST_DIR__/qs_no_such_input.pdf', kind := 'form_fields');
 ----
 qs_no_such_input.pdf' does not exist
 
 statement error
-SELECT * FROM pdf_annotations('__TEST_DIR__/qs_no_such_input.pdf');
+SELECT * FROM pdf_objects('__TEST_DIR__/qs_no_such_input.pdf', kind := 'annotations');
 ----
 qs_no_such_input.pdf' does not exist
 
 # nonexistent output directory
 statement error
-SELECT pdf_compress('__TEST_DIR__/qs1.pdf', '__TEST_DIR__/qs_no_such_dir/out.pdf');
+SELECT pdf_rewrite('__TEST_DIR__/qs1.pdf', '__TEST_DIR__/qs_no_such_dir/out.pdf', {mode: 'compress'});
 ----
 qs_no_such_dir' does not exist
 
@@ -246,12 +246,12 @@ qs_no_such_dir' does not exist
 
 # in-place operation is refused (qpdf reads the source lazily during write)
 statement error
-SELECT pdf_compress('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qs123.pdf');
+SELECT pdf_rewrite('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/qs123.pdf', {mode: 'compress'});
 ----
 output path must differ from input path
 
 statement error
-SELECT pdf_decrypt('__TEST_DIR__/qsenc.pdf', '__TEST_DIR__/qsenc.pdf', 'hunter2');
+SELECT pdf_rewrite('__TEST_DIR__/qsenc.pdf', '__TEST_DIR__/qsenc.pdf', {mode: 'decrypt', password: 'hunter2'});
 ----
 output path must differ from input path
 
@@ -263,7 +263,7 @@ out of range
 
 # Different spellings of the same file must never truncate the input.
 statement error
-SELECT pdf_compress('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/./qs123.pdf');
+SELECT pdf_rewrite('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/./qs123.pdf', {mode: 'compress'});
 ----
 output path must differ
 
@@ -282,6 +282,6 @@ SELECT pdf_pages('__TEST_DIR__/qs123.pdf', '__TEST_DIR__/preserve_output.pdf', '
 out of range
 
 query I
-SELECT contains(pdf_to_text('__TEST_DIR__/preserve_output.pdf'), 'UNCHANGED DESTINATION');
+SELECT contains(pdf_text('__TEST_DIR__/preserve_output.pdf'), 'UNCHANGED DESTINATION');
 ----
 true

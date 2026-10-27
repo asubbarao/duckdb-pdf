@@ -1,0 +1,187 @@
+# name: test/sql/pdf_consolidated_api.test
+# description: selection of consolidated PDF APIs and their output grains
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# Default remains the page grain; explicit line and element grains have their
+# own schemas and do not lose content from the page.
+query I
+SELECT len(list(page)) FROM read_pdf('test/data/two_pages.pdf');
+----
+2
+
+query I
+SELECT len(list(text)) > 0 FROM read_pdf('test/data/hello.pdf', grain := 'line');
+----
+true
+
+query I
+SELECT len(list(text)) > 0 FROM read_pdf('test/data/hello.pdf', grain := 'element');
+----
+true
+
+query I
+SELECT len(list(cells)) > 0 FROM read_pdf('test/data/table.pdf', grain := 'table', force := true);
+----
+true
+
+query I
+SELECT len(list(text)) > 0 FROM read_pdf('test/data/hello.pdf', grain := 'chunk');
+----
+true
+
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', grain := 'unknown');
+----
+unsupported grain
+
+statement error
+SELECT * FROM pdf_objects('test/data/hello.pdf');
+----
+unsupported kind
+
+statement error
+SELECT * FROM pdf_objects('test/data/hello.pdf', kind := 'unknown');
+----
+unsupported kind
+
+statement error
+SELECT * FROM pdf_info('test/data/hello.pdf', detail := 'unknown');
+----
+unsupported detail
+
+statement error
+SELECT * FROM pdf_split('test/data/hello.pdf', '__TEST_DIR__', mode := 'unknown');
+----
+unsupported mode
+
+# Selectors cannot silently default from NULL, and a mode must not accept
+# parameters belonging to a different result schema.
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', grain := NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM pdf_info('test/data/hello.pdf', detail := NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM pdf_objects('test/data/hello.pdf', kind := NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM pdf_split('test/data/hello.pdf', '__TEST_DIR__', mode := NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM pdf_render('test/data/hello.pdf', output_dir := NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', grain := 'page', chunk_size := 100);
+----
+not supported
+
+statement error
+SELECT * FROM pdf_split('test/data/hello.pdf', '__TEST_DIR__', mode := 'page', blank_threshold := 0.9);
+----
+not supported
+
+statement error
+SELECT * FROM pdf_objects('test/data/hello.pdf', kind := 'fonts', first_page := 1);
+----
+not supported
+
+statement error
+SELECT * FROM pdf_info('test/data/hello.pdf', detail := 'qpdf', ignore_errors := true);
+----
+not supported
+
+# Projection and multi-file routing survive the family dispatch. The glob
+# holds two valid PDFs and each of these schemas carries a file identity.
+query I
+SELECT count(DISTINCT filename) FROM read_pdf('test/data/mixed_glob/good*.pdf');
+----
+2
+
+query I
+SELECT count(DISTINCT filename) FROM read_pdf('test/data/mixed_glob/good*.pdf', grain := 'line');
+----
+2
+
+query I
+SELECT count(DISTINCT file) FROM pdf_info('test/data/mixed_glob/good*.pdf');
+----
+2
+
+query I
+SELECT count(DISTINCT file) FROM pdf_objects('test/data/mixed_glob/good*.pdf', kind := 'pages');
+----
+2
+
+query I
+SELECT count(DISTINCT file) FROM pdf_render('test/data/mixed_glob/good*.pdf', dpi := 72);
+----
+2
+
+# The table and scalar renderers both produce PNG, while SVG is UTF-8 bytes
+# at the scalar boundary.
+query I
+SELECT png[1:4] = '\x89PNG'::BLOB FROM pdf_render('test/data/hello.pdf', dpi := 72);
+----
+true
+
+query I
+SELECT contains(decode(pdf_render('test/data/hello.pdf', 1, {format: 'svg', dpi: 72})), '<svg');
+----
+true
+
+statement error
+SELECT pdf_render('test/data/hello.pdf', 1, {format: 'unknown'});
+----
+unknown format
+
+statement error
+SELECT pdf_text('test/data/hello.pdf', {format: 'unknown'});
+----
+unknown format
+
+# NULL in an applicable scalar option propagates; NULL in an inapplicable
+# field still raises rather than disguising a bad request as a NULL result.
+query I
+SELECT pdf_text('test/data/hello.pdf', {layout: NULL}) IS NULL
+   AND pdf_render('test/data/hello.pdf', 1, {dpi: NULL}) IS NULL
+   AND pdf_pages('test/data/hello.pdf', '__TEST_DIR__/null_rotate.pdf', {rotate: NULL}) IS NULL
+   AND pdf_stamp('test/data/hello.pdf', '__TEST_DIR__/null_stamp.pdf', {mode: 'watermark', text: NULL}) IS NULL
+   AND pdf_rewrite('test/data/hello.pdf', '__TEST_DIR__/null_rewrite.pdf', {mode: 'encrypt', password: NULL}) IS NULL;
+----
+true
+
+statement error
+SELECT pdf_text('test/data/hello.pdf', {format: 'html', layout: NULL});
+----
+inapplicable option
+
+statement error
+SELECT pdf_stamp('test/data/hello.pdf', '__TEST_DIR__/bad_stamp.pdf', {mode: 'bates', text: NULL});
+----
+inapplicable option
+
+statement error
+SELECT pdf_rewrite('test/data/hello.pdf', '__TEST_DIR__/bad_rewrite.pdf', {mode: 'compress', password: NULL});
+----
+inapplicable option
+
+statement error
+SELECT pdf_render('test/data/hello.pdf', 1, {dpi: 72, unknown: NULL});
+----
+unknown option

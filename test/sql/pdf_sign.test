@@ -21,7 +21,7 @@ FROM pdf_sign('test/data/hello.pdf', '__TEST_DIR__/signed_basic.pdf',
 true	Signature1
 
 query I
-SELECT count(*) FROM pdf_signatures('__TEST_DIR__/signed_basic.pdf');
+SELECT count(*) FROM pdf_objects('__TEST_DIR__/signed_basic.pdf', kind := 'signatures');
 ----
 1
 
@@ -30,7 +30,7 @@ SELECT field_name, subfilter, covers_whole_file, verified, has_verified
 FROM (
   SELECT field_name, subfilter, covers_whole_file, verified,
          verified IS NOT NULL AS has_verified
-  FROM pdf_signatures('__TEST_DIR__/signed_basic.pdf')
+  FROM pdf_objects('__TEST_DIR__/signed_basic.pdf', kind := 'signatures')
 );
 ----
 Signature1	adbe.pkcs7.detached	true	true	true
@@ -38,7 +38,7 @@ Signature1	adbe.pkcs7.detached	true	true	true
 # dictionary metadata flows through from the named params
 query IIII
 SELECT signer_name, reason, location, signing_time IS NOT NULL
-FROM pdf_signatures('__TEST_DIR__/signed_basic.pdf');
+FROM pdf_objects('__TEST_DIR__/signed_basic.pdf', kind := 'signatures');
 ----
 Vori Signer	I approve	Bay Area	true
 
@@ -51,14 +51,14 @@ SELECT * FROM pdf_sign('test/data/hello.pdf', '__TEST_DIR__/signed_named.pdf',
 
 query III
 SELECT field_name, covers_whole_file, verified
-FROM pdf_signatures('__TEST_DIR__/signed_named.pdf');
+FROM pdf_objects('__TEST_DIR__/signed_named.pdf', kind := 'signatures');
 ----
 ApprovalSig	true	true
 
 # ── original input is left unchanged ──
 
 query I
-SELECT count(*) FROM pdf_signatures('test/data/hello.pdf');
+SELECT count(*) FROM pdf_objects('test/data/hello.pdf', kind := 'signatures');
 ----
 0
 
@@ -71,7 +71,7 @@ SELECT * FROM pdf_sign('test/data/hello.pdf', '__TEST_DIR__/signed_enc.pdf',
 
 query II
 SELECT covers_whole_file, verified
-FROM pdf_signatures('__TEST_DIR__/signed_enc.pdf');
+FROM pdf_objects('__TEST_DIR__/signed_enc.pdf', kind := 'signatures');
 ----
 true	true
 
@@ -83,7 +83,7 @@ SELECT * FROM pdf_sign('test/data/two_pages.pdf', '__TEST_DIR__/signed_two.pdf',
 
 query II
 SELECT covers_whole_file, verified
-FROM pdf_signatures('__TEST_DIR__/signed_two.pdf');
+FROM pdf_objects('__TEST_DIR__/signed_two.pdf', kind := 'signatures');
 ----
 true	true
 

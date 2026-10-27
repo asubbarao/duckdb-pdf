@@ -46,7 +46,7 @@ false	true
 
 # table extraction's auto-OCR path degrades the same way
 statement ok
-SELECT * FROM read_pdf_tables('test/data/blank_split.pdf', tessdata_dir := '/nonexistent/tessdata');
+SELECT * FROM read_pdf('test/data/blank_split.pdf', tessdata_dir := '/nonexistent/tessdata', grain := 'table');
 
 # explicit OCR keeps the loud, actionable error (does not use bundled eng when
 # tessdata_dir is set to a broken path)

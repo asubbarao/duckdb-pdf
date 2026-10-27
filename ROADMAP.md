@@ -1,197 +1,75 @@
 # Roadmap
 
-An honest snapshot of what the `pdf` extension does today, what is being built
-right now, and where it is (and is not) headed. See `README.md` for the full
-function reference.
+This file describes the current source branch, not a published release.
+See [README.md](README.md) for the callable API and migration contracts.
 
-## What it is
+## Implemented: 48 to 19 public names
 
-`pdf` turns PDFs into tables and tables into PDFs, in SQL, in the DuckDB
-process. Native readers do not invoke `pdftotext` or Python; writers and OCR
-can use temporary files, and Office conversion invokes LibreOffice. Every entry point answers
-one of six questions:
+The previous four-name cleanup (52 to 48) is the base of this change.
+The broader consolidation now exposes 19 names without retired aliases:
 
-- **What does this document say** — text, at whatever grain you need.
-- **What is it** — a census: metadata, page counts, encryption, version.
-- **What is inside it** — the non-text structure: outline, attachments, form
-  fields, annotations, embedded images, signatures.
-- **Show me a page** — a page or a document as an image.
-- **Make me a different PDF** — merge, split, rotate, compress, encrypt,
-  redact, sign, stamp.
-- **Make a PDF from this data** — typeset text, a query result, or another
-  document format into a PDF.
+| Family | Selection |
+|---|---|
+| `read_pdf` | grain: page, line, element, table, chunk |
+| `read_pdf_words` | positioned words |
+| `pdf_info` | detail: basic or qpdf |
+| `pdf_objects` | kind: outline, structure, destinations, fonts, form_fields, annotations, attachments, images, signatures, revisions, pages |
+| `pdf_text` | scalar options format: text, markdown, html, xml, json |
+| `pdf_render` | scalar and table forms; png/svg, in memory or page-image export |
+| `pdf_merge` | concatenate documents |
+| `pdf_pages` | extract/reorder, rotate a complete document, or rotate extracted pages |
+| `pdf_split` | mode: page or blank |
+| `pdf_stamp` | scalar options mode: watermark or bates |
+| `pdf_rewrite` | scalar options mode: compress, repair, encrypt, decrypt |
+| `pdf_redact` | constant-input raster redaction |
+| `pdf_redact_lateral` | per-row raster redaction |
+| `pdf_sign` | detached CMS signing |
+| `write_pdf` | native text-to-PDF |
+| `to_pdf` | LibreOffice conversion |
+| `ocr_image` | scalar per-row OCR and table output with confidence |
+| `pdf_ocr` | persist searchable OCR layers |
+| `poppler_version` | runtime version |
 
-## Shipped
+This corrects omissions in the earlier 19-family sketch: tagged structure and
+persisted OCR remain available. It does not add the proposed sniff_pdf or
+pdf_help helpers. Existing catalog descriptions, parameter names and examples
+provide discoverable help without another public registration.
 
-### What does this document say
+Table selectors choose schemas at bind time and dispatch directly to the native
+reader callbacks, retaining projection, file scheduling and page bounds.
+Unsupported options are rejected for the selected mode. Scalar STRUCT options
+are checked for valid names and types; transform side effects remain volatile
+and outputs are staged atomically.
 
-- **Grain readers** — `read_pdf` (one row per page), `read_pdf_lines` (one row
-  per layout-preserving line), `read_pdf_words` (one row
-  per word: bbox, font, OCR source/confidence, geometric `line`,
-  `column_index`, `page_width`/`page_height`), `read_pdf_tables` (one row per
-  detected table row), `read_pdf_elements` (one row per layout element —
-  heading/paragraph/list_item/other — in reading order), `pdf_chunks`
-  (retrieval-ready chunks with section headings). OCR is not a separate step:
-  `read_pdf` and `read_pdf_words` auto-trigger Tesseract on pages with no text
-  layer, tunable via `ocr_vars` / `ocr_config` / `ocr_dpi` / `ocr_psm` /
-  `ocr_oem` / `ocr_preprocess` / `ocr_retry` / `tessdata_dir`. English (eng) is
-  bundled, so community binaries OCR a scan with no host tessdata install.
-- **Whole-document scalars** — `pdf_to_text`, `pdf_to_markdown`, `pdf_to_html`,
-  `pdf_to_xml`, `pdf_json`, on paths, globs, and BLOBs.
-- **OCR primitives** — `tesseract_ocr` (scalar, text from an image BLOB) and
-  `ocr_image` (table, named-param OCR returning text + confidence + format) for
-  pipelines that need OCR decoupled from PDF reading.
+Scalar pdf_render returns encoded BLOB bytes for both formats; SVG callers use
+decode for VARCHAR. The table form streams PNG BLOBs or SVG strings and can
+export either format to disk. Scalar ocr_image preserves row-wise image OCR;
+its table counterpart retains confidence reporting. Whole-document rotation is
+separate from page extraction within pdf_pages, so rotating does not discard
+the document catalog, metadata or bookmarks.
 
-### What is it
-
-- **Per-file census** — `pdf_info` (metadata, timestamps, dimensions, size,
-  encryption, PDF/A detection, permissions, forms/JavaScript features and IDs),
-  `pdf_qpdf_info` (qpdf's own document report: xref census, encryption bits,
-  linearization). `pdf_info` supports projection pushdown and `ignore_errors`.
-- **Per-page geometry** — `pdf_pages_info` (crop/media size, rotation,
-  orientation, label per page).
-
-### What is inside it
-
-- **Navigation** — `pdf_outline` (bookmarks, depth-first), `pdf_destinations`
-  (named/explicit destinations with position and zoom).
-- **Embedded objects** — `pdf_attachments` (embedded files as BLOBs),
-  `pdf_images` (embedded raster XObjects), `pdf_fonts`.
-- **Interactive layer** — `pdf_form_fields` (AcroForm fields with type and
-  value), `pdf_annotations` (annotations and hyperlinks).
-- **Provenance and trust** — `pdf_revisions` (incremental-update forensics,
-  oldest first), `pdf_signatures` (detect + OpenSSL CMS verification).
-
-### Show me a page
-
-- **Page PNGs at scale** — `pdf_page_images` (one row per page, rendered PNG
-  BLOB), `pdf_write_page_images` (writes `out_dir/<stem>/p{N}.png` trees).
-  Bundled URW base-14 fonts so community/vcpkg builds do not raster blank
-  pages.
-- **Single-page scalars** — `pdf_to_svg`, `pdf_to_png`, on paths, globs, and
-  BLOBs.
-- **Runtime diagnostics** — `poppler_version()` reports the linked Poppler build.
-
-### Make me a different PDF
-
-- **Assemble / split** — `pdf_merge` (concatenate in list order), `pdf_split`
-  (one single-page PDF per page), `pdf_split_blank` (split on blank-page
-  separators, for mailroom batches).
-- **Reflow** — `pdf_rotate` (multiples of 90°), `pdf_pages` (extract a range
-  like `'1-3,7'` or `'r2'`), `pdf_watermark` (diagonal text stamp), `pdf_bates`
-  (Bates numbering).
-- **Repair, shrink, lock** — `pdf_compress` (structural compression +
-  linearization), `pdf_repair` (rebuild a damaged file via qpdf), `pdf_encrypt`
-  / `pdf_decrypt` (AES-256).
-- **Redact** — `pdf_redact` (constant-arg raster true-removal of boxed
-  regions), `pdf_redact_lateral` (column-ref / dependent-join form of the same
-  operation); both fail loudly rather than emitting a blank page when Poppler
-  has no display fonts.
-- **Sign** — `pdf_sign` (apply a `pkcs7.detached` CMS signature, verified via
-  `pdf_signatures`).
-
-### Make a PDF from this data
-
-- **Native write** — `write_pdf` (text to PDF via libharu), `COPY ... TO ...
-  (FORMAT pdf)` (a query result typeset as a PDF, with `TITLE`/`AUTHOR`/
-  `HEADER`/`FOOTER`/`FONT_SIZE`/`PAGE_SIZE`/`MARGIN`).
-- **Office conversion** — `to_pdf` (office/markup documents via a LibreOffice
-  runtime shell-out).
-
-## Current consolidation: 52 to 48 names
-
-The branch removes `read_pdf_layout`, `poppler_render_page`,
-`read_pdf_meta`, and `pdf_permissions`. Their capabilities are provided by
-`read_pdf_words`, `pdf_to_png`, and the expanded `pdf_info`.
-The README migration table records changed column names, NULL semantics and
-options. These removals are breaking changes; old spellings are not aliases.
-
-The 48 existing names expose descriptions, meaningful positional parameter
-names, typed named options and examples through `duckdb_functions()`.
-This describes branch behavior, not a claim that a release is published.
-
-## Broader consolidation proposal
-
-48 is an intermediate count, not a minimum. The earlier 19-family sketch below
-would combine readers by `grain`, inspection by `kind`, conversions by
-`format`, and related transforms by typed options. It is not implemented or
-approved by the four-name cleanup. It needs explicit decisions about dynamic
-result schemas, scalar versus table calls, BLOB inputs, passwords, projection,
-errors and output side effects. Changing a name alone does not solve those
-contracts.
-
-The sketch also proposes `sniff_pdf` and `pdf_help`, neither implemented.
-Catalog metadata already provides queryable help, so a separate help function
-needs evidence that it earns another public name.
-
-| 1.0.0 name | absorbs |
-| --- | --- |
-| `read_pdf(file, grain := 'page')` | `read_pdf_lines`, `read_pdf_elements`, `read_pdf_tables`, `pdf_chunks` — `grain` chooses the schema at bind time |
-| `read_pdf_words` | keeps its own name (the one grain with a genuinely different row shape) |
-| `pdf_info(file, detail := 'basic')` | `pdf_info`, `pdf_qpdf_info` |
-| `pdf_objects(file, kind := …)` | `pdf_outline`, `pdf_destinations`, `pdf_fonts`, `pdf_form_fields`, `pdf_annotations`, `pdf_attachments`, `pdf_images`, `pdf_signatures`, `pdf_revisions`, `pdf_pages_info` |
-| `pdf_text(src, format := 'text')` | `pdf_to_text`, `pdf_to_markdown`, `pdf_to_html`, `pdf_to_xml`, `pdf_json` |
-| `pdf_render(file, format := 'png', …)` | `pdf_to_png`, `pdf_to_svg`, `pdf_page_images`, `pdf_write_page_images` |
-| `pdf_merge` | `pdf_merge` |
-| `pdf_pages` | `pdf_pages`, `pdf_rotate` |
-| `pdf_split` | `pdf_split`, `pdf_split_blank` |
-| `pdf_stamp` | `pdf_watermark`, `pdf_bates` |
-| `pdf_rewrite` | `pdf_compress`, `pdf_repair`, `pdf_encrypt`, `pdf_decrypt` |
-| `pdf_redact` | `pdf_redact` |
-| `pdf_redact_lateral` | `pdf_redact_lateral` |
-| `pdf_sign` | `pdf_sign` |
-| `write_pdf` | `write_pdf` |
-| `to_pdf` | `to_pdf` |
-| `ocr_image` | `ocr_image`, `tesseract_ocr` — two names and nine overloads become one function with named parameters. `tesseract_ocr` is an eight-rung positional ladder, `(BLOB)` through `(BLOB, VARCHAR, INTEGER, …)` out to eight arguments, beside an `ocr_image` that takes eighteen; `duckdb_functions()` renders the whole thing as `col0 … col7` |
-| `sniff_pdf` | new in 0.9.0 |
-| `pdf_help` | new in 0.9.0, and the home for `poppler_version` — "what am I actually running" belongs next to the Tesseract and qpdf versions, not in its own registration |
-
-Each transform takes a STRUCT of options, so the call site labels itself
-instead of relying on positional order.
-
-Also in 1.0.0: canonical column names everywhere. `filename` first, then
-`page`, `page_count`, `x0`/`y0`/`x1`/`y1`, `is_encrypted` — retiring four bbox
-spellings (`x0`, `bbox_x0`, `rect_x0`, `left`/`bottom`/`right`/`top`), two file
-spellings (`filename`, `file`), and two page spellings (`page`, `page_number`).
-Old names are removed, not aliased.
-
-The compatibility surface, recorded honestly: the known downstream consumer is
-`teaguesterling`'s `duckeye`, a terminal document reader driving DuckDB from a
-shell script. It uses exactly three things — `read_pdf(file, first_page := N,
-last_page := M)` reading `page` and `text`; `pdf_to_text(<BLOB>)`, the BLOB
-overload, fed straight from `zim_get_content()`; and `pdf_to_markdown` in its
-`--help`. Page-range pushdown is load-bearing to it ("reading 2 pages of 400
-beats reading 400 and discarding 398"), and its tests assert on text content
-rather than row counts. So `read_pdf`'s name, its `first_page`/`last_page`
-parameters, and its `page`/`text` columns are the contract 1.0.0 must keep;
-`pdf_to_text`'s BLOB overload must survive as `pdf_text(src, …)` accepting a
-BLOB.
+The earlier column-normalization sketch is not bundled into these removals:
+existing per-grain schemas remain explicit in the README, including file versus
+filename, page versus page_number, and object-specific bbox column spellings.
+The existing read_pdf page/text and first_page/last_page contract stays intact.
+The scalar path/BLOB text contract moves to pdf_text.
 
 ## Planned
 
-- **True content-stream redaction** — remove the underlying text/vector
-  operators, not just the rendered pixels, so no recoverable content remains
-  even under specialized PDF forensics tools. Raster redaction already makes
-  text unextractable via `read_pdf` / ordinary copy-paste.
-- **PDF/A validation** — beyond the current `pdfaid` detection, actually
-  validate conformance against the PDF/A profile.
-- **`write_pdf_table`** — typeset a query result as a multi-column table PDF
-  (issue #19).
-- **Standalone `ocr` extension** — a generic image-OCR extension for non-PDF
-  inputs, factored out once the PDF OCR surface stabilizes further.
-- **Shared pack open, narrowed** — one word walk already feeds `read_pdf`,
-  `read_pdf_lines`, `read_pdf_elements` and `pdf_to_markdown`, so the remaining
-  case for a shared Poppler-document open is narrower than this file used to
-  claim: it is specifically the pack that needs page images alongside text
-  grains, without opening the document twice.
+- **Content-stream redaction**: remove selected text/vector operators while
+  retaining unaffected vector content. Current redaction replaces affected
+  pages with rasters and removes their underlying text.
+- **PDF/A validation**: validate conformance beyond reading pdfaid metadata.
+- **Table PDF authoring**: typeset a query result as a multi-column PDF table.
+- **Standalone OCR extension**: factor generic image OCR after the surface
+  stabilizes.
+- **Shared document open for mixed output**: avoid reopening a document when a
+  caller needs page images and text grains together. Text grains already share
+  the word-walk implementation where appropriate.
 
 ## Non-goals
 
-- **ML document understanding** — semantic layout models, entity extraction,
-  question answering. That is docling / marker / model-server territory.
-- **Merged-cell / borderless table reconstruction** — heuristic geometry
-  handles ruled and simply-aligned tables; fully model-driven table recovery is
-  out of scope.
-- **Deprecation shims** — 1.0.0 removes old names rather than aliasing them.
-  Keeping the retired spellings around would defeat the reason for doing the
-  consolidation at all.
+- ML document understanding, semantic layout models and entity extraction.
+- Reliable merged-cell or complex borderless-table reconstruction.
+- Deprecation aliases that keep retired public function names alive.
+- Claiming source changes are available in community binaries before release.

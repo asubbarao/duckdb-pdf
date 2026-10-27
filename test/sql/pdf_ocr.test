@@ -23,12 +23,12 @@ FROM read_pdf('__TEST_DIR__/ocr_scanned.pdf', auto_ocr := false);
 true	false	true
 
 query I
-SELECT count(*) > 0 FROM read_pdf_elements('__TEST_DIR__/ocr_scanned.pdf');
+SELECT count(*) > 0 FROM read_pdf('__TEST_DIR__/ocr_scanned.pdf', grain := 'element');
 ----
 true
 
 query I
-SELECT count(*) > 0 FROM pdf_chunks('__TEST_DIR__/ocr_scanned.pdf');
+SELECT count(*) > 0 FROM read_pdf('__TEST_DIR__/ocr_scanned.pdf', grain := 'chunk');
 ----
 true
 
@@ -124,7 +124,7 @@ true
 
 # Password must be retained through the final qpdf reopen.
 statement ok
-SELECT pdf_encrypt('test/data/scanned.pdf', '__TEST_DIR__/ocr_encrypted_input.pdf', 'secret');
+SELECT pdf_rewrite('test/data/scanned.pdf', '__TEST_DIR__/ocr_encrypted_input.pdf', {mode: 'encrypt', password: 'secret'});
 
 query I
 SELECT bool_and(ocr_applied) FROM pdf_ocr('__TEST_DIR__/ocr_encrypted_input.pdf',

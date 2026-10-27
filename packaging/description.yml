@@ -37,7 +37,7 @@ docs:
   hello_world: |
     LOAD pdf;
 
-    -- One row per page (file, list, or glob; parallel across pages/files)
+    -- One row per page (path or glob; parallel across pages/files)
     SELECT filename, page, text
     FROM read_pdf('reports/*.pdf')
     WHERE contains(lower(text), 'revenue');
@@ -46,11 +46,11 @@ docs:
     SELECT file, title, author, page_count FROM pdf_info('reports/*.pdf');
 
     -- RAG chunks in one statement
-    CREATE TABLE chunks AS FROM pdf_chunks('reports/*.pdf');
+    CREATE TABLE chunks AS FROM read_pdf('reports/*.pdf', grain := 'chunk');
 
     -- Page raster + native write
-    SELECT pdf_to_png('report.pdf', 1, 150) AS page_image;
-    COPY (SELECT * FROM findings)
+    SELECT pdf_render('report.pdf', 1, {dpi: 150}) AS page_image;
+    COPY (SELECT file, page_count FROM pdf_info('reports/*.pdf'))
     TO 'findings.pdf' (FORMAT pdf, TITLE 'Findings', FOOTER 'page {page}');
 
   extended_description: |
@@ -59,21 +59,22 @@ docs:
     ops. Full docs and recipes:
     [github.com/asubbarao/duckdb-pdf](https://github.com/asubbarao/duckdb-pdf).
 
-    **Read** — `read_pdf`, `read_pdf_lines`,
-    `read_pdf_words` (word boxes + geometric `line` + page size),
-    `read_pdf_elements`, `read_pdf_tables`, `pdf_chunks`. Auto-OCR on
-    image-only pages; English model bundled.
+    **Read** — `read_pdf` selects page, line, element, table or chunk grain;
+    `read_pdf_words` returns word boxes, geometric `line` and page size. Auto-OCR on
+    image-only pages for page/line/word/table readers; element/chunk OCR is
+    opt-in. English model bundled.
 
-    **Inspect** — `pdf_info`, `pdf_pages_info` (per-page geometry), outline,
-    attachments, form fields, annotations, revisions, signatures, embedded
-    images.
+    **Inspect** — `pdf_info` selects metadata/permissions or qpdf statistics;
+    `pdf_objects` selects pages, outline, tagged structure, destinations, fonts,
+    attachments, form fields, annotations, revisions, signatures or images.
 
-    **Convert / render** — text, markdown, HTML, XML, SVG, PNG; low-level
-    `pdf_to_png` + `tesseract_ocr` / **`ocr_image`** (named params,
-    `format` text|hocr|tsv) for blob pipelines; `read_pdf.ocr_confidence`.
+    **Convert / render** — `pdf_text` selects text, Markdown, HTML, XML or JSON;
+    `pdf_render` renders PNG/SVG as a scalar or streams pages as a table.
+    `ocr_image` has scalar and table forms, with text/hocr/tsv output.
 
-    **Transform & write** — merge, split, rotate, compress, encrypt/decrypt,
-    watermark, Bates, sign, redact; `write_pdf` / `COPY … (FORMAT pdf)`;
+    **Transform & write** — `pdf_merge`, `pdf_pages`, `pdf_split`, `pdf_stamp`,
+    `pdf_rewrite`, `pdf_sign`, `pdf_redact`, `pdf_ocr`;
+    `write_pdf` / `COPY … (FORMAT pdf)`;
     `to_pdf` for office docs (LibreOffice at runtime).
 
     **Scope** — deterministic extraction, not ML document AI. **License** —

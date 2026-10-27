@@ -1,11 +1,40 @@
 # Testing this extension
-This directory contains all the tests for this extension. The `sql` directory holds tests that are written as [SQLLogicTests](https://duckdb.org/dev/sqllogictest/intro.html). DuckDB aims to have most its tests in this format as SQL statements, so for the `pdf` extension, this is the goal too.
 
-The root makefile contains targets to build and run all of these tests. To run the SQLLogicTests:
+Build from the repository root before testing:
+
 ```bash
+make release
 make test
+PDF_NETWORK_TESTS=1 make test
+make format-check
 ```
-or 
+
+`test/sql` contains SQLLogicTests. The default run omits tests gated by
+`PDF_NETWORK_TESTS` and `LIBREOFFICE_PATH`. Network tests fetch real PDFs and
+install httpfs/quack into the build repository. To exercise Office conversion,
+set `LIBREOFFICE_PATH` to your LibreOffice executable. Inspect skipped-test
+reasons; a skipped dependency or zero selected cases is not validation.
+
+The Makefile enables extension autoloading and `--fail-require-skip` in the
+DuckDB test runner. DuckDB 2.0 isolates each test's extension installation;
+companions must be available in the build repository. The build guard compares
+the loaded extension's version against the artifact selected by the Makefile
+and checks the pinned stable host identity. Do not replace these checks with a
+successful CLI query against a globally installed binary.
+
+For an explicit artifact check, start the built CLI from the repository root:
+
 ```bash
-make test_debug
+./build/release/duckdb -unsigned
 ```
+
+```sql
+LOAD 'build/release/extension/pdf/pdf.duckdb_extension';
+SELECT * FROM pragma_version();
+SELECT extension_name, loaded, extension_version
+FROM duckdb_extensions() WHERE extension_name = 'pdf';
+```
+
+Debug builds use `make debug` then `make test_debug`. The Makefile currently
+derives `EXPECTED_EXT_VERSION` from the release artifact, so keep that artifact
+at the same source revision when running the debug suite.

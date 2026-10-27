@@ -58,10 +58,10 @@ true
 
 # ── shared params are advertised on every OCR-capable function ──────────────
 statement ok
-SELECT * FROM read_pdf_lines('test/data/skewed_scan.pdf', ocr:=true, ocr_preprocess:=false, ocr_retry:=false);
+SELECT * FROM read_pdf('test/data/skewed_scan.pdf', ocr:=true, ocr_preprocess:=false, ocr_retry:=false, grain := 'line');
 
 statement ok
-SELECT * FROM read_pdf_tables('test/data/scanned.pdf', ocr:=true, ocr_preprocess:=true, ocr_retry:=false);
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr:=true, ocr_preprocess:=true, ocr_retry:=false, grain := 'table');
 
 # ── preprocessing must not corrupt an already-clean OCR page ─────────────────
 # scanned.pdf is the axis-aligned, image-only fixture the existing OCR suite

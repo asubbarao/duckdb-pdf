@@ -13,61 +13,61 @@ SELECT write_pdf('blob roundtrip marker text', '__TEST_DIR__/blob_src.pdf');
 
 # (b) BLOB roundtrip: read_blob -> pdf_to_text(BLOB) — proves BLOB overload + roundtrip
 query I
-SELECT contains(pdf_to_text(content), 'blob roundtrip marker')
+SELECT contains(pdf_text(content), 'blob roundtrip marker')
 FROM read_blob('__TEST_DIR__/blob_src.pdf');
 ----
 true
 
 # (c) BLOB overload: pdf_to_xml — prefix check
 query I
-SELECT starts_with(pdf_to_xml(content), '<?xml')
+SELECT starts_with(pdf_text(content, {format: 'xml'}), '<?xml')
 FROM read_blob('__TEST_DIR__/blob_src.pdf');
 ----
 true
 
 # (c) BLOB overload: pdf_to_html — DOCTYPE prefix check
 query I
-SELECT starts_with(pdf_to_html(content), '<!DOCTYPE html')
+SELECT starts_with(pdf_text(content, {format: 'html'}), '<!DOCTYPE html')
 FROM read_blob('__TEST_DIR__/blob_src.pdf');
 ----
 true
 
 # (d) BLOB overload: pdf_to_svg — SVG XML prefix check
 query I
-SELECT starts_with(pdf_to_svg(content, 1), '<?xml')
+SELECT starts_with(decode(pdf_render(content, 1, {format: 'svg'})), '<?xml')
 FROM read_blob('__TEST_DIR__/blob_src.pdf');
 ----
 true
 
 # (e) Invalid BLOB must error
 statement error
-SELECT pdf_to_text('notapdf'::BLOB);
+SELECT pdf_text('notapdf'::BLOB);
 ----
 
 # (f) Regression: path-based scalars still work after VFS refactor
 query I
-SELECT contains(pdf_to_text('__TEST_DIR__/blob_src.pdf'), 'blob roundtrip marker');
+SELECT contains(pdf_text('__TEST_DIR__/blob_src.pdf'), 'blob roundtrip marker');
 ----
 true
 
 query I
-SELECT starts_with(pdf_to_xml('__TEST_DIR__/blob_src.pdf'), '<?xml');
+SELECT starts_with(pdf_text('__TEST_DIR__/blob_src.pdf', {format: 'xml'}), '<?xml');
 ----
 true
 
 query I
-SELECT starts_with(pdf_to_html('__TEST_DIR__/blob_src.pdf'), '<!DOCTYPE html');
+SELECT starts_with(pdf_text('__TEST_DIR__/blob_src.pdf', {format: 'html'}), '<!DOCTYPE html');
 ----
 true
 
 query I
-SELECT starts_with(pdf_to_svg('__TEST_DIR__/blob_src.pdf', 1), '<?xml');
+SELECT starts_with(decode(pdf_render('__TEST_DIR__/blob_src.pdf', 1, {format: 'svg'})), '<?xml');
 ----
 true
 
 # (g) BLOB overload: pdf_to_text with layout parameter
 query I
-SELECT contains(pdf_to_text(content, 'physical'), 'blob roundtrip marker')
+SELECT contains(pdf_text(content, {layout: 'physical'}), 'blob roundtrip marker')
 FROM read_blob('__TEST_DIR__/blob_src.pdf');
 ----
 true
@@ -86,14 +86,14 @@ SELECT write_pdf(marker, path) FROM leak_test_pdfs;
 
 # Call pdf_to_html on each distinct path and verify all outputs are valid HTML
 query I
-SELECT bool_and(starts_with(pdf_to_html(path), '<!DOCTYPE html'))
+SELECT bool_and(starts_with(pdf_text(path, {format: 'html'}), '<!DOCTYPE html'))
 FROM leak_test_pdfs;
 ----
 true
 
 # Call pdf_to_xml on each distinct path and verify all outputs are valid XML
 query I
-SELECT bool_and(starts_with(pdf_to_xml(path), '<?xml'))
+SELECT bool_and(starts_with(pdf_text(path, {format: 'xml'}), '<?xml'))
 FROM leak_test_pdfs;
 ----
 true
@@ -101,33 +101,33 @@ true
 # BLOB overloads: read each distinct PDF as blob, verify pdf_to_html works
 # Use separate queries per file (one BLOB input per row) to ensure distinct invocation
 query I
-SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_1.pdf'))), '<!DOCTYPE html');
+SELECT starts_with(pdf_text((SELECT content FROM read_blob('__TEST_DIR__/leak_1.pdf')), {format: 'html'}), '<!DOCTYPE html');
 ----
 true
 
 query I
-SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_2.pdf'))), '<!DOCTYPE html');
+SELECT starts_with(pdf_text((SELECT content FROM read_blob('__TEST_DIR__/leak_2.pdf')), {format: 'html'}), '<!DOCTYPE html');
 ----
 true
 
 query I
-SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_3.pdf'))), '<!DOCTYPE html');
+SELECT starts_with(pdf_text((SELECT content FROM read_blob('__TEST_DIR__/leak_3.pdf')), {format: 'html'}), '<!DOCTYPE html');
 ----
 true
 
 query I
-SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_4.pdf'))), '<!DOCTYPE html');
+SELECT starts_with(pdf_text((SELECT content FROM read_blob('__TEST_DIR__/leak_4.pdf')), {format: 'html'}), '<!DOCTYPE html');
 ----
 true
 
 query I
-SELECT starts_with(pdf_to_html((SELECT content FROM read_blob('__TEST_DIR__/leak_5.pdf'))), '<!DOCTYPE html');
+SELECT starts_with(pdf_text((SELECT content FROM read_blob('__TEST_DIR__/leak_5.pdf')), {format: 'html'}), '<!DOCTYPE html');
 ----
 true
 
 # pdf_to_svg on distinct paths (requires page arg)
 query I
-SELECT bool_and(starts_with(pdf_to_svg(path, 1), '<?xml'))
+SELECT bool_and(starts_with(decode(pdf_render(path, 1, {format: 'svg'})), '<?xml'))
 FROM leak_test_pdfs;
 ----
 true

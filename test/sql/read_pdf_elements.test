@@ -33,7 +33,7 @@ COPY (
 # Exact element counts per type
 query II
 SELECT element_type, COUNT(*)
-FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+FROM read_pdf('__TEST_DIR__/elements_fixture.pdf', grain := 'element')
 GROUP BY element_type
 ORDER BY element_type;
 ----
@@ -43,7 +43,7 @@ paragraph	3
 
 # No headings in a single-font document
 query I
-SELECT COUNT(*) FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+SELECT COUNT(*) FROM read_pdf('__TEST_DIR__/elements_fixture.pdf', grain := 'element')
 WHERE element_type = 'heading';
 ----
 0
@@ -51,7 +51,7 @@ WHERE element_type = 'heading';
 # Reading order: element_idx is 1-based, dense, and follows top-down y order
 query I
 SELECT COUNT(*) = MAX(element_idx) AND MIN(element_idx) = 1
-FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf');
+FROM read_pdf('__TEST_DIR__/elements_fixture.pdf', grain := 'element');
 ----
 true
 
@@ -59,7 +59,7 @@ query I
 SELECT COUNT(*) = 0 FROM (
   SELECT element_idx, bbox_y0,
          LAG(bbox_y0) OVER (PARTITION BY file, page_number ORDER BY element_idx) AS prev_y0
-  FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+  FROM read_pdf('__TEST_DIR__/elements_fixture.pdf', grain := 'element')
 ) WHERE prev_y0 IS NOT NULL AND bbox_y0 < prev_y0;
 ----
 true
@@ -67,7 +67,7 @@ true
 # First element in reading order is the topmost paragraph
 query I
 SELECT contains(lower(text), 'quick brown fox')
-FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+FROM read_pdf('__TEST_DIR__/elements_fixture.pdf', grain := 'element')
 WHERE element_idx = 1 AND page_number = 1;
 ----
 true
@@ -75,7 +75,7 @@ true
 # The bullet and numbered lines are the list items
 query I
 SELECT COUNT(*) = 2
-FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+FROM read_pdf('__TEST_DIR__/elements_fixture.pdf', grain := 'element')
 WHERE element_type = 'list_item'
   AND (starts_with(text, '- alpha') OR starts_with(text, '1. numbered'));
 ----
@@ -83,7 +83,7 @@ true
 
 # The isolated fragment is 'other'
 query I
-SELECT element_type FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+SELECT element_type FROM read_pdf('__TEST_DIR__/elements_fixture.pdf', grain := 'element')
 WHERE text = '42';
 ----
 other
@@ -91,7 +91,7 @@ other
 # bbox monotonicity: x0 < x1 and y0 < y1 on every element
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+FROM read_pdf('__TEST_DIR__/elements_fixture.pdf', grain := 'element')
 WHERE NOT (bbox_x0 < bbox_x1 AND bbox_y0 < bbox_y1);
 ----
 true
@@ -103,25 +103,25 @@ true
 
 query I
 SELECT count() = 0
-FROM read_pdf_elements('test/data/scanned.pdf');
+FROM read_pdf('test/data/scanned.pdf', grain := 'element');
 ----
 true
 
 query I
 SELECT count() = 0
-FROM read_pdf_elements('test/data/skewed_scan.pdf');
+FROM read_pdf('test/data/skewed_scan.pdf', grain := 'element');
 ----
 true
 
 query I
 SELECT count() > 0
-FROM read_pdf_elements('test/data/scanned.pdf', auto_ocr := true);
+FROM read_pdf('test/data/scanned.pdf', auto_ocr := true, grain := 'element');
 ----
 true
 
 query I
 SELECT count() = 0
-FROM read_pdf_elements('test/data/scanned.pdf', auto_ocr := false);
+FROM read_pdf('test/data/scanned.pdf', auto_ocr := false, grain := 'element');
 ----
 true
 
@@ -133,7 +133,7 @@ WITH words AS (
 ), elements AS (
   SELECT page_number AS page, string_agg(text, ' ' ORDER BY element_idx) AS text,
          bool_and(font_size IS NULL AND font_name IS NULL) AS null_fonts
-  FROM read_pdf_elements('test/data/scanned.pdf', ocr := true)
+  FROM read_pdf('test/data/scanned.pdf', ocr := true, grain := 'element')
   GROUP BY page_number
 )
 SELECT count() > 0 AND bool_and(words.text = elements.text AND elements.null_fonts)
@@ -144,7 +144,7 @@ true
 
 query I
 SELECT count() > 0
-FROM read_pdf_elements('test/data/scanned.pdf', ocr := true)
+FROM read_pdf('test/data/scanned.pdf', ocr := true, grain := 'element')
 WHERE element_type = 'paragraph';
 ----
 true
@@ -157,7 +157,7 @@ WITH words AS (
 ), elements AS (
   SELECT page_number AS page, string_agg(text, ' ' ORDER BY element_idx) AS text,
          bool_and(font_size IS NULL AND font_name IS NULL) AS null_fonts
-  FROM read_pdf_elements('test/data/skewed_scan.pdf', ocr := true)
+  FROM read_pdf('test/data/skewed_scan.pdf', ocr := true, grain := 'element')
   GROUP BY page_number
 )
 SELECT count() > 0 AND bool_and(words.text = elements.text AND elements.null_fonts)
@@ -168,7 +168,7 @@ true
 
 query I
 SELECT count() > 0
-FROM read_pdf_elements('test/data/skewed_scan.pdf', ocr := true)
+FROM read_pdf('test/data/skewed_scan.pdf', ocr := true, grain := 'element')
 WHERE element_type = 'paragraph';
 ----
 true
@@ -176,14 +176,14 @@ true
 # Native text layer: font_size present and near the writer's 10pt default
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_elements('__TEST_DIR__/elements_fixture.pdf')
+FROM read_pdf('__TEST_DIR__/elements_fixture.pdf', grain := 'element')
 WHERE font_size IS NULL OR font_size < 9 OR font_size > 11;
 ----
 true
 
 # Native text layer: one-font elements report their font name
 query I
-SELECT font_name FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+SELECT font_name FROM read_pdf('test/data/markdown_fixture.pdf', grain := 'element')
 WHERE text = 'Markdown Fixture Title';
 ----
 Helvetica-Bold
@@ -193,26 +193,26 @@ Helvetica-Bold
 
 # Exactly the two oversized short blocks classify as headings
 query I
-SELECT COUNT(*) FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+SELECT COUNT(*) FROM read_pdf('test/data/markdown_fixture.pdf', grain := 'element')
 WHERE element_type = 'heading';
 ----
 2
 
 query I
-SELECT element_type FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+SELECT element_type FROM read_pdf('test/data/markdown_fixture.pdf', grain := 'element')
 WHERE text = 'Markdown Fixture Title';
 ----
 heading
 
 query I
-SELECT element_type FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+SELECT element_type FROM read_pdf('test/data/markdown_fixture.pdf', grain := 'element')
 WHERE text = 'Introduction Section';
 ----
 heading
 
 # Mixed-font elements report the font carrying the most characters
 query I
-SELECT font_name FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+SELECT font_name FROM read_pdf('test/data/markdown_fixture.pdf', grain := 'element')
 WHERE text = 'The word important is bold here.';
 ----
 Helvetica
@@ -220,36 +220,36 @@ Helvetica
 # The title is the first element in reading order
 query I
 SELECT text = 'Markdown Fixture Title'
-FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+FROM read_pdf('test/data/markdown_fixture.pdf', grain := 'element')
 WHERE page_number = 1 AND element_idx = 1;
 ----
 true
 
 # The three '- item ...' bullets classify as list items
 query I
-SELECT COUNT(*) FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+SELECT COUNT(*) FROM read_pdf('test/data/markdown_fixture.pdf', grain := 'element')
 WHERE element_type = 'list_item' AND starts_with(text, '- item');
 ----
 3
 
 # Body prose classifies as paragraph
 query I
-SELECT element_type FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+SELECT element_type FROM read_pdf('test/data/markdown_fixture.pdf', grain := 'element')
 WHERE contains(lower(text), 'layout-aware markdown');
 ----
 paragraph
 
 # Font-size sanity: every heading is larger than every paragraph
 query I
-SELECT (SELECT MIN(font_size) FROM read_pdf_elements('test/data/markdown_fixture.pdf') WHERE element_type = 'heading')
-     > (SELECT MAX(font_size) FROM read_pdf_elements('test/data/markdown_fixture.pdf') WHERE element_type = 'paragraph');
+SELECT (SELECT MIN(font_size) FROM read_pdf('test/data/markdown_fixture.pdf', grain := 'element') WHERE element_type = 'heading')
+     > (SELECT MAX(font_size) FROM read_pdf('test/data/markdown_fixture.pdf', grain := 'element') WHERE element_type = 'paragraph');
 ----
 true
 
 # bbox monotonicity holds on the multi-font fixture too
 query I
 SELECT COUNT(*) = 0
-FROM read_pdf_elements('test/data/markdown_fixture.pdf')
+FROM read_pdf('test/data/markdown_fixture.pdf', grain := 'element')
 WHERE NOT (bbox_x0 < bbox_x1 AND bbox_y0 < bbox_y1);
 ----
 true
@@ -257,17 +257,17 @@ true
 # ── multi-page + page-range params ───────────────────────────────────────────
 
 query I
-SELECT COUNT(DISTINCT page_number) FROM read_pdf_elements('test/data/two_pages.pdf');
+SELECT COUNT(DISTINCT page_number) FROM read_pdf('test/data/two_pages.pdf', grain := 'element');
 ----
 2
 
 query I
-SELECT MAX(page_number) FROM read_pdf_elements('test/data/two_pages.pdf', last_page := 1);
+SELECT MAX(page_number) FROM read_pdf('test/data/two_pages.pdf', last_page := 1, grain := 'element');
 ----
 1
 
 query I
-SELECT MIN(page_number) FROM read_pdf_elements('test/data/two_pages.pdf', first_page := 2);
+SELECT MIN(page_number) FROM read_pdf('test/data/two_pages.pdf', first_page := 2, grain := 'element');
 ----
 2
 
@@ -282,13 +282,13 @@ COPY (SELECT 'second glob file body text here' AS line)
 TO '__TEST_DIR__/elements_glob2.pdf' (FORMAT pdf);
 
 query I
-SELECT COUNT(DISTINCT file) FROM read_pdf_elements('__TEST_DIR__/elements_glob*.pdf');
+SELECT COUNT(DISTINCT file) FROM read_pdf('__TEST_DIR__/elements_glob*.pdf', grain := 'element');
 ----
 2
 
 # Every row carries the file it came from
 query I
-SELECT COUNT(*) = 0 FROM read_pdf_elements('__TEST_DIR__/elements_glob*.pdf')
+SELECT COUNT(*) = 0 FROM read_pdf('__TEST_DIR__/elements_glob*.pdf', grain := 'element')
 WHERE NOT contains(file, 'elements_glob');
 ----
 true
@@ -317,34 +317,34 @@ COPY (
 
 # Both caps headers are headings despite body-size font
 query I
-SELECT element_type FROM read_pdf_elements('__TEST_DIR__/elements_caps.pdf')
+SELECT element_type FROM read_pdf('__TEST_DIR__/elements_caps.pdf', grain := 'element')
 WHERE text = 'PROFESSIONAL SUMMARY';
 ----
 heading
 
 query I
-SELECT element_type FROM read_pdf_elements('__TEST_DIR__/elements_caps.pdf')
+SELECT element_type FROM read_pdf('__TEST_DIR__/elements_caps.pdf', grain := 'element')
 WHERE text = 'CAREER HIGHLIGHTS';
 ----
 heading
 
 # 'IV' has only 2 alphabetic chars (< ELEM_CAPS_HEADING_MIN_ALPHA) -> other
 query I
-SELECT element_type FROM read_pdf_elements('__TEST_DIR__/elements_caps.pdf')
+SELECT element_type FROM read_pdf('__TEST_DIR__/elements_caps.pdf', grain := 'element')
 WHERE text = 'IV';
 ----
 other
 
 # 6 caps words is not "fewer than ELEM_CAPS_HEADING_MAX_WORDS" -> paragraph
 query I
-SELECT element_type FROM read_pdf_elements('__TEST_DIR__/elements_caps.pdf')
+SELECT element_type FROM read_pdf('__TEST_DIR__/elements_caps.pdf', grain := 'element')
 WHERE text = 'ALPHA BETA GAMMA DELTA EPSILON ZETA';
 ----
 paragraph
 
 # Mixed-case body prose is untouched by the caps rule
 query I
-SELECT COUNT(*) FROM read_pdf_elements('__TEST_DIR__/elements_caps.pdf')
+SELECT COUNT(*) FROM read_pdf('__TEST_DIR__/elements_caps.pdf', grain := 'element')
 WHERE element_type = 'paragraph';
 ----
 3
@@ -363,14 +363,14 @@ COPY (
 
 query I
 SELECT COUNT(text) = 1
-FROM read_pdf_elements('__TEST_DIR__/elements_caps_running_header.pdf')
+FROM read_pdf('__TEST_DIR__/elements_caps_running_header.pdf', grain := 'element')
 WHERE text = '4.1 CUDA 97' AND element_type <> 'heading';
 ----
 true
 
 query I
 SELECT element_type
-FROM read_pdf_elements('__TEST_DIR__/elements_caps_running_header.pdf')
+FROM read_pdf('__TEST_DIR__/elements_caps_running_header.pdf', grain := 'element')
 WHERE text = 'BODY SIZE CAPS';
 ----
 heading
@@ -380,13 +380,13 @@ heading
 # drops U+25CF / U+200B). Word/Docs emit ● and stick ZWSP after the marker.
 
 query I
-SELECT COUNT(*) FROM read_pdf_elements('test/data/gdocs_lists.pdf')
+SELECT COUNT(*) FROM read_pdf('test/data/gdocs_lists.pdf', grain := 'element')
 WHERE element_type = 'list_item';
 ----
 2
 
 query I
-SELECT COUNT(*) FROM read_pdf_elements('test/data/gdocs_lists.pdf')
+SELECT COUNT(*) FROM read_pdf('test/data/gdocs_lists.pdf', grain := 'element')
 WHERE element_type = 'list_item'
   AND (contains(text, 'Black circle') OR contains(text, 'Numbered zwsp'));
 ----
@@ -398,19 +398,19 @@ WHERE element_type = 'list_item'
 # become other; the cover byline stays heading.
 
 query I
-SELECT COUNT(*) FROM read_pdf_elements('test/data/running_header.pdf')
+SELECT COUNT(*) FROM read_pdf('test/data/running_header.pdf', grain := 'element')
 WHERE element_type = 'heading' AND text = 'RUNNING HEADER';
 ----
 1
 
 query I
-SELECT COUNT(*) FROM read_pdf_elements('test/data/running_header.pdf')
+SELECT COUNT(*) FROM read_pdf('test/data/running_header.pdf', grain := 'element')
 WHERE element_type = 'other' AND text = 'RUNNING HEADER';
 ----
 6
 
 query I
-SELECT page_number FROM read_pdf_elements('test/data/running_header.pdf')
+SELECT page_number FROM read_pdf('test/data/running_header.pdf', grain := 'element')
 WHERE element_type = 'heading' AND text = 'RUNNING HEADER';
 ----
 1
@@ -420,11 +420,11 @@ WHERE element_type = 'heading' AND text = 'RUNNING HEADER';
 # Native filesystem errors may normalize this to an absolute Windows path.
 # Assert the missing path while accepting either directory separator.
 statement error
-SELECT * FROM read_pdf_elements('test/data/no_such_file.pdf');
+SELECT * FROM read_pdf('test/data/no_such_file.pdf', grain := 'element');
 ----
 <REGEX>:.*test[/\\]data[/\\]no_such_file\.pdf.*
 
 statement error
-SELECT * FROM read_pdf_elements('test/data/two_pages.pdf', first_page := 0);
+SELECT * FROM read_pdf('test/data/two_pages.pdf', first_page := 0, grain := 'element');
 ----
 first_page

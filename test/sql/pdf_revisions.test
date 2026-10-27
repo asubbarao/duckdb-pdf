@@ -11,13 +11,13 @@ PRAGMA enable_verification
 
 query IIIII
 SELECT revision_index, startxref_offset, eof_offset, size_bytes, is_incremental
-FROM pdf_revisions('test/data/hello.pdf')
+FROM pdf_objects('test/data/hello.pdf', kind := 'revisions')
 ORDER BY revision_index;
 ----
 0	669	979	979	false
 
 query I
-SELECT count(*) FROM pdf_revisions('test/data/hello.pdf');
+SELECT count(*) FROM pdf_objects('test/data/hello.pdf', kind := 'revisions');
 ----
 1
 
@@ -26,13 +26,13 @@ SELECT count(*) FROM pdf_revisions('test/data/hello.pdf');
 # trailer /Prev 669 pointing at the original xref.
 
 query I
-SELECT count(*) FROM pdf_revisions('test/data/incremental.pdf');
+SELECT count(*) FROM pdf_objects('test/data/incremental.pdf', kind := 'revisions');
 ----
 2
 
 query IIIII
 SELECT revision_index, startxref_offset, eof_offset, size_bytes, is_incremental
-FROM pdf_revisions('test/data/incremental.pdf')
+FROM pdf_objects('test/data/incremental.pdf', kind := 'revisions')
 ORDER BY revision_index;
 ----
 0	669	979	979	false
@@ -45,29 +45,29 @@ SELECT bool_and(startxref_offset < eof_offset)
 FROM (
   SELECT startxref_offset, eof_offset,
          lag(eof_offset, 1, 0) OVER (ORDER BY revision_index) AS lag_eof
-  FROM pdf_revisions('test/data/incremental.pdf')
+  FROM pdf_objects('test/data/incremental.pdf', kind := 'revisions')
 );
 ----
 true
 
 # size_bytes covers the whole file when summed
 query I
-SELECT sum(size_bytes) = (SELECT eof_offset FROM pdf_revisions('test/data/incremental.pdf')
+SELECT sum(size_bytes) = (SELECT eof_offset FROM pdf_objects('test/data/incremental.pdf', kind := 'revisions')
                           ORDER BY revision_index DESC LIMIT 1)
-FROM pdf_revisions('test/data/incremental.pdf');
+FROM pdf_objects('test/data/incremental.pdf', kind := 'revisions');
 ----
 true
 
 # is_incremental is false only for revision 0
 query I
 SELECT bool_and(CASE WHEN revision_index = 0 THEN NOT is_incremental ELSE is_incremental END)
-FROM pdf_revisions('test/data/incremental.pdf');
+FROM pdf_objects('test/data/incremental.pdf', kind := 'revisions');
 ----
 true
 
 # password named parameter is accepted (unused for trailer walk)
 query I
-SELECT count(*) FROM pdf_revisions('test/data/incremental.pdf', password := '');
+SELECT count(*) FROM pdf_objects('test/data/incremental.pdf', password := '', kind := 'revisions');
 ----
 2
 
@@ -78,7 +78,7 @@ SELECT count(*) FROM pdf_revisions('test/data/incremental.pdf', password := '');
 # query returned "database has been invalidated"). It must instead throw an
 # ordinary IO Error, and — critically — the connection must stay usable.
 statement error
-SELECT * FROM pdf_revisions('test/data/text_as_pdf.pdf');
+SELECT * FROM pdf_objects('test/data/text_as_pdf.pdf', kind := 'revisions');
 ----
 is not a PDF (missing %PDF- header)
 
@@ -90,12 +90,12 @@ SELECT 42;
 
 # and pdf_revisions itself still works on a valid file in the same connection
 query I
-SELECT count(*) FROM pdf_revisions('test/data/hello.pdf');
+SELECT count(*) FROM pdf_objects('test/data/hello.pdf', kind := 'revisions');
 ----
 1
 
 query I
-SELECT count(DISTINCT filename) FROM pdf_revisions('test/data/hello*.pdf')
+SELECT count(DISTINCT filename) FROM pdf_objects('test/data/hello*.pdf', kind := 'revisions')
 WHERE ends_with(filename, 'hello.pdf');
 ----
 1

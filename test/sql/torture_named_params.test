@@ -76,7 +76,7 @@ SELECT COUNT(*) FROM read_pdf('test/data/does_not_exist.pdf', layout := 'bogus')
 layout must be one of ['auto', 'physical', 'reading', 'raw'], not 'bogus'
 
 statement error
-SELECT contains( pdf_to_text('test/data/hello.pdf', 'bogus'), 'Hello' );
+SELECT contains( pdf_text('test/data/hello.pdf', {layout: 'bogus'}), 'Hello' );
 ----
 layout must be one of ['auto', 'physical', 'reading', 'raw'], not 'bogus'
 
@@ -89,23 +89,23 @@ Invalid named parameter "layout"
 # ── pdf_to_svg page edges: pages are 1-based and range-checked ──────────────
 
 statement error
-SELECT length(pdf_to_svg('test/data/hello.pdf', 0)) > 0;
+SELECT length(decode(pdf_render('test/data/hello.pdf', 0, {format: 'svg'}))) > 0;
 ----
 out of range
 
 statement error
-SELECT pdf_to_svg('test/data/hello.pdf', 99999);
+SELECT decode(pdf_render('test/data/hello.pdf', 99999, {format: 'svg'}));
 ----
 out of range
 
 statement error
-SELECT pdf_to_svg('test/data/hello.pdf', 2);
+SELECT decode(pdf_render('test/data/hello.pdf', 2, {format: 'svg'}));
 ----
 out of range
 
 # first_page last_page also on words/lines
 query I
-SELECT COUNT(*) = 0 FROM read_pdf_lines('test/data/two_pages.pdf', first_page := 99, last_page := 100, auto_ocr := false);
+SELECT COUNT(*) = 0 FROM read_pdf('test/data/two_pages.pdf', first_page := 99, last_page := 100, auto_ocr := false, grain := 'line');
 ----
 true
 

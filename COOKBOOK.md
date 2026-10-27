@@ -4,14 +4,17 @@ Task-oriented recipes for the `pdf` community extension. Each recipe is a real
 goal, a runnable SQL block, and the one gotcha that bites people. For the full
 per-function reference (every column, every parameter), see [README.md](README.md).
 
-Every recipe assumes the extension is loaded:
+These recipes target this source branch's 19-name API; released community binaries
+may expose the earlier API. Load the matching source build (see README), or use
+the following once the matching version is published:
 
 ```sql
 INSTALL pdf FROM community; LOAD pdf;
 ```
 
-Every function takes a single path **or a glob**, so the natural unit of work is
-a folder of PDFs. Recipes below use `docs/*.pdf`; substitute your own path.
+The multi-file readers accept a path or glob. Scalar readers consume one path
+or BLOB; document writers take individual paths or an explicit input list.
+Recipes below use `docs/*.pdf`; substitute your own path.
 
 ---
 
@@ -22,10 +25,10 @@ retrieval chunk that already knows its filename, page span, and section heading 
 ready to embed.
 
 ```sql
--- One statement. pdf_chunks packs the layout-element grain into chunks,
+-- One statement. The chunk grain packs layout elements into chunks,
 -- keeps headings glued to their section, and overlaps chunk boundaries.
 CREATE TABLE rag_chunks AS
-FROM pdf_chunks('docs/*.pdf', chunk_size := 1200, overlap := 150);
+FROM read_pdf('docs/*.pdf', grain := 'chunk', chunk_size := 1200, overlap := 150);
 
 SELECT file, chunk_idx, heading, page_start, page_end, n_chars
 FROM rag_chunks
@@ -47,10 +50,10 @@ CREATE INDEX chunks_hnsw ON rag_chunks USING HNSW (embedding);
 ```
 
 **Gotcha:** the extension ships **no ML** — it does not embed or call models.
-`pdf_chunks` is deterministic (no tokenizer); it reads the native text layer
-only. For scanned/image-only PDFs it produces empty chunks — OCR those first
-(recipe 3) into a text column and chunk that instead. The full runnable RAG
-script is in [`examples/rag_pdf_vss.sql`](examples/rag_pdf_vss.sql).
+`read_pdf(..., grain := 'chunk')` is deterministic (no tokenizer); by default it
+reads the native text layer. Set `auto_ocr := true` to include image-only pages,
+or persist OCR first (recipe 11). The RAG template in
+[`examples/rag_pdf_vss.sql`](examples/rag_pdf_vss.sql) needs your embedder and query vector.
 
 ---
 
@@ -84,7 +87,7 @@ LIMIT 10;
 you insert new pages. Re-run the `PRAGMA` after changing the base table. The key
 column (`id` here) must be a single column and unique per row. For a quick
 one-off search without an index, skip FTS entirely and use
-`WHERE text ILIKE '%revenue%'` on `read_pdf` (or `read_pdf_lines` to keep line
+`WHERE text ILIKE '%revenue%'` on `read_pdf` (or `read_pdf(..., grain := 'line')` to keep line
 context).
 
 ---
@@ -94,17 +97,17 @@ context).
 **Goal:** pull line-item tables out of a scanned (no text layer) invoice.
 
 ```sql
--- read_pdf_tables runs OCR on image-only pages when ocr := true,
+-- The table grain runs OCR on image-only pages when ocr := true,
 -- then detects tables over the OCR word geometry
 SELECT page, table_index, row_index, cells
-FROM read_pdf_tables('scanned.pdf', ocr := true)
+FROM read_pdf('scanned.pdf', grain := 'table', ocr := true)
 ORDER BY page, table_index, row_index;
 
 -- Words with confidence, for building your own extraction geometry
 SELECT page, word, x0, y0, confidence
 FROM read_pdf_words('scanned.pdf', ocr := true)
 WHERE source = 'ocr'
-ORDER BY page, y1 DESC, x0;
+ORDER BY page, y0, x0;
 ```
 
 **English is bundled** (tessdata_fast eng, extracted on first OCR) — zero host
@@ -126,7 +129,7 @@ forces OCR on every page.
 Same doctrine as the rest of the extension: **add parameters, not functions**.
 
 **In-process Tess `SetVariable` + config** (shared by `read_pdf*` and
-`tesseract_ocr`):
+scalar `ocr_image`):
 
 ```sql
 -- Digits-only OCR for a scanned amount field
@@ -143,14 +146,11 @@ FROM read_pdf_words('scan.pdf', ocr := true,
   ocr_config := 'digits',
   ocr_vars := MAP {'tessedit_char_blacklist': '|'});
 
--- Scalar on a rendered PNG BLOB (positional: lang, psm, oem, tessdata_dir,
--- preprocess, vars MAP, config path — empty string = default tessdata)
-SELECT tesseract_ocr(
-  pdf_to_png((SELECT content FROM read_blob('scan.pdf')), 1, 200),
-  'eng', 6, 3, '', true,
-  MAP {'tessedit_char_whitelist': 'ABC0123456789'},
-  ''
-);
+-- Scalar OCR accepts a BLOB column and options as a STRUCT.
+SELECT ocr_image(pdf_render(content, 1, {dpi: 200}),
+  {language: 'eng', psm: 6, oem: 3, tessdata_dir: '', preprocess: true,
+   vars: MAP {'tessedit_char_whitelist': 'ABC0123456789'}, config: ''})
+FROM read_blob('scan.pdf');
 ```
 
 **Shellfs CLI hatch** when you need the full Tesseract binary (env, obscure
@@ -159,10 +159,9 @@ not a product `.sh`:
 
 ```sql
 -- After writing a page PNG to a path the host tesseract can see:
-SELECT column0 AS text
-FROM read_csv(
-  'TESSDATA_PREFIX=/opt/tessdata tesseract /tmp/page.png stdout -l eng --psm 4 -c load_system_dawg=0 |',
-  header := false
+SELECT content AS text
+FROM read_text(
+  'TESSDATA_PREFIX=/opt/tessdata tesseract /tmp/page.png stdout -l eng --psm 4 -c load_system_dawg=0 |'
 );
 
 SELECT * FROM read_text(
@@ -178,7 +177,7 @@ First arg must be foldable (no subqueries):
 
 ```sql
 SET VARIABLE page_png = (
-  SELECT pdf_to_png(content, 1, 200) FROM read_blob('scan.pdf')
+  SELECT pdf_render(content, 1, {dpi: 200}) FROM read_blob('scan.pdf')
 );
 SELECT text, confidence, format
 FROM ocr_image(
@@ -203,14 +202,14 @@ two full opens and without DIY `round(y0)` line clustering or `max(bbox)` page
 geometry.
 
 ```sql
--- Single pin. line is geometric (same rule as read_pdf_elements).
+-- Single pin. line is geometric (the same rule as the element grain).
 CREATE TABLE pdf_words AS
-SELECT file_name(filename) AS filename, page AS page_no, line AS line_no,
-       word, (x0, y0, x1, y1) AS bbox, font_size,
+SELECT filename, page AS page_no, line AS line_no,
+       word, struct_pack(x0 := x0, y0 := y0, x1 := x1, y1 := y1) AS bbox, font_size,
        page_width AS width_pt, page_height AS height_pt
 FROM read_pdf_words('docs/*.pdf');
 
--- Line grain free from the word pin (no read_pdf_lines second walk)
+-- Line grain free from the word pin (no second reader walk)
 CREATE TABLE pdf_lines AS
 SELECT filename, page_no, line_no,
        string_agg(word, ' ' ORDER BY bbox.x0) AS line_text
@@ -223,11 +222,11 @@ SELECT DISTINCT filename, page_no, width_pt, height_pt
 FROM pdf_words;
 ```
 
-**Gotcha:** geometric `line` is the join key for bbox work. `read_pdf_lines`
+**Gotcha:** geometric `line` is the join key for bbox work. `read_pdf(..., grain := 'line')`
 (geometry text for `layout := 'auto'`, Poppler text for other layouts) can differ on multi-column pages —
 use it when you only need grep-style line context without boxes. Prefer
-`pdf_pages_info` when you need rotation/media box **without** extracting words.
-Raster previews: `pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100)` —
+`pdf_objects(..., kind := 'pages')` when you need rotation/media box **without** extracting words.
+Raster previews: `pdf_render('docs/*.pdf', output_dir := 'pages', dpi := 100)` —
 do not shell `pdftoppm` (bundled base-14 fonts fix blank rasters on community
 builds).
 
@@ -253,7 +252,7 @@ SELECT DISTINCT filename FROM read_pdf('docs/*.pdf', ignore_errors := true);
 
 **Gotcha:** without `ignore_errors := true`, **one bad file aborts the whole
 scan** (the default). `ignore_errors` is accepted by `read_pdf`,
-`pdf_info`, `pdf_outline`, and `pdf_structure`. Encrypted files count as "unopenable" unless you pass the
+`pdf_info`, `pdf_objects(..., kind := 'outline')`, and `pdf_objects(..., kind := 'structure')`. Encrypted files count as "unopenable" unless you pass the
 `password`, so a password-protected file shows up in the quarantine list too.
 
 ---
@@ -264,24 +263,24 @@ scan** (the default). `ignore_errors` is accepted by `read_pdf`,
 whether the signature itself is intact.
 
 ```sql
--- Was this file edited after it was first written? PDFs are append-only;
--- each edit adds an incremental-update revision (revision 0 = original).
+-- Count retained incremental updates (revision 0 = original).
+-- A full rewrite can remove revision history; not every PDF edit is append-only.
 SELECT count(*) - 1 AS updates_after_original
-FROM pdf_revisions('contract.pdf');
+FROM pdf_objects('contract.pdf', kind := 'revisions');
 
 -- Timeline of what each edit added, oldest first
 SELECT revision_index, size_bytes, eof_offset, is_incremental
-FROM pdf_revisions('contract.pdf')
+FROM pdf_objects('contract.pdf', kind := 'revisions')
 ORDER BY revision_index;
 
 -- Signature integrity: verified = the signed bytes are unaltered.
 -- covers_whole_file = false means the file grew AFTER signing.
 SELECT file, signer_name, signing_time, verified, covers_whole_file
-FROM pdf_signatures('contracts/*.pdf');
+FROM pdf_objects('contracts/*.pdf', kind := 'signatures');
 
 -- The dangerous case: a valid signature that no longer covers the file
 SELECT file, field_name
-FROM pdf_signatures('contracts/*.pdf')
+FROM pdf_objects('contracts/*.pdf', kind := 'signatures')
 WHERE verified AND NOT covers_whole_file;
 ```
 
@@ -290,7 +289,7 @@ does *not* validate certificate-chain trust (no CA store is consulted). A
 self-signed or expired cert can still report `verified = true`. And a signature
 can be `verified = true` while `covers_whole_file = false`: the signature is
 valid over its own byte range, but later incremental revisions changed the
-visible document. Cross-check with `pdf_revisions` to recover what the document
+visible document. Cross-check with `pdf_objects(..., kind := 'revisions')` to recover what the document
 said before the last edit (truncate the file at an earlier `eof_offset`).
 
 ---
@@ -301,50 +300,50 @@ said before the last edit (truncate the file at an earlier `eof_offset`).
 
 ```sql
 -- Merge a whole folder into one PDF (build the list in SQL, then compress)
-SELECT pdf_compress(
+SELECT pdf_rewrite(
          pdf_merge(list(file ORDER BY file), 'combined.pdf'),
-         'combined_small.pdf')
+         'combined_small.pdf', {mode: 'compress'})
 FROM glob('docs/*.pdf');
 
 -- Split one PDF into single-page files (dir must EXIST — see gotcha)
 SELECT page, file FROM pdf_split('combined.pdf', 'out');
 ```
 
-**Split a scanned batch on blank separator pages** *(requires pdf ≥ 0.5)* — a
+**Split a scanned batch on blank separator pages** — a
 mailroom scan is often N documents divided by blank sheets:
 
 ```sql
 -- Detects separators (no text AND a near-white raster) and writes each
 -- logical document to out/<stem>_doc<K>.pdf, dropping the blanks.
 SELECT document, first_page, last_page, page_count, file
-FROM pdf_split_blank('batch.pdf', 'out');
+FROM pdf_split('batch.pdf', 'out', mode := 'blank');
 
 -- Raise the threshold to demand a purer-white separator (default 0.995)
-SELECT * FROM pdf_split_blank('batch.pdf', 'out', blank_threshold := 0.999);
+SELECT * FROM pdf_split('batch.pdf', 'out', mode := 'blank', blank_threshold := 0.999);
 ```
 
-**Stamp Bates numbers across a discovery set** *(requires pdf ≥ 0.5)*:
+**Stamp Bates numbers across a discovery set**:
 
 ```sql
 -- prefix + zero-padded (min 6 digits) sequential number, bottom-right,
 -- incrementing per page: page 1 -> ACME000100, page 2 -> ACME000101, ...
-SELECT pdf_bates('deposition.pdf', 'deposition_stamped.pdf', 'ACME', 100);
+SELECT pdf_stamp('deposition.pdf', 'deposition_stamped.pdf', {mode: 'bates', prefix: 'ACME', start: 100});
 ```
 
-**Watermark drafts** *(requires pdf ≥ 0.5)*:
+**Watermark drafts**:
 
 ```sql
 -- Large 45° diagonal gray text, centered on every page. Real selectable
--- text (searchable), not a flattened raster. 4-arg form sets fill alpha.
-SELECT pdf_watermark('report.pdf', 'report_draft.pdf', 'DRAFT');
-SELECT pdf_watermark('report.pdf', 'report_faint.pdf', 'CONFIDENTIAL', 0.15);
+-- text (searchable), not a flattened raster. Opacity sets fill alpha.
+SELECT pdf_stamp('report.pdf', 'report_draft.pdf', {mode: 'watermark', text: 'DRAFT'});
+SELECT pdf_stamp('report.pdf', 'report_faint.pdf', {mode: 'watermark', text: 'CONFIDENTIAL', opacity: 0.15});
 ```
 
 **Gotcha:** these qpdf writers **overwrite** an existing output file but treat a
 missing output *directory* as an error (never created — `mkdir` first), and
 **refuse in-place operation** (`input == output`) because qpdf reads the source
 lazily during the write. Every scalar returns the output path, so they compose:
-the output of `pdf_merge` is the input of `pdf_compress`, as above.
+the output of `pdf_merge` is the input of `pdf_rewrite(..., {mode: 'compress'})`, as above.
 
 ---
 
@@ -355,14 +354,14 @@ back out of a scan.
 
 ```sql
 -- Render a page to PNG bytes for a vision model (DPI controls raster size)
-SELECT pdf_to_png('report.pdf', 1)       AS page1_150dpi,
-       pdf_to_png('report.pdf', 1, 300)  AS page1_300dpi;
+SELECT pdf_render('report.pdf', 1)       AS page1_150dpi,
+       pdf_render('report.pdf', 1, {dpi: 300})  AS page1_300dpi;
 
 -- BLOB per page (path or glob) for vision / llm pipelines
-SELECT file, page, png FROM pdf_page_images('docs/*.pdf', dpi := 100);
+SELECT file, page, png FROM pdf_render('docs/*.pdf', dpi := 100);
 ```
 
-Columns from `pdf_page_images`: `file`, `page` (1-based), `page_count`, `dpi`,
+Columns from `pdf_render`: `file`, `page` (1-based), `page_count`, `dpi`,
 `width`, `height` (pixel size from the PNG IHDR), `png` (`BLOB`). DPI range
 1–2400 (default 150). Feed `png` straight to a vision / llm extension, or keep
 it as a column for downstream SQL.
@@ -370,29 +369,29 @@ it as a column for downstream SQL.
 ### Closure-style static tree: `pages/<stem>/pN.png` (no `pdftoppm`)
 
 Static UIs and file servers want a **deterministic on-disk tree** of page PNGs.
-Use `pdf_write_page_images` — one call, multi-file, same raster + bundled
-base-14 fonts as `pdf_page_images` / `pdf_to_png`:
+Use `pdf_render(..., output_dir := 'pages')` to write multiple files using the
+same raster and bundled base-14 fonts as the in-memory and scalar forms:
 
 ```sql
 -- Writes pages/<stem>/p1.png, p2.png, … (1-based, no zero-pad)
 -- Creates out_dir and per-stem subdirs if missing.
 SELECT file, page, out_path, width, height, bytes
-FROM pdf_write_page_images('docs/*.pdf', 'pages', dpi := 100);
+FROM pdf_render('docs/*.pdf', output_dir := 'pages', dpi := 100);
 
 -- Page range + password (same named params as the readers)
 SELECT *
-FROM pdf_write_page_images('locked.pdf', 'pages', dpi := 100,
+FROM pdf_render('locked.pdf', output_dir := 'pages', dpi := 100,
                            password := 'secret', first_page := 1, last_page := 3);
 ```
 
 Columns: `file`, `page` (1-based), `out_path`, `width`, `height`, `bytes`.
 Overwrite replaces existing PNGs. Side effects run at scan time (`EXPLAIN`
-writes nothing). Requires pdf ≥ 0.7.7.
+writes nothing). Use `format := 'svg'` to write SVG pages instead.
 
 For a **single** page without a tree, the scalar + core `COPY` still works:
 
 ```sql
-COPY (SELECT pdf_to_png('report.pdf', 1, 100))
+COPY (SELECT pdf_render('report.pdf', 1, {dpi: 100}))
 TO 'pages/report/p1.png' (FORMAT BLOB);  -- mkdir parent first
 ```
 
@@ -402,25 +401,24 @@ TO 'pages/report/p1.png' (FORMAT BLOB);  -- mkdir parent first
 -- Pull the ACTUAL stored rasters (the JPEG the scanner wrote), not a render
 SELECT file, page, image_index, width, height, colorspace, format,
        octet_length(data) AS bytes
-FROM pdf_images('scans/*.pdf')
+FROM pdf_objects('scans/*.pdf', kind := 'images')
 ORDER BY file, page, image_index;
 ```
 
-**Gotcha:** `pdf_page_images` / `pdf_write_page_images` / `pdf_to_png` **render**
-the page (1-based page numbers, DPI 1–2400) — they are rasterizers. `pdf_images`
+**Gotcha:** The scalar and table forms of `pdf_render` **render**
+the page (1-based page numbers, DPI 1–2400) — they are rasterizers. `pdf_objects(..., kind := 'images')`
 **extracts** the embedded image XObjects byte-for-byte and does not render
 anything; files with no images yield zero rows. Check the `format` column
 before using `data`: `jpeg`/`png` bytes drop straight into any image tool, but
 `ccitt` (fax) and `raw` (CMYK/indexed/exotic depth) rows need the
 `colorspace`/`bits_per_component`/`width`/`height` columns to interpret.
-`pdf_images` requires pdf ≥ 0.5; `pdf_write_page_images` requires pdf ≥ 0.7.7.
 
 ### Fonts (pdf ≥ 0.7.3)
 
 From **0.7.3**, community binaries **bundle URW base-14 substitute fonts**
 (Helvetica / Times / Courier / Symbol / ZapfDingbats) and register them with
 Poppler at load. Page previews, OCR rasters, `pdf_redact`, and
-`pdf_write_page_images` should **not** come back blank on font-starved hosts
+`pdf_render(..., output_dir := 'pages')` should **not** come back blank on font-starved hosts
 (vcpkg/community Poppler without fontconfig or system display fonts). Exotic
 non-base-14 faces can still fail; standard office PDFs are the happy path.
 
@@ -452,8 +450,8 @@ SELECT to_pdf('resume.docx');   -- -> 'resume.pdf'
 Helvetica only** (WinAnsi/Latin-1) — non-Latin scripts and many UTF-8 glyphs
 will not render; use `to_pdf` + HTML for international text. `FOOTER` supports a
 literal `{page}` placeholder; if you set `HEADER`/`FOOTER`, `MARGIN` must be
-≥ 24 to fit the band. `to_pdf` is the **only** function that shells out at
-runtime — it needs LibreOffice installed (`brew install --cask libreoffice` /
+≥ 24 to fit the band. `to_pdf` is the **only** function that launches an external
+application at runtime (without a shell) — it needs LibreOffice installed (`brew install --cask libreoffice` /
 `apt-get install libreoffice`) and errors with an actionable message if absent.
 
 ---
@@ -466,18 +464,19 @@ runtime — it needs LibreOffice installed (`brew install --cask libreoffice` /
 INSTALL httpfs; LOAD httpfs;
 
 -- Path form: the scalars route through DuckDB's FileSystem, so a URL works
-SELECT pdf_to_text('https://example.com/report.pdf') AS body;
+SELECT pdf_text('https://example.com/report.pdf') AS body;
 
 -- BLOB form: read_blob fetches bytes, the scalar consumes them directly
 -- (no second filesystem round-trip). The BLOB overloads accept raw bytes.
-SELECT pdf_to_text(content)          AS body,
-       octet_length(pdf_to_png(content, 1)) AS page1_png_bytes
+SELECT pdf_text(content)          AS body,
+       octet_length(pdf_render(content, 1)) AS page1_png_bytes
 FROM read_blob('https://example.com/report.pdf');
 ```
 
-**Gotcha:** the **scalar** readers (`pdf_to_text`/`html`/`xml`/`svg`/`png`)
-accept a `BLOB`, so `read_blob(url) → scalar` needs no temp file. The **table**
-functions (`read_pdf`, `pdf_chunks`, `read_pdf_tables`, ...) and the qpdf writers
+**Gotcha:** the **scalar** readers (`pdf_text` and `pdf_render`)
+accept a `BLOB`, so `read_blob(url) → scalar` needs no temp file. Markdown output
+from `pdf_text` currently requires a path. The **table**
+functions (`read_pdf`, `read_pdf(..., grain := 'chunk')`, `read_pdf(..., grain := 'table')`, ...) and the qpdf writers
 take a **path or glob, not a BLOB** — for those, give the URL as the path (they
 route through the VFS) rather than piping bytes. The qpdf writers additionally
 require a **local** output path.
@@ -503,7 +502,7 @@ WITH words AS (
   SELECT page, line, text FROM lines ANTI JOIN furniture USING (text)
 ), anchors AS (     -- a bookmark starts at the line on its page that prints its title
   SELECT o.ord, o.depth, o.title, o.page, coalesce(min(b.line), 0) AS line
-  FROM pdf_outline('https://blobs.duckdb.org/docs/ducklake-docs.pdf') o
+  FROM pdf_objects('https://blobs.duckdb.org/docs/ducklake-docs.pdf', kind := 'outline') o
   LEFT JOIN body b ON b.page = o.page AND b.text = o.title
   GROUP BY o.ord, o.depth, o.title, o.page
 ), sections AS (    -- each line belongs to the deepest bookmark at or before it
@@ -526,16 +525,16 @@ contents                          page  lines  chars  opening
       ducklake_column_mapping       30     13    587  Mappings contain the information used to map Parquet fields to column ids …
 ```
 
-`pdf_outline.page` is the page each bookmark points at, so the contents join
+`pdf_objects(..., kind := 'outline').page` is the page each bookmark points at, so the contents join
 straight onto the text. Anchoring a bookmark to the line that prints its title,
 not just its page, keeps two sections that share a page apart. Keying the ASOF
 join on `ord` as well gives a shared line to the deeper bookmark.
 
-**Gotcha:** a document without bookmarks returns no rows from `pdf_outline`.
-Take the anchors from `read_pdf_elements` instead
+**Gotcha:** a document without bookmarks returns no rows from `pdf_objects(..., kind := 'outline')`.
+Take the anchors from `read_pdf(..., grain := 'element')` instead
 (`WHERE element_type = 'heading'`, with `page_number` and the element's text).
 For the printed page number rather than the physical index, join
-`pdf_pages_info(file)` on `page` and use its `label`.
+`pdf_objects(file, kind := 'pages')` on `page` and use its `label`.
 The runnable script is [`examples/digest_long_document.sql`](examples/digest_long_document.sql).
 
 ---
@@ -552,8 +551,8 @@ quickly and no query pays for OCR twice.
 FROM pdf_ocr('scans/invoice.pdf', 'scans/invoice.searchable.pdf');
 
 -- The copy is an ordinary text PDF: no OCR option needed from here on.
-SELECT page_number, element_type, text FROM read_pdf_elements('scans/invoice.searchable.pdf');
-SELECT chunk_idx, page_start, n_chars    FROM pdf_chunks('scans/invoice.searchable.pdf');
+SELECT page_number, element_type, text FROM read_pdf('scans/invoice.searchable.pdf', grain := 'element');
+SELECT chunk_idx, page_start, n_chars    FROM read_pdf('scans/invoice.searchable.pdf', grain := 'chunk');
 ```
 
 Pages that already have a text layer retain their content (`ocr_applied = false`); `force := true`
@@ -567,22 +566,22 @@ spliced into the original with qpdf, so links, outline and metadata survive.
 fixture the run takes about a quarter of a second and reads every row, but "Item" comes back as
 "ltem": check `mean_confidence` and do not treat the output as authoritative for handwriting or
 anything where a misread is costly. For a one-off look without writing a file,
-`read_pdf_words(..., ocr := true)` still works, and `read_pdf_elements` takes the same OCR options.
+`read_pdf_words(..., ocr := true)` still works, and `read_pdf(..., grain := 'element')` takes the same OCR options.
 
 ---
 
 ## 12. Tagged PDFs: read the author's own structure instead of guessing it
 
 **Goal:** many PDFs (PowerPoint and Word exports, anything PDF/UA) carry a structure tree that
-says what each piece is: heading, paragraph, list item, table cell, figure. `read_pdf_elements`
-infers those from font size and position; `pdf_structure` reads what the file declares.
+says what each piece is: heading, paragraph, list item, table cell, figure. `read_pdf(..., grain := 'element')`
+infers those from font size and position; `pdf_objects(..., kind := 'structure')` reads what the file declares.
 
 ```sql
--- pdf_structure(files, password, first_page, last_page, ignore_errors)
+-- pdf_objects(files, kind := 'structure', password, first_page, last_page, ignore_errors)
 -- One row per structure element, depth-first: file, ord, depth, parent_ord, tag, role, page,
 --   alt, actual_text, lang, mcids INTEGER[]   (role = tag after the document's /RoleMap)
 SELECT role, len(list(ord)) AS n
-FROM pdf_structure('https://blobs.duckdb.org/events/duckcon7/floyd-berndsen-ducklake-on-hetzner.pdf')
+FROM pdf_objects('https://blobs.duckdb.org/events/duckcon7/floyd-berndsen-ducklake-on-hetzner.pdf', kind := 'structure')
 GROUP BY role ORDER BY n DESC;
 ```
 
@@ -590,6 +589,6 @@ An untagged file returns no rows, so the same query tells you which documents ha
 one exists it is exact: on a tagged conference deck the tree has far more headings (`H1`) per page
 than the geometric guess finds, because a slide title is often no larger than the type around it.
 
-**Gotcha:** `pdf_structure` returns the structure, not its text. `mcids` are the marked-content
+**Gotcha:** `pdf_objects(..., kind := 'structure')` returns the structure, not its text. `mcids` are the marked-content
 ids that belong to each element, which is what a later step needs to attach text; until then, join
-the tags to `read_pdf_elements` by page. Compare the two on your own documents before choosing one.
+the tags to `read_pdf(..., grain := 'element')` by page. Compare the two on your own documents before choosing one.

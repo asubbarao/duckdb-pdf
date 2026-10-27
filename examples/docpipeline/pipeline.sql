@@ -7,13 +7,13 @@
 --   2. FTS      BM25 full-text index
 --   3. VSS      chunk + embed (llm OR documented stub) + HNSW
 --   4. HYBRID   Reciprocal Rank Fusion (BM25 + vector)  << headline
---   5. REDACT   matched term -> pixel rectangles via word_boxes
+--   5. HIGHLIGHT matched term -> displayed-page point rectangles
 --
--- Parameterization: set :folder (or the SET below) to ANY corpus directory.
+-- Parameterization: edit the SET block below for your corpus directory.
 -- Not hardcoded to a domain (legal / medical / invoices / …).
 --
 -- Binary (read_pdf extension + tesseract OCR built in):
---   ./build/release/duckdb   (from the duckdb-read_pdf repo root after `make`)
+--   ./build/release/duckdb   (from the duckdb-pdf repo root after `make release`)
 --
 -- Run (from repo root):
 --   ./build/release/duckdb -c ".read examples/docpipeline/pipeline.sql"
@@ -24,17 +24,19 @@
 -- 0. EXTENSIONS + PARAMETERS
 -- -----------------------------------------------------------------------------
 -- read_pdf is linked into the custom build; no INSTALL needed for that binary.
--- fts / vss ship as core extensions.
+-- Install the compatible core extension artifacts before loading.
+INSTALL fts;
 LOAD fts;
+INSTALL vss;
 LOAD vss;
 
 -- Optional: real embeddings via llm (skipped when unavailable — see stub below).
 -- INSTALL llm FROM community; LOAD llm;
 
 -- >>> PARAMETER: point this at any folder of PDFs <<<
-SET VARIABLE folder = 'test/data';  -- any folder of PDFs; shipped fixtures work out of the box
+SET VARIABLE folder = 'build/docpipeline-corpus';  -- prepare the five-file corpus per README
 -- Output artifact root (versioned recipe lives alongside this script)
-SET VARIABLE out_dir = '/tmp/read_pdf_docpipeline_artifacts';  -- change to a writable path
+SET VARIABLE out_dir = 'build/docpipeline-artifacts';  -- create before running
 
 -- Embedding dimension for the stub (change if you swap in a real model)
 SET VARIABLE emb_dim = 32;
@@ -82,7 +84,7 @@ SELECT
   confidence
 FROM read_pdf_words(getvariable('folder') || '/*.pdf',
                     auto_ocr := true)
-ORDER BY file, page, y1 DESC, x0;
+ORDER BY file, page, y0, x0;
 
 -- Nest word boxes onto each page (generic redaction/highlight surface)
 CREATE OR REPLACE TABLE docs AS
@@ -408,8 +410,8 @@ SELECT file, page, rrf_score, fts_rank, vss_rank, bm25, distance, used_ocr, snip
 FROM q_hybrid;
 
 -- -----------------------------------------------------------------------------
--- 5. REDACTION-COORD JOIN: term -> pixel rectangles
---    Generic "locate term on page -> x/y box" for redact / highlight / UI.
+-- 5. HIGHLIGHT-COORD JOIN: term -> displayed-page point rectangles
+--    Top-left origin; convert crop/rotation/origin before using pdf_redact.
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE TABLE q_coords AS
 SELECT
@@ -417,39 +419,39 @@ SELECT
   w.page,
   w.word,
   w.x0, w.y0, w.x1, w.y1,
-  (w.x1 - w.x0) AS width_px,
-  (w.y1 - w.y0) AS height_px,
+  (w.x1 - w.x0) AS width_pt,
+  (w.y1 - w.y0) AS height_pt,
   w.source,
   w.confidence,
   p.used_ocr,
-  -- ready for pdf_redact rectangles: STRUCT(page, x, y, w, h)
+  -- UI highlight rectangle, NOT an original PDF user-space redaction box.
   struct_pack(
     page := w.page,
     x    := w.x0,
     y    := w.y0,
     w    := (w.x1 - w.x0),
     h    := (w.y1 - w.y0)
-  ) AS redact_rect
+  ) AS highlight_rect
 FROM words w
 JOIN pages p USING (file, page)
 WHERE lower(w.word) = lower(getvariable('q_ocr_term'))
    OR w.word ILIKE '%' || getvariable('q_keyword') || '%'
    OR lower(w.word) LIKE '%secret%'
-ORDER BY w.file, w.page, w.y1 DESC, w.x0;
+ORDER BY w.file, w.page, w.y0, w.x0;
 
-SELECT '=== 5. REDACTION-COORD JOIN (term -> boxes) ===' AS stage;
+SELECT '=== 5. HIGHLIGHT-COORD JOIN (term -> boxes) ===' AS stage;
 SELECT * FROM q_coords;
 
--- Bonus: pack all rects for a single file (call pdf_redact with this list)
-CREATE OR REPLACE TABLE redact_payload AS
+-- Bonus: pack top-left point rectangles for a per-file highlight overlay.
+CREATE OR REPLACE TABLE highlight_payload AS
 SELECT
   file,
-  list(redact_rect) AS rects
+  list(highlight_rect) AS rects
 FROM q_coords
 GROUP BY file;
 
-SELECT '=== 5b. redact_payload (per-file rect lists) ===' AS stage;
-SELECT * FROM redact_payload;
+SELECT '=== 5b. highlight_payload (per-file rect lists) ===' AS stage;
+SELECT * FROM highlight_payload;
 
 -- -----------------------------------------------------------------------------
 -- 6. EXPORT ARTIFACTS (parquet snapshots for reproducibility)

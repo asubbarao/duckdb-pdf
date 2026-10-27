@@ -10,7 +10,7 @@ PRAGMA enable_verification
 # ── NULL propagation ─────────────────────────────────────────────────────────
 
 query I
-SELECT pdf_to_markdown(NULL) IS NULL;
+SELECT pdf_text(NULL, {format: 'markdown'}) IS NULL;
 ----
 true
 
@@ -18,22 +18,22 @@ true
 
 # Output contains a level-1 heading (# ...) containing the title text
 query I
-SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '# Markdown Fixture Title');
+SELECT contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), '# Markdown Fixture Title');
 ----
 true
 
 # Output contains a level-2 or level-3 heading containing the subheading text
 query I
-SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), 'Introduction Section')
-   AND (contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '## Introduction Section')
-     OR contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '### Introduction Section'));
+SELECT contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), 'Introduction Section')
+   AND (contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), '## Introduction Section')
+     OR contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), '### Introduction Section'));
 ----
 true
 
 # ── fixture: body text present ───────────────────────────────────────────────
 
 query I
-SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), 'layout-aware markdown');
+SELECT contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), 'layout-aware markdown');
 ----
 true
 
@@ -41,7 +41,7 @@ true
 
 # The inline bold text "important" (from gen_markdown_fixture.c) must be exactly **important**
 query I
-SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '**important**');
+SELECT contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), '**important**');
 ----
 true
 
@@ -49,28 +49,28 @@ true
 
 # Output contains markdown list items (- prefix)
 query I
-SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '- item one');
+SELECT contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), '- item one');
 ----
 true
 
 # Google Docs ● + ZWSP and 1.<ZWSP> normalize to markdown list lines
 query I
-SELECT contains(pdf_to_markdown('test/data/gdocs_lists.pdf'), '- Black circle item one');
+SELECT contains(pdf_text('test/data/gdocs_lists.pdf', {format: 'markdown'}), '- Black circle item one');
 ----
 true
 
 query I
-SELECT contains(pdf_to_markdown('test/data/gdocs_lists.pdf'), '1. Numbered zwsp item two');
+SELECT contains(pdf_text('test/data/gdocs_lists.pdf', {format: 'markdown'}), '1. Numbered zwsp item two');
 ----
 true
 
 query I
-SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '- item two');
+SELECT contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), '- item two');
 ----
 true
 
 query I
-SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '- item three');
+SELECT contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), '- item three');
 ----
 true
 
@@ -78,31 +78,31 @@ true
 
 # Output contains a pipe table separator row
 query I
-SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '|---|');
+SELECT contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), '|---|');
 ----
 true
 
 # Output contains at least one pipe-delimited data row
 query I
-SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), '|');
+SELECT contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), '|');
 ----
 true
 
 # Table cell values are present
 query I
-SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), 'Apples');
+SELECT contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), 'Apples');
 ----
 true
 
 query I
-SELECT contains(pdf_to_markdown('test/data/markdown_fixture.pdf'), 'Cherries');
+SELECT contains(pdf_text('test/data/markdown_fixture.pdf', {format: 'markdown'}), 'Cherries');
 ----
 true
 
 # ── error: missing file ───────────────────────────────────────────────────────
 
 statement error
-SELECT pdf_to_markdown('test/data/does_not_exist.pdf');
+SELECT pdf_text('test/data/does_not_exist.pdf', {format: 'markdown'});
 ----
 
 # Prose sharing the vertical span of a table must not be suppressed.
@@ -110,7 +110,7 @@ query I
 SELECT contains(md, 'SENTINELALPHA') AND contains(md, 'SENTINELBETA')
    AND contains(md, 'SENTINELGAMMA') AND contains(md, 'SENTINELDELTA')
    AND contains(md, '|Apples|10|')
-FROM (SELECT pdf_to_markdown('test/data/markdown_prose_table.pdf') AS md);
+FROM (SELECT pdf_text('test/data/markdown_prose_table.pdf', {format: 'markdown'}) AS md);
 ----
 true
 
@@ -118,13 +118,13 @@ true
 query I
 SELECT contains(md, '|Almond|11|') AND contains(md, '|Orange|21|')
    AND contains(md, 'Between tables')
-FROM (SELECT pdf_to_markdown('test/data/markdown_two_tables.pdf') AS md);
+FROM (SELECT pdf_text('test/data/markdown_two_tables.pdf', {format: 'markdown'}) AS md);
 ----
 true
 
 query I
 SELECT contains(md, '|First|Count|') AND contains(md, '|Second|Count|')
    AND contains(md, '|Almond|11|') AND contains(md, '|Orange|21|')
-FROM (SELECT pdf_to_markdown('test/data/markdown_two_tables_gap.pdf') AS md);
+FROM (SELECT pdf_text('test/data/markdown_two_tables_gap.pdf', {format: 'markdown'}) AS md);
 ----
 true

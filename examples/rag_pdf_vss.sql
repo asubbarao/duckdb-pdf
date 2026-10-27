@@ -1,26 +1,28 @@
 -- =============================================================================
--- RAG over a folder of PDFs in three statements — pdf_chunks + core vss
+-- RAG over a folder of PDFs in three stages — chunk grain + core vss
 -- =============================================================================
 -- The pdf extension is a deterministic reader/writer: it does NOT embed and
--- does NOT call models. This recipe shows the composition: pdf_chunks makes
+-- does NOT call models. This recipe shows the composition: the chunk grain makes
 -- retrieval-ready, section-aware chunks; YOU bring the embedder (any local
 -- model, API, or DuckDB UDF that yields a FLOAT[N]); DuckDB's core vss
 -- extension does the nearest-neighbor search.
 --
--- Run with:  duckdb -init examples/rag_pdf_vss.sql
--- (adjust the glob and the embedding dimension N=384 to your setup)
+-- TEMPLATE: supply your embedder and a 384-element query vector before running.
+-- Run with a matching pdf build: ./build/release/duckdb -f examples/rag_pdf_vss.sql
+-- Adjust the glob and embedding dimension N=384 to your setup.
 
-INSTALL pdf FROM community;
+-- The source-build CLI links pdf; signed community builds may have an older API.
 LOAD pdf;
 
 -- -----------------------------------------------------------------------------
 -- Statement 1: chunk every PDF in the folder.
---   chunk_size / overlap are characters; defaults are 1200 / 150.
+--   chunk_size / overlap are byte budgets; defaults are 1200 / 150.
+--   n_chars counts UTF-8 codepoints. Set auto_ocr := true for scanned pages.
 --   Every chunk carries file, page_start/page_end, and the text of the
 --   nearest preceding heading — citation context for free.
 -- -----------------------------------------------------------------------------
 CREATE TABLE chunks AS
-FROM pdf_chunks('docs/*.pdf', chunk_size := 1200, overlap := 150);
+FROM read_pdf('docs/*.pdf', grain := 'chunk', chunk_size := 1200, overlap := 150);
 
 -- Sanity peek: sections found and chunk sizes
 SELECT file, heading, COUNT(*) AS chunks, MAX(n_chars) AS max_chars

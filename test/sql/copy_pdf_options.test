@@ -61,7 +61,7 @@ statement ok
 COPY (SELECT 'hfbody' AS c) TO '__TEST_DIR__/copy_opts_hf.pdf' (FORMAT pdf, FOOTER 'FooterMarker42', USE_TMP_FILE false);
 
 query I
-SELECT contains(pdf_to_text('__TEST_DIR__/copy_opts_hf.pdf'), 'FooterMarker42');
+SELECT contains(pdf_text('__TEST_DIR__/copy_opts_hf.pdf'), 'FooterMarker42');
 ----
 true
 
@@ -70,7 +70,7 @@ statement ok
 COPY (SELECT 'DEFREG_MARKER' AS c) TO '__TEST_DIR__/copy_opts_def.pdf' (FORMAT pdf, USE_TMP_FILE false);
 
 query I
-SELECT contains(pdf_to_text('__TEST_DIR__/copy_opts_def.pdf'), 'DEFREG_MARKER')
+SELECT contains(pdf_text('__TEST_DIR__/copy_opts_def.pdf'), 'DEFREG_MARKER')
    AND (SELECT page_count FROM read_pdf('__TEST_DIR__/copy_opts_def.pdf', auto_ocr := false) LIMIT 1) = 1;
 ----
 true
@@ -99,7 +99,7 @@ TO '__TEST_DIR__/copy_opts_pageno.pdf' (FORMAT pdf, FOOTER 'p {page}', USE_TMP_F
 query I
 SELECT contains((SELECT text FROM read_pdf('__TEST_DIR__/copy_opts_pageno.pdf', auto_ocr := false) WHERE page = 1), 'p 1')
    AND contains((SELECT text FROM read_pdf('__TEST_DIR__/copy_opts_pageno.pdf', auto_ocr := false) WHERE page = 2), 'p 2')
-   AND contains(pdf_to_text('__TEST_DIR__/copy_opts_pageno.pdf', 'reading'), 'p1');
+   AND contains(pdf_text('__TEST_DIR__/copy_opts_pageno.pdf', {layout: 'reading'}), 'p1');
 ----
 true
 
