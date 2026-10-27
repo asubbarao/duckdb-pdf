@@ -4,7 +4,8 @@ Task-oriented recipes for the `pdf` community extension. Each recipe is a real
 goal, a runnable SQL block, and the one gotcha that bites people. For the full
 per-function reference (every column, every parameter), see [README.md](README.md).
 
-These recipes target this source branch's 19-name API; released community binaries
+These recipes target this source branch's 19 canonical function families; two
+deprecated aliases bring the catalog to 21 names. Released community binaries
 may expose the earlier API. Load the matching source build (see README), or use
 the following once the matching version is published:
 

@@ -10322,6 +10322,9 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	                                ReadPdfElementsBind, ReadPdfElementsInit);
 	AddOcrNamedParams(read_pdf_elements);
 	readers.Add("element", NativePdfReader<ReadPdfElementsBindData>(read_pdf_elements));
+	// Deprecated spelling retained for downstream readers during migration.
+	// Both registrations use the same native binder, scan and scheduling callbacks.
+	loader.RegisterFunction(NativePdfReader<ReadPdfElementsBindData>(read_pdf_elements));
 
 	// pdf_chunks packs the element grain into retrieval-ready chunks; it
 	// honors the same file handling + page-range/password params as

@@ -1,0 +1,75 @@
+# name: test/sql/pdf_compatibility_aliases.test
+# description: two deprecated PDF names retain their legacy contracts
+# group: [sql]
+
+require pdf
+
+query I
+WITH legacy AS (SELECT * FROM read_pdf_elements('test/data/two_pages.pdf', first_page := 2, last_page := 2)),
+canonical AS (SELECT * FROM read_pdf('test/data/two_pages.pdf', grain := 'element', first_page := 2, last_page := 2))
+SELECT NOT EXISTS (FROM legacy EXCEPT ALL FROM canonical)
+   AND NOT EXISTS (FROM canonical EXCEPT ALL FROM legacy)
+   AND (SELECT bool_and(page_number=2) FROM legacy);
+----
+true
+
+query I
+WITH legacy AS (SELECT * FROM read_pdf_elements('test/data/mixed_glob/good*.pdf')),
+canonical AS (SELECT * FROM read_pdf('test/data/mixed_glob/good*.pdf', grain := 'element'))
+SELECT NOT EXISTS (FROM legacy EXCEPT ALL FROM canonical)
+   AND NOT EXISTS (FROM canonical EXCEPT ALL FROM legacy);
+----
+true
+
+query I
+SELECT pdf_to_text('test/data/two_pages.pdf')=pdf_text('test/data/two_pages.pdf');
+----
+true
+
+query I
+SELECT bool_and(pdf_to_text('test/data/two_pages.pdf', layout)
+                IS NOT DISTINCT FROM pdf_text('test/data/two_pages.pdf', {layout:layout}))
+FROM (SELECT unnest(['reading','physical','raw',NULL]) AS layout);
+----
+true
+
+query I
+SELECT pdf_to_text(content)=pdf_text(content)
+   AND pdf_to_text(content,'physical')=pdf_text(content,{layout:'physical'})
+FROM read_blob('test/data/two_pages.pdf');
+----
+true
+
+query I
+SELECT pdf_to_text(NULL::VARCHAR) IS NULL AND pdf_to_text(NULL::BLOB) IS NULL
+   AND pdf_to_text('test/data/hello.pdf',NULL) IS NULL;
+----
+true
+
+statement error
+SELECT pdf_to_text('test/data/hello.pdf','invalid-layout');
+----
+layout
+
+statement error
+SELECT pdf_to_text('test/data/missing-compatibility.pdf');
+----
+<REGEX>:.*(read|open|exist).*
+
+statement error
+SELECT * FROM read_pdf_elements('test/data/hello.pdf',grain:='element');
+----
+<REGEX>:.*(grain|named parameter).*
+
+query I
+SELECT bool_and(starts_with(description,'Deprecated compatibility alias:'))
+   AND len(list(DISTINCT function_name))=2
+FROM duckdb_functions() WHERE function_name IN ('pdf_to_text','read_pdf_elements');
+----
+true
+
+query I
+SELECT len(list(function_name))=4 AND bool_and(parameters[1]='input')
+FROM duckdb_functions() WHERE function_name='pdf_to_text';
+----
+true

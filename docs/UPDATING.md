@@ -34,5 +34,8 @@ the distribution build. A GitHub Release does not update community installation.
 Before submitting it to `duckdb/community-extensions`, set `extension.version`
 and `repo.ref` to the intended release and immutable commit, then ensure its
 examples work against that commit. Submit it as `extensions/pdf/description.yml`.
-Do not describe the 19-name API as community-published until the registry change
+The source API has 19 canonical families plus two deprecated aliases (21 catalog
+names): `read_pdf_elements` and `pdf_to_text`. Retain those aliases through 0.9.x;
+removal is planned no earlier than 1.0 after downstream migration and an announced
+breaking release. Do not describe this API as community-published until the registry change
 and its artifacts are available.
