@@ -8,7 +8,8 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-add_executable(pdf_office_conversion_test EXCLUDE_FROM_ALL test/office_conversion_test.cpp)
+add_executable(pdf_office_conversion_test EXCLUDE_FROM_ALL
+               test/office_conversion_test.cpp)
 target_include_directories(pdf_office_conversion_test PRIVATE src/include)
 
 set(CMAKE_CXX_STANDARD
