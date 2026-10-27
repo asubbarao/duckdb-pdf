@@ -18,6 +18,16 @@ struct PdfFunctionDoc {
 // One public API inventory, shared by scalar/table overload registration.
 // Names describe positional arguments; typed kwargs remain on the signature.
 static const PdfFunctionDoc PDF_FUNCTION_DOCS[] = {
+    {"read_pdf_elements", "files",
+     "Deprecated compatibility alias: use read_pdf(files, grain := 'element'). Preserves element schema, page bounds, "
+     "password and OCR options. Retained through 0.9.x; removal planned no earlier than 1.0 after downstream "
+     "migration.",
+     "SELECT * FROM read_pdf('document.pdf', grain := 'element');"},
+    {"pdf_to_text", "input,layout",
+     "Deprecated compatibility alias: use pdf_text(input) or pdf_text(input, {layout: 'physical'}). Accepts a path or "
+     "BLOB and the legacy optional layout string. Retained through 0.9.x; removal planned no earlier than 1.0 after "
+     "downstream migration.",
+     "SELECT pdf_text('document.pdf', {layout: 'physical'});"},
     {"read_pdf", "files",
      "Read PDF pages by default, or select grain page, line, element, table or chunk at bind time. Each grain retains "
      "its native typed columns and streams through DuckDB file readers. Unsupported options for the selected grain are "

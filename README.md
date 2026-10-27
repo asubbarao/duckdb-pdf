@@ -3,9 +3,11 @@
 **Everything PDF, in SQL.** A DuckDB community extension (`pdf`) that turns PDFs into tables and tables into PDFs: read text at every grain (page, line, word, layout element, retrieval chunk), inspect metadata / outlines / attachments / form fields / annotations / revisions / digital signatures, and do the everyday document operations people open Adobe Acrobat for — merge, split, rotate, compress, encrypt, decrypt, extract pages, write new PDFs. Built on [Poppler](https://poppler.freedesktop.org/) (parsing/rendering), [Tesseract](https://github.com/tesseract-ocr/tesseract) (OCR for scanned documents), [qpdf](https://qpdf.sourceforge.io/) (document surgery), and [libharu](https://github.com/libharu/libharu) (native PDF writing) — in the DuckDB process. Office conversion through `to_pdf` additionally requires LibreOffice at runtime.
 
 
-This branch consolidates the API from 48 names to **19 public names**. The changes
-are breaking: retired names are removed rather than retained as aliases. The
-community registry and released binaries may lag this source tree.
+This branch consolidates the API into **19 canonical function families**.
+Two deprecated compatibility aliases, `read_pdf_elements` and `pdf_to_text`,
+remain for downstream migration: the catalog therefore contains **21 names**.
+Other retired names are removed. The community registry and released binaries
+may lag this source tree.
 
 ```sql
 INSTALL pdf FROM community;
@@ -309,6 +311,17 @@ Its status schema is `page INTEGER, had_text_layer BOOLEAN, ocr_applied BOOLEAN,
 words INTEGER, mean_confidence DOUBLE, seconds DOUBLE, out_path VARCHAR`.
 
 ## Migration from 48 names
+
+`read_pdf_elements(files, ...)` and `pdf_to_text(input [, layout])` are deprecated
+compatibility aliases. The former preserves the element schema, streaming file
+reader, password, page bounds and OCR options; the latter preserves all four
+path/BLOB overloads, the optional layout string and NULL propagation. Both share
+the canonical implementations. Prefer `read_pdf(files, grain := 'element', ...)`
+and `pdf_text(input [, {layout: ...}])` in new code.
+
+These two aliases remain throughout 0.9.x. Removal is planned no earlier than
+1.0, after downstream releases have migrated, and will be announced in that
+release's migration notes. Catalog descriptions mark every overload deprecated.
 
 | Previous names | Replacement |
 |---|---|

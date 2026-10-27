@@ -206,6 +206,22 @@ static void PdfFamilyText(DataChunk &args, ExpressionState &state, Vector &resul
 	}
 }
 
+// Preserve pdf_to_text(input[, layout]) while sharing the consolidated executor.
+static void PdfLegacyText(DataChunk &args, ExpressionState &state, Vector &result) {
+	if (args.ColumnCount() == 1) {
+		PdfFamilyText(args, state, result);
+		return;
+	}
+	DataChunk forwarded;
+	forwarded.Initialize(Allocator::DefaultAllocator(),
+	                     {args.data[0].GetType(), LogicalType::STRUCT({{"layout", LogicalType::VARCHAR}})});
+	forwarded.data[0].Reference(args.data[0]);
+	for (idx_t row = 0; row < args.size(); ++row)
+		forwarded.SetValue(1, row, Value::STRUCT({{"layout", args.GetValue(1, row)}}));
+	forwarded.SetCardinality(args.size());
+	PdfFamilyText(forwarded, state, result);
+}
+
 static void PdfFamilyRender(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &context = state.GetContext();
@@ -415,6 +431,13 @@ static void RegisterPdfFamilyScalars(PdfLoader &loader) {
 			f.SetResolveTypesCallback(PdfFamilyResolveOptions);
 	});
 	loader.RegisterFunction(std::move(text_set));
+	ScalarFunctionSet legacy_text("pdf_to_text");
+	for (auto input : {LogicalType::VARCHAR, LogicalType::BLOB}) {
+		legacy_text.AddFunction(ScalarFunction({input}, LogicalType::VARCHAR, PdfLegacyText));
+		legacy_text.AddFunction(ScalarFunction({input, LogicalType::VARCHAR}, LogicalType::VARCHAR, PdfLegacyText));
+	}
+	legacy_text.ApplyToFunctions([](ScalarFunction &f) { f.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY); });
+	loader.RegisterFunction(std::move(legacy_text));
 	loader.RegisterFunction(std::move(render_set));
 	ScalarFunctionSet pages("pdf_pages");
 	pages.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
