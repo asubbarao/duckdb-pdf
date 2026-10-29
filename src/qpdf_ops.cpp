@@ -2111,7 +2111,7 @@ static const char *EncryptionMethodName(QPDF::encryption_method_e m) {
 DocumentStats InspectDocument(const std::string &pdf_bytes, const std::string &password) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	QPDF doc;
-	OpenQpdfBytes(doc, "pdf_qpdf_info", pdf_bytes, password);
+	OpenQpdfBytes(doc, "pdf_info", pdf_bytes, password);
 
 	DocumentStats s;
 	s.is_linearized = doc.isLinearized();
@@ -2180,13 +2180,13 @@ DocumentStats InspectDocument(const std::string &pdf_bytes, const std::string &p
 std::string WriteJson(const std::string &pdf_bytes, const std::string &password, int json_version) {
 	std::lock_guard<std::recursive_mutex> qpdf_guard(QpdfMutex());
 	if (json_version < 1) {
-		throw std::runtime_error("pdf_json: json_version must be >= 1");
+		throw std::runtime_error("pdf_text: json_version must be >= 1");
 	}
 	QPDF doc;
 	doc.setSuppressWarnings(true);
-	OpenQpdfBytes(doc, "pdf_json", pdf_bytes, password);
+	OpenQpdfBytes(doc, "pdf_text", pdf_bytes, password);
 	std::string out;
-	Pl_String pipe("pdf_json", nullptr, out);
+	Pl_String pipe("pdf_text", nullptr, out);
 	// Structure-only: do not inline stream bytes (images/fonts) into the JSON.
 	std::set<std::string> wanted; // empty => all objects
 	doc.writeJSON(json_version, &pipe, qpdf_dl_none, qpdf_sj_none, /*file_prefix=*/"", wanted);

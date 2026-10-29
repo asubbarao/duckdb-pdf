@@ -5320,10 +5320,10 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 			doc = LoadDoc(bytes, bind.opt.password, f);
 		} catch (const std::exception &e) {
 			// unwrap duckdb exceptions (their .what() is JSON) to expose the clean inner message
-			// e.g. "read_pdf_tables: read_pdf: could not open '...'"
+			// e.g. "read_pdf: read_pdf: could not open '...'"
 			ErrorData ed(e);
 			string msg = ed.HasError() ? ed.RawMessage() : string(e.what());
-			throw InvalidInputException("read_pdf_tables: %s", msg.c_str());
+			throw InvalidInputException("read_pdf: %s", msg.c_str());
 		}
 		int page_count = doc->pages();
 		int first0 = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
@@ -5777,7 +5777,7 @@ static string PngToSvg(poppler::document &doc, int32_t page_no, const string &pn
 	// We still need a page for the rect; recreate (cheap) or could thread the rect out of helper.
 	unique_ptr<poppler::page> page(doc.create_page(page_no - 1));
 	if (!page) {
-		throw IOException("pdf_to_svg: could not read page %d", (int)page_no);
+		throw IOException("pdf_render: could not read page %d", (int)page_no);
 	}
 	auto rect = page->page_rect();
 	string w = FmtCoord(rect.width());
@@ -5794,14 +5794,14 @@ static string DocToSvg(poppler::document &doc, int32_t page_no, int32_t dpi) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	int n = doc.pages();
 	if (page_no < 1 || page_no > n) {
-		throw IOException("pdf_to_svg: page %d is out of range (document has %d page%s)", (int)page_no, n,
+		throw IOException("pdf_render: page %d is out of range (document has %d page%s)", (int)page_no, n,
 		                  n == 1 ? "" : "s");
 	}
 	if (dpi <= 0) {
-		throw InvalidInputException("pdf_to_svg: dpi must be positive (got %d)", (int)dpi);
+		throw InvalidInputException("pdf_render: dpi must be positive (got %d)", (int)dpi);
 	}
 	// Delegate the actual raster + temp PNG + read bytes to the shared helper (no duplication).
-	string png = RenderPageToPngBytes(doc, page_no, dpi, "pdf_to_svg");
+	string png = RenderPageToPngBytes(doc, page_no, dpi, "pdf_render");
 
 	return PngToSvg(doc, page_no, png);
 }
@@ -5826,13 +5826,13 @@ static string DocToPng(poppler::document &doc, int32_t page_no, int32_t dpi) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	int n = doc.pages();
 	if (page_no < 1 || page_no > n) {
-		throw IOException("pdf_to_png: page %d is out of range (document has %d page%s)", (int)page_no, n,
+		throw IOException("pdf_render: page %d is out of range (document has %d page%s)", (int)page_no, n,
 		                  n == 1 ? "" : "s");
 	}
 	if (dpi < 1 || dpi > 2400) {
-		throw InvalidInputException("pdf_to_png: dpi must be between 1 and 2400 (got %d)", (int)dpi);
+		throw InvalidInputException("pdf_render: dpi must be between 1 and 2400 (got %d)", (int)dpi);
 	}
-	return RenderPageToPngBytes(doc, page_no, dpi, "pdf_to_png");
+	return RenderPageToPngBytes(doc, page_no, dpi, "pdf_render");
 }
 
 //===--------------------------------------------------------------------===//
@@ -7590,13 +7590,13 @@ static void PdfMergeFun(DataChunk &args, ExpressionState &state, Vector &result)
 // 'z' (last page) / 'r2' (second-to-last).
 static string PdfRotateImpl(const string &input, const string &output, int32_t degrees, const string &pages_spec) {
 	if (degrees % 90 != 0) {
-		throw InvalidInputException("pdf_rotate: degrees must be a multiple of 90 (got %d)", degrees);
+		throw InvalidInputException("pdf_pages: degrees must be a multiple of 90 (got %d)", degrees);
 	}
-	PdfOpsCheckInputExists("pdf_rotate", input);
-	PdfOpsCheckOutputDir("pdf_rotate", PdfOpsParentDir(output));
+	PdfOpsCheckInputExists("pdf_pages", input);
+	PdfOpsCheckOutputDir("pdf_pages", PdfOpsParentDir(output));
 	if (PdfSameFile(input, output)) {
 		// qpdf reads the source lazily during write; writing over it would corrupt.
-		throw InvalidInputException("pdf_rotate: output path must differ from input path '%s'", input);
+		throw InvalidInputException("pdf_pages: output path must differ from input path '%s'", input);
 	}
 	try {
 		// 'all' short-circuits here; anything else is qpdf's own CLI range
@@ -7607,7 +7607,7 @@ static string PdfRotateImpl(const string &input, const string &output, int32_t d
 		pdf_qpdf::Rotate(input, staged.TempPath(), degrees, all_pages, pages_spec);
 		staged.Commit();
 	} catch (const std::exception &e) {
-		throw InvalidInputException("pdf_rotate: %s", string(e.what()));
+		throw InvalidInputException("pdf_pages: %s", string(e.what()));
 	}
 	return output;
 }
@@ -7769,7 +7769,7 @@ static unique_ptr<FunctionData> PdfSplitBlankBind(ClientContext &context, TableF
 		}
 	}
 	if (!(result->blank_threshold > 0.0) || result->blank_threshold > 1.0) {
-		throw InvalidInputException("pdf_split_blank: blank_threshold must be in (0, 1] (got %f)",
+		throw InvalidInputException("pdf_split: blank_threshold must be in (0, 1] (got %f)",
 		                            result->blank_threshold);
 	}
 	return_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER,
@@ -7787,11 +7787,11 @@ static void PdfSplitBlankExecute(ClientContext &context, const string &input, co
                                  double blank_threshold, std::vector<PdfSplitBlankEmitted> &emitted) {
 	PdfCheckAccess(context, input);
 	PdfCheckAccess(context, output_dir, FileType::FILE_TYPE_DIR);
-	PdfOpsCheckInputExists("pdf_split_blank", input);
+	PdfOpsCheckInputExists("pdf_split", input);
 	{
 		auto fs = FileSystem::CreateLocal();
 		if (!fs->DirectoryExists(output_dir)) {
-			throw InvalidInputException("pdf_split_blank: output directory '%s' does not exist", output_dir);
+			throw InvalidInputException("pdf_split: output directory '%s' does not exist", output_dir);
 		}
 	}
 
@@ -7838,7 +7838,7 @@ static void PdfSplitBlankExecute(ClientContext &context, const string &input, co
 	try {
 		pdf_qpdf::SplitRanges(input, output_dir, PdfOpsStem(input), ranges, files);
 	} catch (const std::exception &e) {
-		throw InvalidInputException("pdf_split_blank: %s", string(e.what()));
+		throw InvalidInputException("pdf_split: %s", string(e.what()));
 	}
 
 	for (size_t k = 0; k < ranges.size(); k++) {
@@ -8133,16 +8133,16 @@ static string PdfPagesImpl(const string &input, const string &output, const stri
 // content, as real (selectable) Helvetica text. `opacity` is the fill alpha,
 // default 0.30, and must be in (0, 1].
 static string PdfWatermarkImpl(const string &input, const string &output, const string &text, double opacity) {
-	PdfOpsCheckInOut("pdf_watermark", input, output);
+	PdfOpsCheckInOut("pdf_stamp", input, output);
 	if (!(opacity > 0.0 && opacity <= 1.0)) {
-		throw InvalidInputException("pdf_watermark: opacity must be in (0, 1] (got %f)", opacity);
+		throw InvalidInputException("pdf_stamp: opacity must be in (0, 1] (got %f)", opacity);
 	}
 	try {
 		AtomicPdfOutput staged(output);
 		pdf_qpdf::Watermark(input, staged.TempPath(), text, opacity);
 		staged.Commit();
 	} catch (const std::exception &e) {
-		throw InvalidInputException("pdf_watermark: %s", string(e.what()));
+		throw InvalidInputException("pdf_stamp: %s", string(e.what()));
 	}
 	return output;
 }
@@ -8151,7 +8151,7 @@ static string PdfWatermarkImpl(const string &input, const string &output, const 
 // Bates numbering: stamps prefix + a zero-padded (min 6 digits) sequential
 // number at the bottom-right of each page as real Helvetica text.
 static string PdfBatesImpl(const string &input, const string &output, const string &prefix, int64_t start_number) {
-	return PdfStagedOperation("pdf_bates", input, output, [&](const string &path) {
+	return PdfStagedOperation("pdf_stamp", input, output, [&](const string &path) {
 		pdf_qpdf::Bates(input, path, prefix, static_cast<long long>(start_number), nullptr);
 	});
 }
@@ -9559,7 +9559,7 @@ static unique_ptr<FunctionData> PdfPageImagesBind(ClientContext &context, TableF
 	if (result->format != "png" && result->format != "svg")
 		throw BinderException("pdf_render: format must be png or svg");
 	if (result->dpi < 1 || result->dpi > 2400) {
-		throw InvalidInputException("pdf_page_images: dpi must be between 1 and 2400 (got %d)", result->dpi);
+		throw InvalidInputException("pdf_render: dpi must be between 1 and 2400 (got %d)", result->dpi);
 	}
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER,
 	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BLOB};
@@ -9599,7 +9599,7 @@ static void PdfPageImagesScan(ClientContext &context, TableFunctionInput &data_p
 	const int page = st.next_page++;
 	string png;
 	if (st.needs_image)
-		png = RenderPageToPngBytes(*st.doc, page, bind.dpi, "pdf_page_images");
+		png = RenderPageToPngBytes(*st.doc, page, bind.dpi, "pdf_render");
 	int width = 0, height = 0;
 	if (png.size() >= 24) {
 		auto u32be = [](const char *b) -> int {
@@ -9715,12 +9715,12 @@ static void PdfWritePageImagesCheckStemCollisions(const vector<string> &files) {
 	std::map<string, string> claimed;
 	for (auto &path : files) {
 		string stem = PdfOpsStem(path);
-		PdfOpsCheckOutputStem("pdf_write_page_images", stem, path);
+		PdfOpsCheckOutputStem("pdf_render", stem, path);
 		string key = StringUtil::Lower(stem);
 		auto it = claimed.find(key);
 		if (it != claimed.end()) {
 			throw InvalidInputException(
-			    "pdf_write_page_images: output collision: inputs '%s' and '%s' both map to stem '%s'", it->second, path,
+			    "pdf_render: output collision: inputs '%s' and '%s' both map to stem '%s'", it->second, path,
 			    key);
 		}
 		claimed[key] = path;
@@ -9751,20 +9751,20 @@ static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, T
 		// LIST(VARCHAR) — multi-file constant list (same shape as pdf_merge inputs).
 		for (auto &child : ListValue::GetChildren(src)) {
 			if (child.IsNull()) {
-				throw InvalidInputException("pdf_write_page_images: input list contains a NULL path");
+				throw InvalidInputException("pdf_render: input list contains a NULL path");
 			}
 			auto resolved = ResolveFiles(context, StringValue::Get(child));
 			result->files.insert(result->files.end(), resolved.begin(), resolved.end());
 		}
 		if (result->files.empty()) {
-			throw InvalidInputException("pdf_write_page_images: input list is empty");
+			throw InvalidInputException("pdf_render: input list is empty");
 		}
 	} else {
 		result->files = ResolveFiles(context, StringValue::Get(src));
 	}
 	result->out_dir = StringValue::Get(input.inputs[1]);
 	if (result->out_dir.empty()) {
-		throw InvalidInputException("pdf_write_page_images: out_dir must not be empty");
+		throw InvalidInputException("pdf_render: out_dir must not be empty");
 	}
 	ParseNamed(input.named_parameters, result->opt);
 	PdfCheckOcrPaths(context, result->opt);
@@ -9780,7 +9780,7 @@ static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, T
 	if (result->format != "png" && result->format != "svg")
 		throw BinderException("pdf_render: format must be png or svg");
 	if (result->dpi < 1 || result->dpi > 2400) {
-		throw InvalidInputException("pdf_write_page_images: dpi must be between 1 and 2400 (got %d)", result->dpi);
+		throw InvalidInputException("pdf_render: dpi must be between 1 and 2400 (got %d)", result->dpi);
 	}
 	PdfWritePageImagesCheckStemCollisions(result->files);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
@@ -9805,7 +9805,7 @@ static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePage
 		try {
 			fs->CreateDirectoriesRecursive(bind.out_dir);
 		} catch (const std::exception &e) {
-			throw IOException("pdf_write_page_images: could not create out_dir '%s': %s", bind.out_dir,
+			throw IOException("pdf_render: could not create out_dir '%s': %s", bind.out_dir,
 			                  string(e.what()));
 		}
 	}
@@ -9827,13 +9827,13 @@ static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePage
 			try {
 				fs->CreateDirectory(stem_dir);
 			} catch (const std::exception &e) {
-				throw IOException("pdf_write_page_images: could not create directory '%s': %s", stem_dir,
+				throw IOException("pdf_render: could not create directory '%s': %s", stem_dir,
 				                  string(e.what()));
 			}
 		}
 
 		for (int p = first; p <= last; p++) {
-			string png = RenderPageToPngBytes(*doc, p, bind.dpi, "pdf_write_page_images");
+			string png = RenderPageToPngBytes(*doc, p, bind.dpi, "pdf_render");
 			string encoded = bind.format == "svg" ? PngToSvg(*doc, p, png) : png;
 			string out_path = PdfWriteJoinPath(stem_dir, "p" + std::to_string(p) + "." + bind.format);
 			PdfWriteBytesToFile(out_path, encoded, "pdf_render");
@@ -9950,12 +9950,12 @@ static void PdfQpdfInfoScan(ClientContext &context, TableFunctionInput &data_p, 
 	while (count < STANDARD_VECTOR_SIZE && st.idx < bind.files.size()) {
 		auto &path = bind.files[st.idx];
 		string bytes;
-		ReadPdfInput(context, "pdf_qpdf_info", path, bytes);
+		ReadPdfInput(context, "pdf_info", path, bytes);
 		pdf_qpdf::DocumentStats s;
 		try {
 			s = pdf_qpdf::InspectDocument(bytes, bind.password);
 		} catch (const std::exception &e) {
-			throw IOException("pdf_qpdf_info: %s", string(e.what()));
+			throw IOException("pdf_info: %s", string(e.what()));
 		}
 		int c = 0;
 		OutString(output.data[c++], count, path);
@@ -10475,7 +10475,7 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	                        PdfSplitInit);
 	split.Add("page", pdf_split);
 
-	TableFunction pdf_split_blank("pdf_split_blank", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfSplitBlankScan,
+	TableFunction pdf_split_blank("pdf_split", {LogicalType::VARCHAR, LogicalType::VARCHAR}, PdfSplitBlankScan,
 	                              PdfSplitBlankBind, PdfSplitBlankInit);
 	AddNamedParameter(pdf_split_blank, "blank_threshold", LogicalType::DOUBLE);
 	split.Add("blank", pdf_split_blank);
@@ -10556,7 +10556,7 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	AddNamedParameter(pdf_destinations, "password", LogicalType::VARCHAR);
 	objects.Add("destinations", NativePdfReader<PdfInspectBindData>(pdf_destinations));
 
-	TableFunction pdf_page_images("pdf_page_images", {LogicalType::VARCHAR}, PdfPageImagesScan, PdfPageImagesBind,
+	TableFunction pdf_page_images("pdf_render", {LogicalType::VARCHAR}, PdfPageImagesScan, PdfPageImagesBind,
 	                              PdfPageImagesInit);
 	pdf_page_images.projection_pushdown = true;
 	AddNamedParameter(pdf_page_images, "password", LogicalType::VARCHAR);
@@ -10574,7 +10574,7 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 		path_types.emplace_back(LogicalTypeId::VARCHAR);
 		path_types.push_back(LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
 		for (auto &path_type : path_types) {
-			TableFunction pdf_write_page_images("pdf_write_page_images",
+			TableFunction pdf_write_page_images("pdf_render",
 			                                    {path_type, LogicalType(LogicalTypeId::VARCHAR)},
 			                                    PdfWritePageImagesScan, PdfWritePageImagesBind, PdfWritePageImagesInit);
 			AddNamedParameter(pdf_write_page_images, "password", LogicalType::VARCHAR);
@@ -10586,7 +10586,7 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 		}
 	}
 
-	TableFunction pdf_qpdf_info("pdf_qpdf_info", {LogicalType::VARCHAR}, PdfQpdfInfoScan, PdfQpdfInfoBind,
+	TableFunction pdf_qpdf_info("pdf_info", {LogicalType::VARCHAR}, PdfQpdfInfoScan, PdfQpdfInfoBind,
 	                            PdfQpdfInfoInit);
 	AddNamedParameter(pdf_qpdf_info, "password", LogicalType::VARCHAR);
 	census.Add("qpdf", NativePdfReader<PdfQpdfInfoBindData>(pdf_qpdf_info));
