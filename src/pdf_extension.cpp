@@ -7769,8 +7769,7 @@ static unique_ptr<FunctionData> PdfSplitBlankBind(ClientContext &context, TableF
 		}
 	}
 	if (!(result->blank_threshold > 0.0) || result->blank_threshold > 1.0) {
-		throw InvalidInputException("pdf_split: blank_threshold must be in (0, 1] (got %f)",
-		                            result->blank_threshold);
+		throw InvalidInputException("pdf_split: blank_threshold must be in (0, 1] (got %f)", result->blank_threshold);
 	}
 	return_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER,
 	                LogicalType::VARCHAR};
@@ -9719,9 +9718,8 @@ static void PdfWritePageImagesCheckStemCollisions(const vector<string> &files) {
 		string key = StringUtil::Lower(stem);
 		auto it = claimed.find(key);
 		if (it != claimed.end()) {
-			throw InvalidInputException(
-			    "pdf_render: output collision: inputs '%s' and '%s' both map to stem '%s'", it->second, path,
-			    key);
+			throw InvalidInputException("pdf_render: output collision: inputs '%s' and '%s' both map to stem '%s'",
+			                            it->second, path, key);
 		}
 		claimed[key] = path;
 	}
@@ -9805,8 +9803,7 @@ static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePage
 		try {
 			fs->CreateDirectoriesRecursive(bind.out_dir);
 		} catch (const std::exception &e) {
-			throw IOException("pdf_render: could not create out_dir '%s': %s", bind.out_dir,
-			                  string(e.what()));
+			throw IOException("pdf_render: could not create out_dir '%s': %s", bind.out_dir, string(e.what()));
 		}
 	}
 
@@ -9827,8 +9824,7 @@ static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePage
 			try {
 				fs->CreateDirectory(stem_dir);
 			} catch (const std::exception &e) {
-				throw IOException("pdf_render: could not create directory '%s': %s", stem_dir,
-				                  string(e.what()));
+				throw IOException("pdf_render: could not create directory '%s': %s", stem_dir, string(e.what()));
 			}
 		}
 
@@ -10574,8 +10570,7 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 		path_types.emplace_back(LogicalTypeId::VARCHAR);
 		path_types.push_back(LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
 		for (auto &path_type : path_types) {
-			TableFunction pdf_write_page_images("pdf_render",
-			                                    {path_type, LogicalType(LogicalTypeId::VARCHAR)},
+			TableFunction pdf_write_page_images("pdf_render", {path_type, LogicalType(LogicalTypeId::VARCHAR)},
 			                                    PdfWritePageImagesScan, PdfWritePageImagesBind, PdfWritePageImagesInit);
 			AddNamedParameter(pdf_write_page_images, "password", LogicalType::VARCHAR);
 			AddNamedParameter(pdf_write_page_images, "dpi", LogicalType::INTEGER);
@@ -10586,8 +10581,7 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 		}
 	}
 
-	TableFunction pdf_qpdf_info("pdf_info", {LogicalType::VARCHAR}, PdfQpdfInfoScan, PdfQpdfInfoBind,
-	                            PdfQpdfInfoInit);
+	TableFunction pdf_qpdf_info("pdf_info", {LogicalType::VARCHAR}, PdfQpdfInfoScan, PdfQpdfInfoBind, PdfQpdfInfoInit);
 	AddNamedParameter(pdf_qpdf_info, "password", LogicalType::VARCHAR);
 	census.Add("qpdf", NativePdfReader<PdfQpdfInfoBindData>(pdf_qpdf_info));
 
