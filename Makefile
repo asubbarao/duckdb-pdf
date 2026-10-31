@@ -55,6 +55,12 @@ httpfs_into_repository_reldebug:
 
 .PHONY: httpfs_into_repository_release httpfs_into_repository_debug httpfs_into_repository_reldebug
 
+# The sqllogictest runner has no macOS requirement, so the Apple Vision OCR tests
+# (test/sql/pdf_ocr_vision.test) are gated on this variable instead.
+ifeq ($(shell uname -s),Darwin)
+export PDF_VISION_TESTS = 1
+endif
+
 # What `make test` must be testing: the version of the artifact just built.
 # Compared against the loaded extension by test/sql/zz_build_guard.test, so a
 # test binary that loads some other copy of the extension fails loudly instead

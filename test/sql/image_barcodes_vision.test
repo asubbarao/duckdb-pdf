@@ -1,0 +1,101 @@
+# name: test/sql/image_barcodes_vision.test
+# description: image_barcodes through Apple Vision (macOS); the Makefile sets PDF_VISION_TESTS on Darwin
+# group: [sql]
+
+# Fixtures were generated once, outside the data path:
+#   uvx segno "https://github.com/asubbarao/duckdb-pdf" --scale 6 --border 4 --output test/data/barcode_qr.png
+#   uvx --from "python-barcode[images]" python-barcode create -t png -b ean13 4006381333931 test/data/barcode_ean13
+# The QR image is 37 modules of 6 px: the symbol spans pixels 24..198.
+
+require pdf
+
+require-env PDF_VISION_TESTS
+
+statement ok
+PRAGMA enable_verification
+
+# One barcode per fixture, with its symbology and payload.
+query IIIII
+SELECT parse_filename(filename), len(image_barcodes(content)), image_barcodes(content)[1].symbology,
+       image_barcodes(content)[1].payload, image_barcodes(content)[1].confidence BETWEEN 50 AND 100
+FROM read_blob('test/data/barcode_*.png') ORDER BY filename;
+----
+barcode_ean13.png	1	EAN13	4006381333931	true
+barcode_qr.png	1	QR	https://github.com/asubbarao/duckdb-pdf	true
+
+# Boxes are upright image pixels with a top-left origin.
+query IIII
+SELECT round(b.x0), round(b.y0), round(b.x1), round(b.y1)
+FROM read_blob('test/data/barcode_qr.png') CROSS JOIN UNNEST(image_barcodes(content)) AS t(b);
+----
+24.0	24.0	198.0	198.0
+
+# The EAN-13 box sits inside the 523x280 image, above the digits printed along
+# its bottom edge (a bottom-left origin would put it below y = 200).
+query I
+SELECT b.x0 > 0 AND b.y0 >= 0 AND b.x1 > b.x0 AND b.y1 > b.y0 AND b.x1 < 523 AND b.y1 < 200
+FROM read_blob('test/data/barcode_ean13.png') CROSS JOIN UNNEST(image_barcodes(content)) AS t(b);
+----
+true
+
+# raw_payload is the symbol's data as Vision returns it: one byte per EAN digit.
+query I
+SELECT b.raw_payload = '\x04\x00\x00\x06\x03\x08\x01\x03\x03\x03\x09\x03\x01'::BLOB AND b.supplemental_payload IS NULL
+       AND NOT b.is_gs1 AND NOT b.color_inverted
+FROM read_blob('test/data/barcode_ean13.png') CROSS JOIN UNNEST(image_barcodes(content)) AS t(b);
+----
+true
+
+# symbologies restricts the search; names are case-insensitive and comma-separated.
+query II
+SELECT len(image_barcodes(content, {symbologies: 'qr'})), len(image_barcodes(content, {symbologies: 'UPCE, ean13'}))
+FROM read_blob('test/data/barcode_ean13.png');
+----
+0	1
+
+# A NULL symbologies field searches every symbology; NULL inputs give NULL.
+query III
+SELECT len(image_barcodes(content, {symbologies: NULL})), image_barcodes(NULL::BLOB) IS NULL,
+       image_barcodes(content, NULL) IS NULL
+FROM read_blob('test/data/barcode_qr.png');
+----
+1	true	true
+
+# An image without a barcode gives an empty list, not NULL.
+query I
+SELECT image_barcodes(pdf_render(content, 1, {dpi: 150}))
+FROM read_blob('test/data/scanned.pdf');
+----
+[]
+
+# OCR and barcodes on the same image: the printed digits match the payload.
+query I
+SELECT contains(replace(ocr_image(content, {backend: 'vision'}), ' ', ''), image_barcodes(content)[1].payload)
+FROM read_blob('test/data/barcode_ean13.png');
+----
+true
+
+statement error
+SELECT image_barcodes(content, {symbologies: 'EAN99'}) FROM read_blob('test/data/barcode_qr.png');
+----
+symbology 'EAN99' is not supported by Vision
+
+statement error
+SELECT image_barcodes('not an image'::BLOB);
+----
+image_barcodes: could not decode image BLOB
+
+statement error
+SELECT image_barcodes(''::BLOB);
+----
+could not decode image BLOB
+
+statement error
+SELECT image_barcodes(content, {format: 'text'}) FROM read_blob('test/data/barcode_qr.png');
+----
+image_barcodes: unknown option 'format'
+
+statement error
+SELECT image_barcodes(content, {symbologies: 13}) FROM read_blob('test/data/barcode_qr.png');
+----
+option 'symbologies' must be VARCHAR
