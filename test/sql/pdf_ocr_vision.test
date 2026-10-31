@@ -78,6 +78,63 @@ SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vis
 ----
 is not supported by Vision
 
+# 'auto' lets Vision detect the language.
+query I
+SELECT contains(lower(text), 'apple')
+FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision', ocr_language := 'auto');
+----
+true
+
+# Vision request settings travel in ocr_vars: the fast level, no language
+# correction, and a custom vocabulary all still read the fixture.
+query I
+SELECT contains(lower(text), 'apple')
+FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision',
+              ocr_vars := MAP {'recognition_level': 'fast'});
+----
+true
+
+query I
+SELECT contains(lower(text), 'apple')
+FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision',
+              ocr_vars := MAP {'language_correction': 'false', 'custom_words': 'Apple, Cherry'});
+----
+true
+
+query I
+SELECT contains(lower(ocr_image(pdf_render(content, 1, {dpi: 300}),
+                                {backend: 'vision', vars: MAP {'recognition_level': 'fast'}})), 'apple')
+FROM read_blob('test/data/scanned.pdf');
+----
+true
+
+# minimum_text_height is a speed/memory hint: Vision downscales the image, so
+# the boxes get coarser, but it does not drop text it can still read.
+query I
+SELECT count(*) > 0
+FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision',
+                    ocr_vars := MAP {'minimum_text_height': '0.5'});
+----
+true
+
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision',
+                       ocr_vars := MAP {'recognition_level': 'quick'});
+----
+recognition_level must be 'accurate' or 'fast'
+
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision',
+                       ocr_vars := MAP {'minimum_text_height': '2'});
+----
+minimum_text_height must be a fraction
+
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision',
+                       ocr_vars := MAP {'tessedit_char_whitelist': 'abc'});
+----
+unknown ocr_vars key 'tessedit_char_whitelist'
+
 # hocr and tsv are Tesseract output formats.
 statement error
 SELECT ocr_image(pdf_render(content, 1, {dpi: 300}), {backend: 'vision', format: 'hocr'}) FROM read_blob('test/data/scanned.pdf');

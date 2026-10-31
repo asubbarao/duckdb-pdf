@@ -12,8 +12,13 @@
 //
 // Languages: Tesseract codes (eng, fra, deu, chi_sim, ...) are mapped to
 // Vision's BCP-47 identifiers; BCP-47 identifiers (en-US, fr-FR) pass
-// through. '+' joins several languages, as in Tesseract. Unknown or
-// unsupported languages throw with the list Vision supports.
+// through. '+' joins several languages, as in Tesseract, and 'auto' turns on
+// Vision's language detection. Unknown or unsupported languages throw with
+// the list Vision supports.
+//
+// Options::vars carries Vision's request options: recognition_level
+// (accurate|fast), language_correction (true|false), custom_words
+// (comma-separated) and minimum_text_height (0..1). Other keys throw.
 //
 // Confidence is the mean of Vision's per-line confidence, scaled to 0..100.
 // Word boxes come from VNRecognizedText boundingBoxForRange per whitespace

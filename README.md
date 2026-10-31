@@ -329,12 +329,26 @@ SELECT ocr_image(content, {backend: 'vision'}) FROM read_blob('photo.jpg');
 
 - `ocr_language` takes Tesseract codes (`eng`, `fra`, `deu`, `chi_sim`, ...),
   which map to Vision's languages, or Vision's own names (`en-US`, `fr-FR`);
-  `+` selects several. An unsupported language is an error that lists the ones
-  this system supports.
+  `+` selects several, and `'auto'` lets Vision detect the language (macOS 13+).
+  An unsupported language is an error that lists the ones this system supports.
+- `ocr_vars` (`vars` on `ocr_image`) sets Vision's request options. Any other
+  key is an error:
+
+  | Key | Values | Effect |
+  |---|---|---|
+  | `recognition_level` | `accurate` (default), `fast` | Apple's lighter recognizer. On the 137-page run it was not reliably faster through `read_pdf` (208–256 ms per page against 246–258, run back to back) and found fewer words (93% against 97%), so `accurate` stays the default. |
+  | `language_correction` | `true` (default), `false` | Off returns raw recognition, without dictionary correction. |
+  | `custom_words` | comma-separated words | Domain vocabulary preferred over the standard lexicon. |
+  | `minimum_text_height` | 0–1, fraction of image height (default 0) | A speed and memory hint: Vision downscales the image, so smaller text may be misread and word boxes get coarser. It is not a filter. |
+
+  ```sql
+  SELECT text FROM read_pdf('claims.pdf', ocr := true, ocr_backend := 'vision',
+                            ocr_vars := MAP {'custom_words': 'subrogation, deductible'});
+  ```
 - Confidence is the mean of Vision's per-line confidence on a 0–100 scale. It is
   not comparable with Tesseract's, so `ocr_retry` does not re-render Vision pages.
-- `psm`, `oem`, `tessdata_dir`, `ocr_preprocess`, `ocr_vars` and `ocr_config`
-  are Tesseract settings and have no effect. `format` must be `text`, and
+- `psm`, `oem`, `tessdata_dir`, `ocr_preprocess` and `ocr_config` are
+  Tesseract settings and have no effect. `format` must be `text`, and
   `pdf_ocr` (the searchable-PDF writer) needs Tesseract.
 - Image BLOBs are decoded by ImageIO (PNG, JPEG, TIFF, HEIC, ...), and EXIF
   orientation is honored.

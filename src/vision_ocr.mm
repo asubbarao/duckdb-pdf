@@ -15,6 +15,7 @@
 #import <Vision/Vision.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -111,21 +112,107 @@ NSArray<NSString *> *VisionLanguages(VNRecognizeTextRequest *request, const std:
 	return out;
 }
 
-// One accurate, language-corrected recognition pass. Returns an error
-// message, or an empty string on success.
-std::string RecognizeLines(CGImageRef image, CGImagePropertyOrientation orientation, const std::string &language,
+// Vision request settings, from Options::vars (the same MAP that carries
+// Tesseract variables). Unknown keys are errors: unlike Tesseract's
+// SetVariable, there is no long tail of engine variables to pass through.
+struct Settings {
+	bool fast = false;
+	bool language_correction = true;
+	double minimum_text_height = 0;
+	std::vector<std::string> custom_words;
+};
+
+bool ParseBool(const std::string &value, bool &out) {
+	if (value == "true" || value == "1") {
+		out = true;
+		return true;
+	}
+	if (value == "false" || value == "0") {
+		out = false;
+		return true;
+	}
+	return false;
+}
+
+// Returns an error message, or an empty string when every key is valid.
+std::string ParseSettings(const Options &opt, Settings &settings) {
+	for (auto &kv : opt.vars) {
+		const std::string &key = kv.first;
+		const std::string &value = kv.second;
+		if (key == "recognition_level") {
+			if (value != "accurate" && value != "fast") {
+				return "recognition_level must be 'accurate' or 'fast' (got '" + value + "')";
+			}
+			settings.fast = value == "fast";
+		} else if (key == "language_correction") {
+			if (!ParseBool(value, settings.language_correction)) {
+				return "language_correction must be true or false (got '" + value + "')";
+			}
+		} else if (key == "minimum_text_height") {
+			char *end = nullptr;
+			settings.minimum_text_height = std::strtod(value.c_str(), &end);
+			if (value.empty() || *end != '\0' || settings.minimum_text_height < 0 || settings.minimum_text_height > 1) {
+				return "minimum_text_height must be a fraction of the image height from 0 to 1 (got '" + value + "')";
+			}
+		} else if (key == "custom_words") {
+			size_t start = 0;
+			while (start <= value.size()) {
+				size_t end = value.find(',', start);
+				if (end == std::string::npos) {
+					end = value.size();
+				}
+				std::string word = value.substr(start, end - start);
+				start = end + 1;
+				const size_t first = word.find_first_not_of(' ');
+				if (first != std::string::npos) {
+					settings.custom_words.push_back(word.substr(first, word.find_last_not_of(' ') - first + 1));
+				}
+			}
+		} else {
+			return "unknown ocr_vars key '" + key +
+			       "' (Vision accepts recognition_level, language_correction, minimum_text_height, custom_words)";
+		}
+	}
+	return std::string();
+}
+
+// One recognition pass with the request configured from `opt`. Returns an
+// error message, or an empty string on success.
+std::string RecognizeLines(CGImageRef image, CGImagePropertyOrientation orientation, const Options &opt,
                            bool want_tokens, std::vector<Line> &lines) {
 	if (@available(macOS 10.15, *)) {
-		std::string error;
+		Settings settings;
+		std::string error = ParseSettings(opt, settings);
+		if (!error.empty()) {
+			return error;
+		}
 		@autoreleasepool {
 			VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
-			request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
-			request.usesLanguageCorrection = YES;
-			NSArray<NSString *> *languages = VisionLanguages(request, language, error);
-			if (!languages) {
-				return error;
+			// The level comes first: the two levels support different languages.
+			request.recognitionLevel =
+			    settings.fast ? VNRequestTextRecognitionLevelFast : VNRequestTextRecognitionLevelAccurate;
+			request.usesLanguageCorrection = settings.language_correction ? YES : NO;
+			request.minimumTextHeight = static_cast<float>(settings.minimum_text_height);
+			if (!settings.custom_words.empty()) {
+				NSMutableArray<NSString *> *words = [NSMutableArray array];
+				for (auto &word : settings.custom_words) {
+					[words addObject:[NSString stringWithUTF8String:word.c_str()]];
+				}
+				request.customWords = words;
 			}
-			request.recognitionLanguages = languages;
+			if (opt.language == "auto") {
+				if (@available(macOS 13.0, *)) {
+					request.automaticallyDetectsLanguage = YES;
+				} else {
+					return std::string("ocr_language 'auto' requires macOS 13 or later");
+				}
+			} else {
+				NSArray<NSString *> *languages = VisionLanguages(request, opt.language, error);
+				if (!languages) {
+					return error;
+				}
+				request.recognitionLanguages = languages;
+			}
 			VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image
 			                                                                    orientation:orientation
 			                                                                        options:@{}];
@@ -264,7 +351,7 @@ TextResult RecognizeVisionText(const unsigned char *data, int width, int height,
 	}
 	std::vector<Line> lines;
 	CGImageRef image = CreateImage(data, width, height, bytes_per_row, format);
-	std::string error = image ? RecognizeLines(image, kCGImagePropertyOrientationUp, opt.language, false, lines)
+	std::string error = image ? RecognizeLines(image, kCGImagePropertyOrientationUp, opt, false, lines)
 	                          : "could not wrap the page bitmap as an image";
 	if (image) {
 		CGImageRelease(image);
@@ -284,7 +371,7 @@ WordsResult RecognizeVisionWords(const unsigned char *data, int width, int heigh
 	}
 	std::vector<Line> lines;
 	CGImageRef image = CreateImage(data, width, height, bytes_per_row, format);
-	std::string error = image ? RecognizeLines(image, kCGImagePropertyOrientationUp, opt.language, true, lines)
+	std::string error = image ? RecognizeLines(image, kCGImagePropertyOrientationUp, opt, true, lines)
 	                          : "could not wrap the page bitmap as an image";
 	if (image) {
 		CGImageRelease(image);
@@ -324,7 +411,7 @@ TextResult RecognizeVisionImageBlob(const unsigned char *data, size_t size, cons
 	CGImagePropertyOrientation orientation;
 	CGImageRef image = DecodeImage(data, size, orientation);
 	std::vector<Line> lines;
-	std::string error = image ? RecognizeLines(image, orientation, opt.language, false, lines)
+	std::string error = image ? RecognizeLines(image, orientation, opt, false, lines)
 	                          : "could not decode image BLOB (expected a format ImageIO reads, e.g. PNG or JPEG)";
 	if (image) {
 		CGImageRelease(image);
