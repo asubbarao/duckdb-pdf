@@ -111,13 +111,30 @@ set(EXTENSION_SOURCES
     ${BASE14_FONT_GEN}
     ${TESSDATA_GEN})
 
+# vision_ocr.mm — Apple Vision only (Objective-C++, ARC). Other platforms get a
+# stub that reports the backend as unavailable.
+if(APPLE)
+  enable_language(OBJCXX)
+  list(APPEND EXTENSION_SOURCES src/vision_ocr.mm)
+  set_source_files_properties(src/vision_ocr.mm PROPERTIES COMPILE_OPTIONS
+                                                           "-fobjc-arc")
+else()
+  list(APPEND EXTENSION_SOURCES src/vision_ocr_stub.cpp)
+endif()
+
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 if(APPLE)
   find_library(PDF_CORESERVICES CoreServices REQUIRED)
-  target_link_libraries(${EXTENSION_NAME} ${PDF_CORESERVICES})
-  target_link_libraries(${LOADABLE_EXTENSION_NAME} ${PDF_CORESERVICES})
+  find_library(PDF_FOUNDATION Foundation REQUIRED)
+  find_library(PDF_COREGRAPHICS CoreGraphics REQUIRED)
+  find_library(PDF_IMAGEIO ImageIO REQUIRED)
+  find_library(PDF_VISION Vision REQUIRED)
+  set(PDF_APPLE_FRAMEWORKS ${PDF_CORESERVICES} ${PDF_FOUNDATION}
+                           ${PDF_COREGRAPHICS} ${PDF_IMAGEIO} ${PDF_VISION})
+  target_link_libraries(${EXTENSION_NAME} ${PDF_APPLE_FRAMEWORKS})
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} ${PDF_APPLE_FRAMEWORKS})
 endif()
 
 set_source_files_properties(${BASE14_FONT_GEN} PROPERTIES GENERATED TRUE)

@@ -12,15 +12,16 @@ static void PdfFamilyResolveOptions(ResolveScalarFunctionTypesInput &input) {
 	auto name = function.GetName().GetIdentifierName();
 	for (auto &field : StructType::GetChildTypes(type)) {
 		auto key = StringUtil::Lower(field.first.GetIdentifierName());
-		bool allowed = (name == "pdf_text" && (key == "format" || key == "layout" || key == "password")) ||
-		               (name == "pdf_render" && (key == "format" || key == "dpi")) ||
-		               (name == "pdf_pages" && (key == "rotate" || key == "rotate_pages")) ||
-		               (name == "pdf_stamp" &&
-		                (key == "mode" || key == "text" || key == "opacity" || key == "prefix" || key == "start")) ||
-		               (name == "pdf_rewrite" && (key == "mode" || key == "password" || key == "owner_password")) ||
-		               (name == "ocr_image" &&
-		                (key == "language" || key == "psm" || key == "oem" || key == "tessdata_dir" ||
-		                 key == "preprocess" || key == "vars" || key == "config" || key == "dpi" || key == "format"));
+		bool allowed =
+		    (name == "pdf_text" && (key == "format" || key == "layout" || key == "password")) ||
+		    (name == "pdf_render" && (key == "format" || key == "dpi")) ||
+		    (name == "pdf_pages" && (key == "rotate" || key == "rotate_pages")) ||
+		    (name == "pdf_stamp" &&
+		     (key == "mode" || key == "text" || key == "opacity" || key == "prefix" || key == "start")) ||
+		    (name == "pdf_rewrite" && (key == "mode" || key == "password" || key == "owner_password")) ||
+		    (name == "ocr_image" &&
+		     (key == "language" || key == "psm" || key == "oem" || key == "tessdata_dir" || key == "preprocess" ||
+		      key == "vars" || key == "config" || key == "dpi" || key == "format" || key == "backend"));
 		if (!allowed)
 			throw BinderException("%s: unknown option '%s'", name, key);
 		bool numeric =
@@ -103,8 +104,8 @@ static void PdfFamilyOcrImage(DataChunk &args, ExpressionState &state, Vector &r
 		}
 		PdfFamilyOptions opt =
 		    args.ColumnCount() > 1 ? PdfFamilyOptions(args.GetValue(1, row), "ocr_image") : PdfFamilyOptions();
-		opt.Validate("ocr_image",
-		             {"language", "psm", "oem", "tessdata_dir", "preprocess", "vars", "config", "dpi", "format"});
+		opt.Validate("ocr_image", {"language", "psm", "oem", "tessdata_dir", "preprocess", "vars", "config", "dpi",
+		                           "format", "backend"});
 		// Optional OCR arguments historically treat NULL as an omitted setting.
 		for (auto setting = opt.values.begin(); setting != opt.values.end();) {
 			if (setting->second.IsNull())
@@ -136,6 +137,7 @@ static void PdfFamilyOcrImage(DataChunk &args, ExpressionState &state, Vector &r
 		if (!o.config.empty())
 			PdfCheckAccess(context, o.config);
 		try {
+			o.backend = pdf_ocr::BackendFromString(opt.Text("backend", "tesseract"));
 			o.format = pdf_ocr::NormalizeOutputFormat(opt.Text("format", "text"));
 			string_t bytes = StringValue::Get(image);
 			auto recognized = pdf_ocr::RecognizeImageBlob(

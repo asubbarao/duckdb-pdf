@@ -1,0 +1,191 @@
+# name: test/sql/pdf_ocr_vision.test
+# description: Apple Vision OCR backend (macOS); the Makefile sets PDF_VISION_TESTS on Darwin
+# group: [sql]
+
+require pdf
+
+require-env PDF_VISION_TESTS
+
+statement ok
+PRAGMA enable_verification
+
+# Page text from an image-only PDF.
+query III
+SELECT used_ocr, contains(lower(text), 'apple'), contains(lower(text), 'cherr')
+FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision');
+----
+true	true	true
+
+# Word boxes carry OCR provenance, a 0..100 confidence and positive extents.
+query IIII
+SELECT count(*) > 0, bool_and(source = 'ocr'), bool_and(confidence BETWEEN 0 AND 100),
+       bool_and(x1 > x0 AND y1 > y0 AND x0 >= 0 AND y0 >= 0)
+FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision');
+----
+true	true	true	true
+
+# TEMPORARY diagnostic for the macos-15 CI runner: prints every word and position
+# from both engines, so a mismatch shows which engine differs there. Expected
+# rows are this Mac's (macOS 27). To be replaced by a version-independent check.
+query TTII
+WITH vision AS (
+  SELECT lower(word) AS word, x0, y0 FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision')
+), tesseract AS (
+  SELECT lower(word) AS word, x0, y0 FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_retry := false)
+)
+SELECT 'vision' AS engine, word, round(x0)::INT, round(y0)::INT FROM vision
+UNION ALL SELECT 'tesseract', word, round(x0)::INT, round(y0)::INT FROM tesseract
+ORDER BY 1, 4, 3;
+----
+tesseract	ltem	60	100
+tesseract	qty	299	101
+tesseract	price	444	102
+tesseract	apples	58	179
+tesseract	100	301	179
+tesseract	1.99	445	179
+tesseract	bananas	60	255
+tesseract	90	299	255
+tesseract	0.99	443	255
+tesseract	cherries	59	330
+tesseract	25	299	332
+tesseract	9.99	443	332
+vision	qty	296	98
+vision	item	54	101
+vision	price	443	102
+vision	1.99	442	177
+vision	apples	56	178
+vision	100	298	179
+vision	0.99	441	254
+vision	50	298	255
+vision	bananas	58	256
+vision	cherries	58	330
+vision	9.99	442	331
+vision	25	298	332
+
+# Vision and Tesseract place the words they both read in the same spot, in the
+# same top-down coordinates.
+query I
+WITH vision AS (
+  SELECT lower(word) AS word, x0, y0 FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision')
+), tesseract AS (
+  SELECT lower(word) AS word, x0, y0 FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_retry := false)
+)
+SELECT count(*) >= 6 AND bool_and(abs(vision.x0 - tesseract.x0) < 6 AND abs(vision.y0 - tesseract.y0) < 6)
+FROM vision JOIN tesseract USING (word);
+----
+true
+
+# Rotated, cropped pages share the frame Tesseract uses. The two engines read
+# the digits differently (Tesseract: SECRET90/65), so match on the word's prefix.
+query I
+WITH vision AS (
+  SELECT word, x0, y0, x1, y1 FROM read_pdf_words('test/data/ocr_cropped_90.pdf', ocr := true, ocr_backend := 'vision')
+  WHERE starts_with(upper(word), 'SECRET')
+), tesseract AS (
+  SELECT word, x0, y0, x1, y1 FROM read_pdf_words('test/data/ocr_cropped_90.pdf', ocr := true, ocr_retry := false)
+  WHERE starts_with(upper(word), 'SECRET')
+)
+SELECT count(*) = 1 AND bool_and(abs(vision.x0 - tesseract.x0) < 5 AND abs(vision.y0 - tesseract.y0) < 5
+                             AND abs(vision.x1 - tesseract.x1) < 5 AND abs(vision.y1 - tesseract.y1) < 5)
+FROM vision CROSS JOIN tesseract;
+----
+true
+
+# Image BLOBs, through the scalar and the table function.
+query I
+SELECT contains(lower(ocr_image(pdf_render(content, 1, {dpi: 300}), {backend: 'vision'})), 'apple')
+FROM read_blob('test/data/scanned.pdf');
+----
+true
+
+query III
+SELECT contains(lower(text), 'apple'), confidence BETWEEN 0 AND 100, format
+FROM ocr_image(pdf_render('test/data/scanned.pdf', 1, {dpi: 300}), backend := 'vision');
+----
+true	true	text
+
+# Tesseract language codes map to Vision languages; '+' selects several.
+query I
+SELECT contains(lower(text), 'apple')
+FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision', ocr_language := 'eng+fra');
+----
+true
+
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision', ocr_language := 'xx_unknown');
+----
+is not supported by Vision
+
+# 'auto' lets Vision detect the language.
+query I
+SELECT contains(lower(text), 'apple')
+FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision', ocr_language := 'auto');
+----
+true
+
+# Vision request settings travel in ocr_vars: the fast level, no language
+# correction, and a custom vocabulary all still read the fixture.
+query I
+SELECT contains(lower(text), 'apple')
+FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision',
+              ocr_vars := MAP {'recognition_level': 'fast'});
+----
+true
+
+query I
+SELECT contains(lower(text), 'apple')
+FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision',
+              ocr_vars := MAP {'language_correction': 'false', 'custom_words': 'Apple, Cherry'});
+----
+true
+
+query I
+SELECT contains(lower(ocr_image(pdf_render(content, 1, {dpi: 300}),
+                                {backend: 'vision', vars: MAP {'recognition_level': 'fast'}})), 'apple')
+FROM read_blob('test/data/scanned.pdf');
+----
+true
+
+# minimum_text_height is a speed/memory hint: Vision downscales the image, so
+# the boxes get coarser, but it does not drop text it can still read.
+query I
+SELECT count(*) > 0
+FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision',
+                    ocr_vars := MAP {'minimum_text_height': '0.5'});
+----
+true
+
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision',
+                       ocr_vars := MAP {'recognition_level': 'quick'});
+----
+recognition_level must be 'accurate' or 'fast'
+
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision',
+                       ocr_vars := MAP {'minimum_text_height': '2'});
+----
+minimum_text_height must be a fraction
+
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision',
+                       ocr_vars := MAP {'tessedit_char_whitelist': 'abc'});
+----
+unknown ocr_vars key 'tessedit_char_whitelist'
+
+# hocr and tsv are Tesseract output formats.
+statement error
+SELECT ocr_image(pdf_render(content, 1, {dpi: 300}), {backend: 'vision', format: 'hocr'}) FROM read_blob('test/data/scanned.pdf');
+----
+format must be 'text'
+
+statement error
+SELECT ocr_image('not an image'::BLOB, {backend: 'vision'});
+----
+could not decode image BLOB
+
+# The searchable-PDF writer is Tesseract's renderer.
+statement error
+SELECT * FROM pdf_ocr('test/data/scanned.pdf', '{TEST_DIR}/vision.pdf', ocr_backend := 'vision');
+----
+requires ocr_backend := 'tesseract'
