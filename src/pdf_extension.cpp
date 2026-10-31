@@ -65,6 +65,8 @@
 // pixel path). TessBaseAPI lives as a thread_local inside ocr_ops — Init once
 // per worker thread / language, Clear between pages (not per-row re-Init).
 #include "ocr_ops.hpp"
+// Apple Vision barcode detection (image_barcodes); plain std types only.
+#include "vision_ocr.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -2223,12 +2225,19 @@ static bool LoadWordsForPage(poppler::page *page, const PdfOptions &opt, std::ve
 // the preprocessing and confidence-retry toggles on PdfOptions. When retry is
 // on and the first pass is low-confidence at a sub-400 dpi render, we re-render
 // at 2x dpi and keep whichever pass scored higher. Returns text + MeanTextConf.
+// The 55 threshold is Tesseract's MeanTextConf scale. Vision's line confidence
+// is not comparable and Vision does not gain from a larger render, so a retry
+// there would only double the work.
+static bool RetryAtDoubleDpi(const PdfOptions &po, const pdf_ocr::Options &opt, int confidence) {
+	return po.ocr_retry && opt.backend == pdf_ocr::Backend::Tesseract && confidence < 55 && po.ocr_dpi < 400;
+}
+
 static pdf_ocr::TextResult OcrPageResult(poppler::page *page, const PdfOptions &po, bool best_effort) {
 	auto opt = MakeOcrOptions(po, best_effort);
 	const int dpi = po.ocr_dpi;
 	poppler::image img = RenderPageForOcr(page, dpi);
 	pdf_ocr::TextResult first = OcrBitmapText(img, opt);
-	if (po.ocr_retry && first.confidence < 55 && dpi < 400) {
+	if (RetryAtDoubleDpi(po, opt, first.confidence)) {
 		auto opt2 = opt;
 		opt2.dpi = dpi * 2;
 		poppler::image img2 = RenderPageForOcr(page, dpi * 2);
@@ -2262,7 +2271,7 @@ static std::vector<OcrWord> OcrPageWords(poppler::page *page, const PdfOptions &
 	poppler::image img = RenderPageForOcr(page, dpi);
 	double raster_height_points = img.height() * 72.0 / dpi;
 	pdf_ocr::WordsResult first = OcrBitmapWords(img, opt);
-	if (po.ocr_retry && first.confidence < 55 && dpi < 400) {
+	if (RetryAtDoubleDpi(po, opt, first.confidence)) {
 		auto opt2 = opt;
 		opt2.dpi = dpi * 2;
 		poppler::image img2 = RenderPageForOcr(page, dpi * 2);
@@ -5926,6 +5935,12 @@ static unique_ptr<FunctionData> OcrImageBind(ClientContext &context, TableFuncti
 			ParseStringMapValueStd(kv.second, result->opt.vars, "ocr_image: vars");
 		} else if (key == "config" || key == "ocr_config") {
 			result->opt.config = StringValue::Get(kv.second);
+		} else if (key == "backend" || key == "ocr_backend") {
+			try {
+				result->opt.backend = pdf_ocr::BackendFromString(StringValue::Get(kv.second));
+			} catch (const std::exception &e) {
+				throw InvalidInputException("ocr_image: %s", string(e.what()));
+			}
 		} else if (key == "format") {
 			try {
 				result->format = pdf_ocr::NormalizeOutputFormat(StringValue::Get(kv.second));
@@ -10450,6 +10465,8 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	AddNamedParameter(ocr_image, "config", LogicalType::VARCHAR);
 	AddNamedParameter(ocr_image, "ocr_config", LogicalType::VARCHAR);
 	AddNamedParameter(ocr_image, "format", LogicalType::VARCHAR);
+	AddNamedParameter(ocr_image, "backend", LogicalType::VARCHAR);
+	AddNamedParameter(ocr_image, "ocr_backend", LogicalType::VARCHAR);
 	loader.RegisterFunction(ocr_image);
 
 	ScalarFunctionSet to_pdf_set("to_pdf");

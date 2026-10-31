@@ -7,6 +7,7 @@
 //===--------------------------------------------------------------------===//
 #include "ocr_ops.hpp"
 #include "ocr_renderer.hpp"
+#include "vision_ocr.hpp"
 
 #include <tesseract/baseapi.h>
 #include <tesseract/resultiterator.h>
@@ -744,7 +745,10 @@ Backend BackendFromString(const std::string &name) {
 	if (lower == "external" || lower == "plugin" || lower == "sota") {
 		return Backend::External;
 	}
-	throw std::runtime_error("read_pdf: ocr_backend must be 'tesseract' or 'external' (got '" + name + "')");
+	if (lower == "vision" || lower == "apple") {
+		return Backend::Vision;
+	}
+	throw std::runtime_error("read_pdf: ocr_backend must be 'tesseract', 'vision' or 'external' (got '" + name + "')");
 }
 
 std::string NormalizeOutputFormat(const std::string &name) {
@@ -765,6 +769,8 @@ const char *BackendName(Backend b) {
 	switch (b) {
 	case Backend::External:
 		return "external";
+	case Backend::Vision:
+		return "vision";
 	case Backend::Tesseract:
 	default:
 		return "tesseract";
@@ -775,6 +781,9 @@ TextResult RecognizeText(const unsigned char *data, int width, int height, int b
                          const Options &opt) {
 	if (opt.backend == Backend::External) {
 		return RecognizeExternal(data, width, height, bytes_per_row, format, opt);
+	}
+	if (opt.backend == Backend::Vision) {
+		return RecognizeVisionText(data, width, height, bytes_per_row, format, opt);
 	}
 	return RecognizeTesseractText(data, width, height, bytes_per_row, format, opt);
 }
@@ -801,6 +810,9 @@ WordsResult RecognizeWords(const unsigned char *data, int width, int height, int
 			wr.words.push_back(std::move(w));
 		}
 		return wr;
+	}
+	if (opt.backend == Backend::Vision) {
+		return RecognizeVisionWords(data, width, height, bytes_per_row, format, opt);
 	}
 	return RecognizeTesseractWords(data, width, height, bytes_per_row, format, opt);
 }
@@ -863,6 +875,9 @@ TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Opti
 		}
 		throw std::runtime_error("external OCR backend is not supported for encoded image BLOBs "
 		                         "(use tesseract, or decode externally and call the plugin C ABI)");
+	}
+	if (opt.backend == Backend::Vision) {
+		return RecognizeVisionImageBlob(data, size, opt);
 	}
 
 	// leptonica owns the decoder (PNG/JPEG/TIFF/…); no poppler dependency here.

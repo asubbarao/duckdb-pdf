@@ -11,7 +11,7 @@ FROM duckdb_functions()
 WHERE starts_with(function_name, 'pdf_')
    OR starts_with(function_name, 'read_pdf')
    OR starts_with(function_name, 'poppler_')
-   OR function_name IN ('tesseract_ocr', 'ocr_image', 'to_pdf', 'write_pdf');
+   OR function_name IN ('tesseract_ocr', 'ocr_image', 'image_barcodes', 'to_pdf', 'write_pdf');
 ----
 true
 
@@ -27,11 +27,11 @@ query I
 WITH expected AS (SELECT unnest(['read_pdf', 'read_pdf_words', 'pdf_info', 'pdf_objects',
  'pdf_text', 'pdf_render', 'pdf_merge', 'pdf_pages', 'pdf_split', 'pdf_stamp',
  'pdf_rewrite', 'pdf_redact', 'pdf_redact_lateral', 'pdf_sign', 'write_pdf',
- 'to_pdf', 'ocr_image', 'pdf_ocr', 'poppler_version', 'read_pdf_elements', 'pdf_to_text']) AS name),
+ 'to_pdf', 'ocr_image', 'image_barcodes', 'pdf_ocr', 'poppler_version', 'read_pdf_elements', 'pdf_to_text']) AS name),
 actual AS (SELECT DISTINCT function_name AS name FROM duckdb_functions()
  WHERE starts_with(function_name, 'pdf_') OR starts_with(function_name, 'read_pdf')
     OR starts_with(function_name, 'poppler_')
-    OR function_name IN ('tesseract_ocr', 'ocr_image', 'to_pdf', 'write_pdf'))
+    OR function_name IN ('tesseract_ocr', 'ocr_image', 'image_barcodes', 'to_pdf', 'write_pdf'))
 SELECT NOT EXISTS (SELECT name FROM actual EXCEPT SELECT name FROM expected)
    AND NOT EXISTS (SELECT name FROM expected EXCEPT SELECT name FROM actual);
 ----
