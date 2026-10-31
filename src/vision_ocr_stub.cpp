@@ -9,7 +9,7 @@
 namespace pdf_ocr {
 namespace {
 
-const char *const kUnavailable ="ocr backend 'vision': Apple Vision is only available on macOS";
+const char *const kUnavailable = "ocr backend 'vision': Apple Vision is only available on macOS";
 
 } // namespace
 

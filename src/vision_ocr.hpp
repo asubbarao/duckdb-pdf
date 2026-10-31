@@ -36,8 +36,8 @@ namespace pdf_ocr {
 // True when this build has the Vision backend and the OS supports it.
 bool VisionAvailable();
 
-TextResult RecognizeVisionText(const unsigned char *data, int width, int height, int bytes_per_row,
-                               ImageFormat format, const Options &opt);
+TextResult RecognizeVisionText(const unsigned char *data, int width, int height, int bytes_per_row, ImageFormat format,
+                               const Options &opt);
 
 WordsResult RecognizeVisionWords(const unsigned char *data, int width, int height, int bytes_per_row,
                                  ImageFormat format, const Options &opt);

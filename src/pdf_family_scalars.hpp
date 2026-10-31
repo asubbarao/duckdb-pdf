@@ -12,16 +12,16 @@ static void PdfFamilyResolveOptions(ResolveScalarFunctionTypesInput &input) {
 	auto name = function.GetName().GetIdentifierName();
 	for (auto &field : StructType::GetChildTypes(type)) {
 		auto key = StringUtil::Lower(field.first.GetIdentifierName());
-		bool allowed = (name == "pdf_text" && (key == "format" || key == "layout" || key == "password")) ||
-		               (name == "pdf_render" && (key == "format" || key == "dpi")) ||
-		               (name == "pdf_pages" && (key == "rotate" || key == "rotate_pages")) ||
-		               (name == "pdf_stamp" &&
-		                (key == "mode" || key == "text" || key == "opacity" || key == "prefix" || key == "start")) ||
-		               (name == "pdf_rewrite" && (key == "mode" || key == "password" || key == "owner_password")) ||
-		               (name == "ocr_image" &&
-		                (key == "language" || key == "psm" || key == "oem" || key == "tessdata_dir" ||
-		                 key == "preprocess" || key == "vars" || key == "config" || key == "dpi" || key == "format" ||
-			                 key == "backend"));
+		bool allowed =
+		    (name == "pdf_text" && (key == "format" || key == "layout" || key == "password")) ||
+		    (name == "pdf_render" && (key == "format" || key == "dpi")) ||
+		    (name == "pdf_pages" && (key == "rotate" || key == "rotate_pages")) ||
+		    (name == "pdf_stamp" &&
+		     (key == "mode" || key == "text" || key == "opacity" || key == "prefix" || key == "start")) ||
+		    (name == "pdf_rewrite" && (key == "mode" || key == "password" || key == "owner_password")) ||
+		    (name == "ocr_image" &&
+		     (key == "language" || key == "psm" || key == "oem" || key == "tessdata_dir" || key == "preprocess" ||
+		      key == "vars" || key == "config" || key == "dpi" || key == "format" || key == "backend"));
 		if (!allowed)
 			throw BinderException("%s: unknown option '%s'", name, key);
 		bool numeric =
