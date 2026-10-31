@@ -89,7 +89,7 @@ printed page label, which can be NULL.
 | `ocr_language` | VARCHAR | `'eng'` | Tesseract model or `+`-separated model combination, such as `'eng+fra'`; all selected models must exist in the resolved model directory. |
 | `ocr_dpi` | INTEGER | 300 | Render DPI for the OCR raster (1–2400). |
 | `ocr_psm` / `ocr_oem` | INTEGER | 3 / 3 | Page segmentation mode (automatic) / OCR engine mode (default). |
-| `ocr_backend` | VARCHAR | `'tesseract'` | `'tesseract'` or `'external'`; external requires a plugin. Persisted `pdf_ocr` requires Tesseract. |
+| `ocr_backend` | VARCHAR | `'tesseract'` | `'tesseract'`, `'vision'` (Apple Vision, macOS only; see [OCR](#ocr)) or `'external'`; external requires a plugin. Persisted `pdf_ocr` requires Tesseract. |
 | `ocr_plugin` | VARCHAR | — | External OCR shared library implementing the C ABI in `src/ocr_ops.hpp`. |
 | `ocr_endpoint` | VARCHAR | — | Reserved; does not send HTTP requests. |
 | `ocr_preprocess` | BOOLEAN | true | Run the Leptonica preprocessing pipeline (grayscale → deskew → binarize → despeckle) on the rendered page before OCR. |
@@ -291,7 +291,8 @@ native PDF writing do not require an Office application.
 
 `ocr_image(image_blob [, options]) -> VARCHAR` is the scalar form for per-row
 OCR. Options are language (eng), psm, oem, tessdata_dir, preprocess (true), vars
-(a MAP(VARCHAR,VARCHAR)), config, dpi (300), and format (text, hocr or tsv).
+(a MAP(VARCHAR,VARCHAR)), config, dpi (300), format (text, hocr or tsv), and
+backend (tesseract or vision).
 The table form `ocr_image(image_blob, language := 'eng', ...)` returns one row
 `text, confidence, format` and accepts named options, including its existing
 lang/ocr_language and ocr_* spellings. Its input must be foldable; use the scalar
@@ -301,6 +302,35 @@ form when the BLOB comes from a row.
 SELECT ocr_image(content, {language: 'eng', psm: 6}) FROM read_blob('scan.png');
 SELECT * FROM pdf_ocr('scan.pdf', 'searchable.pdf', first_page := 2, last_page := 5);
 ```
+
+### Apple Vision (macOS)
+
+`ocr_backend := 'vision'` on the readers, and `backend: 'vision'` on
+`ocr_image`, use Apple's on-device text recognizer (`VNRecognizeTextRequest`,
+accurate level, language correction on) instead of Tesseract. It needs no model
+files. On staging's scanned PDFs it was about five times faster than Tesseract
+at similar accuracy. Vision picks its own compute device (CPU, GPU or Neural
+Engine), so there is no device option.
+
+```sql
+SELECT page, text FROM read_pdf('scan.pdf', ocr := true, ocr_backend := 'vision');
+SELECT word, x0, y0, x1, y1, confidence
+FROM read_pdf_words('scan.pdf', ocr := true, ocr_backend := 'vision');
+SELECT ocr_image(content, {backend: 'vision'}) FROM read_blob('photo.jpg');
+```
+
+- `ocr_language` takes Tesseract codes (`eng`, `fra`, `deu`, `chi_sim`, ...),
+  which map to Vision's languages, or Vision's own names (`en-US`, `fr-FR`);
+  `+` selects several. An unsupported language is an error that lists the ones
+  this system supports.
+- Confidence is the mean of Vision's per-line confidence on a 0–100 scale. It is
+  not comparable with Tesseract's, so `ocr_retry` does not re-render Vision pages.
+- `psm`, `oem`, `tessdata_dir`, `ocr_preprocess`, `ocr_vars` and `ocr_config`
+  are Tesseract settings and have no effect. `format` must be `text`, and
+  `pdf_ocr` (the searchable-PDF writer) needs Tesseract.
+- Image BLOBs are decoded by ImageIO (PNG, JPEG, TIFF, HEIC, ...), and EXIF
+  orientation is honored.
+- On other platforms, choosing `vision` is an error.
 
 English tessdata is bundled. Resolution is explicit tessdata_dir, then
 TESSDATA_PREFIX, package-manager paths, and bundled English. An invalid explicit

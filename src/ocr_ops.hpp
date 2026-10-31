@@ -27,6 +27,9 @@
 // --------
 //   "tesseract" (default, linked): in-process TessBaseAPI + leptonica
 //                                  preprocess. Built into this TU.
+//   "vision" (macOS): Apple Vision VNRecognizeTextRequest, implemented in
+//                     vision_ocr.mm. Text, word boxes and image BLOBs; no
+//                     searchable-PDF renderer and no hocr/tsv output.
 //   "external": NO shell-out. Resolves in this order:
 //     1. If Options::external_plugin is non-empty, dlopen/LoadLibrary that
 //        shared library and call the C ABI below (pdf_ocr_plugin_recognize).
@@ -66,7 +69,8 @@ enum class ImageFormat : int {
 };
 
 // Which engine should Recognize* dispatch to.
-enum class Backend : int { Tesseract = 0, External = 1 };
+// Vision is Apple's on-device recognizer (macOS only; see vision_ocr.hpp).
+enum class Backend : int { Tesseract = 0, External = 1, Vision = 2 };
 
 // Parse a user-facing backend name. Unknown values throw std::runtime_error.
 Backend BackendFromString(const std::string &name);
