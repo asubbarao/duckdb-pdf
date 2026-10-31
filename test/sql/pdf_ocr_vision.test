@@ -24,6 +24,44 @@ FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision
 ----
 true	true	true	true
 
+# TEMPORARY diagnostic for the macos-15 CI runner: prints every word and position
+# from both engines, so a mismatch shows which engine differs there. Expected
+# rows are this Mac's (macOS 27). To be replaced by a version-independent check.
+query TTII
+WITH vision AS (
+  SELECT lower(word) AS word, x0, y0 FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision')
+), tesseract AS (
+  SELECT lower(word) AS word, x0, y0 FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_retry := false)
+)
+SELECT 'vision' AS engine, word, round(x0)::INT, round(y0)::INT FROM vision
+UNION ALL SELECT 'tesseract', word, round(x0)::INT, round(y0)::INT FROM tesseract
+ORDER BY 1, 4, 3;
+----
+tesseract	ltem	60	100
+tesseract	qty	299	101
+tesseract	price	444	102
+tesseract	apples	58	179
+tesseract	100	301	179
+tesseract	1.99	445	179
+tesseract	bananas	60	255
+tesseract	90	299	255
+tesseract	0.99	443	255
+tesseract	cherries	59	330
+tesseract	25	299	332
+tesseract	9.99	443	332
+vision	qty	296	98
+vision	item	54	101
+vision	price	443	102
+vision	1.99	442	177
+vision	apples	56	178
+vision	100	298	179
+vision	0.99	441	254
+vision	50	298	255
+vision	bananas	58	256
+vision	cherries	58	330
+vision	9.99	442	331
+vision	25	298	332
+
 # Vision and Tesseract place the words they both read in the same spot, in the
 # same top-down coordinates.
 query I
