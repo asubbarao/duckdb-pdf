@@ -308,9 +308,17 @@ SELECT * FROM pdf_ocr('scan.pdf', 'searchable.pdf', first_page := 2, last_page :
 `ocr_backend := 'vision'` on the readers, and `backend: 'vision'` on
 `ocr_image`, use Apple's on-device text recognizer (`VNRecognizeTextRequest`,
 accurate level, language correction on) instead of Tesseract. It needs no model
-files. On staging's scanned PDFs it was about five times faster than Tesseract
-at similar accuracy. Vision picks its own compute device (CPU, GPU or Neural
-Engine), so there is no device option.
+files. Vision picks its own compute device (CPU, GPU or Neural Engine), so
+there is no device option.
+
+Speed depends on threads. Vision handles one page at a time per machine, so it
+runs at about 210 ms per page (300 dpi, render included) whatever `threads` is.
+Tesseract is about five times slower per page but scales with threads: in one
+137-page run it took 1,060 ms per page on 1 thread, 329 on 4 and 218 on 15,
+level with Vision. Choose Vision for fast OCR on a few threads, for languages
+without installed Tesseract models, or to leave the cores free for other work.
+Accuracy was similar: Vision found more words (97% against 96%) with slightly
+more character errors (9.5% against 8.5%).
 
 ```sql
 SELECT page, text FROM read_pdf('scan.pdf', ocr := true, ocr_backend := 'vision');
