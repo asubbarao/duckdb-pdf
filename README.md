@@ -50,6 +50,7 @@ names and field types, and execution checks which fields apply to the mode.
 | `write_pdf` | Scalar | Native text-to-PDF writer. |
 | `to_pdf` | Scalar | Office conversion through installed desktop apps or LibreOffice. |
 | `ocr_image` | Scalar and table | Image OCR as text or a row with confidence. |
+| `image_barcodes` | Scalar | Barcodes and QR codes in an image, through Apple Vision (macOS). |
 | `pdf_ocr` | Table | Persist searchable OCR layers. |
 | `poppler_version` | Scalar | Linked Poppler version. |
 
@@ -373,6 +374,46 @@ control this writer. Its output is a rewrite, not an incremental byte update.
 Its status schema is `page INTEGER, had_text_layer BOOLEAN, ocr_applied BOOLEAN,
 words INTEGER, mean_confidence DOUBLE, seconds DOUBLE, out_path VARCHAR`.
 
+## Barcodes (Apple Vision, macOS)
+
+`image_barcodes(image_blob [, options])` finds barcodes and 2D codes in an
+encoded image BLOB with Apple's on-device detector (`VNDetectBarcodesRequest`,
+the newest revision the OS offers). It returns one list per image, empty when
+there is no code:
+
+```
+STRUCT(symbology VARCHAR, payload VARCHAR, raw_payload BLOB,
+       supplemental_payload VARCHAR, is_gs1 BOOLEAN, color_inverted BOOLEAN,
+       confidence DOUBLE, x0 DOUBLE, y0 DOUBLE, x1 DOUBLE, y1 DOUBLE)[]
+```
+
+```sql
+SELECT filename, b.symbology, b.payload
+FROM read_blob('shelf/*.jpg') CROSS JOIN UNNEST(image_barcodes(content)) AS t(b);
+-- Retail codes only, with the label text from the same image.
+SELECT image_barcodes(content, {symbologies: 'EAN13,EAN8,UPCE'}),
+       ocr_image(content, {backend: 'vision'})
+FROM read_blob('label.jpg');
+SELECT image_barcodes(pdf_render('packing-slip.pdf', 1, {dpi: 200}));
+```
+
+- `symbology` drops Vision's `VNBarcodeSymbology` prefix: `EAN13`, `EAN8`,
+  `UPCE`, `QR`, `Code128`, `DataMatrix`, `ITF14`, `GS1DataBar`, `PDF417`, ...
+  Vision reports UPC-A as `EAN13` with a leading zero.
+- `payload` is Vision's decoded string, NULL when it has none. `raw_payload` is
+  the symbol data as Vision returns it, not the decoded text: one byte per digit
+  for EAN/UPC, the data codewords (mode, length and padding bits) for QR.
+  `supplemental_payload` carries add-on codes such as EAN-5. These three and
+  `is_gs1` / `color_inverted` need macOS 14.
+- `confidence` is Vision's observation confidence on a 0–100 scale.
+- `x0, y0, x1, y1` are pixels of the upright image (EXIF orientation applied)
+  with a top-left origin. Boxes can extend past the image edge.
+- The only option is `symbologies`, a comma-separated, case-insensitive list
+  that restricts the search. An unknown name is an error listing the
+  symbologies this system supports.
+- A NULL image or options gives NULL; a BLOB ImageIO cannot decode is an error.
+  On other platforms the function is an error.
+
 ## Migration from 48 names
 
 `read_pdf_elements(files, ...)` and `pdf_to_text(input [, layout])` are deprecated
@@ -411,7 +452,7 @@ No sniff_pdf or pdf_help was added. Queryable help is already in the catalog:
 SELECT function_name, function_type, parameters, parameter_types,
        return_type, description, examples
 FROM duckdb_functions()
-WHERE function_name IN ('read_pdf', 'read_pdf_words', 'pdf_info', 'pdf_objects', 'pdf_text', 'pdf_render', 'pdf_merge', 'pdf_pages', 'pdf_split', 'pdf_stamp', 'pdf_rewrite', 'pdf_redact', 'pdf_redact_lateral', 'pdf_sign', 'write_pdf', 'to_pdf', 'ocr_image', 'pdf_ocr', 'poppler_version')
+WHERE function_name IN ('read_pdf', 'read_pdf_words', 'pdf_info', 'pdf_objects', 'pdf_text', 'pdf_render', 'pdf_merge', 'pdf_pages', 'pdf_split', 'pdf_stamp', 'pdf_rewrite', 'pdf_redact', 'pdf_redact_lateral', 'pdf_sign', 'write_pdf', 'to_pdf', 'ocr_image', 'image_barcodes', 'pdf_ocr', 'poppler_version')
 ORDER BY function_name, function_type, len(parameters);
 ```
 

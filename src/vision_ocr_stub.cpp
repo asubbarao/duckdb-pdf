@@ -44,4 +44,8 @@ TextResult RecognizeVisionImageBlob(const unsigned char *, size_t, const Options
 	return out;
 }
 
+std::vector<Barcode> DetectVisionBarcodes(const unsigned char *, size_t, const std::vector<std::string> &) {
+	throw std::runtime_error("barcode detection uses Apple Vision, which is only available on macOS");
+}
+
 } // namespace pdf_ocr

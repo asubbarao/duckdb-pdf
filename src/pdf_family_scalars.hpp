@@ -21,7 +21,8 @@ static void PdfFamilyResolveOptions(ResolveScalarFunctionTypesInput &input) {
 		    (name == "pdf_rewrite" && (key == "mode" || key == "password" || key == "owner_password")) ||
 		    (name == "ocr_image" &&
 		     (key == "language" || key == "psm" || key == "oem" || key == "tessdata_dir" || key == "preprocess" ||
-		      key == "vars" || key == "config" || key == "dpi" || key == "format" || key == "backend"));
+		      key == "vars" || key == "config" || key == "dpi" || key == "format" || key == "backend")) ||
+		    (name == "image_barcodes" && key == "symbologies");
 		if (!allowed)
 			throw BinderException("%s: unknown option '%s'", name, key);
 		bool numeric =
@@ -146,6 +147,67 @@ static void PdfFamilyOcrImage(DataChunk &args, ExpressionState &state, Vector &r
 		} catch (const std::exception &e) {
 			RethrowOcrImageError(e);
 		}
+	}
+}
+
+// image_barcodes(image_blob [, {symbologies: 'EAN13,UPCE'}]) -> LIST(STRUCT)
+// through Apple Vision; see vision_ocr.hpp for names, boxes and confidence.
+static LogicalType ImageBarcodeType() {
+	return LogicalType::STRUCT({{"symbology", LogicalType::VARCHAR},
+	                            {"payload", LogicalType::VARCHAR},
+	                            {"raw_payload", LogicalType::BLOB},
+	                            {"supplemental_payload", LogicalType::VARCHAR},
+	                            {"is_gs1", LogicalType::BOOLEAN},
+	                            {"color_inverted", LogicalType::BOOLEAN},
+	                            {"confidence", LogicalType::DOUBLE},
+	                            {"x0", LogicalType::DOUBLE},
+	                            {"y0", LogicalType::DOUBLE},
+	                            {"x1", LogicalType::DOUBLE},
+	                            {"y1", LogicalType::DOUBLE}});
+}
+
+static void PdfFamilyImageBarcodes(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &context = state.GetContext();
+	auto barcode_type = ImageBarcodeType();
+	for (idx_t row = 0; row < args.size(); row++) {
+		context.BlockingInterruptCheck();
+		auto image = args.GetValue(0, row);
+		if (image.IsNull() || (args.ColumnCount() > 1 && args.GetValue(1, row).IsNull())) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		PdfFamilyOptions opt =
+		    args.ColumnCount() > 1 ? PdfFamilyOptions(args.GetValue(1, row), "image_barcodes") : PdfFamilyOptions();
+		opt.Validate("image_barcodes", {"symbologies"});
+		std::vector<std::string> symbologies;
+		if (opt.Has("symbologies") && !opt.values.at("symbologies").IsNull()) {
+			for (auto &name : StringUtil::Split(opt.Text("symbologies"), ',')) {
+				StringUtil::Trim(name);
+				if (!name.empty())
+					symbologies.push_back(name);
+			}
+		}
+		string_t bytes = StringValue::Get(image);
+		std::vector<pdf_ocr::Barcode> found;
+		try {
+			found = pdf_ocr::DetectVisionBarcodes(reinterpret_cast<const unsigned char *>(bytes.GetDataUnsafe()),
+			                                      bytes.GetSize(), symbologies);
+		} catch (const std::exception &e) {
+			throw IOException("image_barcodes: %s", string(e.what()));
+		}
+		vector<Value> barcodes;
+		for (auto &b : found) {
+			barcodes.push_back(Value::STRUCT(
+			    barcode_type,
+			    {Value(b.symbology), b.has_payload ? Value(b.payload) : Value(LogicalType::VARCHAR),
+			     b.has_payload_bytes ? Value::BLOB(const_data_ptr_cast(b.payload_bytes.data()), b.payload_bytes.size())
+			                         : Value(LogicalType::BLOB),
+			     b.has_supplemental ? Value(b.supplemental) : Value(LogicalType::VARCHAR), Value::BOOLEAN(b.gs1),
+			     Value::BOOLEAN(b.color_inverted), Value::DOUBLE(b.confidence), Value::DOUBLE(b.x0),
+			     Value::DOUBLE(b.y0), Value::DOUBLE(b.x1), Value::DOUBLE(b.y1)}));
+		}
+		result.SetValue(row, Value::LIST(barcode_type, std::move(barcodes)));
 	}
 }
 
@@ -414,6 +476,14 @@ static void RegisterPdfFamilyScalars(PdfLoader &loader) {
 	image_ocr_options.SetResolveTypesCallback(PdfFamilyResolveOptions);
 	image_ocr.AddFunction(std::move(image_ocr_options));
 	loader.RegisterFunction(std::move(image_ocr));
+	ScalarFunctionSet image_barcodes("image_barcodes");
+	image_barcodes.AddFunction(
+	    ScalarFunction({LogicalType::BLOB}, LogicalType::LIST(ImageBarcodeType()), PdfFamilyImageBarcodes));
+	ScalarFunction image_barcodes_options({LogicalType::BLOB, LogicalType::ANY}, LogicalType::LIST(ImageBarcodeType()),
+	                                      PdfFamilyImageBarcodes);
+	image_barcodes_options.SetResolveTypesCallback(PdfFamilyResolveOptions);
+	image_barcodes.AddFunction(std::move(image_barcodes_options));
+	loader.RegisterFunction(std::move(image_barcodes));
 	ScalarFunctionSet text_set("pdf_text"), render_set("pdf_render");
 	for (auto input : {LogicalType::VARCHAR, LogicalType::BLOB}) {
 		text_set.AddFunction(ScalarFunction({input}, LogicalType::VARCHAR, PdfFamilyText));
