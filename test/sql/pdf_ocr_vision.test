@@ -25,14 +25,15 @@ FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision
 true	true	true	true
 
 # Vision and Tesseract place the words they both read in the same spot, in the
-# same top-down coordinates.
+# same top-down coordinates. The 10px tolerance absorbs Apple Vision's word-box
+# drift across macOS versions (CI runs macos-15, dev is on macOS 27).
 query I
 WITH vision AS (
   SELECT lower(word) AS word, x0, y0 FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_backend := 'vision')
 ), tesseract AS (
   SELECT lower(word) AS word, x0, y0 FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_retry := false)
 )
-SELECT count(*) >= 6 AND bool_and(abs(vision.x0 - tesseract.x0) < 6 AND abs(vision.y0 - tesseract.y0) < 6)
+SELECT count(*) >= 6 AND bool_and(abs(vision.x0 - tesseract.x0) < 10 AND abs(vision.y0 - tesseract.y0) < 10)
 FROM vision JOIN tesseract USING (word);
 ----
 true
@@ -47,8 +48,8 @@ WITH vision AS (
   SELECT word, x0, y0, x1, y1 FROM read_pdf_words('test/data/ocr_cropped_90.pdf', ocr := true, ocr_retry := false)
   WHERE starts_with(upper(word), 'SECRET')
 )
-SELECT count(*) = 1 AND bool_and(abs(vision.x0 - tesseract.x0) < 5 AND abs(vision.y0 - tesseract.y0) < 5
-                             AND abs(vision.x1 - tesseract.x1) < 5 AND abs(vision.y1 - tesseract.y1) < 5)
+SELECT count(*) = 1 AND bool_and(abs(vision.x0 - tesseract.x0) < 10 AND abs(vision.y0 - tesseract.y0) < 10
+                             AND abs(vision.x1 - tesseract.x1) < 10 AND abs(vision.y1 - tesseract.y1) < 10)
 FROM vision CROSS JOIN tesseract;
 ----
 true
