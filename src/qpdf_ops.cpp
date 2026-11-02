@@ -927,7 +927,8 @@ static std::string X509CommonName(X509 *cert) {
 	if (!cert) {
 		return std::string();
 	}
-	X509_NAME *name = X509_get_subject_name(cert);
+	// const: OpenSSL 4 returns a const name; OpenSSL 3 accepts one below.
+	const X509_NAME *name = X509_get_subject_name(cert);
 	if (!name) {
 		return std::string();
 	}

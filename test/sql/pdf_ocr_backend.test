@@ -1,0 +1,20 @@
+# name: test/sql/pdf_ocr_backend.test
+# description: OCR backend names are validated on every platform
+# group: [sql]
+
+require pdf
+
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_backend := 'nonsense');
+----
+ocr_backend must be 'tesseract', 'vision' or 'external'
+
+statement error
+SELECT * FROM ocr_image('x'::BLOB, backend := 'nonsense');
+----
+ocr_backend must be 'tesseract', 'vision' or 'external'
+
+statement error
+SELECT ocr_image('x'::BLOB, {backend: 'nonsense'});
+----
+ocr_backend must be 'tesseract', 'vision' or 'external'
