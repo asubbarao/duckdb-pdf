@@ -72,8 +72,9 @@ enum class ImageFormat : int {
 // Vision is Apple's on-device recognizer (macOS only; see vision_ocr.hpp).
 enum class Backend : int { Tesseract = 0, External = 1, Vision = 2 };
 
-// Parse a user-facing backend name. Unknown values throw std::runtime_error.
-Backend BackendFromString(const std::string &name);
+// Parse a user-facing backend name. Unknown values throw std::runtime_error
+// naming the calling function (callers surface it through several entry points).
+Backend BackendFromString(const std::string &name, const char *function);
 const char *BackendName(Backend b);
 
 struct Options {

@@ -2141,7 +2141,7 @@ static pdf_ocr::Options MakeOcrOptions(const PdfOptions &po, bool best_effort) {
 	o.tessdata_dir = po.tessdata_dir;
 	o.preprocess = po.ocr_preprocess;
 	o.best_effort = best_effort;
-	o.backend = pdf_ocr::BackendFromString(po.ocr_backend);
+	o.backend = pdf_ocr::BackendFromString(po.ocr_backend, "read_pdf");
 	o.external_plugin = po.ocr_plugin;
 	o.external_endpoint = po.ocr_endpoint;
 	o.vars = po.ocr_vars;
@@ -2379,7 +2379,7 @@ static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
 	}
 	// ocr_backend name is validated via BackendFromString so typos fail fast.
 	try {
-		(void)pdf_ocr::BackendFromString(o.ocr_backend);
+		(void)pdf_ocr::BackendFromString(o.ocr_backend, "read_pdf");
 	} catch (const std::exception &e) {
 		throw InvalidInputException("%s", string(e.what()));
 	}
@@ -5934,11 +5934,8 @@ static unique_ptr<FunctionData> OcrImageBind(ClientContext &context, TableFuncti
 		} else if (key == "config" || key == "ocr_config") {
 			result->opt.config = StringValue::Get(kv.second);
 		} else if (key == "backend" || key == "ocr_backend") {
-			try {
-				result->opt.backend = pdf_ocr::BackendFromString(StringValue::Get(kv.second));
-			} catch (const std::exception &e) {
-				throw InvalidInputException("ocr_image: %s", string(e.what()));
-			}
+			// BackendFromString already names the calling function in its error.
+			result->opt.backend = pdf_ocr::BackendFromString(StringValue::Get(kv.second), "ocr_image");
 		} else if (key == "format") {
 			try {
 				result->format = pdf_ocr::NormalizeOutputFormat(StringValue::Get(kv.second));

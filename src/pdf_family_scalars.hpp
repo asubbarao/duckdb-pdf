@@ -137,7 +137,7 @@ static void PdfFamilyOcrImage(DataChunk &args, ExpressionState &state, Vector &r
 		if (!o.config.empty())
 			PdfCheckAccess(context, o.config);
 		try {
-			o.backend = pdf_ocr::BackendFromString(opt.Text("backend", "tesseract"));
+			o.backend = pdf_ocr::BackendFromString(opt.Text("backend", "tesseract"), "ocr_image");
 			o.format = pdf_ocr::NormalizeOutputFormat(opt.Text("format", "text"));
 			string_t bytes = StringValue::Get(image);
 			auto recognized = pdf_ocr::RecognizeImageBlob(
