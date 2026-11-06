@@ -744,8 +744,8 @@ Backend BackendFromString(const std::string &name, const char *function) {
 	if (lower == "external" || lower == "plugin" || lower == "sota") {
 		return Backend::External;
 	}
-	throw std::runtime_error(std::string(function) +
-	                         ": ocr_backend must be 'tesseract' or 'external' (got '" + name + "')");
+	throw std::runtime_error(std::string(function) + ": ocr_backend must be 'tesseract' or 'external' (got '" + name +
+	                         "')");
 }
 
 std::string NormalizeOutputFormat(const std::string &name) {
