@@ -69,7 +69,7 @@ enum class ImageFormat : int {
 enum class Backend : int { Tesseract = 0, External = 1 };
 
 // Parse a user-facing backend name. Unknown values throw std::runtime_error.
-Backend BackendFromString(const std::string &name);
+Backend BackendFromString(const std::string &name, const char *function);
 const char *BackendName(Backend b);
 
 struct Options {

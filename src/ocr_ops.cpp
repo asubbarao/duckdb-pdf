@@ -736,7 +736,7 @@ static std::string LowerAscii(const std::string &name) {
 	return lower;
 }
 
-Backend BackendFromString(const std::string &name) {
+Backend BackendFromString(const std::string &name, const char *function) {
 	std::string lower = LowerAscii(name);
 	if (lower.empty() || lower == "tesseract" || lower == "default") {
 		return Backend::Tesseract;
@@ -744,7 +744,8 @@ Backend BackendFromString(const std::string &name) {
 	if (lower == "external" || lower == "plugin" || lower == "sota") {
 		return Backend::External;
 	}
-	throw std::runtime_error("read_pdf: ocr_backend must be 'tesseract' or 'external' (got '" + name + "')");
+	throw std::runtime_error(std::string(function) +
+	                         ": ocr_backend must be 'tesseract' or 'external' (got '" + name + "')");
 }
 
 std::string NormalizeOutputFormat(const std::string &name) {

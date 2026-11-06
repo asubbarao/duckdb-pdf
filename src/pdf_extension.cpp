@@ -127,21 +127,21 @@ static bool LayoutIsAuto(const string &s) {
 // Rejecting an unrecognised value is the whole point. Falling back to a default
 // here used to make `layout := true` (which casts to the string 'true') and any
 // typo silently produce the wrong text on multi-column pages, with no signal.
-static void ValidateLayout(const string &s) {
+static void ValidateLayout(const string &s, const char *fn) {
 	auto l = StringUtil::Lower(s);
 	if (l != "auto" && l != "physical" && l != "reading" && l != "raw") {
-		throw InvalidInputException("read_pdf: layout must be one of ['auto', 'physical', 'reading', 'raw'], not '%s'",
+		throw InvalidInputException("%s: layout must be one of ['auto', 'physical', 'reading', 'raw'], not '%s'", fn,
 		                            s);
 	}
 }
 
-static poppler::page::text_layout_enum LayoutFromString(const string &s, bool parse_tables) {
+static poppler::page::text_layout_enum LayoutFromString(const string &s, bool parse_tables, const char *fn) {
 	if (parse_tables) {
 		// physical layout preserves column alignment — the portable approximation of
 		// poppler core's table mode (true cell extraction is a core-engine follow-up).
 		return poppler::page::physical_layout;
 	}
-	ValidateLayout(s);
+	ValidateLayout(s, fn);
 	auto l = StringUtil::Lower(s);
 	if (l == "physical") {
 		return poppler::page::physical_layout;
@@ -2141,7 +2141,9 @@ static pdf_ocr::Options MakeOcrOptions(const PdfOptions &po, bool best_effort) {
 	o.tessdata_dir = po.tessdata_dir;
 	o.preprocess = po.ocr_preprocess;
 	o.best_effort = best_effort;
-	o.backend = pdf_ocr::BackendFromString(po.ocr_backend);
+	// Bind-time ParseNamed already validated the backend name for every
+	// caller, so this cannot fire on a typo; "read_pdf" is the legacy label.
+	o.backend = pdf_ocr::BackendFromString(po.ocr_backend, "read_pdf");
 	o.external_plugin = po.ocr_plugin;
 	o.external_endpoint = po.ocr_endpoint;
 	o.vars = po.ocr_vars;
@@ -2298,7 +2300,7 @@ static void PdfCheckOcrPaths(ClientContext &context, const PdfOptions &opt) {
 		PdfCheckAccess(context, opt.tessdata_dir, FileType::FILE_TYPE_DIR);
 }
 
-static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
+static void ParseNamed(const named_argument_map_t &params, PdfOptions &o, const char *fn) {
 	for (auto &kv : params) {
 		auto key = StringUtil::Lower(kv.first.GetIdentifierName());
 		if (key == "ocr") {
@@ -2341,7 +2343,7 @@ static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
 			o.ocr_endpoint = StringValue::Get(kv.second);
 		} else if (key == "ocr_vars") {
 			o.ocr_vars.clear();
-			ParseStringMapValue(kv.second, o.ocr_vars, "read_pdf: ocr_vars");
+			ParseStringMapValue(kv.second, o.ocr_vars, (string(fn) + ": ocr_vars").c_str());
 		} else if (key == "ocr_config") {
 			o.ocr_config = StringValue::Get(kv.second);
 		}
@@ -2352,27 +2354,27 @@ static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
 	// rendering / OCR engines (a huge dpi can OOM; an out-of-range psm/oem is
 	// cast into an undefined enum).
 	if (o.ocr_dpi < 1 || o.ocr_dpi > 2400) {
-		throw InvalidInputException("read_pdf: ocr_dpi must be between 1 and 2400 (got %d)", o.ocr_dpi);
+		throw InvalidInputException("%s: ocr_dpi must be between 1 and 2400 (got %d)", fn, o.ocr_dpi);
 	}
 	if (o.ocr_psm < 0 || o.ocr_psm > 13) {
-		throw InvalidInputException("read_pdf: ocr_psm must be between 0 and 13 (got %d)", o.ocr_psm);
+		throw InvalidInputException("%s: ocr_psm must be between 0 and 13 (got %d)", fn, o.ocr_psm);
 	}
 	if (o.ocr_oem < 0 || o.ocr_oem > 3) {
-		throw InvalidInputException("read_pdf: ocr_oem must be between 0 and 3 (got %d)", o.ocr_oem);
+		throw InvalidInputException("%s: ocr_oem must be between 0 and 3 (got %d)", fn, o.ocr_oem);
 	}
-	ValidateLayout(o.layout);
+	ValidateLayout(o.layout, fn);
 	if (o.first_page < 1) {
-		throw InvalidInputException("read_pdf: first_page must be >= 1 (got %d)", o.first_page);
+		throw InvalidInputException("%s: first_page must be >= 1 (got %d)", fn, o.first_page);
 	}
 	if (o.last_page == 0 || o.last_page < -1) {
-		throw InvalidInputException("read_pdf: last_page must be >= 1 (got %d)", o.last_page);
+		throw InvalidInputException("%s: last_page must be >= 1 (got %d)", fn, o.last_page);
 	}
 	if (o.last_page > 0 && o.last_page < o.first_page) {
-		throw InvalidInputException("read_pdf: last_page (%d) must be >= first_page (%d)", o.last_page, o.first_page);
+		throw InvalidInputException("%s: last_page (%d) must be >= first_page (%d)", fn, o.last_page, o.first_page);
 	}
 	// ocr_backend name is validated via BackendFromString so typos fail fast.
 	try {
-		(void)pdf_ocr::BackendFromString(o.ocr_backend);
+		(void)pdf_ocr::BackendFromString(o.ocr_backend, fn);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("%s", string(e.what()));
 	}
@@ -2506,23 +2508,24 @@ static void ReadPdfInput(ClientContext &context, const char *fn, const string &p
 	ReadAllBytes(context, path, bytes);
 }
 
-static unique_ptr<poppler::document> LoadDoc(const string &bytes, const string &password, const string &path) {
+static unique_ptr<poppler::document> LoadDoc(const string &bytes, const string &password, const string &path,
+                                             const char *fn) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	// poppler's load_from_raw_data takes an int length; guard against silent
 	// truncation (and the corresponding garbage read) for >2 GiB inputs.
 	if (bytes.size() > (size_t)NumericLimits<int>::Maximum()) {
-		throw IOException("read_pdf: '%s' is too large (%lld bytes; max ~2 GiB)", path, (long long)bytes.size());
+		throw IOException("%s: '%s' is too large (%lld bytes; max ~2 GiB)", fn, path, (long long)bytes.size());
 	}
 	auto doc = unique_ptr<poppler::document>(
 	    poppler::document::load_from_raw_data(bytes.data(), (int)bytes.size(), password, password));
 	if (!doc) {
-		throw IOException("read_pdf: could not open '%s' (corrupt or not a PDF)", path);
+		throw IOException("%s: could not open '%s' (corrupt or not a PDF)", fn, path);
 	}
 	if (doc->is_locked()) {
-		throw IOException("read_pdf: '%s' is encrypted; supply the correct password via password := '...'", path);
+		throw IOException("%s: '%s' is encrypted; supply the correct password via password := '...'", fn, path);
 	}
 	if (doc->pages() <= 0) {
-		throw IOException("read_pdf: '%s' has no readable pages (empty or unreadable document)", path);
+		throw IOException("%s: '%s' has no readable pages (empty or unreadable document)", fn, path);
 	}
 	// First successful document open initializes poppler's globalParams. Register
 	// bundled base-14 substitute fonts so subsequent rasterization does not depend
@@ -2585,7 +2588,7 @@ static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctio
                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ReadPdfBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
-	ParseNamed(input.named_parameters, result->opt);
+	ParseNamed(input.named_parameters, result->opt, "read_pdf");
 	PdfCheckOcrPaths(context, result->opt);
 
 	// has_text_layer: true when the native embedded text layer is non-blank.
@@ -2621,7 +2624,7 @@ static bool EnsureFileSlotLoaded(ClientContext &context, const ReadPdfBindData &
 			slot.input_bytes = &slot.bytes;
 		}
 		// The native reader outlives its decode state and every local worker.
-		auto probe = LoadDoc(*slot.input_bytes, bind.opt.password, slot.path);
+		auto probe = LoadDoc(*slot.input_bytes, bind.opt.password, slot.path, "read_pdf");
 		slot.page_count = probe->pages();
 		slot.has_page_labels = pdf_qpdf::HasPageLabels(*slot.input_bytes, bind.opt.password);
 		slot.first_page_0 = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
@@ -2670,7 +2673,7 @@ static bool ClaimNextPage(ClientContext &context, const ReadPdfBindData &bind, R
 			l.file_idx = fi;
 			l.current_file = slot.path;
 			// The native reader owns the borrowed buffer for the scan lifetime.
-			l.doc = LoadDoc(*slot.input_bytes, bind.opt.password, slot.path);
+			l.doc = LoadDoc(*slot.input_bytes, bind.opt.password, slot.path, "read_pdf");
 		}
 		l.page_idx = page;
 		l.page_count = slot.page_count;
@@ -2724,7 +2727,7 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 	auto &g = data_p.global_state->Cast<ReadPdfGlobalState>();
 	auto &l = data_p.local_state->Cast<ReadPdfLocalState>();
 	const bool auto_layout = !bind.opt.parse_tables && LayoutIsAuto(bind.opt.layout);
-	auto layout = LayoutFromString(bind.opt.layout, bind.opt.parse_tables);
+	auto layout = LayoutFromString(bind.opt.layout, bind.opt.parse_tables, "read_pdf");
 
 	idx_t count = 0;
 	while (count < (g.needs_ocr ? 1 : STANDARD_VECTOR_SIZE)) {
@@ -2859,10 +2862,11 @@ struct PdfInspectBindData : public TableFunctionData {
 };
 
 // Shared bind: resolve the file list and parse the password named parameter.
-static unique_ptr<FunctionData> PdfInspectBindCommon(ClientContext &context, TableFunctionBindInput &input) {
+static unique_ptr<FunctionData> PdfInspectBindCommon(ClientContext &context, TableFunctionBindInput &input,
+                                                     const char *fn) {
 	auto result = make_uniq<PdfInspectBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
-	ParseNamed(input.named_parameters, result->opt);
+	ParseNamed(input.named_parameters, result->opt, fn);
 	PdfCheckOcrPaths(context, result->opt);
 	return std::move(result);
 }
@@ -2987,7 +2991,7 @@ static unique_ptr<FunctionData> PdfInfoBind(ClientContext &context, TableFunctio
 	         "page_layout",
 	         "permanent_id",
 	         "update_id"};
-	return PdfInspectBindCommon(context, input);
+	return PdfInspectBindCommon(context, input, "pdf_info");
 }
 
 static unique_ptr<GlobalTableFunctionState> PdfInfoInit(ClientContext &, TableFunctionInitInput &input) {
@@ -3014,7 +3018,7 @@ static void PdfInfoScan(ClientContext &context, TableFunctionInput &data_p, Data
 		unique_ptr<poppler::document> doc;
 		try {
 			ReadAllBytes(context, path, bytes);
-			doc = LoadDoc(bytes, bind.opt.password, path);
+			doc = LoadDoc(bytes, bind.opt.password, path, "pdf_info");
 		} catch (const std::exception &) {
 			context.BlockingInterruptCheck();
 			if (!bind.opt.ignore_errors)
@@ -3219,7 +3223,7 @@ static unique_ptr<FunctionData> PdfStructureBind(ClientContext &context, TableFu
 	                LogicalType::VARCHAR,
 	                LogicalType::LIST(LogicalType::INTEGER)};
 	names = {"file", "ord", "depth", "parent_ord", "tag", "role", "page", "alt", "actual_text", "lang", "mcids"};
-	return PdfInspectBindCommon(context, input);
+	return PdfInspectBindCommon(context, input, "pdf_objects");
 }
 
 static unique_ptr<GlobalTableFunctionState> PdfStructureInit(ClientContext &, TableFunctionInitInput &) {
@@ -3308,7 +3312,7 @@ static unique_ptr<FunctionData> PdfOutlineBind(ClientContext &context, TableFunc
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::INTEGER};
 	names = {"file", "ord", "depth", "title", "page"};
-	return PdfInspectBindCommon(context, input);
+	return PdfInspectBindCommon(context, input, "pdf_objects");
 }
 
 static unique_ptr<GlobalTableFunctionState> PdfOutlineInit(ClientContext &, TableFunctionInitInput &) {
@@ -3332,7 +3336,7 @@ static void PdfOutlineScan(ClientContext &context, TableFunctionInput &data_p, D
 			string bytes;
 			try {
 				ReadAllBytes(context, st.current_file, bytes);
-				auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+				auto doc = LoadDoc(bytes, bind.opt.password, st.current_file, "pdf_objects");
 				unique_ptr<poppler::toc> toc(doc->create_toc());
 				if (toc && toc->root()) {
 					int ord = 0;
@@ -3398,7 +3402,7 @@ static unique_ptr<FunctionData> PdfAttachmentsBind(ClientContext &context, Table
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::BLOB};
 	names = {"file", "name", "description", "size", "mime_type", "data"};
-	return PdfInspectBindCommon(context, input);
+	return PdfInspectBindCommon(context, input, "pdf_objects");
 }
 
 static unique_ptr<GlobalTableFunctionState> PdfAttachmentsInit(ClientContext &, TableFunctionInitInput &) {
@@ -3421,7 +3425,7 @@ static void PdfAttachmentsScan(ClientContext &context, TableFunctionInput &data_
 			st.current_file = bind.files[st.file_idx++];
 			string bytes;
 			ReadAllBytes(context, st.current_file, bytes);
-			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file, "pdf_objects");
 			// embedded_file objects are owned by the document — copy everything
 			// out while the document is alive.
 			for (auto attachment : doc->embedded_files()) {
@@ -3773,7 +3777,7 @@ static unique_ptr<FunctionData> PdfRevisionsBind(ClientContext &context, TableFu
 	return_types = {LogicalType::INTEGER, LogicalType::BIGINT,  LogicalType::BIGINT,
 	                LogicalType::BIGINT,  LogicalType::BOOLEAN, LogicalType::VARCHAR};
 	names = {"revision_index", "startxref_offset", "eof_offset", "size_bytes", "is_incremental", "filename"};
-	return PdfInspectBindCommon(context, input);
+	return PdfInspectBindCommon(context, input, "pdf_objects");
 }
 
 static unique_ptr<GlobalTableFunctionState> PdfRevisionsInit(ClientContext &, TableFunctionInitInput &) {
@@ -3846,7 +3850,7 @@ static unique_ptr<FunctionData> ReadPdfWordsBind(ClientContext &context, TableFu
                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ReadPdfWordsBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
-	ParseNamed(input.named_parameters, result->opt);
+	ParseNamed(input.named_parameters, result->opt, "read_pdf_words");
 	PdfCheckOcrPaths(context, result->opt);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::DOUBLE,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::VARCHAR,
@@ -3946,7 +3950,7 @@ static void WordsOpenFile(ClientContext &context, const ReadPdfWordsBindData &bi
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	g.current_file = bind.files[g.file_idx];
 	ReadAllBytes(context, g.current_file, g.file_bytes);
-	g.doc = LoadDoc(g.file_bytes, bind.opt.password, g.current_file);
+	g.doc = LoadDoc(g.file_bytes, bind.opt.password, g.current_file, "read_pdf_words");
 	g.has_page_labels = pdf_qpdf::HasPageLabels(g.file_bytes, bind.opt.password);
 	g.page_count = g.doc->pages();
 	g.page_idx = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
@@ -4086,7 +4090,7 @@ static unique_ptr<FunctionData> ReadPdfLinesBind(ClientContext &context, TableFu
                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ReadPdfLinesBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
-	ParseNamed(input.named_parameters, result->opt);
+	ParseNamed(input.named_parameters, result->opt, "read_pdf");
 	PdfCheckOcrPaths(context, result->opt);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR};
@@ -4115,7 +4119,7 @@ static void LinesOpenFile(ClientContext &context, const ReadPdfLinesBindData &bi
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
 	g.current_file = bind.files[g.file_idx];
 	ReadAllBytes(context, g.current_file, g.file_bytes);
-	g.doc = LoadDoc(g.file_bytes, bind.opt.password, g.current_file);
+	g.doc = LoadDoc(g.file_bytes, bind.opt.password, g.current_file, "read_pdf");
 	g.has_page_labels = pdf_qpdf::HasPageLabels(g.file_bytes, bind.opt.password);
 	g.page_count = g.doc->pages();
 	g.page_idx = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
@@ -4134,7 +4138,7 @@ static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 		return false;
 	}
 	const bool auto_layout = LayoutIsAuto(opt.layout);
-	auto layout = LayoutFromString(opt.layout, false);
+	auto layout = LayoutFromString(opt.layout, false, "read_pdf");
 	unique_ptr<poppler::page> page(g.doc->create_page(g.page_idx));
 	if (page) {
 		auto poppler_label = UStringToUtf8(page->label());
@@ -4783,7 +4787,7 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 	rows.clear();
 	string bytes;
 	ReadAllBytes(context, path, bytes);
-	auto doc = LoadDoc(bytes, opt.password, path);
+	auto doc = LoadDoc(bytes, opt.password, path, "read_pdf_elements");
 	int page_count = doc->pages();
 	int first_0 = opt.first_page > 0 ? opt.first_page - 1 : 0;
 	int last_0 = opt.last_page < 0 ? page_count : MinValue<int>(opt.last_page, page_count);
@@ -4881,7 +4885,7 @@ static unique_ptr<FunctionData> ReadPdfElementsBind(ClientContext &context, Tabl
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	// Preserve the legacy native-only default; OCR is opt-in for this reader.
 	result->opt.auto_ocr = false;
-	ParseNamed(input.named_parameters, result->opt);
+	ParseNamed(input.named_parameters, result->opt, "read_pdf_elements");
 	PdfCheckOcrPaths(context, result->opt);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
@@ -5194,7 +5198,7 @@ static unique_ptr<FunctionData> PdfChunksBind(ClientContext &context, TableFunct
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
 	// Chunks inherit the element reader's legacy native-only default.
 	result->opt.auto_ocr = false;
-	ParseNamed(input.named_parameters, result->opt);
+	ParseNamed(input.named_parameters, result->opt, "pdf_chunks");
 	PdfCheckOcrPaths(context, result->opt);
 	int32_t chunk_size = CHUNK_DEFAULT_SIZE;
 	int32_t overlap = CHUNK_DEFAULT_OVERLAP;
@@ -5300,7 +5304,7 @@ static unique_ptr<FunctionData> ReadPdfTablesBind(ClientContext &context, TableF
                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ReadPdfTablesBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
-	ParseNamed(input.named_parameters, result->opt);
+	ParseNamed(input.named_parameters, result->opt, "read_pdf");
 	PdfCheckOcrPaths(context, result->opt);
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER,
 	                LogicalType::LIST(LogicalType::VARCHAR)};
@@ -5317,13 +5321,13 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 		unique_ptr<poppler::document> doc;
 		try {
 			ReadAllBytes(context, f, bytes);
-			doc = LoadDoc(bytes, bind.opt.password, f);
+			doc = LoadDoc(bytes, bind.opt.password, f, "read_pdf");
 		} catch (const std::exception &e) {
 			// unwrap duckdb exceptions (their .what() is JSON) to expose the clean inner message
-			// e.g. "read_pdf: read_pdf: could not open '...'"
+			// e.g. "read_pdf: could not open '...'" (LoadDoc already names the function)
 			ErrorData ed(e);
 			string msg = ed.HasError() ? ed.RawMessage() : string(e.what());
-			throw InvalidInputException("read_pdf: %s", msg.c_str());
+			throw InvalidInputException("%s", msg.c_str());
 		}
 		int page_count = doc->pages();
 		int first0 = bind.opt.first_page > 0 ? bind.opt.first_page - 1 : 0;
@@ -5437,9 +5441,9 @@ static void ReadPdfTablesScan(ClientContext &context, TableFunctionInput &data_p
 // Library-backed (poppler-cpp); no external process. layout is one of
 // 'reading' (default) | 'physical' | 'raw'.
 //===--------------------------------------------------------------------===//
-static string DocToText(poppler::document &doc, const string &layout_str) {
+static string DocToText(poppler::document &doc, const string &layout_str, const char *fn) {
 	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-	auto layout = LayoutFromString(layout_str, false);
+	auto layout = LayoutFromString(layout_str, false, fn);
 	string out;
 	int n = doc.pages();
 	for (int p = 0; p < n; p++) {
@@ -7796,7 +7800,7 @@ static void PdfSplitBlankExecute(ClientContext &context, const string &input, co
 
 	string bytes;
 	ReadAllBytes(context, input, bytes);
-	auto doc = LoadDoc(bytes, "", input);
+	auto doc = LoadDoc(bytes, "", input, "pdf_split");
 	const int page_count = doc->pages();
 
 	std::vector<bool> is_separator(page_count, false);
@@ -7943,7 +7947,7 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 	PdfOpsCheckInOut("pdf_ocr", input, output);
 	string bytes;
 	ReadPdfInput(context, "pdf_ocr", input, bytes);
-	auto doc = LoadDoc(bytes, po.password, input);
+	auto doc = LoadDoc(bytes, po.password, input, "pdf_ocr");
 	if (StringUtil::Lower(po.ocr_backend) != "tesseract") {
 		throw InvalidInputException("pdf_ocr: the searchable-PDF renderer requires ocr_backend := 'tesseract'");
 	}
@@ -8024,7 +8028,7 @@ static unique_ptr<FunctionData> PdfOcrBind(ClientContext &context, TableFunction
 	auto result = make_uniq<PdfOcrBindData>();
 	result->input = StringValue::Get(input.inputs[0]);
 	result->output = StringValue::Get(input.inputs[1]);
-	ParseNamed(input.named_parameters, result->opt);
+	ParseNamed(input.named_parameters, result->opt, "pdf_ocr");
 	PdfCheckOcrPaths(context, result->opt);
 	for (auto &kv : input.named_parameters) {
 		if (StringUtil::Lower(kv.first.GetIdentifierName()) == "force") {
@@ -8821,7 +8825,7 @@ static void PdfRedactExecuteFile(ClientContext &context, const string &input_pat
 
 	string bytes;
 	ReadAllBytes(context, input_path, bytes);
-	auto doc = LoadDoc(bytes, password, input_path);
+	auto doc = LoadDoc(bytes, password, input_path, "pdf_redact");
 	const int page_count = doc->pages();
 
 	for (auto &box : boxes) {
@@ -9247,7 +9251,7 @@ static unique_ptr<FunctionData> PdfPagesInfoBind(ClientContext &context, TableFu
 	                LogicalType::DOUBLE};
 	names = {"file",       "page",        "page_count", "width",       "height", "media_width", "media_height",
 	         "crop_width", "crop_height", "rotation",   "orientation", "label",  "duration"};
-	return PdfInspectBindCommon(context, input);
+	return PdfInspectBindCommon(context, input, "pdf_objects");
 }
 
 static unique_ptr<GlobalTableFunctionState> PdfPagesInfoInit(ClientContext &, TableFunctionInitInput &) {
@@ -9269,7 +9273,7 @@ static void PdfPagesInfoScan(ClientContext &context, TableFunctionInput &data_p,
 			st.current_file = bind.files[st.file_idx++];
 			string bytes;
 			ReadAllBytes(context, st.current_file, bytes);
-			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file, "pdf_objects");
 			st.has_page_labels = pdf_qpdf::HasPageLabels(bytes, bind.opt.password);
 			st.page_count = doc->pages();
 			for (int i = 0; i < st.page_count; i++) {
@@ -9348,7 +9352,7 @@ static unique_ptr<FunctionData> PdfFontsBind(ClientContext &context, TableFuncti
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::VARCHAR};
 	names = {"file", "page", "name", "type", "embedded", "subset", "font_file"};
-	return PdfInspectBindCommon(context, input);
+	return PdfInspectBindCommon(context, input, "pdf_objects");
 }
 
 static unique_ptr<GlobalTableFunctionState> PdfFontsInit(ClientContext &, TableFunctionInitInput &) {
@@ -9370,7 +9374,7 @@ static void PdfFontsScan(ClientContext &context, TableFunctionInput &data_p, Dat
 			st.current_file = bind.files[st.file_idx++];
 			string bytes;
 			ReadAllBytes(context, st.current_file, bytes);
-			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file, "pdf_objects");
 			// Prefer the page-walking iterator so each font is tagged with the
 			// page it first appears on; fall back to document::fonts() if the
 			// iterator is unavailable.
@@ -9448,7 +9452,7 @@ static unique_ptr<FunctionData> PdfDestinationsBind(ClientContext &context, Tabl
 	                LogicalType::DOUBLE,  LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN};
 	names = {"file",  "name", "type", "page",        "left",       "bottom",
 	         "right", "top",  "zoom", "change_left", "change_top", "change_zoom"};
-	return PdfInspectBindCommon(context, input);
+	return PdfInspectBindCommon(context, input, "pdf_objects");
 }
 
 static unique_ptr<GlobalTableFunctionState> PdfDestinationsInit(ClientContext &, TableFunctionInitInput &) {
@@ -9470,7 +9474,7 @@ static void PdfDestinationsScan(ClientContext &context, TableFunctionInput &data
 			st.current_file = bind.files[st.file_idx++];
 			string bytes;
 			ReadAllBytes(context, st.current_file, bytes);
-			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file);
+			auto doc = LoadDoc(bytes, bind.opt.password, st.current_file, "pdf_objects");
 			// create_destination_map returns by value; destinations are movable.
 			auto dest_map = doc->create_destination_map();
 			for (auto &kv : dest_map) {
@@ -9544,7 +9548,7 @@ static unique_ptr<FunctionData> PdfPageImagesBind(ClientContext &context, TableF
                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PdfPageImagesBindData>();
 	result->files = ResolveFiles(context, StringValue::Get(input.inputs[0]));
-	ParseNamed(input.named_parameters, result->opt);
+	ParseNamed(input.named_parameters, result->opt, "pdf_render");
 	PdfCheckOcrPaths(context, result->opt);
 	for (auto &kv : input.named_parameters) {
 		if (StringUtil::Lower(kv.first.GetIdentifierName()) == "dpi") {
@@ -9589,7 +9593,7 @@ static void PdfPageImagesScan(ClientContext &context, TableFunctionInput &data_p
 		}
 		st.current_file = bind.files[st.file_idx++];
 		ReadAllBytes(context, st.current_file, st.file_bytes);
-		st.doc = LoadDoc(st.file_bytes, bind.opt.password, st.current_file);
+		st.doc = LoadDoc(st.file_bytes, bind.opt.password, st.current_file, "pdf_render");
 		st.page_count = st.doc->pages();
 		st.next_page = bind.opt.first_page > 0 ? bind.opt.first_page : 1;
 		st.last_page = bind.opt.last_page < 0 ? st.page_count : MinValue<int>(bind.opt.last_page, st.page_count);
@@ -9764,7 +9768,7 @@ static unique_ptr<FunctionData> PdfWritePageImagesBind(ClientContext &context, T
 	if (result->out_dir.empty()) {
 		throw InvalidInputException("pdf_render: out_dir must not be empty");
 	}
-	ParseNamed(input.named_parameters, result->opt);
+	ParseNamed(input.named_parameters, result->opt, "pdf_render");
 	PdfCheckOcrPaths(context, result->opt);
 	for (auto &kv : input.named_parameters) {
 		if (StringUtil::Lower(kv.first.GetIdentifierName()) == "dpi") {
@@ -9810,7 +9814,7 @@ static void PdfWritePageImagesExecute(ClientContext &context, const PdfWritePage
 	for (auto &path : bind.files) {
 		string bytes;
 		ReadAllBytes(context, path, bytes);
-		auto doc = LoadDoc(bytes, bind.opt.password, path);
+		auto doc = LoadDoc(bytes, bind.opt.password, path, "pdf_render");
 		int page_count = doc->pages();
 		int first = bind.opt.first_page > 0 ? bind.opt.first_page : 1;
 		int last = bind.opt.last_page < 0 ? page_count : MinValue<int>(bind.opt.last_page, page_count);

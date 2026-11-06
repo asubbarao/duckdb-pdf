@@ -147,7 +147,7 @@ static void PdfFamilyOcrImage(DataChunk &args, ExpressionState &state, Vector &r
 	}
 }
 
-static void PdfFamilyText(DataChunk &args, ExpressionState &state, Vector &result) {
+static void PdfFamilyTextImpl(DataChunk &args, ExpressionState &state, Vector &result, const char *fn) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &context = state.GetContext();
 	bool blob = args.data[0].GetType().id() == LogicalTypeId::BLOB;
@@ -159,17 +159,17 @@ static void PdfFamilyText(DataChunk &args, ExpressionState &state, Vector &resul
 			continue;
 		}
 		PdfFamilyOptions opt =
-		    args.ColumnCount() > 1 ? PdfFamilyOptions(args.GetValue(1, row), "pdf_text") : PdfFamilyOptions();
+		    args.ColumnCount() > 1 ? PdfFamilyOptions(args.GetValue(1, row), fn) : PdfFamilyOptions();
 		if (!opt.Has("format") || !opt.values.at("format").IsNull()) {
 			auto f = StringUtil::Lower(opt.Text("format", "text"));
 			if (f == "text")
-				opt.Validate("pdf_text", {"format", "layout", "password"});
+				opt.Validate(fn, {"format", "layout", "password"});
 			else if (f == "html" || f == "xml" || f == "json")
-				opt.Validate("pdf_text", {"format", "password"});
+				opt.Validate(fn, {"format", "password"});
 			else if (f == "markdown")
-				opt.Validate("pdf_text", {"format"});
+				opt.Validate(fn, {"format"});
 			else
-				throw InvalidInputException("pdf_text: unknown format '%s'", f);
+				throw InvalidInputException("%s: unknown format '%s'", fn, f);
 		}
 		if (opt.HasNull()) {
 			FlatVector::SetNull(result, row, true);
@@ -181,7 +181,7 @@ static void PdfFamilyText(DataChunk &args, ExpressionState &state, Vector &resul
 			PdfCheckAccess(context, value);
 		if (format == "markdown") {
 			if (blob)
-				throw InvalidInputException("pdf_text: markdown requires a path");
+				throw InvalidInputException("%s: markdown requires a path", fn);
 			result.SetValue(row, Value(DocToMarkdown(context, value)));
 			continue;
 		}
@@ -194,22 +194,26 @@ static void PdfFamilyText(DataChunk &args, ExpressionState &state, Vector &resul
 			try {
 				result.SetValue(row, Value(pdf_qpdf::WriteJson(bytes, opt.Text("password"), 2)));
 			} catch (const std::exception &e) {
-				throw IOException("pdf_text: %s", string(e.what()));
+				throw IOException("%s: %s", fn, string(e.what()));
 			}
 			continue;
 		}
-		auto doc = LoadDoc(bytes, opt.Text("password"), blob ? "<blob>" : value);
-		string output = format == "text"   ? DocToText(*doc, opt.Text("layout", "reading"))
+		auto doc = LoadDoc(bytes, opt.Text("password"), blob ? "<blob>" : value, fn);
+		string output = format == "text"   ? DocToText(*doc, opt.Text("layout", "reading"), fn)
 		                : format == "html" ? DocToHtml(*doc)
 		                                   : DocToXml(*doc);
 		result.SetValue(row, Value(output));
 	}
 }
 
+static void PdfFamilyText(DataChunk &args, ExpressionState &state, Vector &result) {
+	PdfFamilyTextImpl(args, state, result, "pdf_text");
+}
+
 // Preserve pdf_to_text(input[, layout]) while sharing the consolidated executor.
 static void PdfLegacyText(DataChunk &args, ExpressionState &state, Vector &result) {
 	if (args.ColumnCount() == 1) {
-		PdfFamilyText(args, state, result);
+		PdfFamilyTextImpl(args, state, result, "pdf_to_text");
 		return;
 	}
 	DataChunk forwarded;
@@ -219,7 +223,7 @@ static void PdfLegacyText(DataChunk &args, ExpressionState &state, Vector &resul
 	for (idx_t row = 0; row < args.size(); ++row)
 		forwarded.SetValue(1, row, Value::STRUCT({{"layout", args.GetValue(1, row)}}));
 	forwarded.SetCardinality(args.size());
-	PdfFamilyText(forwarded, state, result);
+	PdfFamilyTextImpl(forwarded, state, result, "pdf_to_text");
 }
 
 static void PdfFamilyRender(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -250,7 +254,7 @@ static void PdfFamilyRender(DataChunk &args, ExpressionState &state, Vector &res
 			bytes = value;
 		else
 			ReadAllBytes(context, value, bytes);
-		auto doc = LoadDoc(bytes, "", blob ? "<blob>" : value);
+		auto doc = LoadDoc(bytes, "", blob ? "<blob>" : value, "pdf_render");
 		auto page_no = IntegerValue::Get(page), dpi = opt.Int("dpi", 150);
 		auto output = format == "png" ? DocToPng(*doc, page_no, dpi) : DocToSvg(*doc, page_no, dpi);
 		result.SetValue(row, Value::BLOB(const_data_ptr_cast(output.data()), output.size()));
