@@ -387,6 +387,8 @@ struct LayoutWord {
 	double x1 = 0.0;
 	double y1 = 0.0;
 	double font_size = 0.0; // 0 when unknown (OCR); only used to spot display type
+	// poppler text_box::rotation(): quarter turns, 0 for upright text. OCR words are 0.
+	int rotation = 0;
 	string text;
 };
 
@@ -400,7 +402,30 @@ struct MergedTextBox {
 	double font_size = 0.0;
 	bool has_font = false;
 	bool has_space_after = true;
+	int rotation = 0;
 };
+
+// Where a word sits along the direction its line is read, so that sorting a line's
+// words by this key reads them in order. Upright text runs left to right; a quarter
+// turn runs top to bottom (1) or bottom to top (3), and upside-down text right to left.
+// Sorting a turned line by x0 instead, which every caller used to do, gives an
+// arbitrary order: all its words share one x.
+static double LayoutReadingKey(int rotation, double x0, double y0, double x1, double y1) {
+	switch (rotation & 3) {
+	case 1:
+		return y0;
+	case 2:
+		return -x1;
+	case 3:
+		return -y1;
+	default:
+		return x0;
+	}
+}
+
+static double LayoutReadingKey(const LayoutWord &w) {
+	return LayoutReadingKey(w.rotation, w.x0, w.y0, w.x1, w.y1);
+}
 
 // A word joins a line when it overlaps that line vertically by at least this
 // fraction of the shorter of the two heights.
@@ -436,13 +461,16 @@ static std::vector<MergedTextBox> MergeSpacelessBoxes(std::vector<poppler::text_
 			current.font_size = box.get_font_size();
 		}
 		current.has_space_after = box.has_space_after();
+		current.rotation = box.rotation();
 		if (!merged.empty()) {
 			auto &previous = merged.back();
 			double gap = current.x0 - previous.x1;
 			double overlap = MinValue<double>(current.y1, previous.y1) - MaxValue<double>(current.y0, previous.y0);
 			double shorter = MinValue<double>(current.y1 - current.y0, previous.y1 - previous.y0);
 			bool same_line = shorter > 0.0 && overlap >= LAYOUT_LINE_OVERLAP_MIN_RATIO * shorter;
-			if (!previous.has_space_after && same_line && std::fabs(gap) < LAYOUT_JOIN_MAX_GAP_RATIO * shorter) {
+			// The gap test is horizontal, so it only describes two upright boxes.
+			if (current.rotation == 0 && previous.rotation == 0 && !previous.has_space_after && same_line &&
+			    std::fabs(gap) < LAYOUT_JOIN_MAX_GAP_RATIO * shorter) {
 				previous.text += current.text;
 				previous.x0 = MinValue<double>(previous.x0, current.x0);
 				previous.y0 = MinValue<double>(previous.y0, current.y0);
@@ -493,6 +521,27 @@ static constexpr double LAYOUT_GUTTER_EDGE_TOLERANCE = 1.5;
 // lines of its own.
 static constexpr double LAYOUT_GUTTER_MAX_CROSSING_WORD_RATIO = 0.2;
 static constexpr size_t LAYOUT_MIN_GUTTER_SIDE_LINES = 8;
+// A full-width figure and its caption over two columns put more than that on crossing
+// lines: 21%, 22% and 35% of the words on pages 11, 6 and 10 of arXiv 2610.39302, which
+// the limit above read as one column, fusing the columns line by line. So does a
+// single-column page holding a two-column table — the DuckDB documentation's
+// Function | Description tables cross 20-50% too — and cutting that one reads every
+// name before every description. Up to this ceiling, a corridor is accepted only when
+// what it separates looks like reading columns rather than table columns.
+static constexpr double LAYOUT_GUTTER_MAX_CROSSING_WORD_RATIO_FOR_COLUMNS = 0.5;
+// Reading columns are set to one width: the narrower side is at least this fraction of
+// the wider (0.94-0.99 on the arXiv pages above). A table's cell boundary falls wherever
+// its content puts it (median 0.42 over the 155 documentation and blog pages it split).
+static constexpr double LAYOUT_COLUMN_MIN_WIDTH_RATIO = 0.8;
+// ...and hold prose: the median line on the sparser side carries at least this many
+// words (6-9 on the arXiv pages; table cells and code carry 1-4 on every page above
+// that passes the width test).
+static constexpr double LAYOUT_COLUMN_MIN_MEDIAN_WORDS = 5.0;
+// ...and are both filled: the side with fewer lines has at least this fraction of the
+// other's (0.87-0.98 on the arXiv pages). A wide table split down the middle beside code
+// fills one side only: DuckDB blog page 603 has 10 table rows on the right against 41
+// lines on the left, and passes the two tests above because its cells are word-dense.
+static constexpr double LAYOUT_COLUMN_MIN_LINE_RATIO = 0.5;
 // LayoutLineIds is defined after the band code that calls it.
 // `spanning_lines`, when given, receives one flag per line id (index id - 1):
 // whether that line crosses a column gutter.
@@ -612,35 +661,57 @@ static std::vector<std::pair<double, double>> LayoutGuttersByVerticalRun(const s
 			// A gutter has text on both sides of it, at the same heights, on most lines.
 			// Blank space alone is not evidence: the empty middle of a figure is clear
 			// too, and cutting there would slice every full-width prose line in two.
-			std::vector<char> has_left(static_cast<size_t>(n_lines) + 1, 0);
-			std::vector<char> has_right(static_cast<size_t>(n_lines) + 1, 0);
+			std::vector<size_t> left_words_on(static_cast<size_t>(n_lines) + 1, 0);
+			std::vector<size_t> right_words_on(static_cast<size_t>(n_lines) + 1, 0);
 			std::vector<char> crosses(static_cast<size_t>(n_lines) + 1, 0);
 			for (size_t i = 0; i < words.size(); i++) {
 				const auto &word = words[i];
 				const size_t l = static_cast<size_t>(line_of[i]);
 				if (word.x1 <= left.position + edge_tol) {
-					has_left[l] = 1;
+					left_words_on[l]++;
 				} else if (word.x0 >= right.position - edge_tol) {
-					has_right[l] = 1;
+					right_words_on[l]++;
 				} else {
 					crosses[l] = 1;
 				}
 			}
 			size_t crossing_words = 0;
-			size_t left_lines = 0;
-			size_t right_lines = 0;
+			std::vector<double> left_line_words;
+			std::vector<double> right_line_words;
 			for (size_t l = 1; l <= static_cast<size_t>(n_lines); l++) {
 				if (crosses[l]) {
 					crossing_words += words_on_line[l];
-				} else if (has_left[l] || has_right[l]) {
-					left_lines += has_left[l];
-					right_lines += has_right[l];
+					continue;
+				}
+				if (left_words_on[l] > 0) {
+					left_line_words.push_back(static_cast<double>(left_words_on[l]));
+				}
+				if (right_words_on[l] > 0) {
+					right_line_words.push_back(static_cast<double>(right_words_on[l]));
 				}
 			}
-			if (static_cast<double>(crossing_words) >
-			        LAYOUT_GUTTER_MAX_CROSSING_WORD_RATIO * static_cast<double>(words.size()) ||
-			    left_lines < LAYOUT_MIN_GUTTER_SIDE_LINES || right_lines < LAYOUT_MIN_GUTTER_SIDE_LINES) {
+			const size_t left_lines = left_line_words.size();
+			const size_t right_lines = right_line_words.size();
+			if (left_lines < LAYOUT_MIN_GUTTER_SIDE_LINES || right_lines < LAYOUT_MIN_GUTTER_SIDE_LINES) {
 				continue;
+			}
+			const double crossing_ratio = static_cast<double>(crossing_words) / static_cast<double>(words.size());
+			if (crossing_ratio > LAYOUT_GUTTER_MAX_CROSSING_WORD_RATIO_FOR_COLUMNS) {
+				continue;
+			}
+			if (crossing_ratio > LAYOUT_GUTTER_MAX_CROSSING_WORD_RATIO) {
+				const double left_width = midpoint - page_left;
+				const double right_width = page_right - midpoint;
+				const double width_ratio =
+				    MinValue<double>(left_width, right_width) / MaxValue<double>(left_width, right_width);
+				const double sparser_median =
+				    MinValue<double>(Median(std::move(left_line_words)), Median(std::move(right_line_words)));
+				const double line_ratio = static_cast<double>(MinValue<size_t>(left_lines, right_lines)) /
+				                          static_cast<double>(MaxValue<size_t>(left_lines, right_lines));
+				if (width_ratio < LAYOUT_COLUMN_MIN_WIDTH_RATIO || sparser_median < LAYOUT_COLUMN_MIN_MEDIAN_WORDS ||
+				    line_ratio < LAYOUT_COLUMN_MIN_LINE_RATIO) {
+					continue;
+				}
 			}
 			candidates.push_back({left.position, right.position, left_lines + right_lines});
 		}
@@ -679,7 +750,11 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 	std::vector<LayoutWord> body_words;
 	body_words.reserve(words.size());
 	for (const auto &w : words) {
-		if (body <= 0.0 || w.font_size <= 0.0 || w.font_size <= LAYOUT_DISPLAY_FONT_RATIO * body) {
+		// Turned text (a margin stamp, an axis label) is not body text either: its box
+		// runs across lines, so it would join lines that never meet in the fallback's
+		// page-wide grouping and inflate the words a corridor appears to cross.
+		if (w.rotation == 0 &&
+		    (body <= 0.0 || w.font_size <= 0.0 || w.font_size <= LAYOUT_DISPLAY_FONT_RATIO * body)) {
 			body_words.push_back(w);
 		}
 	}
@@ -799,6 +874,9 @@ static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, 
 		double y0;
 		double y1;
 		bool spanning;
+		bool rotated; // a line of turned text (rotation != 0)
+		double x0;
+		double x1;
 	};
 	std::vector<size_t> order(words.size());
 	for (size_t i = 0; i < order.size(); i++) {
@@ -813,9 +891,18 @@ static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, 
 		}
 		return words[a].x0 < words[b].x0;
 	});
+	// Turned text never joins an upright line. Its box runs across the lines it sits
+	// beside — arXiv's vertical margin stamp is 20pt wide and 20-56pt tall beside 13pt
+	// lines of the abstract — and a line grows to cover every word it takes in, so one
+	// stamp word used to swallow the next three to five lines and interleave their words.
 	std::vector<LineGroup> fragments;
+	std::vector<size_t> turned;
 	for (size_t idx : order) {
 		const auto &w = words[idx];
+		if (w.rotation != 0) {
+			turned.push_back(idx);
+			continue;
+		}
 		bool joined = !fragments.empty() && bands[idx] == fragments.back().band;
 		if (joined) {
 			const auto &fragment = fragments.back();
@@ -828,11 +915,52 @@ static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, 
 			fragment.members.push_back(idx);
 			fragment.y0 = MinValue<double>(fragment.y0, w.y0);
 			fragment.y1 = MaxValue<double>(fragment.y1, w.y1);
+			fragment.x0 = MinValue<double>(fragment.x0, w.x0);
+			fragment.x1 = MaxValue<double>(fragment.x1, w.x1);
 		} else {
-			fragments.push_back({{idx}, bands[idx], w.y0, w.y1, false});
+			fragments.push_back({{idx}, bands[idx], w.y0, w.y1, false, false, w.x0, w.x1});
+		}
+	}
+	// A line of turned text is the same test turned with it: words of one rotation in
+	// one band whose boxes overlap across the direction they are read.
+	std::sort(turned.begin(), turned.end(), [&](size_t a, size_t b) {
+		if (bands[a] != bands[b]) {
+			return bands[a] < bands[b];
+		}
+		if (words[a].rotation != words[b].rotation) {
+			return words[a].rotation < words[b].rotation;
+		}
+		if (words[a].x0 != words[b].x0) {
+			return words[a].x0 < words[b].x0;
+		}
+		return LayoutReadingKey(words[a]) < LayoutReadingKey(words[b]);
+	});
+	const size_t first_turned_fragment = fragments.size();
+	for (size_t idx : turned) {
+		const auto &w = words[idx];
+		bool joined = fragments.size() > first_turned_fragment && bands[idx] == fragments.back().band &&
+		              w.rotation == words[fragments.back().members.front()].rotation;
+		if (joined) {
+			const auto &fragment = fragments.back();
+			const double overlap = MinValue<double>(w.x1, fragment.x1) - MaxValue<double>(w.x0, fragment.x0);
+			const double narrower = MinValue<double>(w.x1 - w.x0, fragment.x1 - fragment.x0);
+			joined = narrower > 0.0 && overlap >= LAYOUT_LINE_OVERLAP_MIN_RATIO * narrower;
+		}
+		if (joined) {
+			auto &fragment = fragments.back();
+			fragment.members.push_back(idx);
+			fragment.y0 = MinValue<double>(fragment.y0, w.y0);
+			fragment.y1 = MaxValue<double>(fragment.y1, w.y1);
+			fragment.x0 = MinValue<double>(fragment.x0, w.x0);
+			fragment.x1 = MaxValue<double>(fragment.x1, w.x1);
+		} else {
+			fragments.push_back({{idx}, bands[idx], w.y0, w.y1, false, true, w.x0, w.x1});
 		}
 	}
 	for (auto &fragment : fragments) {
+		if (fragment.rotated) {
+			continue;
+		}
 		for (size_t idx : fragment.members) {
 			for (const auto &gutter : gutters) {
 				if (words[idx].x0 < gutter.second - LAYOUT_GUTTER_EDGE_TOLERANCE &&
@@ -875,7 +1003,7 @@ static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, 
 			continue;
 		}
 		bool merge = fragments[i].spanning;
-		if (!merge) {
+		if (!merge && !fragments[i].rotated) {
 			for (size_t j = 0; j < fragments.size(); j++) {
 				if (fragments[j].spanning && overlaps(fragments[i], fragments[j])) {
 					merge = true;
@@ -890,7 +1018,8 @@ static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, 
 			while (changed) {
 				changed = false;
 				for (size_t j = 0; j < fragments.size(); j++) {
-					if (consumed[j] || !overlaps(group, fragments[j]) || !connects(group, fragments[j])) {
+					if (consumed[j] || fragments[j].rotated || !overlaps(group, fragments[j]) ||
+					    !connects(group, fragments[j])) {
 						continue;
 					}
 					group.members.insert(group.members.end(), fragments[j].members.begin(), fragments[j].members.end());
@@ -931,6 +1060,20 @@ static std::vector<int32_t> LayoutLineIds(const std::vector<LayoutWord> &words, 
 		group_order[i] = i;
 	}
 	std::sort(group_order.begin(), group_order.end(), [&](size_t a, size_t b) {
+		// Turned text is its own flow — margin stamps, axis labels, a sideways table
+		// header — read after the page's upright text, by band and then left to right.
+		if (groups[a].rotated != groups[b].rotated) {
+			return !groups[a].rotated;
+		}
+		if (groups[a].rotated) {
+			if (groups[a].band != groups[b].band) {
+				return groups[a].band < groups[b].band;
+			}
+			if (groups[a].x0 != groups[b].x0) {
+				return groups[a].x0 < groups[b].x0;
+			}
+			return groups[a].y0 < groups[b].y0;
+		}
 		auto section = [&](size_t group_index) {
 			if (groups[group_index].spanning) {
 				return spanning_rank(group_index);
@@ -1026,7 +1169,8 @@ static string LayoutPageText(const std::vector<LayoutWord> &words, double page_w
 	bool continues = false;
 	for (size_t l = 0; l < by_line.size(); l++) {
 		auto &idxs = by_line[l];
-		std::sort(idxs.begin(), idxs.end(), [&](size_t a, size_t b) { return words[a].x0 < words[b].x0; });
+		std::sort(idxs.begin(), idxs.end(),
+		          [&](size_t a, size_t b) { return LayoutReadingKey(words[a]) < LayoutReadingKey(words[b]); });
 		if (!out.empty() && !continues) {
 			out += "\n";
 		}
@@ -1040,7 +1184,8 @@ static string LayoutPageText(const std::vector<LayoutWord> &words, double page_w
 		// Every line id has at least one word, so its band is that of any member;
 		// spanning lines share one band and form their own flow.
 		const bool same_flow = l + 1 < by_line.size() && !idxs.empty() && !by_line[l + 1].empty() &&
-		                       spanning[l] == spanning[l + 1] && bands[idxs.front()] == bands[by_line[l + 1].front()];
+		                       spanning[l] == spanning[l + 1] && bands[idxs.front()] == bands[by_line[l + 1].front()] &&
+		                       words[idxs.front()].rotation == words[by_line[l + 1].front()].rotation;
 		const size_t hyphen = same_flow ? TrailingLineHyphenBytes(line) : 0;
 		continues = hyphen > 0;
 		line.resize(line.size() - hyphen);
@@ -1061,6 +1206,7 @@ static std::vector<LayoutWord> LayoutWordsFromBoxes(const std::vector<MergedText
 		w.x1 = b.x1;
 		w.y1 = b.y1;
 		w.font_size = b.has_font ? b.font_size : 0.0;
+		w.rotation = b.rotation;
 		w.text = b.text;
 		words.push_back(std::move(w));
 	}
@@ -4319,6 +4465,7 @@ static constexpr double ELEM_RUNNING_BAND_FRAC = 0.12;
 
 struct ElemWord {
 	double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+	int rotation = 0;
 	string text;
 	string font_name;
 	double font_size = 0.0;
@@ -4624,6 +4771,7 @@ static std::vector<ElemLine> ElemBuildLines(std::vector<ElemWord> words, double 
 		g.x1 = w.x1;
 		g.y1 = w.y1;
 		g.font_size = w.has_size_signal ? w.size_signal : (w.has_font ? w.font_size : 0.0);
+		g.rotation = w.rotation;
 		g.text = w.text;
 		geom.push_back(std::move(g));
 	}
@@ -4643,7 +4791,8 @@ static std::vector<ElemLine> ElemBuildLines(std::vector<ElemWord> words, double 
 	std::vector<ElemLine> lines(static_cast<size_t>(line_count));
 	for (size_t li = 0; li < members.size(); li++) {
 		auto &idxs = members[li];
-		std::sort(idxs.begin(), idxs.end(), [&](size_t a, size_t b) { return words[a].x0 < words[b].x0; });
+		std::sort(idxs.begin(), idxs.end(),
+		          [&](size_t a, size_t b) { return LayoutReadingKey(geom[a]) < LayoutReadingKey(geom[b]); });
 		auto &line = lines[li];
 		ElemFontHistogram line_hist;
 		ElemFontHistogram line_size_hist;
@@ -4840,6 +4989,7 @@ static void ElementsProcessFile(ClientContext &context, const string &path, cons
 				w.y0 = b.y0;
 				w.x1 = b.x1;
 				w.y1 = b.y1;
+				w.rotation = b.rotation;
 				w.has_font = b.has_font;
 				w.font_name = b.has_font ? b.font_name : string();
 				w.font_size = b.has_font ? b.font_size : 0.0;
@@ -7034,6 +7184,7 @@ struct MdWord {
 	string text;
 	string font_name;
 	double font_size = 0.0;
+	int rotation = 0;
 };
 
 static string DocToMarkdown(ClientContext &context, const string &path) {
@@ -7059,6 +7210,7 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 			w.xMax = b.x1;
 			w.yMax = b.y1;
 			w.text = b.text;
+			w.rotation = b.rotation;
 			if (b.has_font) {
 				w.font_name = b.font_name;
 				w.font_size = b.font_size;
@@ -7226,6 +7378,7 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 			g.x1 = w.xMax;
 			g.y1 = w.yMax;
 			g.font_size = w.font_size;
+			g.rotation = w.rotation;
 			g.text = w.text;
 			geom.push_back(std::move(g));
 		}
@@ -7256,7 +7409,10 @@ static string DocToMarkdown(ClientContext &context, const string &path) {
 			}
 		}
 		for (auto &r : rows) {
-			std::sort(r.begin(), r.end(), [](const MdWord &a, const MdWord &b) { return a.xMin < b.xMin; });
+			std::sort(r.begin(), r.end(), [](const MdWord &a, const MdWord &b) {
+				return LayoutReadingKey(a.rotation, a.xMin, a.yMin, a.xMax, a.yMax) <
+				       LayoutReadingKey(b.rotation, b.xMin, b.yMin, b.xMax, b.yMax);
+			});
 		}
 
 		// table detection + y-suppression zone(s)

@@ -75,3 +75,101 @@ SELECT min(line) FILTER (text = 'Full width title spans both columns') <
 FROM read_pdf('test/data/full_width_lines.pdf', grain := 'line');
 ----
 true
+
+# Turned text is its own line. arXiv's margin stamp is 20pt type turned to read bottom
+# to top beside 10pt abstract lines; its boxes overlap several of them, and each one used
+# to swallow the lines it overlapped and interleave their words (2610.39302, page 1).
+query I
+SELECT count(*) = 20
+FROM read_pdf('test/data/rotated_margin_stamp.pdf', grain := 'line')
+WHERE starts_with(text, 'Abstract line') AND ends_with(text, 'across the page without interruption.')
+  AND length(text) = length('Abstract line 01 reads left to right across the page without interruption.');
+----
+true
+
+# The stamp reads in its own direction, as one line, after the page's upright text.
+query I
+SELECT max(line) FILTER (starts_with(text, 'Abstract line')) <
+       min(line) FILTER (text = 'arXiv:0000.00000v1 [cs.AI] 29 Oct 2026')
+FROM read_pdf('test/data/rotated_margin_stamp.pdf', grain := 'line');
+----
+true
+
+query I
+SELECT strpos(text, concat('line 01 reads left to right across the page without interruption.', chr(10),
+                           'Abstract line 02 reads')) > 0
+FROM read_pdf('test/data/rotated_margin_stamp.pdf');
+----
+true
+
+query I
+SELECT strpos(pdf_text('test/data/rotated_margin_stamp.pdf', {format: 'markdown'}),
+              'arXiv:0000.00000v1 [cs.AI] 29 Oct 2026') > 0;
+----
+true
+
+# Interleaved lines read "Abstract Abstract ... line line"; no element may contain that.
+query I
+SELECT count(*) FILTER (contains(text, 'Abstract Abstract')) = 0 AND count(*) > 0
+FROM read_pdf('test/data/rotated_margin_stamp.pdf', grain := 'element');
+----
+true
+
+# A full-width figure over two columns: its caption and axis labels cross the gutter
+# and hold about a third of the page's words. Below a majority that is a figure, not
+# full-width prose, so the columns below it still split (2610.39302, pages 6, 10, 11).
+query I
+SELECT list(DISTINCT column_index ORDER BY column_index) = [0, 1]
+FROM read_pdf_words('test/data/two_columns_full_width_figure.pdf');
+----
+true
+
+query I
+SELECT count(*) FILTER (starts_with(text, 'Figure caption line') AND ends_with(text, 'keeps going right.')) = 6
+   AND count(*) FILTER (starts_with(text, 'left-body-') AND ends_with(text, 'alpha beta gamma delta')) = 24
+   AND count(*) FILTER (contains(text, 'left-body-') AND contains(text, 'right-body-')) = 0
+FROM read_pdf('test/data/two_columns_full_width_figure.pdf', grain := 'line');
+----
+true
+
+query I
+SELECT max(line) FILTER (starts_with(text, 'Figure caption line')) <
+       min(line) FILTER (starts_with(text, 'left-body-')) AND
+       max(line) FILTER (starts_with(text, 'left-body-')) <
+       min(line) FILTER (starts_with(text, 'right-body-'))
+FROM read_pdf('test/data/two_columns_full_width_figure.pdf', grain := 'line');
+----
+true
+
+# The same crossing fraction on a single-column page with a Function | Description
+# table (the DuckDB documentation's function pages): both sides are wide enough to be
+# columns, but a narrow name column beside a wide description column is a table, so the
+# page stays one column and every row reads name then description.
+query I
+SELECT list(DISTINCT column_index) = [0]
+FROM read_pdf_words('test/data/single_column_function_table.pdf');
+----
+true
+
+query I
+SELECT count(*) = 14
+FROM read_pdf('test/data/single_column_function_table.pdf', grain := 'line')
+WHERE starts_with(text, 'function_name_number_') AND ends_with(text, 'computes from its argument.');
+----
+true
+
+# A wide table above code (DuckDB blog page 603): the table's halves are as wide and as
+# word-dense as prose columns, but only the left side goes on below it. One column, and
+# each row reads across.
+query I
+SELECT list(DISTINCT column_index) = [0]
+FROM read_pdf_words('test/data/single_column_wide_table.pdf');
+----
+true
+
+query I
+SELECT count(*) = 10
+FROM read_pdf('test/data/single_column_wide_table.pdf', grain := 'line')
+WHERE starts_with(text, 'row ') AND ends_with(text, ' done');
+----
+true
