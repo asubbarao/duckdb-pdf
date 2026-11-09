@@ -1,11 +1,11 @@
 # duckdb-pdf
 
-**Everything PDF, in SQL.** A DuckDB community extension (`pdf`) that turns PDFs into tables and tables into PDFs: read text at every grain (page, line, word, layout element, retrieval chunk), inspect metadata / outlines / attachments / form fields / annotations / revisions / digital signatures, and do the everyday document operations people open Adobe Acrobat for — merge, split, rotate, compress, encrypt, decrypt, extract pages, write new PDFs. Built on [Poppler](https://poppler.freedesktop.org/) (parsing/rendering), [Tesseract](https://github.com/tesseract-ocr/tesseract) (OCR for scanned documents), [qpdf](https://qpdf.sourceforge.io/) (document surgery), and [libharu](https://github.com/libharu/libharu) (native PDF writing) — in the DuckDB process. Office conversion through `to_pdf` uses installed Microsoft or Apple apps on macOS, with LibreOffice as a fallback.
+**Everything PDF, in SQL.** A DuckDB community extension (`pdf`) that turns PDFs into tables and tables into PDFs: read text at every grain (page, line, word, layout element, retrieval chunk), inspect metadata / outlines / attachments / form fields / annotations / revisions / digital signatures, and do the everyday document operations people open Adobe Acrobat for — merge, split, rotate, compress, encrypt, decrypt, extract pages, write new PDFs. Built on [Poppler](https://poppler.freedesktop.org/) (parsing/rendering), [Tesseract](https://github.com/tesseract-ocr/tesseract) (OCR for scanned documents; on macOS, Apple Vision is a second OCR engine and also reads barcodes and QR codes), [qpdf](https://qpdf.sourceforge.io/) (document surgery), and [libharu](https://github.com/libharu/libharu) (native PDF writing) — in the DuckDB process. Office conversion through `to_pdf` uses installed Microsoft or Apple apps on macOS, with LibreOffice as a fallback.
 
 
-This branch consolidates the API into **19 canonical function families**.
+This branch consolidates the API into **20 canonical function families**.
 Two deprecated compatibility aliases, `read_pdf_elements` and `pdf_to_text`,
-remain for downstream migration: the catalog therefore contains **21 names**.
+remain for downstream migration: the catalog therefore contains **22 names**.
 Other retired names are removed. The community registry and released binaries
 may lag this source tree.
 
@@ -77,6 +77,32 @@ The `words` row above belongs to the separate `read_pdf_words(files, ...)`
 function. Its boxes use displayed-page points with a top-left origin; its
 `line` and `column_index` fields group words geometrically. `label` is a
 printed page label, which can be NULL.
+
+### Reading order with `layout := 'auto'`
+
+The default layout reads a page the way a person does, from its geometry:
+
+- **Columns.** It finds the whitespace gutters a page actually has, assigns each
+  word a `column_index`, and reads each column top to bottom before the next.
+  A line that spans the gutter, such as a title, is one line and divides the
+  columns above it from those below.
+- **Full-width figures and captions.** Figure labels and captions that cross
+  the gutter do not turn a two-column page into one. When 20–50% of the
+  page's words sit on lines crossing a candidate gutter, it still splits there
+  if both sides look like reading columns: similar width (narrower ≥ 0.8 of
+  wider), dense lines on both sides (median ≥ 5 words per line), both sides
+  filled (the side with fewer lines has at least half the other's), and words
+  rather than figures on both sides (at least half of each side's words are
+  alphabetic). Tables with a narrow name column and a wide description column,
+  and loss-run style tables of policy numbers, dates and amounts, stay one
+  column, so each row reads across.
+- **Rotated text.** Words set sideways, such as arXiv's vertical margin stamp
+  or a rotated axis title, form their own lines. They are read in the direction
+  the text runs and come after the page's upright text, so they never merge
+  with the lines beside them.
+
+Ordering a rotated line's words by `x0` does not give its reading order. Use
+`read_pdf(..., grain := 'line')` for the text of such lines.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
