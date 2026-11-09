@@ -173,3 +173,20 @@ FROM read_pdf('test/data/single_column_wide_table.pdf', grain := 'line')
 WHERE starts_with(text, 'row ') AND ends_with(text, ' done');
 ----
 true
+
+# A carrier loss-run table: policy and date cells left of a gap, dollar amounts right of
+# it, prose disclaimers across the page. Both halves are as wide, as cell-dense and as
+# long as prose columns, but their cells are numbers, not words. One column, and each
+# row reads from policy to total.
+query I
+SELECT list(DISTINCT column_index) = [0]
+FROM read_pdf_words('test/data/single_column_loss_run.pdf');
+----
+true
+
+query I
+SELECT count(*) = 20
+FROM read_pdf('test/data/single_column_loss_run.pdf', grain := 'line')
+WHERE starts_with(text, 'POL D3501') AND contains(text, ' $0 $1,135 $0 $0 $') AND ends_with(text, ',318');
+----
+true

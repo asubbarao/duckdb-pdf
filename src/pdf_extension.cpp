@@ -542,6 +542,38 @@ static constexpr double LAYOUT_COLUMN_MIN_MEDIAN_WORDS = 5.0;
 // fills one side only: DuckDB blog page 603 has 10 table rows on the right against 41
 // lines on the left, and passes the two tests above because its cells are word-dense.
 static constexpr double LAYOUT_COLUMN_MIN_LINE_RATIO = 0.5;
+// ...and are both words: on the side with fewer, at least this fraction of the words are
+// alphabetic (LayoutIsAlphabeticWord). Prose columns score 0.80-0.96 (arXiv pages 6, 10
+// and 11, a two-column job description in a school-district loss-run exhibit). A carrier
+// loss-run table split between its policy and date cells and its dollar amounts passes
+// the three tests above, with six cells a row on both halves of the full table, but
+// scores 0.25 at most: cells like `08/15/2024`, `D350147` and `$217,183` are not words.
+static constexpr double LAYOUT_COLUMN_MIN_ALPHABETIC_RATIO = 0.5;
+// A word of letters, with hyphens or apostrophes inside it and punctuation at its
+// edges, as prose is made of. Any byte of a multi-byte UTF-8 sequence counts as a
+// letter, so accented and non-Latin words count; digits, `$`, `/` and `_` do not.
+static bool LayoutIsAlphabeticWord(const string &text) {
+	static const char *edge_punctuation = ".,;:()[]{}\"!?*";
+	size_t begin = 0;
+	size_t end = text.size();
+	while (begin < end && strchr(edge_punctuation, text[begin]) != nullptr) {
+		begin++;
+	}
+	while (end > begin && strchr(edge_punctuation, text[end - 1]) != nullptr) {
+		end--;
+	}
+	if (begin == end) {
+		return false;
+	}
+	for (size_t i = begin; i < end; i++) {
+		const auto c = static_cast<unsigned char>(text[i]);
+		const bool letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80;
+		if (!letter && c != '-' && c != '\'') {
+			return false;
+		}
+	}
+	return true;
+}
 // LayoutLineIds is defined after the band code that calls it.
 // `spanning_lines`, when given, receives one flag per line id (index id - 1):
 // whether that line crosses a column gutter.
@@ -637,6 +669,10 @@ static std::vector<std::pair<double, double>> LayoutGuttersByVerticalRun(const s
 	for (int32_t l : line_of) {
 		words_on_line[static_cast<size_t>(l)]++;
 	}
+	std::vector<char> alphabetic(words.size(), 0);
+	for (size_t i = 0; i < words.size(); i++) {
+		alphabetic[i] = LayoutIsAlphabeticWord(words[i].text);
+	}
 	for (const auto &left : left_edges) {
 		if (left.count < LAYOUT_MIN_GUTTER_EDGE_SUPPORT) {
 			continue;
@@ -663,14 +699,18 @@ static std::vector<std::pair<double, double>> LayoutGuttersByVerticalRun(const s
 			// too, and cutting there would slice every full-width prose line in two.
 			std::vector<size_t> left_words_on(static_cast<size_t>(n_lines) + 1, 0);
 			std::vector<size_t> right_words_on(static_cast<size_t>(n_lines) + 1, 0);
+			std::vector<size_t> left_alphabetic_on(static_cast<size_t>(n_lines) + 1, 0);
+			std::vector<size_t> right_alphabetic_on(static_cast<size_t>(n_lines) + 1, 0);
 			std::vector<char> crosses(static_cast<size_t>(n_lines) + 1, 0);
 			for (size_t i = 0; i < words.size(); i++) {
 				const auto &word = words[i];
 				const size_t l = static_cast<size_t>(line_of[i]);
 				if (word.x1 <= left.position + edge_tol) {
 					left_words_on[l]++;
+					left_alphabetic_on[l] += alphabetic[i];
 				} else if (word.x0 >= right.position - edge_tol) {
 					right_words_on[l]++;
+					right_alphabetic_on[l] += alphabetic[i];
 				} else {
 					crosses[l] = 1;
 				}
@@ -678,6 +718,10 @@ static std::vector<std::pair<double, double>> LayoutGuttersByVerticalRun(const s
 			size_t crossing_words = 0;
 			std::vector<double> left_line_words;
 			std::vector<double> right_line_words;
+			size_t left_side_words = 0;
+			size_t right_side_words = 0;
+			size_t left_side_alphabetic = 0;
+			size_t right_side_alphabetic = 0;
 			for (size_t l = 1; l <= static_cast<size_t>(n_lines); l++) {
 				if (crosses[l]) {
 					crossing_words += words_on_line[l];
@@ -685,9 +729,13 @@ static std::vector<std::pair<double, double>> LayoutGuttersByVerticalRun(const s
 				}
 				if (left_words_on[l] > 0) {
 					left_line_words.push_back(static_cast<double>(left_words_on[l]));
+					left_side_words += left_words_on[l];
+					left_side_alphabetic += left_alphabetic_on[l];
 				}
 				if (right_words_on[l] > 0) {
 					right_line_words.push_back(static_cast<double>(right_words_on[l]));
+					right_side_words += right_words_on[l];
+					right_side_alphabetic += right_alphabetic_on[l];
 				}
 			}
 			const size_t left_lines = left_line_words.size();
@@ -708,8 +756,13 @@ static std::vector<std::pair<double, double>> LayoutGuttersByVerticalRun(const s
 				    MinValue<double>(Median(std::move(left_line_words)), Median(std::move(right_line_words)));
 				const double line_ratio = static_cast<double>(MinValue<size_t>(left_lines, right_lines)) /
 				                          static_cast<double>(MaxValue<size_t>(left_lines, right_lines));
+				// Both sides hold at least LAYOUT_MIN_GUTTER_SIDE_LINES lines of words here.
+				const double alphabetic_ratio = MinValue<double>(
+				    static_cast<double>(left_side_alphabetic) / static_cast<double>(left_side_words),
+				    static_cast<double>(right_side_alphabetic) / static_cast<double>(right_side_words));
 				if (width_ratio < LAYOUT_COLUMN_MIN_WIDTH_RATIO || sparser_median < LAYOUT_COLUMN_MIN_MEDIAN_WORDS ||
-				    line_ratio < LAYOUT_COLUMN_MIN_LINE_RATIO) {
+				    line_ratio < LAYOUT_COLUMN_MIN_LINE_RATIO ||
+				    alphabetic_ratio < LAYOUT_COLUMN_MIN_ALPHABETIC_RATIO) {
 					continue;
 				}
 			}
@@ -753,8 +806,7 @@ static std::vector<int32_t> LayoutColumnBands(const std::vector<LayoutWord> &wor
 		// Turned text (a margin stamp, an axis label) is not body text either: its box
 		// runs across lines, so it would join lines that never meet in the fallback's
 		// page-wide grouping and inflate the words a corridor appears to cross.
-		if (w.rotation == 0 &&
-		    (body <= 0.0 || w.font_size <= 0.0 || w.font_size <= LAYOUT_DISPLAY_FONT_RATIO * body)) {
+		if (w.rotation == 0 && (body <= 0.0 || w.font_size <= 0.0 || w.font_size <= LAYOUT_DISPLAY_FONT_RATIO * body)) {
 			body_words.push_back(w);
 		}
 	}

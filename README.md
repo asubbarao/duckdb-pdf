@@ -90,9 +90,12 @@ The default layout reads a page the way a person does, from its geometry:
   the gutter do not turn a two-column page into one. When 20–50% of the
   page's words sit on lines crossing a candidate gutter, it still splits there
   if both sides look like reading columns: similar width (narrower ≥ 0.8 of
-  wider), prose on both sides (median ≥ 5 words per line), and both sides
-  filled (the side with fewer lines has at least half the other's). Tables
-  with a narrow name column and a wide description column stay one column.
+  wider), dense lines on both sides (median ≥ 5 words per line), both sides
+  filled (the side with fewer lines has at least half the other's), and words
+  rather than figures on both sides (at least half of each side's words are
+  alphabetic). Tables with a narrow name column and a wide description column,
+  and loss-run style tables of policy numbers, dates and amounts, stay one
+  column, so each row reads across.
 - **Rotated text.** Words set sideways, such as arXiv's vertical margin stamp
   or a rotated axis title, form their own lines. They are read in the direction
   the text runs and come after the page's upright text, so they never merge

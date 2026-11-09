@@ -3,7 +3,9 @@
  * measured on arXiv 2610.39302 (2026-11-08).
  *
  * Build and run from the repository root with libharu to regenerate
- * test/data/rotated_margin_stamp.pdf and test/data/two_columns_full_width_figure.pdf:
+ * test/data/rotated_margin_stamp.pdf, two_columns_full_width_figure.pdf,
+ * single_column_function_table.pdf, single_column_wide_table.pdf and
+ * single_column_loss_run.pdf:
  *
  *   cc -o /tmp/gen_layout_fixture test/data/gen_layout_fixture.c -lhpdf && /tmp/gen_layout_fixture
  */
@@ -121,9 +123,10 @@ static int write_single_column_function_table(const char *path) {
 	 * lines that cross the table's gap, inside the band the reading-column test decides. */
 	for (int i = 0; i < 5; i++) {
 		char line[160];
-		snprintf(line, sizeof(line),
-		         "Prose line %02d explains the functions in the table below and runs across the whole width of the page.",
-		         i + 1);
+		snprintf(
+		    line, sizeof(line),
+		    "Prose line %02d explains the functions in the table below and runs across the whole width of the page.",
+		    i + 1);
 		float y = i < 3 ? 740.0f - 14.0f * (float)i : 380.0f - 14.0f * (float)(i - 3);
 		write_text(page, font, 10.0f, 72.0f, y, line);
 	}
@@ -164,12 +167,14 @@ static int write_single_column_wide_table(const char *path) {
 		float y = i < 5 ? 740.0f - 14.0f * (float)i : 120.0f - 14.0f * (float)(i - 5);
 		write_text(page, font, 10.0f, 72.0f, y, line);
 	}
+	/* Cells of words rather than numbers, so the alphabetic-word test passes too and only
+	 * the line-count test keeps this table in one piece. */
 	for (int r = 0; r < 10; r++) {
 		char left[64];
 		char right[96];
 		float y = 670.0f - 14.0f * (float)r;
-		snprintf(left, sizeof(left), "row %02d (2, 0, 1) (3, 0, 1)", r + 1);
-		snprintf(right, sizeof(right), "(2, %d, 2) (3, %d, 3) (4, %d, 4) (5, %d, 5) (6, %d, 6) done", r, r, r, r, r);
+		snprintf(left, sizeof(left), "row %02d keeps alpha beta gamma", r + 1);
+		snprintf(right, sizeof(right), "delta epsilon zeta eta theta iota kappa done");
 		write_text(page, font, 10.0f, 72.0f, y, left);
 		write_text(page, font, 10.0f, 345.0f, y, right);
 	}
@@ -183,11 +188,46 @@ static int write_single_column_wide_table(const char *path) {
 	return save(pdf, path);
 }
 
+/*
+ * A loss-run table, as carriers print them: prose header and disclaimer lines across the
+ * page, and rows whose policy and date cells sit left of a gap and whose dollar amounts
+ * sit right of it. Both halves are about as wide and as many cells per row as prose
+ * columns, and both run the full table, so only the alphabetic-word test tells them from
+ * reading columns. The page stays one column and each row reads policy to total.
+ */
+static int write_single_column_loss_run(const char *path) {
+	HPDF_Doc pdf;
+	HPDF_Page page;
+	HPDF_Font font;
+	if (begin_page(&pdf, &page, &font) != 0) {
+		return 1;
+	}
+	for (int i = 0; i < 8; i++) {
+		char line[160];
+		snprintf(line, sizeof(line),
+		         "Disclaimer line %02d says the loss information below may not be current and runs across the page.",
+		         i + 1);
+		float y = i < 3 ? 740.0f - 14.0f * (float)i : 200.0f - 14.0f * (float)(i - 3);
+		write_text(page, font, 10.0f, 72.0f, y, line);
+	}
+	for (int r = 0; r < 20; r++) {
+		char left[64];
+		char right[96];
+		float y = 680.0f - 14.0f * (float)r;
+		snprintf(left, sizeof(left), "POL D3501%02d %02d 08/15/20%02d 08/15/20%02d %d", r, r, r + 5, r + 6, r % 3);
+		snprintf(right, sizeof(right), "$%d,183 $0 $1,135 $0 $0 $%d,318", r + 1, r + 2);
+		write_text(page, font, 10.0f, 72.0f, y, left);
+		write_text(page, font, 10.0f, 330.0f, y, right);
+	}
+	return save(pdf, path);
+}
+
 int main(int argc, char **argv) {
 	const char *stamp_path = argc > 1 ? argv[1] : "test/data/rotated_margin_stamp.pdf";
 	const char *figure_path = argc > 2 ? argv[2] : "test/data/two_columns_full_width_figure.pdf";
 	const char *table_path = argc > 3 ? argv[3] : "test/data/single_column_function_table.pdf";
 	const char *wide_table_path = argc > 4 ? argv[4] : "test/data/single_column_wide_table.pdf";
+	const char *loss_run_path = argc > 5 ? argv[5] : "test/data/single_column_loss_run.pdf";
 	if (write_rotated_margin_stamp(stamp_path) != 0) {
 		return 1;
 	}
@@ -197,5 +237,8 @@ int main(int argc, char **argv) {
 	if (write_single_column_function_table(table_path) != 0) {
 		return 1;
 	}
-	return write_single_column_wide_table(wide_table_path);
+	if (write_single_column_wide_table(wide_table_path) != 0) {
+		return 1;
+	}
+	return write_single_column_loss_run(loss_run_path);
 }
