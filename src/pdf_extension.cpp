@@ -2166,11 +2166,16 @@ static poppler::image RenderPageForOcr(poppler::page *page, int dpi) {
 // carries a text layer that holds only the stamp. Asking "does the page have
 // any glyphs?" then answers yes, and auto_ocr skips the scan underneath: on a
 // 209-page county RFP addendum this hid a carrier's whole loss run. A page is
-// read as a scan when its native layer is a handful of words and the rendered
-// page still has ink outside every native word box. A blank back page with a
-// stamp has no such ink and keeps its native text; a digital page with real
-// text has more words than a stamp.
+// read as a scan when its native layer is a handful of small words and the
+// rendered page still has ink outside every native word box. A blank back page
+// with a stamp has no such ink and keeps its native text; a digital page with
+// real text has more words than a stamp — or, on a title slide, fewer words
+// but at display size, so the word count alone cannot tell a stamp from a
+// title: the stamp's words are small type, the title's are not.
 static constexpr size_t STAMP_ONLY_MAX_WORDS = 24;
+// A page number or Bates label runs 8–12pt; the DuckCon 6 title slide this
+// gate also has to exclude is 24pt at its smallest word.
+static constexpr double STAMP_ONLY_MAX_FONT_SIZE = 16.0;
 static constexpr int STAMP_PROBE_DPI = 36;
 // Five lines of 16pt type on a landscape page ink 0.8% of it at this dpi, so
 // the floor sits well below that. A blank back page that is OCR'd anyway costs
@@ -2181,6 +2186,14 @@ static constexpr size_t STAMP_PROBE_MAX_TEXT_BYTES = 400;
 static bool NativeLayerIsAStampOverAScan(poppler::page *page, const std::vector<MergedTextBox> &boxes) {
 	if (!page || boxes.empty() || boxes.size() > STAMP_ONLY_MAX_WORDS) {
 		return false;
+	}
+	// Every native word must be small type. Without this a title slide reads as
+	// a stamp: ten words, and its background art inks outside every word box.
+	for (auto &box : boxes) {
+		const double size = box.has_font ? box.font_size : (box.y1 - box.y0);
+		if (size > STAMP_ONLY_MAX_FONT_SIZE) {
+			return false;
+		}
 	}
 	poppler::image img = RenderPageForOcr(page, STAMP_PROBE_DPI);
 	if (!img.is_valid() || img.width() <= 0 || img.height() <= 0) {
