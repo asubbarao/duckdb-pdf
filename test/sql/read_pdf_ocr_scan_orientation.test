@@ -1,6 +1,6 @@
 # name: test/sql/read_pdf_ocr_scan_orientation.test
 # description: auto_ocr reads scans that are upside down or carry only a page stamp as text
-# group: [pdf]
+# group: [sql]
 
 require pdf
 
