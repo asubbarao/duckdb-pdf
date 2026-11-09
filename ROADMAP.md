@@ -30,6 +30,10 @@ The broader consolidation now exposes 19 names without retired aliases:
 | `pdf_ocr` | persist searchable OCR layers |
 | `poppler_version` | runtime version |
 
+Since then, Apple Vision became a second OCR backend on macOS
+(`ocr_backend := 'vision'`), and `image_barcodes` (Vision barcode and QR
+detection) brought the public names to 20.
+
 This corrects omissions in the earlier 19-family sketch: tagged structure and
 persisted OCR remain available. It does not add the proposed sniff_pdf or
 pdf_help helpers. Existing catalog descriptions, parameter names and examples

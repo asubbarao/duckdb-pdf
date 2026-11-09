@@ -4,8 +4,8 @@ Task-oriented recipes for the `pdf` community extension. Each recipe is a real
 goal, a runnable SQL block, and the one gotcha that bites people. For the full
 per-function reference (every column, every parameter), see [README.md](README.md).
 
-These recipes target this source branch's 19 canonical function families; two
-deprecated aliases bring the catalog to 21 names. Released community binaries
+These recipes target this source branch's 20 canonical function families; two
+deprecated aliases bring the catalog to 22 names. Released community binaries
 may expose the earlier API. Load the matching source build (see README), or use
 the following once the matching version is published:
 
@@ -210,7 +210,9 @@ SELECT filename, page AS page_no, line AS line_no,
        page_width AS width_pt, page_height AS height_pt
 FROM read_pdf_words('docs/*.pdf');
 
--- Line grain free from the word pin (no second reader walk)
+-- Line grain free from the word pin (no second reader walk).
+-- ORDER BY x0 is reading order for upright lines only: rotated text (a margin
+-- stamp, a sideways axis title) forms its own lines at the end of the page.
 CREATE TABLE pdf_lines AS
 SELECT filename, page_no, line_no,
        string_agg(word, ' ' ORDER BY bbox.x0) AS line_text
@@ -515,7 +517,8 @@ from the word grain and the bookmarks.
 ```sql
 WITH words AS (
   FROM read_pdf_words('https://blobs.duckdb.org/docs/ducklake-docs.pdf')
-), lines AS (       -- read_pdf_words numbers lines per page, already in column order
+), lines AS (       -- read_pdf_words numbers lines per page, already in column order;
+                    -- rotated text gets its own lines after the upright ones
   SELECT page, line, string_agg(word, ' ' ORDER BY x0) AS text,
          len(list(DISTINCT page) OVER ()) AS n_pages
   FROM words GROUP BY page, line
