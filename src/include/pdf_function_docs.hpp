@@ -97,6 +97,12 @@ static const PdfFunctionDoc PDF_FUNCTION_DOCS[] = {
      "Recognize an encoded image BLOB. Scalar returns text, HOCR or TSV and accepts an optional options STRUCT. Table "
      "returns text, confidence and format with named OCR settings.",
      "SELECT ocr_image(pdf_render('document.pdf', 1), {language: 'eng'});"},
+    {"image_barcodes", "image_blob,options",
+     "Detect barcodes and QR codes in an encoded image BLOB with Apple Vision (macOS only). Returns a list of structs: "
+     "symbology, payload, raw_payload, supplemental_payload, is_gs1, color_inverted, confidence (0-100) and a box "
+     "x0, y0, x1, y1 in upright image pixels with a top-left origin. Optional STRUCT symbologies "
+     "(comma-separated, e.g. 'EAN13,UPCE') restricts the search.",
+     "SELECT unnest(image_barcodes(content), recursive := true) FROM read_blob('shelf.jpg');"},
     {"pdf_ocr", "input,output",
      "Add searchable Tesseract layers to selected pages and return one status row per document page. Existing text "
      "pages are skipped unless force is true. Force adds another layer and can duplicate extracted text.",

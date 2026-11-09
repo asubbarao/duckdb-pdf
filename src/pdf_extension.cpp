@@ -65,6 +65,8 @@
 // pixel path). TessBaseAPI lives as a thread_local inside ocr_ops — Init once
 // per worker thread / language, Clear between pages (not per-row re-Init).
 #include "ocr_ops.hpp"
+// Apple Vision barcode detection (image_barcodes); plain std types only.
+#include "vision_ocr.hpp"
 
 #include <algorithm>
 #include <atomic>

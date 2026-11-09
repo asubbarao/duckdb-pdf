@@ -4,8 +4,8 @@
 // headers here.
 //
 // Nothing throws inside an @autoreleasepool or while a CGImage is held:
-// RecognizeLines reports failure as a message and the public functions throw
-// after releasing everything.
+// RecognizeLines and DetectBarcodes report failure as a message and the
+// public functions throw after releasing everything.
 //===--------------------------------------------------------------------===//
 #include "vision_ocr.hpp"
 
@@ -19,6 +19,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace pdf_ocr {
@@ -322,6 +323,109 @@ void FillText(const std::vector<Line> &lines, TextResult &out) {
 	out.confidence = MeanConfidence(lines);
 }
 
+// "VNBarcodeSymbologyEAN13" -> "EAN13".
+NSString *ShortSymbology(NSString *symbology) {
+	NSString *prefix = @"VNBarcodeSymbology";
+	return [symbology hasPrefix:prefix] ? [symbology substringFromIndex:prefix.length] : symbology;
+}
+
+std::string SymbologyName(NSString *symbology) {
+	return FromNSString(ShortSymbology(symbology));
+}
+
+NSArray<VNBarcodeSymbology> *SupportedSymbologies(VNDetectBarcodesRequest *request) API_AVAILABLE(macos(10.15)) {
+	NSArray<VNBarcodeSymbology> *supported = nil;
+	if (@available(macOS 12.0, *)) {
+		NSError *error = nil;
+		supported = [request supportedSymbologiesAndReturnError:&error];
+	} else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+		supported = [VNDetectBarcodesRequest supportedSymbologies];
+#pragma clang diagnostic pop
+	}
+	return supported ? supported : @[];
+}
+
+// One detection pass. Returns an error message, or an empty string on success.
+std::string DetectBarcodes(CGImageRef image, CGImagePropertyOrientation orientation,
+                           const std::vector<std::string> &wanted, std::vector<Barcode> &barcodes) {
+	if (@available(macOS 10.15, *)) {
+		@autoreleasepool {
+			VNDetectBarcodesRequest *request = [[VNDetectBarcodesRequest alloc] init];
+			if (!wanted.empty()) {
+				NSArray<VNBarcodeSymbology> *supported = SupportedSymbologies(request);
+				NSMutableArray<VNBarcodeSymbology> *selected = [NSMutableArray array];
+				for (auto &name : wanted) {
+					NSString *candidate = [NSString stringWithUTF8String:name.c_str()];
+					VNBarcodeSymbology match = nil;
+					for (VNBarcodeSymbology s in supported) {
+						if (candidate && [ShortSymbology(s) caseInsensitiveCompare:candidate] == NSOrderedSame) {
+							match = s;
+							break;
+						}
+					}
+					if (!match) {
+						std::string names;
+						for (VNBarcodeSymbology s in supported) {
+							names += (names.empty() ? "" : ", ") + SymbologyName(s);
+						}
+						return "symbology '" + name + "' is not supported by Vision on this system; supported: " + names;
+					}
+					[selected addObject:match];
+				}
+				request.symbologies = selected;
+			}
+			VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image
+			                                                                    orientation:orientation
+			                                                                        options:@{}];
+			NSError *failure = nil;
+			if (![handler performRequests:@[ request ] error:&failure]) {
+				return "barcode detection failed: " + FromNSString(failure.localizedDescription);
+			}
+			// Vision's boxes are normalized to the upright image, origin bottom-left.
+			// EXIF orientations 5-8 turn the stored image a quarter turn.
+			double width = static_cast<double>(CGImageGetWidth(image));
+			double height = static_cast<double>(CGImageGetHeight(image));
+			if (orientation >= kCGImagePropertyOrientationLeftMirrored) {
+				std::swap(width, height);
+			}
+			for (VNBarcodeObservation *observation in request.results) {
+				Barcode b;
+				b.symbology = SymbologyName(observation.symbology);
+				NSString *payload = observation.payloadStringValue;
+				if (payload) {
+					b.has_payload = true;
+					b.payload = FromNSString(payload);
+				}
+				if (@available(macOS 14.0, *)) {
+					NSData *bytes = observation.payloadData;
+					if (bytes) {
+						b.has_payload_bytes = true;
+						b.payload_bytes.assign(static_cast<const char *>(bytes.bytes), bytes.length);
+					}
+					NSString *supplemental = observation.supplementalPayloadString;
+					if (supplemental) {
+						b.has_supplemental = true;
+						b.supplemental = FromNSString(supplemental);
+					}
+					b.gs1 = observation.isGS1DataCarrier;
+					b.color_inverted = observation.isColorInverted;
+				}
+				b.confidence = 100.0 * observation.confidence;
+				const CGRect box = observation.boundingBox;
+				b.x0 = CGRectGetMinX(box) * width;
+				b.x1 = CGRectGetMaxX(box) * width;
+				b.y0 = (1.0 - CGRectGetMaxY(box)) * height;
+				b.y1 = (1.0 - CGRectGetMinY(box)) * height;
+				barcodes.push_back(std::move(b));
+			}
+		}
+		return std::string();
+	}
+	return "requires macOS 10.15 or later";
+}
+
 // Throws, unless best_effort asks for an empty result instead.
 bool Failed(const std::string &error, const Options &opt) {
 	if (error.empty()) {
@@ -420,6 +524,22 @@ TextResult RecognizeVisionImageBlob(const unsigned char *data, size_t size, cons
 		FillText(lines, out);
 	}
 	return out;
+}
+
+std::vector<Barcode> DetectVisionBarcodes(const unsigned char *data, size_t size,
+                                          const std::vector<std::string> &symbologies) {
+	std::vector<Barcode> barcodes;
+	CGImagePropertyOrientation orientation = kCGImagePropertyOrientationUp;
+	CGImageRef image = data && size > 0 ? DecodeImage(data, size, orientation) : nullptr;
+	std::string error = image ? DetectBarcodes(image, orientation, symbologies, barcodes)
+	                          : "could not decode image BLOB (expected a format ImageIO reads, e.g. PNG or JPEG)";
+	if (image) {
+		CGImageRelease(image);
+	}
+	if (!error.empty()) {
+		throw std::runtime_error(error);
+	}
+	return barcodes;
 }
 
 } // namespace pdf_ocr
