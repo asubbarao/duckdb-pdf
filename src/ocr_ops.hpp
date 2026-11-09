@@ -140,6 +140,10 @@ struct WordsResult {
 	std::vector<Word> words;
 	int confidence = 0; // MeanTextConf 0..100 of the whole page
 	Backend backend_used = Backend::Tesseract;
+	// Clockwise degrees (0, 90, 180, 270) the Tesseract path turned a sideways
+	// or upside-down scan before reading it. Word boxes are mapped back to the
+	// image as given, so they stay in the page's frame.
+	int rotation = 0;
 };
 
 struct PdfResult {

@@ -1,0 +1,54 @@
+# name: test/sql/read_pdf_ocr_scan_orientation.test
+# description: auto_ocr reads scans that are upside down or carry only a page stamp as text
+# group: [pdf]
+
+require pdf
+
+# An upside-down scan with no text layer. Tesseract alone read it as nonsense
+# ("SSOT" for "LOSS"); the page is now re-read at the other quarter turns.
+query II
+SELECT used_ocr, contains(text, 'WC-1002 07/02/2025 Open 4,210.55 9,000.00 13,210.55')
+FROM read_pdf('test/data/scan_upside_down.pdf');
+----
+true	true
+
+# Word boxes stay in the frame of the page as scanned (here upside down), so a
+# box still marks the word on the page; the words themselves read correctly.
+query I
+SELECT list_sort(list(word)) = list_sort(string_split('LOSS RUN REPORT Valuation Date: 01/31/2026 Claim Number Date of Loss Status Paid Reserve Incurred WC-1001 03/14/2025 Closed 12,500.00 0.00 12,500.00 WC-1002 07/02/2025 Open 4,210.55 9,000.00 13,210.55 Totals 16,710.55 9,000.00 25,710.55', ' '))
+FROM read_pdf_words('test/data/scan_upside_down.pdf');
+----
+true
+
+# "LOSS" was printed at the top left; upside down it sits at the bottom right.
+query I
+SELECT bool_and(x0 > page_width / 2 AND y0 > page_height / 2)
+FROM read_pdf_words('test/data/scan_upside_down.pdf') WHERE word = 'LOSS';
+----
+true
+
+# The same scan upright under a native "Page 1 of 1" stamp. The stamp made the
+# page look like text, so auto_ocr skipped the scan beneath it.
+query III
+SELECT has_text_layer, used_ocr, contains(text, 'Totals 16,710.55 9,000.00 25,710.55')
+FROM read_pdf('test/data/scan_under_page_stamp.pdf');
+----
+true	true	true
+
+query I
+SELECT bool_and(source = 'ocr') AND contains(string_agg(word, ' ' ORDER BY line, x0), 'WC-1001 03/14/2025 Closed')
+FROM read_pdf_words('test/data/scan_under_page_stamp.pdf');
+----
+true
+
+query I
+SELECT contains(string_agg(text, ' ' ORDER BY line), 'Claim Number Date of Loss Status Paid Reserve Incurred')
+FROM read_pdf('test/data/scan_under_page_stamp.pdf', grain := 'line');
+----
+true
+
+# auto_ocr := false still keeps the stamp only.
+query II
+SELECT used_ocr, text FROM read_pdf('test/data/scan_under_page_stamp.pdf', auto_ocr := false);
+----
+false	Page 1 of 1

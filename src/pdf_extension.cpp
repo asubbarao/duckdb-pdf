@@ -2162,6 +2162,112 @@ static poppler::image RenderPageForOcr(poppler::page *page, int dpi) {
 	return renderer.render_page(page, dpi, dpi);
 }
 
+// A scanned page stamped with a page number or Bates label ("Page 50 of 209")
+// carries a text layer that holds only the stamp. Asking "does the page have
+// any glyphs?" then answers yes, and auto_ocr skips the scan underneath: on a
+// 209-page county RFP addendum this hid a carrier's whole loss run. A page is
+// read as a scan when its native layer is a handful of words and the rendered
+// page still has ink outside every native word box. A blank back page with a
+// stamp has no such ink and keeps its native text; a digital page with real
+// text has more words than a stamp.
+static constexpr size_t STAMP_ONLY_MAX_WORDS = 24;
+static constexpr int STAMP_PROBE_DPI = 36;
+// Five lines of 16pt type on a landscape page ink 0.8% of it at this dpi, so
+// the floor sits well below that. A blank back page that is OCR'd anyway costs
+// time, not text: OCR replaces the stamp only when it reads more than it.
+static constexpr double STAMP_PROBE_MIN_INK = 0.002;
+static constexpr size_t STAMP_PROBE_MAX_TEXT_BYTES = 400;
+
+static bool NativeLayerIsAStampOverAScan(poppler::page *page, const std::vector<MergedTextBox> &boxes) {
+	if (!page || boxes.empty() || boxes.size() > STAMP_ONLY_MAX_WORDS) {
+		return false;
+	}
+	poppler::image img = RenderPageForOcr(page, STAMP_PROBE_DPI);
+	if (!img.is_valid() || img.width() <= 0 || img.height() <= 0) {
+		return false;
+	}
+	const int w = img.width();
+	const int h = img.height();
+	const auto format = img.format();
+	int bytes_per_pixel;
+	if (format == poppler::image::format_argb32) {
+		bytes_per_pixel = 4;
+	} else if (format == poppler::image::format_rgb24) {
+		bytes_per_pixel = 3;
+	} else if (format == poppler::image::format_gray8) {
+		bytes_per_pixel = 1;
+	} else {
+		return false;
+	}
+	std::vector<char> inside_native(static_cast<size_t>(w) * static_cast<size_t>(h), 0);
+	const double scale = STAMP_PROBE_DPI / 72.0;
+	for (auto &b : boxes) {
+		const int px0 = std::max(0, static_cast<int>(std::floor(b.x0 * scale)) - 1);
+		const int px1 = std::min(w - 1, static_cast<int>(std::ceil(b.x1 * scale)) + 1);
+		const int py0 = std::max(0, static_cast<int>(std::floor(b.y0 * scale)) - 1);
+		const int py1 = std::min(h - 1, static_cast<int>(std::ceil(b.y1 * scale)) + 1);
+		for (int y = py0; y <= py1; y++) {
+			for (int x = px0; x <= px1; x++) {
+				inside_native[static_cast<size_t>(y) * w + x] = 1;
+			}
+		}
+	}
+	const unsigned char *base = reinterpret_cast<const unsigned char *>(img.const_data());
+	size_t ink = 0;
+	for (int y = 0; y < h; y++) {
+		const unsigned char *row = base + static_cast<size_t>(y) * img.bytes_per_row();
+		for (int x = 0; x < w; x++) {
+			if (inside_native[static_cast<size_t>(y) * w + x]) {
+				continue;
+			}
+			const unsigned char *px = row + static_cast<size_t>(x) * bytes_per_pixel;
+			int luminance;
+			if (bytes_per_pixel == 1) {
+				luminance = px[0];
+			} else if (bytes_per_pixel == 4) {
+				// argb32 in little-endian memory order is B,G,R,A.
+				luminance = (px[2] * 299 + px[1] * 587 + px[0] * 114) / 1000;
+			} else {
+				luminance = (px[0] * 299 + px[1] * 587 + px[2] * 114) / 1000;
+			}
+			// At the probe's low dpi a type stroke is a grey pixel, not a black one.
+			if (luminance < 192) {
+				ink++;
+			}
+		}
+	}
+	return static_cast<double>(ink) / (static_cast<double>(w) * h) >= STAMP_PROBE_MIN_INK;
+}
+
+// The one auto_ocr decision for every grain: a page with no native text, or
+// whose native text is only a stamp over a scan (see above).
+static bool AutoOcrWantsPage(poppler::page *page, const std::vector<MergedTextBox> &boxes) {
+	return boxes.empty() || NativeLayerIsAStampOverAScan(page, boxes);
+}
+
+// Page and line grains hold the native text as a string. Only a short one can
+// be a stamp, so the word boxes are fetched again only then.
+static bool AutoOcrWantsPageText(poppler::page *page, const string &native) {
+	if (!pdf_ocr::HasGlyphs(native)) {
+		return true;
+	}
+	if (native.size() > STAMP_PROBE_MAX_TEXT_BYTES) {
+		return false;
+	}
+	return NativeLayerIsAStampOverAScan(page,
+	                                    MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font)));
+}
+
+static size_t GlyphCount(const string &s) {
+	size_t n = 0;
+	for (unsigned char c : s) {
+		if (!std::isspace(c)) {
+			n++;
+		}
+	}
+	return n;
+}
+
 static pdf_ocr::TextResult OcrBitmapText(const poppler::image &img, const pdf_ocr::Options &opt) {
 	if (!img.is_valid()) {
 		return pdf_ocr::TextResult();
@@ -2214,11 +2320,17 @@ static bool LoadWordsForPage(poppler::page *page, const PdfOptions &opt, std::ve
 		return false;
 	}
 	boxes = MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font));
-	if (!boxes.empty() || !opt.auto_ocr) {
+	if (!opt.auto_ocr || !AutoOcrWantsPage(page, boxes)) {
 		return false;
 	}
 	ocr_boxes = OcrPageWords(page, opt, /*best_effort=*/true);
-	return !ocr_boxes.empty();
+	// Over a stamp, OCR wins only when it read more than the stamp itself.
+	if (ocr_boxes.size() <= boxes.size()) {
+		ocr_boxes.clear();
+		return false;
+	}
+	boxes.clear();
+	return true;
 }
 
 // Render a poppler page and OCR it with tesseract, honoring engine knobs plus
@@ -2781,9 +2893,13 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 					                    : UStringToUtf8(page->text(poppler::rectf(), layout));
 					has_text_layer = pdf_ocr::HasGlyphs(native);
 					text = native;
-					want_ocr = g.needs_ocr && (bind.opt.force_ocr || (bind.opt.auto_ocr && !has_text_layer));
+					want_ocr = g.needs_ocr && (bind.opt.force_ocr || bind.opt.auto_ocr);
 				}
 			}
+		}
+		// Outside the document guard: the stamp probe renders the page.
+		if (page && want_ocr && !bind.opt.force_ocr) {
+			want_ocr = AutoOcrWantsPageText(page.get(), text);
 		}
 		if (page && want_ocr) {
 			// best_effort under force_ocr too when the page has a native layer:
@@ -2792,7 +2908,9 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 			// loud missing-model error under force_ocr.
 			const bool best_effort = !bind.opt.force_ocr || has_text_layer;
 			auto ocr = OcrPageResult(page.get(), bind.opt, best_effort);
-			if (pdf_ocr::HasGlyphs(ocr.text)) {
+			// Over a stamp, OCR wins only when it read more than the stamp itself.
+			const bool ocr_adds = bind.opt.force_ocr || !has_text_layer || GlyphCount(ocr.text) > GlyphCount(text);
+			if (ocr_adds && pdf_ocr::HasGlyphs(ocr.text)) {
 				text = std::move(ocr.text);
 				used_ocr = true;
 				ocr_confidence = static_cast<double>(ocr.confidence);
@@ -4160,9 +4278,10 @@ static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 		                                           page->page_rect().width())
 		                          : UStringToUtf8(page->text(poppler::rectf(), layout));
 		bool has_native = pdf_ocr::HasGlyphs(text);
-		if (opt.force_ocr || (opt.auto_ocr && !has_native)) {
+		if (opt.force_ocr || (opt.auto_ocr && AutoOcrWantsPageText(page.get(), text))) {
 			auto recognized = OcrPageResult(page.get(), opt, !opt.force_ocr || has_native);
-			if (pdf_ocr::HasGlyphs(recognized.text))
+			const bool ocr_adds = opt.force_ocr || !has_native || GlyphCount(recognized.text) > GlyphCount(text);
+			if (ocr_adds && pdf_ocr::HasGlyphs(recognized.text))
 				text = std::move(recognized.text);
 		}
 		size_t start = 0;
@@ -5379,7 +5498,8 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 					}
 				}
 			} else {
-				for (auto &b : MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font))) {
+				auto native_boxes = MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font));
+				for (auto &b : native_boxes) {
 					PdfWord w;
 					w.xMin = b.x0;
 					w.yMin = b.y0;
@@ -5389,8 +5509,14 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 					w.text = b.text;
 					words.push_back(std::move(w));
 				}
-				if (words.empty() && bind.opt.auto_ocr) {
+				if (bind.opt.auto_ocr && AutoOcrWantsPage(page.get(), native_boxes)) {
 					auto ocr_words = OcrPageWords(page.get(), bind.opt, /*best_effort=*/true);
+					// Over a stamp, OCR wins only when it read more than the stamp itself.
+					if (ocr_words.size() > words.size()) {
+						words.clear();
+					} else {
+						ocr_words.clear();
+					}
 					for (auto &ow : ocr_words) {
 						PdfWord w;
 						w.xMin = ow.x0;
