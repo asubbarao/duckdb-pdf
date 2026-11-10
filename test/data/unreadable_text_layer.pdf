@@ -1,0 +1,155 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>
+endobj
+5 0 obj
+<< /Length 257 >>
+stream
+BT /F1 14 Tf 72 720 Td 20 TL
+(LOSS RUN REPORT BY POLICY AND CLAIM) Tj T*
+(Report Losses as of 11/08/2026) Tj T*
+(CLAIM NO: R00000001 CLAIM STATUS: Open) Tj T*
+(MEDICAL $32,068 $15,961) Tj T*
+(INDEMNITY $37,599 $10,948) Tj T*
+(TOTAL $79,167 $28,106) Tj T*
+ET
+endstream
+endobj
+6 0 obj
+<< /Length 1448 >>
+stream
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Adobe-Identity-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+94 beginbfchar
+<21> <0001>
+<22> <0002>
+<23> <0003>
+<24> <0004>
+<25> <0005>
+<26> <0006>
+<27> <0007>
+<28> <0008>
+<29> <000E>
+<2A> <000F>
+<2B> <0010>
+<2C> <0011>
+<2D> <0012>
+<2E> <0013>
+<2F> <0014>
+<30> <0015>
+<31> <0016>
+<32> <0017>
+<33> <0018>
+<34> <0019>
+<35> <001A>
+<36> <001B>
+<37> <001C>
+<38> <001D>
+<39> <001E>
+<3A> <001F>
+<3B> <0001>
+<3C> <0002>
+<3D> <0003>
+<3E> <0004>
+<3F> <0005>
+<40> <0006>
+<41> <0007>
+<42> <0008>
+<43> <000E>
+<44> <000F>
+<45> <0010>
+<46> <0011>
+<47> <0012>
+<48> <0013>
+<49> <0014>
+<4A> <0015>
+<4B> <0016>
+<4C> <0017>
+<4D> <0018>
+<4E> <0019>
+<4F> <001A>
+<50> <001B>
+<51> <001C>
+<52> <001D>
+<53> <001E>
+<54> <001F>
+<55> <0001>
+<56> <0002>
+<57> <0003>
+<58> <0004>
+<59> <0005>
+<5A> <0006>
+<5B> <0007>
+<5C> <0008>
+<5D> <000E>
+<5E> <000F>
+<5F> <0010>
+<60> <0011>
+<61> <0012>
+<62> <0013>
+<63> <0014>
+<64> <0015>
+<65> <0016>
+<66> <0017>
+<67> <0018>
+<68> <0019>
+<69> <001A>
+<6A> <001B>
+<6B> <001C>
+<6C> <001D>
+<6D> <001E>
+<6E> <001F>
+<6F> <0001>
+<70> <0002>
+<71> <0003>
+<72> <0004>
+<73> <0005>
+<74> <0006>
+<75> <0007>
+<76> <0008>
+<77> <000E>
+<78> <000F>
+<79> <0010>
+<7A> <0011>
+<7B> <0012>
+<7C> <0013>
+<7D> <0014>
+<7E> <0015>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+endstream
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000000361 00000 n 
+0000000669 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+2169
+%%EOF
