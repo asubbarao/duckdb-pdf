@@ -28,10 +28,7 @@ CONTROLS = [c for c in range(1, 32) if c not in (9, 10, 11, 12, 13)]
 
 def to_unicode_cmap() -> bytes:
     codes = list(range(0x21, 0x7F))
-    entries = [
-        f"<{code:02X}> <{CONTROLS[i % len(CONTROLS)]:04X}>"
-        for i, code in enumerate(codes)
-    ]
+    entries = [f"<{code:02X}> <{CONTROLS[i % len(CONTROLS)]:04X}>" for i, code in enumerate(codes)]
     blocks = []
     for start in range(0, len(entries), 100):
         chunk = entries[start : start + 100]
@@ -44,13 +41,7 @@ def to_unicode_cmap() -> bytes:
         + "\n".join(blocks)
         + "\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend"
     ).encode("ascii")
-    return (
-        b"<< /Length "
-        + str(len(cmap)).encode("ascii")
-        + b" >>\nstream\n"
-        + cmap
-        + b"\nendstream"
-    )
+    return b"<< /Length " + str(len(cmap)).encode("ascii") + b" >>\nstream\n" + cmap + b"\nendstream"
 
 
 def page_content() -> bytes:
@@ -60,13 +51,7 @@ def page_content() -> bytes:
         ops.append(f"({escaped}) Tj T*")
     ops.append("ET")
     content = "\n".join(ops).encode("ascii")
-    return (
-        b"<< /Length "
-        + str(len(content)).encode("ascii")
-        + b" >>\nstream\n"
-        + content
-        + b"\nendstream"
-    )
+    return b"<< /Length " + str(len(content)).encode("ascii") + b" >>\nstream\n" + content + b"\nendstream"
 
 
 def make_pdf() -> None:
@@ -91,9 +76,7 @@ def make_pdf() -> None:
     for offset in offsets[1:]:
         output.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
     output.extend(
-        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode(
-            "ascii"
-        )
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode("ascii")
     )
     OUT.write_bytes(output)
 
