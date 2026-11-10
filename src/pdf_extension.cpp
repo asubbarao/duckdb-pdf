@@ -8108,6 +8108,7 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 		unique_ptr<poppler::page> page;
 		double width = 0;
 		bool had_text_layer = false;
+		bool stamp_over_scan = false;
 		int native_words = 0;
 		{
 			PopplerDocGuard poppler_guard;
@@ -8116,14 +8117,19 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 				throw IOException("pdf_ocr: could not read page %d", page_idx + 1);
 			}
 			width = page->page_rect().width();
-			auto layout_words =
-			    LayoutWordsFromBoxes(MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font)));
+			auto native_boxes = MergeSpacelessBoxes(page->text_list(poppler::page::text_list_include_font));
+			auto layout_words = LayoutWordsFromBoxes(native_boxes);
 			for (const auto &word : layout_words) {
 				if (pdf_ocr::HasGlyphs(word.text)) {
 					native_words++;
 				}
 			}
 			had_text_layer = pdf_ocr::HasGlyphs(LayoutPageText(layout_words, width));
+			// A page stamped with a page number or Bates label over a scan
+			// reads as text, so the skip below would leave the scan
+			// underneath un-OCR'd — the same stamp the read_pdf grains
+			// already see through.
+			stamp_over_scan = had_text_layer && NativeLayerIsAStampOverAScan(page.get(), native_boxes);
 		}
 
 		PdfOcrRow row;
@@ -8131,7 +8137,7 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 		row.had_text_layer = had_text_layer;
 		row.words = native_words;
 		const bool selected = row.page >= po.first_page && (po.last_page < 0 || row.page <= po.last_page);
-		if (!selected || (had_text_layer && !force)) {
+		if (!selected || (had_text_layer && !force && !stamp_over_scan)) {
 			rows.push_back(row);
 			continue;
 		}
@@ -8152,6 +8158,13 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 				chosen_path = second_path;
 				chosen = second;
 			}
+		}
+		// Over a stamp, OCR wins only when it read more than the stamp itself,
+		// mirroring the read_pdf grains — otherwise the added layer is OCR noise
+		// next to the stamp. force_ocr keeps its old unconditional behaviour.
+		if (!force && stamp_over_scan && chosen.words <= native_words) {
+			rows.push_back(row);
+			continue;
 		}
 		row.ocr_applied = true;
 		row.words = chosen.words;
