@@ -2450,16 +2450,96 @@ static bool NativeLayerIsAStampOverAScan(poppler::page *page, const std::vector<
 	return static_cast<double>(ink) / (static_cast<double>(w) * h) >= STAMP_PROBE_MIN_INK;
 }
 
-// The one auto_ocr decision for every grain: a page with no native text, or
-// whose native text is only a stamp over a scan (see above).
+// A text layer drawn with fonts that have no Unicode map comes out of poppler
+// as control characters and private-use code points: the page looks like text
+// but reads as nothing (a Republic Indemnity loss run reads "0917)489\x13*$").
+// Real text has none of these, so a layer where at least one glyph in ten is
+// one is unreadable and auto_ocr reads the page image instead.
+static constexpr size_t UNREADABLE_MIN_GLYPHS = 20;
+static constexpr size_t UNREADABLE_GLYPHS_PER_TEN = 1;
+
+struct GlyphTally {
+	size_t readable = 0;
+	size_t unreadable = 0;
+};
+
+static GlyphTally TallyGlyphs(const string &s) {
+	GlyphTally t;
+	for (size_t i = 0; i < s.size();) {
+		const unsigned char c = static_cast<unsigned char>(s[i]);
+		uint32_t cp;
+		size_t len;
+		if (c < 0x80) {
+			cp = c;
+			len = 1;
+		} else if ((c >> 5) == 0x6 && i + 1 < s.size()) {
+			cp = ((c & 0x1Fu) << 6) | (static_cast<unsigned char>(s[i + 1]) & 0x3Fu);
+			len = 2;
+		} else if ((c >> 4) == 0xE && i + 2 < s.size()) {
+			cp = ((c & 0x0Fu) << 12) | ((static_cast<unsigned char>(s[i + 1]) & 0x3Fu) << 6) |
+			     (static_cast<unsigned char>(s[i + 2]) & 0x3Fu);
+			len = 3;
+		} else if ((c >> 3) == 0x1E && i + 3 < s.size()) {
+			cp = ((c & 0x07u) << 18) | ((static_cast<unsigned char>(s[i + 1]) & 0x3Fu) << 12) |
+			     ((static_cast<unsigned char>(s[i + 2]) & 0x3Fu) << 6) | (static_cast<unsigned char>(s[i + 3]) & 0x3Fu);
+			len = 4;
+		} else {
+			t.unreadable++;
+			i++;
+			continue;
+		}
+		i += len;
+		if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == '\f' || cp == '\v') {
+			continue;
+		}
+		if (cp < 0x20 || cp == 0x7F || cp == 0xFFFD || (cp >= 0xE000 && cp <= 0xF8FF)) {
+			t.unreadable++;
+		} else {
+			t.readable++;
+		}
+	}
+	return t;
+}
+
+static bool TextLayerIsUnreadable(const GlyphTally &t) {
+	const size_t glyphs = t.readable + t.unreadable;
+	return glyphs >= UNREADABLE_MIN_GLYPHS && t.unreadable * 10 >= glyphs * UNREADABLE_GLYPHS_PER_TEN;
+}
+
+static GlyphTally TallyBoxes(const std::vector<MergedTextBox> &boxes) {
+	GlyphTally t;
+	for (auto &b : boxes) {
+		auto bt = TallyGlyphs(b.text);
+		t.readable += bt.readable;
+		t.unreadable += bt.unreadable;
+	}
+	return t;
+}
+
+// Words of the native layer a reader could use: none of their glyphs is unreadable.
+// OCR replaces a native layer only when it reads more than this.
+static size_t ReadableWordCount(const std::vector<MergedTextBox> &boxes) {
+	size_t n = 0;
+	for (auto &b : boxes) {
+		auto t = TallyGlyphs(b.text);
+		if (t.readable > 0 && t.unreadable == 0) {
+			n++;
+		}
+	}
+	return n;
+}
+
+// The one auto_ocr decision for every grain: a page with no native text, a
+// native layer that is only a stamp over a scan (see above), or one that is
+// unreadable.
 static bool AutoOcrWantsPage(poppler::page *page, const std::vector<MergedTextBox> &boxes) {
-	return boxes.empty() || NativeLayerIsAStampOverAScan(page, boxes);
+	return boxes.empty() || TextLayerIsUnreadable(TallyBoxes(boxes)) || NativeLayerIsAStampOverAScan(page, boxes);
 }
 
 // Page and line grains hold the native text as a string. Only a short one can
 // be a stamp, so the word boxes are fetched again only then.
 static bool AutoOcrWantsPageText(poppler::page *page, const string &native) {
-	if (!pdf_ocr::HasGlyphs(native)) {
+	if (!pdf_ocr::HasGlyphs(native) || TextLayerIsUnreadable(TallyGlyphs(native))) {
 		return true;
 	}
 	if (native.size() > STAMP_PROBE_MAX_TEXT_BYTES) {
@@ -2477,6 +2557,11 @@ static size_t GlyphCount(const string &s) {
 		}
 	}
 	return n;
+}
+
+// What a native layer offers a reader: its glyphs, less any unreadable ones.
+static size_t ReadableGlyphCount(const string &s) {
+	return TallyGlyphs(s).readable;
 }
 
 static pdf_ocr::TextResult OcrBitmapText(const poppler::image &img, const pdf_ocr::Options &opt) {
@@ -2536,7 +2621,7 @@ static bool LoadWordsForPage(poppler::page *page, const PdfOptions &opt, std::ve
 	}
 	ocr_boxes = OcrPageWords(page, opt, /*best_effort=*/true);
 	// Over a stamp, OCR wins only when it read more than the stamp itself.
-	if (ocr_boxes.size() <= boxes.size()) {
+	if (ocr_boxes.size() <= ReadableWordCount(boxes)) {
 		ocr_boxes.clear();
 		return false;
 	}
@@ -3120,7 +3205,8 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 			const bool best_effort = !bind.opt.force_ocr || has_text_layer;
 			auto ocr = OcrPageResult(page.get(), bind.opt, best_effort);
 			// Over a stamp, OCR wins only when it read more than the stamp itself.
-			const bool ocr_adds = bind.opt.force_ocr || !has_text_layer || GlyphCount(ocr.text) > GlyphCount(text);
+			const bool ocr_adds =
+			    bind.opt.force_ocr || !has_text_layer || GlyphCount(ocr.text) > ReadableGlyphCount(text);
 			if (ocr_adds && pdf_ocr::HasGlyphs(ocr.text)) {
 				text = std::move(ocr.text);
 				used_ocr = true;
@@ -4491,7 +4577,8 @@ static bool LinesLoadPage(ReadPdfLinesState &g, const PdfOptions &opt) {
 		bool has_native = pdf_ocr::HasGlyphs(text);
 		if (opt.force_ocr || (opt.auto_ocr && AutoOcrWantsPageText(page.get(), text))) {
 			auto recognized = OcrPageResult(page.get(), opt, !opt.force_ocr || has_native);
-			const bool ocr_adds = opt.force_ocr || !has_native || GlyphCount(recognized.text) > GlyphCount(text);
+			const bool ocr_adds =
+			    opt.force_ocr || !has_native || GlyphCount(recognized.text) > ReadableGlyphCount(text);
 			if (ocr_adds && pdf_ocr::HasGlyphs(recognized.text))
 				text = std::move(recognized.text);
 		}
@@ -5727,7 +5814,7 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfTablesInit(ClientContext &con
 				if (bind.opt.auto_ocr && AutoOcrWantsPage(page.get(), native_boxes)) {
 					auto ocr_words = OcrPageWords(page.get(), bind.opt, /*best_effort=*/true);
 					// Over a stamp, OCR wins only when it read more than the stamp itself.
-					if (ocr_words.size() > words.size()) {
+					if (ocr_words.size() > ReadableWordCount(native_boxes)) {
 						words.clear();
 					} else {
 						ocr_words.clear();
@@ -8316,8 +8403,9 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 		unique_ptr<poppler::page> page;
 		double width = 0;
 		bool had_text_layer = false;
-		bool stamp_over_scan = false;
+		bool native_not_usable = false;
 		int native_words = 0;
+		size_t readable_native_words = 0;
 		{
 			PopplerDocGuard poppler_guard;
 			page.reset(doc->create_page(page_idx));
@@ -8333,11 +8421,13 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 				}
 			}
 			had_text_layer = pdf_ocr::HasGlyphs(LayoutPageText(layout_words, width));
-			// A page stamped with a page number or Bates label over a scan
-			// reads as text, so the skip below would leave the scan
-			// underneath un-OCR'd — the same stamp the read_pdf grains
-			// already see through.
-			stamp_over_scan = had_text_layer && NativeLayerIsAStampOverAScan(page.get(), native_boxes);
+			// A page stamped with a page number or Bates label over a scan, or
+			// one whose text layer is unreadable, reads as text, so the skip
+			// below would leave the page un-OCR'd. The read_pdf grains already
+			// see through both.
+			native_not_usable = had_text_layer && (TextLayerIsUnreadable(TallyBoxes(native_boxes)) ||
+			                                       NativeLayerIsAStampOverAScan(page.get(), native_boxes));
+			readable_native_words = ReadableWordCount(native_boxes);
 		}
 
 		PdfOcrRow row;
@@ -8345,7 +8435,7 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 		row.had_text_layer = had_text_layer;
 		row.words = native_words;
 		const bool selected = row.page >= po.first_page && (po.last_page < 0 || row.page <= po.last_page);
-		if (!selected || (had_text_layer && !force && !stamp_over_scan)) {
+		if (!selected || (had_text_layer && !force && !native_not_usable)) {
 			rows.push_back(row);
 			continue;
 		}
@@ -8367,10 +8457,10 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 				chosen = second;
 			}
 		}
-		// Over a stamp, OCR wins only when it read more than the stamp itself,
-		// mirroring the read_pdf grains — otherwise the added layer is OCR noise
-		// next to the stamp. force_ocr keeps its old unconditional behaviour.
-		if (!force && stamp_over_scan && chosen.words <= native_words) {
+		// OCR wins only when it read more than the native layer's readable
+		// words, mirroring the read_pdf grains — otherwise the added layer is
+		// OCR noise next to a stamp. force_ocr keeps its unconditional behaviour.
+		if (!force && native_not_usable && static_cast<size_t>(chosen.words) <= readable_native_words) {
 			rows.push_back(row);
 			continue;
 		}

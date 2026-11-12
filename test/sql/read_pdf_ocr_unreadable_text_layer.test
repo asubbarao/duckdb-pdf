@@ -1,0 +1,33 @@
+# name: test/sql/read_pdf_ocr_unreadable_text_layer.test
+# description: auto_ocr reads a page whose text layer extracts as control characters
+# group: [sql]
+
+require pdf
+
+# The page renders as Helvetica text, but its font maps every glyph to a control
+# character, as fonts without a usable Unicode map do on real carrier reports.
+# The page has glyphs, so auto_ocr used to keep the unreadable layer.
+query III
+SELECT has_text_layer, used_ocr, contains(text, 'TOTAL $79,167 $28,106')
+FROM read_pdf('test/data/unreadable_text_layer.pdf');
+----
+true	true	true
+
+query I
+SELECT contains(string_agg(text, ' ' ORDER BY line), 'LOSS RUN REPORT BY POLICY AND CLAIM')
+FROM read_pdf('test/data/unreadable_text_layer.pdf', grain := 'line');
+----
+true
+
+query I
+SELECT bool_and(source = 'ocr') AND contains(string_agg(word, ' ' ORDER BY line, x0), 'TOTAL $79,167 $28,106')
+FROM read_pdf_words('test/data/unreadable_text_layer.pdf');
+----
+true
+
+# auto_ocr := false still returns the native layer as it is.
+query II
+SELECT used_ocr, contains(text, 'LOSS')
+FROM read_pdf('test/data/unreadable_text_layer.pdf', auto_ocr := false);
+----
+false	false
