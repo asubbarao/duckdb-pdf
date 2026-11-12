@@ -152,3 +152,18 @@ SELECT count(*) > 0 AND bool_and(abs(src.x0 - dst.x0) < 10 AND abs(src.y0 - dst.
 FROM src JOIN dst USING (word);
 ----
 true
+
+# A scan under a page-number stamp: the stamp used to make the page look like
+# text, so pdf_ocr skipped it and the searchable output kept only the stamp.
+# The stamp is 4 words; the scan underneath reads far more.
+query IIII
+SELECT page, had_text_layer, ocr_applied, words > 4
+FROM pdf_ocr('test/data/scan_under_page_stamp.pdf', '__TEST_DIR__/ocr_stamp.pdf', ocr_retry := false);
+----
+1	true	true	true
+
+query I
+SELECT contains(text, 'Totals 16,710.55')
+FROM read_pdf('__TEST_DIR__/ocr_stamp.pdf', auto_ocr := false);
+----
+true

@@ -116,7 +116,8 @@ true
 #
 # Page 1 has a text layer; page 2 is a screenshot with none, so auto_ocr fires
 # on one page of a document and not the other — the mixed case a scanned-file
-# fixture cannot produce.
+# fixture cannot produce. Page 1 is also the stamp-heuristic regression case:
+# ten words at 24–54pt with background art must not read as a stamp over a scan.
 
 query IIII
 SELECT page, has_text_layer, used_ocr, length(text) > 0

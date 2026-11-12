@@ -14,6 +14,7 @@
 
 #include <leptonica/allheaders.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -601,6 +602,89 @@ bool EnsureTesseract(const Options &opt) {
 	return true;
 }
 
+// Scanned and faxed loss runs often arrive sideways or upside down: a landscape
+// report fed through a portrait scanner. Tesseract reads those as nonsense
+// ("SSO]" for "Loss") with no error, only a low confidence. Leptonica's
+// orientation detector counts ascenders and descenders, and a loss run is
+// mostly capitals and digits, which have neither: on a sideways Travelers
+// detail page it reported no preference at all. So Tesseract's own confidence
+// is the judge. When a page reads badly, it is read again a half turn and both
+// quarter turns from the image Tesseract was given, and the turn that reads
+// clearly better replaces it. A page that reads well is never re-read, so
+// upright scans and digital pages cost nothing extra.
+static constexpr int ORIENTATION_RETRY_BELOW_CONFIDENCE = 60;
+static constexpr int ORIENTATION_MIN_GAIN = 15;
+
+// pixRotateOrth turns clockwise. Map a box measured on the image turned by
+// `degrees` back to the original width x height image.
+void UnturnBox(int degrees, int width, int height, int &left, int &top, int &right, int &bottom) {
+	int x0 = left, y0 = top, x1 = right, y1 = bottom;
+	switch (degrees) {
+	case 90: // turned (x, y) = (height - y, x)
+		left = y0;
+		right = y1;
+		top = height - x1;
+		bottom = height - x0;
+		break;
+	case 180: // turned (x, y) = (width - x, height - y)
+		left = width - x1;
+		right = width - x0;
+		top = height - y1;
+		bottom = height - y0;
+		break;
+	case 270: // turned (x, y) = (y, width - x)
+		left = width - y1;
+		right = width - y0;
+		top = x0;
+		bottom = x1;
+		break;
+	default:
+		break;
+	}
+}
+
+// Returns the clockwise degrees of the better turn (0 when none was better)
+// and leaves that image set on the API; `processed` then owns it. Whenever the
+// page was re-read (confidence below the bar) the API holds a fresh image with
+// no results, so the caller recognizes again either way.
+int RereadAtOtherQuarterTurns(tesseract::TessBaseAPI &api, Pix *&processed, int confidence) {
+	if (!processed || confidence >= ORIENTATION_RETRY_BELOW_CONFIDENCE) {
+		return 0;
+	}
+	Pix *best = nullptr;
+	int best_quads = 0;
+	// A turn must read clearly better and also read well on its own: a page of
+	// one or two words gives noisy confidences, and a turned misread of a lone
+	// stamp can beat its upright reading without being right.
+	int best_confidence = std::max(confidence + ORIENTATION_MIN_GAIN, ORIENTATION_RETRY_BELOW_CONFIDENCE) - 1;
+	for (int quads : {2, 1, 3}) {
+		Pix *turned = pixRotateOrth(processed, quads);
+		if (!turned) {
+			continue;
+		}
+		api.SetImage(turned);
+		const int turned_confidence = api.MeanTextConf();
+		if (turned_confidence > best_confidence) {
+			if (best) {
+				pixDestroy(&best);
+			}
+			best = turned;
+			best_quads = quads;
+			best_confidence = turned_confidence;
+		} else {
+			pixDestroy(&turned);
+		}
+	}
+	if (!best) {
+		api.SetImage(processed);
+		return 0;
+	}
+	pixDestroy(&processed);
+	processed = best;
+	api.SetImage(processed);
+	return best_quads * 90;
+}
+
 void SetOcrImage(tesseract::TessBaseAPI &api, const unsigned char *data, int width, int height, int bytes_per_row,
                  ImageFormat format, int dpi, bool preprocess, Pix *&base, Pix *&processed, bool deskew = true) {
 	base = preprocess ? BufferToPix(data, width, height, bytes_per_row, format) : nullptr;
@@ -662,6 +746,10 @@ TextResult RecognizeTesseractText(const unsigned char *data, int width, int heig
 	// read_pdf page path always wants plain text; format on Options is for
 	// RecognizeImageBlob / ocr_image TVF. Keep text-only here for stability.
 	FillTextFromApi(api, "text", out);
+	if (out.confidence < ORIENTATION_RETRY_BELOW_CONFIDENCE && processed) {
+		RereadAtOtherQuarterTurns(api, processed, out.confidence);
+		FillTextFromApi(api, "text", out);
+	}
 	// Keep the engine warm for the next page on this thread; free only page state.
 	api.Clear();
 	DestroyPixPair(processed, base);
@@ -692,6 +780,15 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 		return out;
 	}
 	out.confidence = api.MeanTextConf();
+	if (out.confidence < ORIENTATION_RETRY_BELOW_CONFIDENCE && processed) {
+		out.rotation = RereadAtOtherQuarterTurns(api, processed, out.confidence);
+		if (api.Recognize(0) != 0) {
+			api.Clear();
+			DestroyPixPair(processed, base);
+			return out;
+		}
+		out.confidence = api.MeanTextConf();
+	}
 	const double dpi = static_cast<double>(opt.dpi > 0 ? opt.dpi : 300);
 	tesseract::ResultIterator *ri = api.GetIterator();
 	if (ri) {
@@ -706,6 +803,10 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 			float conf = ri->Confidence(tesseract::RIL_WORD);
 			int left = 0, top = 0, right = 0, bottom = 0;
 			ri->BoundingBox(tesseract::RIL_WORD, &left, &top, &right, &bottom);
+			// Boxes read on a turned image go back to the page as rendered, so a
+			// word box still marks the same spot on the page (citations, redaction,
+			// searchable-PDF text) whichever way the scan was fed.
+			UnturnBox(out.rotation, width, height, left, top, right, bottom);
 			Word w;
 			w.text = std::string(word_text);
 			delete[] word_text;
