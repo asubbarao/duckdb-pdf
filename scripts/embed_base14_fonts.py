@@ -282,33 +282,13 @@ globalParams->addFontFile(std::string(blob.base14_name), path);
 // Files must be real binary PFB (FreeType rejects mislabeled PFA on some builds).
 // Pass absolute dir — relative fails when openFile is not cwd-relative.
 // setupBaseFonts skips names already in fontFiles (addFontFile above).
+//
+// Nothing here touches the process environment. A poppler built with fontconfig
+// resolves base-14 names through findBase14FontFile, which reads the fontFiles
+// map addFontFile filled, so these fonts need no fontconfig setup either. The
+// environment belongs to the host: a FONTCONFIG_* set here would be inherited by
+// every child process it starts (LibreOffice then finds only these 14 fonts).
 globalParams->setupBaseFonts(dir.c_str());
-
-// When poppler is built WITH fontconfig (community may enable it), point it at
-// our temp tree so system fontconfig emptiness does not blank-render pages.
-{
-const std::string conf = dir + sep + "fonts.conf";
-std::ofstream cf(conf, std::ios::trunc);
-if (cf) {
-cf << "<?xml version=\"1.0\"?>\n"
-      "<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n"
-      "<fontconfig>\n"
-      "  <dir>" << dir << "</dir>\n"
-      "  <cachedir>" << dir << "/cache</cachedir>\n"
-      "  <config></config>\n"
-      "</fontconfig>\n";
-cf.close();
-#ifndef _WIN32
-// Do not clobber an operator-set FONTCONFIG_*; only fill when unset.
-if (!std::getenv("FONTCONFIG_FILE")) {
-setenv("FONTCONFIG_FILE", conf.c_str(), 0);
-}
-if (!std::getenv("FONTCONFIG_PATH")) {
-setenv("FONTCONFIG_PATH", dir.c_str(), 0);
-}
-#endif
-}
-}
 }
 
 } // namespace duckdb
