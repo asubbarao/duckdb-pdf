@@ -125,6 +125,12 @@ endif()
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+# A process that renders a page keeps its environment: the extension linked
+# statically, the way the CLI and unittest link it.
+add_executable(pdf_process_env_test test/process_env_test.cpp)
+target_link_libraries(pdf_process_env_test duckdb_static)
+link_extension_libraries(pdf_process_env_test "")
+
 if(APPLE)
   find_library(PDF_CORESERVICES CoreServices REQUIRED)
   find_library(PDF_FOUNDATION Foundation REQUIRED)
