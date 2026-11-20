@@ -283,11 +283,12 @@ globalParams->addFontFile(std::string(blob.base14_name), path);
 // Pass absolute dir — relative fails when openFile is not cwd-relative.
 // setupBaseFonts skips names already in fontFiles (addFontFile above).
 //
-// Nothing here touches the process environment. A poppler built with fontconfig
-// resolves base-14 names through findBase14FontFile, which reads the fontFiles
-// map addFontFile filled, so these fonts need no fontconfig setup either. The
-// environment belongs to the host: a FONTCONFIG_* set here would be inherited by
-// every child process it starts (LibreOffice then finds only these 14 fonts).
+// Nothing here touches the process environment: a FONTCONFIG_* set here would be
+// inherited by every child process the host starts (LibreOffice then finds only
+// these 14 fonts). With poppler built on fontconfig, setupBaseFonts is a no-op and
+// findBase14FontFile asks fontconfig, but GfxFont::locateFont first tries
+// findFontFile(name), and its 8-bit fallback findFontFile(substitute name), so
+// the exact base-14 names still resolve to the fonts addFontFile registered.
 globalParams->setupBaseFonts(dir.c_str());
 }
 

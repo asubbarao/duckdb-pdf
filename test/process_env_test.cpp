@@ -48,6 +48,11 @@ int main() {
 	std::cout << "skip: POSIX only\n";
 	return 0;
 #else
+	// Start from neither variable set. The old code only set them when unset, so a
+	// host that presets them would otherwise hide it.
+	unsetenv("FONTCONFIG_FILE");
+	unsetenv("FONTCONFIG_PATH");
+
 	// What a child sees: its own FONTCONFIG_* and how many fonts fontconfig lists.
 	const char *child_env = "printf 'FONTCONFIG_FILE=%s FONTCONFIG_PATH=%s' \"${FONTCONFIG_FILE-unset}\" "
 	                        "\"${FONTCONFIG_PATH-unset}\"";
