@@ -75,10 +75,12 @@ export EXPECTED_EXT_VERSION = $(PDF_BUILT_VERSION)
 # The outside-container Linux pass deliberately skips all executable tests.
 ifneq ($(SKIP_TESTS),1)
 define OFFICE_CONVERSION_TEST
-test_$(1): office_conversion_test_$(1)
+test_$(1): office_conversion_test_$(1) process_env_test_$(1)
 office_conversion_test_$(1):
 	./build/$(1)/extension/pdf/pdf_office_conversion_test
-.PHONY: office_conversion_test_$(1)
+process_env_test_$(1):
+	./build/$(1)/extension/pdf/pdf_process_env_test
+.PHONY: office_conversion_test_$(1) process_env_test_$(1)
 endef
 $(foreach config,release debug reldebug,$(eval $(call OFFICE_CONVERSION_TEST,$(config))))
 endif
