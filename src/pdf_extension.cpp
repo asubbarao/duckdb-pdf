@@ -2454,7 +2454,10 @@ static bool NativeLayerIsAStampOverAScan(poppler::page *page, const std::vector<
 // as control characters and private-use code points: the page looks like text
 // but reads as nothing (a Republic Indemnity loss run reads "0917)489\x13*$").
 // Real text has none of these, so a layer where at least one glyph in ten is
-// one is unreadable and auto_ocr reads the page image instead.
+// one is unreadable and auto_ocr reads the page image instead. The minimum
+// below keeps a stray control character or two in a mostly-readable layer from
+// triggering OCR; a layer of nothing but such characters is unreadable at any
+// size, since there is no readable content to protect.
 static constexpr size_t UNREADABLE_MIN_GLYPHS = 20;
 static constexpr size_t UNREADABLE_GLYPHS_PER_TEN = 1;
 
@@ -2503,6 +2506,15 @@ static GlyphTally TallyGlyphs(const string &s) {
 
 static bool TextLayerIsUnreadable(const GlyphTally &t) {
 	const size_t glyphs = t.readable + t.unreadable;
+	// A layer of nothing but control characters is unreadable at any size:
+	// the OCR-wins guards below keep the native layer whenever OCR reads
+	// nothing better, so there is nothing to lose by trying. Without this a
+	// short stamp in a broken font over a scan is invisible to both detectors
+	// at once: too few glyphs for the minimum here, and too large a point
+	// size for the stamp probe's 16pt gate.
+	if (glyphs > 0 && t.unreadable == glyphs) {
+		return true;
+	}
 	return glyphs >= UNREADABLE_MIN_GLYPHS && t.unreadable * 10 >= glyphs * UNREADABLE_GLYPHS_PER_TEN;
 }
 

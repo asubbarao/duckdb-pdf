@@ -167,3 +167,18 @@ SELECT contains(text, 'Totals 16,710.55')
 FROM read_pdf('__TEST_DIR__/ocr_stamp.pdf', auto_ocr := false);
 ----
 true
+
+# A short stamp in a broken font over the same scan: eight control-character
+# glyphs at 24pt, below the unreadable-layer minimum and above the stamp
+# probe's font-size gate. pdf_ocr used to skip the page and keep only the stamp.
+query IIII
+SELECT page, had_text_layer, ocr_applied, words > 4
+FROM pdf_ocr('test/data/unreadable_short_stamp.pdf', '__TEST_DIR__/ocr_unreadable_stamp.pdf', ocr_retry := false);
+----
+1	true	true	true
+
+query I
+SELECT contains(text, 'Totals 16,710.55')
+FROM read_pdf('__TEST_DIR__/ocr_unreadable_stamp.pdf', auto_ocr := false);
+----
+true
