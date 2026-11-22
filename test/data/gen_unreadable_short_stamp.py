@@ -77,7 +77,7 @@ def to_unicode_cmap() -> bytes:
     entries = [f"<{code:02X}> <{CONTROLS[i % len(CONTROLS)]:04X}>" for i, code in enumerate(codes)]
     blocks = []
     for start in range(0, len(entries), 100):
-        chunk = entries[start:start + 100]
+        chunk = entries[start : start + 100]
         blocks.append(f"{len(chunk)} beginbfchar\n" + "\n".join(chunk) + "\nendbfchar")
     cmap = (
         "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
@@ -99,7 +99,9 @@ def make_pdf() -> None:
         b"/Resources << /XObject << /Im0 4 0 R >> /Font << /F1 5 0 R >> >> /Contents 6 0 R >>",
         b"<< /Type /XObject /Subtype /Image /Width %d /Height %d "
         b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length %d >>\nstream\n"
-        % (width, height, len(jpeg)) + jpeg + b"\nendstream",
+        % (width, height, len(jpeg))
+        + jpeg
+        + b"\nendstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /ToUnicode 7 0 R >>",
         b"<< /Length 0 >>\nstream\n\nendstream",  # placeholder, replaced below
         to_unicode_cmap(),
