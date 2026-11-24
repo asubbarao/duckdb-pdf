@@ -24,6 +24,9 @@ namespace duckdb {
 // globalParams (first document open). Retries until registration succeeds.
 void EnsurePdfBase14Fonts();
 
+// Called after a successful open under PopplerMutex.
+void PreparePopplerForRendering();
+
 // Install setErrorCallback once (poppler private API). Safe under PopplerMutex.
 // Tracks missing-display-font for fail-loud font paths; stderr only when
 // PDF_POPPLER_LOG=1 (default quiet — LoadDoc still throws on open failure).

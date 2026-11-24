@@ -1,0 +1,30 @@
+# name: test/sql/pdf_render_parallel.test
+# description: concurrent private documents render the same PNG bytes as a serial baseline
+# group: [sql]
+
+require pdf
+
+require notwindows
+
+statement ok
+SET threads=1
+
+statement ok
+CREATE TABLE baseline AS
+SELECT filename, page, pdf_render(filename, page, {dpi: 72}) AS png
+FROM (
+  SELECT filename, page FROM read_pdf('test/data/running_header.pdf', auto_ocr := false)
+  UNION ALL
+  SELECT filename, page FROM read_pdf('test/data/page_labels.pdf', auto_ocr := false)
+)
+
+# Run eight client threads even when these small tables fit in a single scan task.
+concurrentloop worker 0 8
+
+query II
+SELECT count(png), count(png) FILTER (WHERE png = pdf_render(filename, page, {dpi: 72}))
+FROM baseline;
+----
+10	10
+
+endloop

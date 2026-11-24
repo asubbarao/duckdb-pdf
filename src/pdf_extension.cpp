@@ -60,8 +60,8 @@
 
 // tesseract + leptonica — OCR for scanned / image-only PDFs. Isolated into
 // ocr_ops.cpp (mirrors the qpdf TU isolation): this file never includes
-// <tesseract/*> or <leptonica/*>. Poppler rendering stays here under
-// PopplerMutex; the raw bitmap is handed to pdf_ocr::Recognize* (zero-copy
+// <tesseract/*> or <leptonica/*>. Poppler renders here and hands the raw
+// bitmap to pdf_ocr::Recognize* (zero-copy
 // pixel path). TessBaseAPI lives as a thread_local inside ocr_ops — Init once
 // per worker thread / language, Clear between pages (not per-row re-Init).
 #include "ocr_ops.hpp"
@@ -159,23 +159,18 @@ static poppler::page::text_layout_enum LayoutFromString(const string &s, bool pa
 
 // poppler is not thread-safe across independent documents ON WINDOWS
 // (observed: intermittent hard process crashes on Windows CI when concurrent
-// multi-doc parse/extract ran unlocked). Every poppler entry point takes this
-// global lock, with ONE carve-out: the parallel read_pdf scan on macOS/Linux,
-// where each thread owns its own poppler::document and per-document page calls
-// (create_page / page_rect / text) run unlocked via PopplerDocGuard no-op.
+// multi-doc parse/extract ran unlocked). On macOS/Linux, workers own their
+// documents and PopplerDocGuard allows concurrent page access.
 //
-// Document OPEN (LoadDoc) and all rasterization (page_renderer — OCR / png /
-// svg) stay globally locked on every platform — those paths touch poppler
-// global/shared state (globalParams, font caches) we cannot prove is
-// per-document. Critical sections are per-call — never held across scan chunks
-// or stored in state — and the mutex is recursive so helpers that call other
-// guarded helpers (e.g. DocToSvg → RenderPageToPngBytes) cannot self-deadlock.
+// Document OPEN (LoadDoc) stays globally locked on every platform: it initializes
+// globalParams and registers bundled fonts. Rasterization can run unlocked on
+// macOS/Linux when each worker owns its document; Windows keeps the guard because
+// concurrent multi-document Poppler use crashed in CI. The mutex is recursive so
+// Windows helpers can safely call other guarded helpers (DocToSvg → render).
 //
 // Windows MaxThreads may be >1: workers own private documents; PopplerDocGuard
-// + LoadDoc + RenderPageForOcr keep every poppler call serialized. That is the
-// safe multi-file / page-parallel shape (I/O + OCR can overlap; text-only
-// poppler work queues on this mutex). Do NOT drop the Windows guard without
-// re-proving multi-doc safety on CI.
+// and LoadDoc keep Poppler calls serialized. Do NOT drop the Windows guard
+// without re-proving multi-doc safety on CI.
 static std::recursive_mutex &PopplerMutex() {
 	static std::recursive_mutex m;
 	return m;
@@ -2349,11 +2344,11 @@ static pdf_ocr::Options MakeOcrOptions(const PdfOptions &po, bool best_effort) {
 	return o;
 }
 
-// Render a poppler page under the global lock. Returns an invalid image on
-// failure. Caller owns the returned poppler::image (value type).
+// Render a poppler page. POSIX workers render their private documents in parallel;
+// Windows retains the global guard. Caller owns the returned poppler::image.
 static poppler::image RenderPageForOcr(poppler::page *page, int dpi) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-	EnsurePdfBase14Fonts();
+	PopplerDocGuard poppler_guard;
+	PreparePopplerForRendering();
 	poppler::page_renderer renderer;
 	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
@@ -2944,7 +2939,7 @@ static unique_ptr<poppler::document> LoadDoc(const string &bytes, const string &
 	// First successful document open initializes poppler's globalParams. Register
 	// bundled base-14 substitute fonts so subsequent rasterization does not depend
 	// on system fontconfig (community/vcpkg binaries ship without it).
-	EnsurePdfBase14Fonts();
+	PreparePopplerForRendering();
 	return doc;
 }
 
@@ -3103,14 +3098,8 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfInitGlobal(ClientContext &con
 	// Cap by scheduler threads, not file count — a single multi-page PDF must
 	// still be allowed to use N workers (intra-PDF page parallelism).
 	//
-	// Windows is no longer forced to MaxThreads=1. Each worker still owns a
-	// private poppler::document; every poppler entry point stays under
-	// PopplerMutex (LoadDoc always; create_page/page_rect/text via
-	// PopplerDocGuard on Win; RenderPageForOcr on all platforms). Historical
-	// CI crashes were unlocked concurrent multi-doc use — that path is gone.
-	// On Windows, text-only poppler work still serializes on the mutex;
-	// multi-thread mainly overlaps ReadAllBytes I/O and tesseract after
-	// render (OCR runs outside PopplerDocGuard; render re-locks).
+	// Workers own private documents. Windows serializes their Poppler calls
+	// while I/O and Tesseract can overlap.
 	auto scheduler_threads = (idx_t)TaskScheduler::GetScheduler(context).NumberOfThreads();
 	idx_t max_threads = MaxValue<idx_t>(1, scheduler_threads);
 	auto g = make_uniq<ReadPdfGlobalState>(max_threads);
@@ -6012,7 +6001,7 @@ static PdfDocHandle LoadRenderDoc(const string &fn, const string &path, ClientCo
 		if (doc->pages() <= 0) {
 			throw InvalidInputException("%s: '%s' has no readable pages", fn, path);
 		}
-		EnsurePdfBase14Fonts();
+		PreparePopplerForRendering();
 		return PdfDocHandle {std::move(bytes), std::move(doc)};
 	} catch (const InvalidInputException &) {
 		throw;
@@ -6155,8 +6144,8 @@ static string TempDir() {
 // and pdf_to_png (to return raw BLOB). Exact same render hints, UUID naming, TempFileGuard,
 // image::save + binary read + magic validation as the original pdf_to_svg path.
 static string RenderPageToPngBytes(poppler::document &doc, int32_t page_no, int32_t dpi, const string &fn_name) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-	EnsurePdfBase14Fonts();
+	PopplerDocGuard poppler_guard;
+	PreparePopplerForRendering();
 
 	unique_ptr<poppler::page> page(doc.create_page(page_no - 1));
 	if (!page) {
@@ -6207,7 +6196,7 @@ static string RenderPageToPngBytes(poppler::document &doc, int32_t page_no, int3
 }
 
 static string PngToSvg(poppler::document &doc, int32_t page_no, const string &png) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	PopplerDocGuard poppler_guard;
 	// Base64-encode the PNG via DuckDB's blob helper.
 	string b64 = Blob::ToBase64(string_t(png.data(), static_cast<uint32_t>(png.size())));
 
@@ -6228,7 +6217,7 @@ static string PngToSvg(poppler::document &doc, int32_t page_no, const string &pn
 }
 
 static string DocToSvg(poppler::document &doc, int32_t page_no, int32_t dpi) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	PopplerDocGuard poppler_guard;
 	int n = doc.pages();
 	if (page_no < 1 || page_no > n) {
 		throw IOException("pdf_to_svg: page %d is out of range (document has %d page%s)", (int)page_no, n,
@@ -6260,7 +6249,7 @@ static string DocToSvg(poppler::document &doc, int32_t page_no, int32_t dpi) {
 //===--------------------------------------------------------------------===//
 
 static string DocToPng(poppler::document &doc, int32_t page_no, int32_t dpi) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
+	PopplerDocGuard poppler_guard;
 	int n = doc.pages();
 	if (page_no < 1 || page_no > n) {
 		throw IOException("pdf_to_png: page %d is out of range (document has %d page%s)", (int)page_no, n,
@@ -8145,8 +8134,8 @@ static void PdfSplitScan(ClientContext &context, TableFunctionInput &data_p, Dat
 // the exact render hints as OcrPage / RenderPageToPngBytes; reads the raw
 // argb32 buffer directly instead of round-tripping through PNG or tesseract.
 static bool PageRendersNearWhite(poppler::page *page, double threshold) {
-	std::lock_guard<std::recursive_mutex> poppler_guard(PopplerMutex());
-	EnsurePdfBase14Fonts();
+	PopplerDocGuard poppler_guard;
+	PreparePopplerForRendering();
 	poppler::page_renderer renderer;
 	renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
@@ -9138,7 +9127,7 @@ static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page
 	EnsurePopplerErrorCallback();
 	// Register base-14 *before* first render; re-run once if poppler still
 	// reports missing fonts (first document open can race globalParams).
-	EnsurePdfBase14Fonts();
+	PreparePopplerForRendering();
 	ResetPopplerMissingDisplayFont();
 
 	unique_ptr<poppler::page> page(doc.create_page(page_idx0));
@@ -9150,8 +9139,8 @@ static pdf_qpdf::RebuiltPage RenderRedactedPage(poppler::document &doc, int page
 	renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
 	poppler::image img = renderer.render_page(page.get(), dpi, dpi);
 	if (PopplerMissingDisplayFont()) {
-		// Retry once after another base-14 pass (temp dir / setupBaseFonts).
-		EnsurePdfBase14Fonts();
+		// Retry once. Windows also refreshes the base-14 registration.
+		PreparePopplerForRendering();
 		ResetPopplerMissingDisplayFont();
 		img = renderer.render_page(page.get(), dpi, dpi);
 	}
