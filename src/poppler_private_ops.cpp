@@ -7,6 +7,9 @@
 #include "base14_fonts.hpp"
 
 #include "Error.h"
+#ifndef _WIN32
+#include "GlobalParams.h"
+#endif
 #include <poppler-version.h>
 #if POPPLER_VERSION_MAJOR < 25
 #include "PDFDoc.h"
@@ -20,11 +23,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 
 namespace duckdb {
 
-static bool g_poppler_missing_display_font = false;
+static thread_local bool g_poppler_missing_display_font = false;
 
 // Opt-in stderr for poppler library chatter. Equality check only (no regex).
 static bool PopplerLogToStderr() {
@@ -68,6 +72,21 @@ void EnsurePopplerErrorCallback() {
 
 void ResetPopplerMissingDisplayFont() {
 	g_poppler_missing_display_font = false;
+}
+
+void PreparePopplerForRendering() {
+#ifdef _WIN32
+	EnsurePdfBase14Fonts();
+#else
+	// poppler-cpp releases globalParams when its last document closes. Hold
+	// one reference so registration survives gaps between worker documents.
+	static GlobalParamsIniter lifetime(PdfPopplerErrorCallback);
+	static std::once_flag initialized;
+	std::call_once(initialized, [] {
+		EnsurePopplerErrorCallback();
+		EnsurePdfBase14Fonts();
+	});
+#endif
 }
 
 bool PopplerMissingDisplayFont() {
