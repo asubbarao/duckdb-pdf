@@ -1,0 +1,28 @@
+# name: test/sql/read_pdf_ocr_auto_options.test
+# description: auto OCR rejects punctuation-only layers and respects explicit OCR options
+# group: [sql]
+
+require pdf
+
+# The scanned page has only en-dashes in its native text layer. The report content
+# underneath must be read from the image when auto_ocr is enabled.
+query II
+SELECT used_ocr, contains(text, 'Totals 16,710.55 9,000.00 25,710.55')
+FROM read_pdf('test/data/dash_text_layer_over_scan.pdf',
+              grain := 'page', auto_ocr := true, ocr_psm := 1);
+----
+true	true
+
+# An explicit ocr := false disables implicit auto OCR, including on scan-only pages.
+query II
+SELECT used_ocr, text = ''
+FROM read_pdf('test/data/scanned.pdf', grain := 'page', ocr := false);
+----
+false	true
+
+# Explicit auto_ocr := true opts back in even when ocr := false is also present.
+query II
+SELECT used_ocr, contains(lower(text), 'apples')
+FROM read_pdf('test/data/scanned.pdf', grain := 'page', ocr := false, auto_ocr := true, ocr_psm := 1);
+----
+true	true

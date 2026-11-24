@@ -65,6 +65,7 @@
 // pixel path). TessBaseAPI lives as a thread_local inside ocr_ops — Init once
 // per worker thread / language, Clear between pages (not per-row re-Init).
 #include "ocr_ops.hpp"
+#include "utf8proc.hpp"
 // Apple Vision barcode detection (image_barcodes); plain std types only.
 #include "vision_ocr.hpp"
 
@@ -2536,17 +2537,65 @@ static size_t ReadableWordCount(const std::vector<MergedTextBox> &boxes) {
 	return n;
 }
 
+// A short text layer made of dashes, rules, or other stamps is not useful page
+// content. Count only whitespace-delimited tokens that contain a Unicode letter
+// or number; punctuation-only tokens do not make a layer readable.
+static size_t AlphanumericWordCount(const string &text) {
+	size_t count = 0;
+	bool token_has_alphanumeric = false;
+	for (size_t i = 0; i < text.size();) {
+		utf8proc_int32_t codepoint;
+		const auto *bytes = reinterpret_cast<const utf8proc_uint8_t *>(text.data() + i);
+		const auto byte_count = utf8proc_iterate(bytes, static_cast<utf8proc_ssize_t>(text.size() - i), &codepoint);
+		if (byte_count <= 0) {
+			i++;
+			continue;
+		}
+		i += static_cast<size_t>(byte_count);
+		const auto category = utf8proc_category(codepoint);
+		const bool whitespace = codepoint == '\t' || codepoint == '\n' || codepoint == '\r' || codepoint == '\f' ||
+		                        codepoint == '\v' || category == UTF8PROC_CATEGORY_ZS ||
+		                        category == UTF8PROC_CATEGORY_ZL || category == UTF8PROC_CATEGORY_ZP;
+		if (whitespace) {
+			if (token_has_alphanumeric) {
+				count++;
+				token_has_alphanumeric = false;
+			}
+		} else if ((category >= UTF8PROC_CATEGORY_LU && category <= UTF8PROC_CATEGORY_LO) ||
+		           category == UTF8PROC_CATEGORY_ND || category == UTF8PROC_CATEGORY_NL ||
+		           category == UTF8PROC_CATEGORY_NO) {
+			token_has_alphanumeric = true;
+		}
+	}
+	if (token_has_alphanumeric) {
+		count++;
+	}
+	return count;
+}
+
+static size_t AlphanumericWordCount(const std::vector<MergedTextBox> &boxes) {
+	size_t count = 0;
+	for (auto &box : boxes) {
+		count += AlphanumericWordCount(box.text);
+	}
+	return count;
+}
+
+static constexpr size_t AUTO_OCR_MIN_CONTENT_WORDS = 10;
+
 // The one auto_ocr decision for every grain: a page with no native text, a
 // native layer that is only a stamp over a scan (see above), or one that is
 // unreadable.
 static bool AutoOcrWantsPage(poppler::page *page, const std::vector<MergedTextBox> &boxes) {
-	return boxes.empty() || TextLayerIsUnreadable(TallyBoxes(boxes)) || NativeLayerIsAStampOverAScan(page, boxes);
+	return boxes.empty() || AlphanumericWordCount(boxes) < AUTO_OCR_MIN_CONTENT_WORDS ||
+	       TextLayerIsUnreadable(TallyBoxes(boxes)) || NativeLayerIsAStampOverAScan(page, boxes);
 }
 
 // Page and line grains hold the native text as a string. Only a short one can
 // be a stamp, so the word boxes are fetched again only then.
 static bool AutoOcrWantsPageText(poppler::page *page, const string &native) {
-	if (!pdf_ocr::HasGlyphs(native) || TextLayerIsUnreadable(TallyGlyphs(native))) {
+	if (!pdf_ocr::HasGlyphs(native) || AlphanumericWordCount(native) < AUTO_OCR_MIN_CONTENT_WORDS ||
+	    TextLayerIsUnreadable(TallyGlyphs(native))) {
 		return true;
 	}
 	if (native.size() > STAMP_PROBE_MAX_TEXT_BYTES) {
@@ -2723,12 +2772,16 @@ static void PdfCheckOcrPaths(ClientContext &context, const PdfOptions &opt) {
 }
 
 static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
+	bool ocr_explicitly_disabled = false;
+	bool auto_ocr_explicitly_enabled = false;
 	for (auto &kv : params) {
 		auto key = StringUtil::Lower(kv.first.GetIdentifierName());
 		if (key == "ocr") {
 			o.force_ocr = BooleanValue::Get(kv.second);
+			ocr_explicitly_disabled = !o.force_ocr;
 		} else if (key == "auto_ocr") {
 			o.auto_ocr = BooleanValue::Get(kv.second);
+			auto_ocr_explicitly_enabled = o.auto_ocr;
 		} else if (key == "ocr_language") {
 			o.ocr_language = StringValue::Get(kv.second);
 		} else if (key == "ocr_dpi") {
@@ -2769,6 +2822,9 @@ static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
 		} else if (key == "ocr_config") {
 			o.ocr_config = StringValue::Get(kv.second);
 		}
+	}
+	if (ocr_explicitly_disabled && !auto_ocr_explicitly_enabled) {
+		o.auto_ocr = false;
 	}
 
 	// Validate up front so bad input fails with a clear message instead of
