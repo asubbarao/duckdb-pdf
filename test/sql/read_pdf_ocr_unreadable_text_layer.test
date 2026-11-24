@@ -31,3 +31,19 @@ SELECT used_ocr, contains(text, 'LOSS')
 FROM read_pdf('test/data/unreadable_text_layer.pdf', auto_ocr := false);
 ----
 false	false
+
+# A short layer of nothing but control characters is unreadable at any size:
+# "Page 1 of 1" at 24pt is eight glyphs (below the 20-glyph minimum) in type
+# too large for the stamp probe, so both detectors used to miss it and the
+# loss run underneath stayed hidden behind the stamp alone.
+query III
+SELECT has_text_layer, used_ocr, contains(text, 'Totals 16,710.55')
+FROM read_pdf('test/data/unreadable_short_stamp.pdf');
+----
+true	true	true
+
+query I
+SELECT bool_and(source = 'ocr') AND contains(string_agg(word, ' ' ORDER BY line, x0), 'Totals 16,710.55')
+FROM read_pdf_words('test/data/unreadable_short_stamp.pdf');
+----
+true
