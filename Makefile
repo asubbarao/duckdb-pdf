@@ -69,7 +69,22 @@ PDF_BUILT_VERSION = $(shell ./build/release/duckdb -unsigned -no-agent -noheader
 	"LOAD '$(PROJ_DIR)build/release/extension/$(EXT_NAME)/$(EXT_NAME).duckdb_extension'; \
 	 SELECT extension_version FROM duckdb_extensions() WHERE extension_name='$(EXT_NAME)';" 2>/dev/null | tail -1)
 export EXPECTED_EXT_VERSION = $(PDF_BUILT_VERSION)
+
+# The guard asserts the pinned DuckDB (v2.0.0, source d54cbbe3df). Community
+# extension CI parses this same Makefile for `make test_release` — the
+# --fail-require-skip flag and the office-conversion prerequisites in its test
+# run come from here — but it builds against its own DuckDB (today v2.0.1), so
+# an unconditional export would run the guard there and fail (community job
+# 138968520845). Export the sentinel only when the DuckDB in play is the
+# pinned one: unset locally (the Makefile default) and v2.0.0 in this repo's
+# own CI, where the reusable workflow sets DUCKDB_VERSION from its
+# duckdb_version input. When the pin moves, update the version here and in
+# test/sql/zz_build_guard.test together.
+ifeq ($(DUCKDB_VERSION),)
 export PDF_LOCAL_BUILD_GUARD = 1
+else ifeq ($(DUCKDB_VERSION),v2.0.0)
+export PDF_LOCAL_BUILD_GUARD = 1
+endif
 
 # Exercise format routing and backend failure behavior even without desktop apps.
 # Compile with the extension, while CI's compiler/container is still active.

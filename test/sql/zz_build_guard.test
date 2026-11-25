@@ -4,7 +4,9 @@
 
 require pdf
 
-# Set by the local test run only (the Makefile); community CI builds against its own DuckDB.
+# Exported by the Makefile only when the build's DuckDB is the pinned v2.0.0;
+# community CI parses the same Makefile but builds against its own DuckDB, so
+# the guard skips there instead of failing on the version assertion below.
 require-env PDF_LOCAL_BUILD_GUARD
 
 require-env EXPECTED_EXT_VERSION

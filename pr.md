@@ -2,12 +2,18 @@
 
 ## Body
 
-The build guard is intended to validate the PDF artifact built by this local checkout. Community extension CI has its own DuckDB source and sets `EXPECTED_EXT_VERSION` through `extension-ci-tools`, so the old `require-env EXPECTED_EXT_VERSION` gate did not skip there.
+The build guard is intended to validate the PDF artifact built by this local checkout. Community extension CI builds against its own DuckDB (today v2.0.1, commit `8d78114e`), so the guard's pinned-host assertion (`v2.0.0`, source `d54cbbe3df`) fails there — community job 138968520845 failed on exactly that line.
 
-Export `PDF_LOCAL_BUILD_GUARD=1` alongside `EXPECTED_EXT_VERSION` from this checkout's Makefile, and require that sentinel before the existing version check. This keeps the artifact-version assertion and prevents the community job from reaching the local-only DuckDB source assertion.
+The first attempt at a gate did not work: `require-env EXPECTED_EXT_VERSION` passes in community CI because this checkout's own `Makefile` exports it unconditionally, and community CI parses that same Makefile for `make test_release` (its test run carries this Makefile's `--fail-require-skip` flag and office-conversion prerequisites). An unconditional `PDF_LOCAL_BUILD_GUARD=1` export from the same Makefile would reach community CI the same way and skip nothing.
+
+So the sentinel is now exported only when the DuckDB in play is the pinned one: `DUCKDB_VERSION` unset (local runs, the Makefile default) or `v2.0.0` (this repo's own CI, where the reusable workflow sets `DUCKDB_VERSION` from its `duckdb_version` input). Community CI runs with `DUCKDB_VERSION=v2.0.1`, so the export is skipped and the guard file skips at `require-env PDF_LOCAL_BUILD_GUARD`. When the pin moves, update the version in the Makefile and in `test/sql/zz_build_guard.test` together.
 
 ## Evidence
 
-- Community CI job 138968520845 ran `make test_release`, then `python3 ./duckdb/scripts/ci/run_tests.py --fail-require-skip ./build/release/test/unittest test/*`; the `zz_build_guard.test` failure followed because `require-env EXPECTED_EXT_VERSION` passed. [Run log](https://github.com/duckdb/community-extensions/actions/runs/45543778181/job/138968520845)
-- The Makefile exports `EXPECTED_EXT_VERSION` from the just-built extension. The extension-test skill repeats this recipe and test example; it was left unchanged per task scope.
-- Validation attempt used the existing `duckdb-pdf-auto-ocr` test runner. Its compiled test tree loaded that worktree's older copy and skipped on `EXPECTED_EXT_VERSION`; selecting this worktree's absolute test path matched no tests. Skip/run behavior for the edited test file therefore remains unverified.
+- Community CI job 138968520845 (`build / linux_amd64`, run 45543778181): 68 passed, 1 failed — `test/sql/zz_build_guard.test:10`, `SELECT library_version = 'v2.0.0' AND starts_with(source_id, 'd54cbbe3df')` returned `0` instead of `true`. Its DuckDB is v2.0.1 / `8d78114e90a53823803660bf821f6073ac87da8c` (from the job's environment dump). [Run log](https://github.com/duckdb/community-extensions/actions/runs/45543778181/job/138968520845)
+- `make -pn test_release` on this branch: `PDF_LOCAL_BUILD_GUARD = 1` is defined with `DUCKDB_VERSION` unset and with `DUCKDB_VERSION=v2.0.0`, and absent with `DUCKDB_VERSION=v2.0.1`.
+- Skip/run behavior of the edited test file against a real test binary remains unverified locally (no built `unittest` binary in this worktree); this branch's own CI is the verification — it pins DuckDB v2.0.0, so the guard must run and pass there.
+
+## Follow-up (not this PR)
+
+Merging this does not by itself turn community-extensions #3788 green: that PR pins duckdb-pdf commit `03000e2` (0.10.1), which predates this fix. After merge, cut a 0.10.2 release and re-pin #3788's `extensions/pdf/description.yml` to the new commit.
