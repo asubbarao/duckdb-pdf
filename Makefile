@@ -69,6 +69,7 @@ PDF_BUILT_VERSION = $(shell ./build/release/duckdb -unsigned -no-agent -noheader
 	"LOAD '$(PROJ_DIR)build/release/extension/$(EXT_NAME)/$(EXT_NAME).duckdb_extension'; \
 	 SELECT extension_version FROM duckdb_extensions() WHERE extension_name='$(EXT_NAME)';" 2>/dev/null | tail -1)
 export EXPECTED_EXT_VERSION = $(PDF_BUILT_VERSION)
+export PDF_LOCAL_BUILD_GUARD = 1
 
 # Exercise format routing and backend failure behavior even without desktop apps.
 # Compile with the extension, while CI's compiler/container is still active.

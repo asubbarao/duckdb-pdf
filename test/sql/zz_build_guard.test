@@ -5,6 +5,7 @@
 require pdf
 
 # Set by the local test run; a build in another tree (community CI) pins its own DuckDB.
+require-env PDF_LOCAL_BUILD_GUARD
 require-env EXPECTED_EXT_VERSION
 
 query I
