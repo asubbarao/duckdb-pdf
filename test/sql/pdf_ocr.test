@@ -182,3 +182,18 @@ SELECT contains(text, 'Totals 16,710.55')
 FROM read_pdf('__TEST_DIR__/ocr_unreadable_stamp.pdf', auto_ocr := false);
 ----
 true
+
+# A scan under a dash-only text layer: en-dashes read as text, so pdf_ocr
+# skipped the page and the searchable output kept only the dashes. The layer
+# has zero alphanumeric words; the scan underneath reads far more.
+query IIII
+SELECT page, had_text_layer, ocr_applied, words > 4
+FROM pdf_ocr('test/data/dash_text_layer_over_scan.pdf', '__TEST_DIR__/ocr_dash_layer.pdf', ocr_retry := false);
+----
+1	true	true	true
+
+query I
+SELECT contains(text, 'Totals 16,710.55')
+FROM read_pdf('__TEST_DIR__/ocr_dash_layer.pdf', auto_ocr := false);
+----
+true

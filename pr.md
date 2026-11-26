@@ -1,30 +1,43 @@
-# fix: make automatic OCR reject stamp-only text and honor OCR opt-out
+# pdf_ocr: OCR dash-only and short-caption layers over scans
 
 ## Body
 
-`read_pdf` treated any readable glyph as useful native text, so a short layer of en-dashes could hide the scanned page beneath it. The unreadable-layer check handled garbled glyphs but did not reject punctuation-only content. Automatic OCR now counts Unicode letter/number words and treats fewer than 10 as an unreadable layer.
+`read_pdf` sees through a punctuation-only text layer since #50: automatic OCR
+counts Unicode letter/number words and treats fewer than 10 as an unreadable
+layer. `pdf_ocr` never got that gate — its skip decision checks only the
+unreadable-glyph tally (control characters / ≥10% unreadable) and the stamp
+probe. A scanned page whose native layer is only en-dashes, or a short
+readable caption, reads as usable text, so `pdf_ocr` skips the page and the
+searchable output keeps only the dashes (or only the caption) while the scan
+underneath stays unsearchable.
 
-`ocr := false` previously cleared only the forced-OCR flag. Since `auto_ocr` defaults to true, scan-only pages were still sent to OCR. An explicit opt-out now disables automatic OCR too, unless `auto_ocr := true` is explicitly supplied.
-
-Automatic OCR already used the common OCR options conversion path, which passes `ocr_psm`, DPI, OEM, language, preprocessing, retry and tessdata settings through. The regression test supplies `ocr_psm := 1`.
+The fix applies the same `AlphanumericWordCount < 10` gate to `pdf_ocr`'s
+`native_not_usable` decision, alongside the two existing checks. The OCR-wins
+guard below it is unchanged: OCR output still replaces the native layer only
+when it reads more readable words, so a photo with a caption keeps the caption
+when OCR reads nothing.
 
 ## False-first evidence
 
-Both new cases were run against the requested base, `d359f96`:
+On the main binary (`f1eeb39`), the committed #50 fixture and a short-caption
+fixture both fail:
 
-- Dash-only text layer over a scanned page: expected `true, true`; actual `false, false` for `(used_ocr, contains(scanned_totals))`.
-- Scan-only page with `ocr := false`: expected `false, true`; actual `true, false` for `(used_ocr, text_is_empty)`.
+- `pdf_ocr('test/data/dash_text_layer_over_scan.pdf', ...)`: `ocr_applied=false`,
+  output text contains no `Totals 16,710.55`. `read_pdf` on the same file gives
+  `used_ocr=true` and recovers the totals.
+- `pdf_ocr` on a scan with a 24pt readable `Figure 1: Revenue` caption:
+  `ocr_applied=false`, output text is the 17-character caption only.
+- `pdf_ocr(..., force := true)` on the dash fixture recovers the totals, so the
+  OCR path itself works — only the auto decision is wrong.
 
-With the fix, `read_pdf_ocr_auto_options.test` passes all 6 assertions using the freshly built linked extension. The full repository test suite passes: 70 passed, 4 skipped (`LIBREOFFICE_PATH` and `PDF_NETWORK_TESTS` were not enabled).
-
-## ICW before and after
-
-Before, on the base reproduction, pages 16, 19, 32, 43, 53 and 62 kept their dash-only text layer with `used_ocr=false`; the other 56 pages used OCR. Passing `ocr := false` still allowed automatic OCR on scan-only pages.
-
-After, the requested `auto_ocr := true, ocr_psm := 1` query returned 62 rows and `used_ocr=true` for every page. The six formerly missed pages now have text lengths 369, 325, 310, 332, 342 and 287 respectively.
-
-After, `ocr := false` returned `used_ocr=false` for all 62 pages. The six native dash layers remained (lengths 7, 7, 3, 7, 11 and 7); the other pages returned empty text.
+With the fix, the new regression test in `test/sql/pdf_ocr.test` (receipt
+`1 true true true` plus the output containing `Totals 16,710.55`) is expected
+to pass; it fails on the pre-fix binary as shown above.
 
 ## Scope
 
-Only `src/pdf_extension.cpp` and OCR SQLLogicTest inputs/fixture were changed. Poppler mutex and page rendering code were not changed. No installed extensions or dev services were touched. This change is committed locally only; it is not pushed and no PR was opened.
+Only `src/pdf_extension.cpp` (one condition) and `test/sql/pdf_ocr.test` (one
+case reusing the #50 fixture) change. No other decision site changes: every
+other auto-OCR call site already goes through `AutoOcrWantsPage` /
+`AutoOcrWantsPageText`, which #50 updated. This change is committed locally
+only; it is not pushed and no PR was opened.

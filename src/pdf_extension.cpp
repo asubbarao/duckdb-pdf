@@ -8478,11 +8478,13 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 				}
 			}
 			had_text_layer = pdf_ocr::HasGlyphs(LayoutPageText(layout_words, width));
-			// A page stamped with a page number or Bates label over a scan, or
-			// one whose text layer is unreadable, reads as text, so the skip
-			// below would leave the page un-OCR'd. The read_pdf grains already
-			// see through both.
+			// A page stamped with a page number or Bates label over a scan, one
+			// whose text layer is unreadable, or one whose layer holds fewer
+			// than ten alphanumeric words (dashes, rules, a short caption)
+			// reads as text, so the skip below would leave the page un-OCR'd.
+			// The read_pdf grains already see through all three.
 			native_not_usable = had_text_layer && (TextLayerIsUnreadable(TallyBoxes(native_boxes)) ||
+			                                       AlphanumericWordCount(native_boxes) < AUTO_OCR_MIN_CONTENT_WORDS ||
 			                                       NativeLayerIsAStampOverAScan(page.get(), native_boxes));
 			readable_native_words = ReadableWordCount(native_boxes);
 		}
