@@ -380,8 +380,8 @@ Pix *PreprocessPixForOcr(Pix *pixs, int dpi, double smooth, bool deskew = true) 
 	// approximates a small Gaussian while remaining available on every supported
 	// Leptonica build. Zero bypasses this block exactly for existing callers.
 	if (smooth > 0.0) {
-		const double sigma = smooth / 10.0 * static_cast<double>(dpi > 0 ? dpi : 300) / 300.0;
-		const int radius = static_cast<int>(std::lround(2.0 * sigma));
+		const double radius_pixels = smooth / 10.0 * static_cast<double>(dpi > 0 ? dpi : 300) / 300.0;
+		const int radius = static_cast<int>(std::lround(radius_pixels));
 		if (radius > 0) {
 			Pix *pixsmoothed = pixBlockconv(pixg, radius, radius);
 			if (pixsmoothed) {

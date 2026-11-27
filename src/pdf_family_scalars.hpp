@@ -21,12 +21,13 @@ static void PdfFamilyResolveOptions(ResolveScalarFunctionTypesInput &input) {
 		    (name == "pdf_rewrite" && (key == "mode" || key == "password" || key == "owner_password")) ||
 		    (name == "ocr_image" &&
 		     (key == "language" || key == "psm" || key == "oem" || key == "tessdata_dir" || key == "preprocess" ||
-		      key == "vars" || key == "config" || key == "dpi" || key == "format" || key == "backend")) ||
+		      key == "vars" || key == "config" || key == "dpi" || key == "format" || key == "backend" ||
+		      key == "ocr_smooth")) ||
 		    (name == "image_barcodes" && key == "symbologies");
 		if (!allowed)
 			throw BinderException("%s: unknown option '%s'", name, key);
-		bool numeric =
-		    key == "dpi" || key == "rotate" || key == "opacity" || key == "start" || key == "psm" || key == "oem";
+		bool numeric = key == "dpi" || key == "rotate" || key == "opacity" || key == "start" || key == "psm" ||
+		               key == "oem" || key == "ocr_smooth";
 		bool boolean = key == "preprocess", map = key == "vars";
 		if (field.second.id() != LogicalTypeId::SQLNULL && (numeric   ? !field.second.IsNumeric()
 		                                                    : boolean ? field.second.id() != LogicalTypeId::BOOLEAN
@@ -106,7 +107,7 @@ static void PdfFamilyOcrImage(DataChunk &args, ExpressionState &state, Vector &r
 		PdfFamilyOptions opt =
 		    args.ColumnCount() > 1 ? PdfFamilyOptions(args.GetValue(1, row), "ocr_image") : PdfFamilyOptions();
 		opt.Validate("ocr_image", {"language", "psm", "oem", "tessdata_dir", "preprocess", "vars", "config", "dpi",
-		                           "format", "backend"});
+		                           "format", "backend", "ocr_smooth"});
 		// Optional OCR arguments historically treat NULL as an omitted setting.
 		for (auto setting = opt.values.begin(); setting != opt.values.end();) {
 			if (setting->second.IsNull())
@@ -121,6 +122,7 @@ static void PdfFamilyOcrImage(DataChunk &args, ExpressionState &state, Vector &r
 		o.psm = opt.Int("psm", 3);
 		o.oem = opt.Int("oem", 3);
 		o.dpi = opt.Int("dpi", 300);
+		o.smooth = opt.Double("ocr_smooth", 0.0);
 		o.tessdata_dir = opt.Text("tessdata_dir");
 		o.config = opt.Text("config");
 		if (opt.Has("preprocess"))
@@ -133,6 +135,8 @@ static void PdfFamilyOcrImage(DataChunk &args, ExpressionState &state, Vector &r
 			throw InvalidInputException("ocr_image: oem must be between 0 and 3");
 		if (o.dpi < 1 || o.dpi > 2400)
 			throw InvalidInputException("ocr_image: dpi must be between 1 and 2400");
+		if (o.smooth < 0.0 || o.smooth > 50.0)
+			throw InvalidInputException("ocr_smooth must be between 0 and 50");
 		if (!o.tessdata_dir.empty())
 			PdfCheckAccess(context, o.tessdata_dir, FileType::FILE_TYPE_DIR);
 		if (!o.config.empty())

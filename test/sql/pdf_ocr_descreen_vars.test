@@ -35,6 +35,25 @@ FROM ocr_image(pdf_render('test/data/halftone_claims.pdf', 1, {dpi: 300}), dpi:=
 ----
 true
 
+# The STRUCT form accepts descreening and sends it through to OCR preprocessing.
+query I
+SELECT contains(text, '4137337') AND contains(text, '5281049') AND contains(text, '6672091')
+   AND contains(text, '7315086') AND contains(text, '8942163')
+FROM (SELECT ocr_image(pdf_render('test/data/halftone_claims.pdf', 1), {ocr_smooth: 10}) AS text);
+----
+true
+
+# At 300 DPI, 4.9 rounds to radius 0 while 5 rounds to radius 1.
+query I
+SELECT count(DISTINCT text) = 2
+FROM (
+    SELECT text FROM read_pdf('test/data/halftone_claims.pdf', ocr:=true, ocr_retry:=false, ocr_smooth:=4.9)
+    UNION ALL
+    SELECT text FROM read_pdf('test/data/halftone_claims.pdf', ocr:=true, ocr_retry:=false, ocr_smooth:=5)
+);
+----
+true
+
 # Zero is an exact opt-out: its text bytes match the default pipeline output.
 query I
 WITH defaults AS (
