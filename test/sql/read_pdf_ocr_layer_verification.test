@@ -18,6 +18,13 @@ FROM read_pdf('test/data/ocr_layer_matching.pdf', ocr_verify_layer := true, ocr_
 ----
 true	false	true	true	true
 
+# Explicit OCR forces OCR even when verification finds a matching layer.
+query I
+SELECT used_ocr
+FROM read_pdf('test/data/ocr_layer_matching.pdf', ocr := true, ocr_verify_layer := true, ocr_retry := false);
+----
+true
+
 query II
 SELECT used_ocr, layer_agreement >= 0.0
 FROM read_pdf('test/data/ocr_layer_mismatched.pdf', ocr_verify_layer := true,

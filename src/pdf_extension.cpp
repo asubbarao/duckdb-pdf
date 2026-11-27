@@ -2704,30 +2704,37 @@ static bool RetryAtDoubleDpi(const PdfOptions &po, const pdf_ocr::Options &opt, 
 	return po.ocr_retry && opt.backend == pdf_ocr::Backend::Tesseract && confidence < 55 && po.ocr_dpi < 400;
 }
 
+template <class Result, class Recognize>
+static std::pair<Result, int32_t> OcrAtCandidateDpis(const PdfOptions &po, Recognize recognize) {
+	if (!po.ocr_dpi_was_list)
+		return {recognize(po.ocr_dpi), po.ocr_dpi};
+
+	Result best;
+	int best_confidence = -1;
+	int32_t best_dpi = po.ocr_dpis.front();
+	for (auto dpi : po.ocr_dpis) {
+		auto result = recognize(dpi);
+		if (result.confidence > best_confidence) {
+			best = std::move(result);
+			best_confidence = best.confidence;
+			best_dpi = dpi;
+		}
+	}
+	return {std::move(best), best_dpi};
+}
+
 static pdf_ocr::TextResult OcrPageResult(poppler::page *page, const PdfOptions &po, bool best_effort,
                                          int32_t *dpi_used = nullptr) {
 	auto opt = MakeOcrOptions(po, best_effort);
-	const auto &dpis = po.ocr_dpis;
-	if (po.ocr_dpi_was_list) {
-		pdf_ocr::TextResult best;
-		int best_confidence = -1;
-		for (auto dpi : dpis) {
-			auto dpi_opt = opt;
-			dpi_opt.dpi = dpi;
-			auto image = RenderPageForOcr(page, dpi);
-			auto result = OcrBitmapText(image, dpi_opt);
-			if (result.confidence > best_confidence) {
-				best = std::move(result);
-				best_confidence = best.confidence;
-				if (dpi_used)
-					*dpi_used = dpi;
-			}
-		}
-		return best;
-	}
-	const int dpi = po.ocr_dpi;
-	poppler::image img = RenderPageForOcr(page, dpi);
-	pdf_ocr::TextResult first = OcrBitmapText(img, opt);
+	auto [first, dpi] = OcrAtCandidateDpis<pdf_ocr::TextResult>(po, [&](int32_t candidate_dpi) {
+		auto dpi_opt = opt;
+		dpi_opt.dpi = candidate_dpi;
+		return OcrBitmapText(RenderPageForOcr(page, candidate_dpi), dpi_opt);
+	});
+	if (dpi_used)
+		*dpi_used = dpi;
+	if (po.ocr_dpi_was_list)
+		return first;
 	if (RetryAtDoubleDpi(po, opt, first.confidence)) {
 		auto opt2 = opt;
 		opt2.dpi = dpi * 2;
@@ -2810,11 +2817,22 @@ static std::pair<double, double> PageDisplayDimensions(poppler::page &page) {
 // the confidences of whichever attempt was kept.
 static std::vector<OcrWord> OcrPageWords(poppler::page *page, const PdfOptions &po, bool best_effort) {
 	auto opt = MakeOcrOptions(po, best_effort);
-	const int dpi = po.ocr_dpi;
-	poppler::image img = RenderPageForOcr(page, dpi);
-	double raster_height_points = img.height() * 72.0 / dpi;
-	pdf_ocr::WordsResult first = OcrBitmapWords(img, opt);
-	if (RetryAtDoubleDpi(po, opt, first.confidence)) {
+	std::vector<std::pair<int32_t, double>> raster_heights;
+	auto [first, dpi] = OcrAtCandidateDpis<pdf_ocr::WordsResult>(po, [&](int32_t candidate_dpi) {
+		auto dpi_opt = opt;
+		dpi_opt.dpi = candidate_dpi;
+		auto image = RenderPageForOcr(page, candidate_dpi);
+		raster_heights.emplace_back(candidate_dpi, image.height() * 72.0 / candidate_dpi);
+		return OcrBitmapWords(image, dpi_opt);
+	});
+	double raster_height_points = 0;
+	for (const auto &candidate : raster_heights) {
+		if (candidate.first == dpi) {
+			raster_height_points = candidate.second;
+			break;
+		}
+	}
+	if (!po.ocr_dpi_was_list && RetryAtDoubleDpi(po, opt, first.confidence)) {
 		auto opt2 = opt;
 		opt2.dpi = dpi * 2;
 		poppler::image img2 = RenderPageForOcr(page, dpi * 2);
@@ -3413,9 +3431,9 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 				has_layer_agreement = true;
 			}
 			// Over a stamp, OCR wins only when it read more than the stamp itself.
-			const bool ocr_adds = compare_layer ? layer_agreement < bind.opt.ocr_layer_agreement
-			                                    : (bind.opt.force_ocr || !has_text_layer ||
-			                                       GlyphCount(ocr.text) > ReadableGlyphCount(text));
+			const bool ocr_adds = bind.opt.force_ocr || (compare_layer ? layer_agreement < bind.opt.ocr_layer_agreement
+			                                                       : (!has_text_layer ||
+			                                                          GlyphCount(ocr.text) > ReadableGlyphCount(text)));
 			if (ocr_adds && pdf_ocr::HasGlyphs(ocr.text)) {
 				text = std::move(ocr.text);
 				used_ocr = true;
@@ -8662,13 +8680,25 @@ static void PdfOcrExecute(ClientContext &context, const string &input, const str
 		}
 
 		const auto started = std::chrono::steady_clock::now();
-		const string first_base = PdfOcrTempBase(row.page, 1);
-		const string first_path = first_base + ".pdf";
-		temp_files.emplace_back(first_path);
-		auto first = RenderOcrLayer(page.get(), po, po.ocr_dpi, first_base);
-		string chosen_path = first_path;
+		int attempt = 0;
+		std::vector<std::pair<int32_t, string>> attempt_paths;
+		auto [first, first_dpi] = OcrAtCandidateDpis<pdf_ocr::PdfResult>(po, [&](int32_t candidate_dpi) {
+			const string base = PdfOcrTempBase(row.page, ++attempt);
+			const string path = base + ".pdf";
+			temp_files.emplace_back(path);
+			attempt_paths.emplace_back(candidate_dpi, path);
+			auto result = RenderOcrLayer(page.get(), po, candidate_dpi, base);
+			return result;
+		});
+		string chosen_path;
+		for (const auto &candidate : attempt_paths) {
+			if (candidate.first == first_dpi) {
+				chosen_path = candidate.second;
+				break;
+			}
+		}
 		pdf_ocr::PdfResult chosen = first;
-		if (po.ocr_retry && first.confidence < 55 && po.ocr_dpi < 400) {
+		if (!po.ocr_dpi_was_list && po.ocr_retry && first.confidence < 55 && po.ocr_dpi < 400) {
 			const string second_base = PdfOcrTempBase(row.page, 2);
 			const string second_path = second_base + ".pdf";
 			temp_files.emplace_back(second_path);
