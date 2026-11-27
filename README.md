@@ -124,7 +124,7 @@ Ordering a rotated line's words by `x0` does not give its reading order. Use
 | `ocr_retry` | BOOLEAN | true | Re-render low-confidence pages (mean confidence < 55) at 2× DPI when the render was below 400 DPI, keeping whichever pass scores higher. |
 | `tessdata_dir` | VARCHAR | auto-detected | Explicit Tesseract model directory (see [OCR](#ocr)). |
 | `ocr_vars` | MAP(VARCHAR, VARCHAR) | — | Tess `SetVariable` key/values for this OCR call (same surface as CLI `-c name=value`). Tesseract `classify` and `textord` parameters can be process-global; those calls are serialized and prior values restored before returning. |
-| `ocr_config` | VARCHAR | — | Path or tessdata config name for `ReadConfigFile` (applied after Init, before `ocr_vars`). |
+| `ocr_config` | VARCHAR | — | Path or tessdata config name. Settings apply for one OCR call, before `ocr_vars`. |
 | `ignore_errors` | BOOLEAN | false | page grain, basic census, outline and structure kinds: skip files that fail their reader's guarded load/extraction stage. |
 
 Element and chunk grains accept the OCR options above, plus `password`, `first_page`, and `last_page` (chunk grain also has `chunk_size` / `overlap`). Their legacy default remains native-only; set `auto_ocr := true` or `ocr := true` to include OCR words.
@@ -393,9 +393,9 @@ persisted text layers avoid deskew so coordinates remain aligned with the page.
 `ocr_smooth` is available on PDF reader functions that accept `ocr_preprocess`,
 on `pdf_ocr`, and on `ocr_image`; it descreens halftone bands before thresholding
 when preprocessing is enabled. Since radius rounds to whole pixels, values below
-`1500 / dpi` have no effect at that DPI. `ocr_vars` overrides
-Tesseract settings for one call; `classify` and `textord` parameters can be
-process-global, so calls with variables are serialized and their prior values
+`1500 / dpi` have no effect at that DPI. `ocr_vars` takes precedence over
+`ocr_config`. Some Tesseract parameters are process-global, so calls with either
+option are serialized and their prior values
 restored before returning. Unknown variables remain ignored. `ocr_endpoint` is
 reserved and sends no HTTP request.
 

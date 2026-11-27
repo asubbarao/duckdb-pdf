@@ -120,6 +120,33 @@ FROM (
 true
 
 statement ok
+CREATE TABLE ocr_config_override AS
+SELECT ocr_image(pdf_render(content, 1, {dpi: 150}), {format: 'tsv', config: 'test/data/ocr_heavy_nr.config'}) AS text
+FROM read_blob('test/data/scanned.pdf');
+
+# A config must produce the same override as vars, then restore the default for the next call.
+query I
+SELECT count(text) = 1 FROM ocr_config_override JOIN ocr_descreen_leak_override USING (text);
+----
+true
+
+query I
+SELECT count(text) = 1 FROM ocr_descreen_leak_before JOIN (
+    SELECT ocr_image(pdf_render(content, 1, {dpi: 150}), {format: 'tsv'}) AS text FROM read_blob('test/data/scanned.pdf')
+) after_config USING (text);
+----
+true
+
+# Explicit vars win when the config sets the same key.
+query I
+SELECT count(text) = 1 FROM ocr_descreen_leak_before JOIN ocr_image(
+    pdf_render('test/data/scanned.pdf', 1, {dpi: 150}), format:='tsv',
+    ocr_config:='test/data/ocr_heavy_nr.config', ocr_vars:=MAP {'textord_heavy_nr': '0'}
+) USING (text);
+----
+true
+
+statement ok
 DROP TABLE ocr_descreen_leak_before;
 
 statement ok

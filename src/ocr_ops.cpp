@@ -513,11 +513,11 @@ static std::string MissingModelMessage(const Options &opt) {
 // pulling tesseract types across the ocr_ops isolation boundary into pdf_extension.
 //
 // Reuse rules:
-//   - Init once per (thread, language, oem, datapath, config)
+//   - Init once per (thread, language, oem, datapath)
 //   - SetPageSegMode only when psm changes
 //   - Clear() between pages (free page bitmap/results) — never End() in the hot loop
 //   - Never call Init unless <datapath>/<lang>.traineddata exists on disk
-//   - ReadConfigFile after Init; apply ocr_vars only for its guarded OCR call
+//   - Apply config and vars only for their guarded OCR call
 struct ThreadTessEngine {
 	tesseract::TessBaseAPI api;
 	bool ready = false;
@@ -525,7 +525,6 @@ struct ThreadTessEngine {
 	int oem = -1;
 	std::string datapath;
 	int psm = -1;
-	std::string config_key; // config path (Init-boundary knobs)
 
 	~ThreadTessEngine() {
 		if (ready) {
@@ -541,19 +540,8 @@ ThreadTessEngine &TlsTess() {
 	return eng;
 }
 
-// A changed config is an Init boundary. ocr_vars are applied and restored per call.
-std::string ConfigKey(const Options &opt) {
-	return opt.config;
-}
-
-void ApplyTessConfigAndVars(tesseract::TessBaseAPI &api, const Options &opt) {
-	if (!opt.config.empty()) {
-		api.ReadConfigFile(opt.config.c_str());
-	}
-}
-
 // Tesseract documents that classify/textord SetVariable parameters can be
-// process-global. Calls with vars take the exclusive lock; ordinary calls take
+// process-global. Calls with config or vars take the exclusive lock; ordinary calls take
 // a shared lock, so none can observe a temporary global override. Instance-only
 // parameters remain parallel with other ordinary calls.
 std::shared_timed_mutex &TessVariableMutex() {
@@ -562,7 +550,7 @@ std::shared_timed_mutex &TessVariableMutex() {
 }
 
 struct TessCallGuard {
-	explicit TessCallGuard(bool has_vars) : exclusive(has_vars) {
+	explicit TessCallGuard(const Options &opt) : exclusive(!opt.vars.empty() || !opt.config.empty()) {
 		if (exclusive) {
 			TessVariableMutex().lock();
 		} else {
@@ -582,20 +570,39 @@ struct TessCallGuard {
 };
 
 struct ScopedTessVariables {
-	explicit ScopedTessVariables(tesseract::TessBaseAPI &api_p, const Options &opt) : api(api_p) {
-		for (const auto &kv : opt.vars) {
-			if (kv.first.empty()) {
-				continue;
-			}
-			std::string previous;
-			if (!api.GetVariableAsString(kv.first.c_str(), &previous)) {
-				continue;
-			}
-			// Unknown or read-only variables retain the existing permissive behavior.
-			if (api.SetVariable(kv.first.c_str(), kv.second.c_str())) {
-				restore.emplace_back(kv.first, std::move(previous));
-			}
+	explicit ScopedTessVariables(tesseract::TessBaseAPI &api_p) : api(api_p) {
+	}
+	void Set(const std::string &key, const std::string &value) {
+		std::string previous;
+		if (api.GetVariableAsString(key.c_str(), &previous)) {
+			restore.emplace_back(key, std::move(previous));
+			api.SetVariable(key.c_str(), value.c_str());
 		}
+	}
+	void Apply(const Options &opt) {
+		if (!opt.config.empty()) {
+			// Match ReadConfigFile's search order and keep the whole value after the first delimiter.
+			std::string dir = api.GetDatapath();
+			std::ifstream file(dir + "/configs/" + opt.config);
+			if (!file.is_open())
+				file.open(dir + "/tessconfigs/" + opt.config);
+			if (!file.is_open())
+				file.open(opt.config);
+			std::string line;
+			while (std::getline(file, line)) {
+				if (!line.empty() && line.back() == '\r')
+					line.pop_back();
+				if (line.empty() || line.front() == '#')
+					continue;
+				auto end = line.find_first_of(" \t");
+				auto start = line.find_first_not_of(" \t", end);
+				Set(line.substr(0, end), start == std::string::npos ? "" : line.substr(start));
+			}
+			// The explicit page segmentation mode takes precedence over the config.
+			api.SetPageSegMode(static_cast<tesseract::PageSegMode>(opt.psm));
+		}
+		for (const auto &kv : opt.vars)
+			Set(kv.first, kv.second);
 	}
 	~ScopedTessVariables() {
 		for (auto it = restore.rbegin(); it != restore.rend(); ++it) {
@@ -621,9 +628,7 @@ bool EnsureTesseract(const Options &opt) {
 	}
 
 	auto &eng = TlsTess();
-	const std::string config_key = ConfigKey(opt);
-	const bool need_init = !eng.ready || eng.language != opt.language || eng.oem != opt.oem ||
-	                       eng.datapath != datadir || eng.config_key != config_key;
+	const bool need_init = !eng.ready || eng.language != opt.language || eng.oem != opt.oem || eng.datapath != datadir;
 	if (need_init) {
 		if (eng.ready) {
 			eng.api.End();
@@ -642,13 +647,10 @@ bool EnsureTesseract(const Options &opt) {
 			}
 			throw std::runtime_error(MissingModelMessage(opt));
 		}
-		// Config is stable per engine. Call variables are scoped and restored below.
-		ApplyTessConfigAndVars(eng.api, opt);
 		eng.ready = true;
 		eng.language = opt.language;
 		eng.oem = opt.oem;
 		eng.datapath = datadir;
-		eng.config_key = config_key;
 		eng.psm = -1; // force SetPageSegMode below
 	}
 	if (eng.psm != opt.psm) {
@@ -795,12 +797,13 @@ TextResult RecognizeTesseractText(const unsigned char *data, int width, int heig
 		return out;
 	}
 
-	TessCallGuard call_guard(!opt.vars.empty());
+	TessCallGuard call_guard(opt);
 	if (!EnsureTesseract(opt)) {
 		return out;
 	}
 	auto &api = TlsTess().api;
-	ScopedTessVariables scoped_vars(api, opt);
+	ScopedTessVariables scoped_vars(api);
+	scoped_vars.Apply(opt);
 
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
@@ -827,12 +830,13 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 		return out;
 	}
 
-	TessCallGuard call_guard(!opt.vars.empty());
+	TessCallGuard call_guard(opt);
 	if (!EnsureTesseract(opt)) {
 		return out;
 	}
 	auto &api = TlsTess().api;
-	ScopedTessVariables scoped_vars(api, opt);
+	ScopedTessVariables scoped_vars(api);
+	scoped_vars.Apply(opt);
 
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
@@ -991,7 +995,7 @@ PdfResult RenderSearchablePdf(const unsigned char *data, int width, int height, 
 	if (!data || width <= 0 || height <= 0) {
 		return out;
 	}
-	TessCallGuard call_guard(!opt.vars.empty());
+	TessCallGuard call_guard(opt);
 	if (!EnsureTesseract(opt)) {
 		return out;
 	}
@@ -1000,7 +1004,8 @@ PdfResult RenderSearchablePdf(const unsigned char *data, int width, int height, 
 	const bool has_pdf_font = pdf_font.good();
 
 	auto &api = TlsTess().api;
-	ScopedTessVariables scoped_vars(api, opt);
+	ScopedTessVariables scoped_vars(api);
+	scoped_vars.Apply(opt);
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
 	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, opt.smooth, base, processed,
@@ -1071,13 +1076,14 @@ TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Opti
 		                         "(expected PNG/JPEG/etc. readable by leptonica, e.g. from pdf_to_png)");
 	}
 
-	TessCallGuard call_guard(!opt.vars.empty());
+	TessCallGuard call_guard(opt);
 	if (!EnsureTesseract(opt)) {
 		pixDestroy(&pix);
 		return out;
 	}
 	auto &api = TlsTess().api;
-	ScopedTessVariables scoped_vars(api, opt);
+	ScopedTessVariables scoped_vars(api);
+	scoped_vars.Apply(opt);
 
 	const int dpi = opt.dpi > 0 ? opt.dpi : 300;
 	// Prefer embedded resolution when present; otherwise stamp dpi for preprocess.
