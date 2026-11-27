@@ -182,3 +182,15 @@ SELECT contains(text, 'Totals 16,710.55')
 FROM read_pdf('__TEST_DIR__/ocr_unreadable_stamp.pdf', auto_ocr := false);
 ----
 true
+
+# A one-item DPI list matches the corresponding scalar OCR pass.
+query I
+WITH listed AS (
+  SELECT page, words, mean_confidence FROM pdf_ocr('test/data/scanned.pdf', '{TEST_DIR}/ocr_scanned_list.pdf', ocr_retry := false, ocr_dpi := [150])
+), scalar AS (
+  SELECT page, words, mean_confidence FROM pdf_ocr('test/data/scanned.pdf', '{TEST_DIR}/ocr_scanned_150.pdf', ocr_retry := false, ocr_dpi := 150)
+)
+SELECT bool_and(listed.words = scalar.words AND listed.mean_confidence = scalar.mean_confidence)
+FROM listed JOIN scalar USING (page);
+----
+true

@@ -29,9 +29,12 @@ static const PdfFunctionDoc PDF_FUNCTION_DOCS[] = {
      "downstream migration.",
      "SELECT pdf_text('document.pdf', {layout: 'physical'});"},
     {"read_pdf", "files",
-     "Read PDF pages by default, or select grain page, line, element, table or chunk at bind time. Each grain retains "
-     "its native typed columns and streams through DuckDB file readers. OCR options include ocr_smooth for halftone "
-     "descreening before thresholding. Unsupported options for the selected grain are rejected.",
+     "Read PDF pages by default, or select grain page, line, element, table or chunk at bind time. Page OCR accepts "
+     "ocr_dpi as an integer or up to five candidate resolutions, can verify a substantial native text layer with "
+     "ocr_verify_layer and ocr_layer_agreement, and offers ocr_smooth for halftone descreening before thresholding. "
+     "The page result includes ocr_dpi_used and layer_agreement provenance. "
+     "Each grain retains its native typed columns and streams through DuckDB file readers. Unsupported options for the "
+     "selected grain are rejected.",
      "SELECT page, text FROM read_pdf('document.pdf', grain := 'page');"},
     {"read_pdf_words", "files",
      "Read positioned words with font, column/line grouping, label and OCR provenance. OCR options include ocr_smooth "

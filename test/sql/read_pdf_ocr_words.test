@@ -90,6 +90,20 @@ FROM read_pdf_words('test/data/scanned.pdf', ocr:=true);
 ----
 true
 
+# A one-item DPI list matches the corresponding scalar OCR pass.
+query I
+WITH listed AS (
+  SELECT page, array_agg(struct_pack(word := word, confidence := confidence) ORDER BY y0, x0, word) AS words
+  FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_retry := false, ocr_dpi := [150]) GROUP BY page
+), scalar AS (
+  SELECT page, array_agg(struct_pack(word := word, confidence := confidence) ORDER BY y0, x0, word) AS words
+  FROM read_pdf_words('test/data/scanned.pdf', ocr := true, ocr_retry := false, ocr_dpi := 150) GROUP BY page
+)
+SELECT bool_and(listed.words = scalar.words)
+FROM listed JOIN scalar USING (page);
+----
+true
+
 # B5. Coordinate sanity: OCR bboxes must be positive and x1>x0, y1>y0.
 
 query I

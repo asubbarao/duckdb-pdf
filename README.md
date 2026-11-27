@@ -66,7 +66,7 @@ this consolidation does not silently rename `file` to `filename` or
 
 | Selection | Columns |
 |---|---|
-| `page` | `filename` VARCHAR, `page` INTEGER, `page_count` INTEGER, `text` VARCHAR, `width` DOUBLE, `height` DOUBLE, `has_text_layer` BOOLEAN, `used_ocr` BOOLEAN, `ocr_confidence` DOUBLE, `label` VARCHAR |
+| `page` | `filename` VARCHAR, `page` INTEGER, `page_count` INTEGER, `text` VARCHAR, `width` DOUBLE, `height` DOUBLE, `has_text_layer` BOOLEAN, `used_ocr` BOOLEAN, `ocr_confidence` DOUBLE, `label` VARCHAR, `ocr_dpi_used` INTEGER, `layer_agreement` DOUBLE |
 | `line` | `filename` VARCHAR, `page` INTEGER, `line` INTEGER, `text` VARCHAR, `label` VARCHAR |
 | `element` | `file` VARCHAR, `page_number` INTEGER, `element_idx` INTEGER, `element_type` VARCHAR, `text` VARCHAR, `font_size` DOUBLE, `bbox_x0` DOUBLE, `bbox_y0` DOUBLE, `bbox_x1` DOUBLE, `bbox_y1` DOUBLE, `font_name` VARCHAR |
 | `table` | `filename` VARCHAR, `page` INTEGER, `table_index` INTEGER, `row_index` INTEGER, `cells` VARCHAR[] |
@@ -114,7 +114,9 @@ Ordering a rotated line's words by `x0` does not give its reading order. Use
 | `ocr` | BOOLEAN | false | Force OCR on every page, even pages with a text layer. |
 | `auto_ocr` | BOOLEAN | true | OCR pages that have no extractable text layer. |
 | `ocr_language` | VARCHAR | `'eng'` | Tesseract model or `+`-separated model combination, such as `'eng+fra'`; all selected models must exist in the resolved model directory. |
-| `ocr_dpi` | INTEGER | 300 | Render DPI for the OCR raster (1–2400). |
+| `ocr_dpi` | INTEGER or INTEGER[] | 300 | Render DPI for the OCR raster (1–2400). A list of 1–5 resolutions runs OCR at each and keeps the highest-confidence result; ties keep the first. `ocr_retry` is skipped when a list is supplied. |
+| `ocr_verify_layer` | BOOLEAN | false | Also OCR text layers with at least 10 alphanumeric tokens of 3 or more characters; replace the layer when its token agreement with OCR is below `ocr_layer_agreement`. |
+| `ocr_layer_agreement` | DOUBLE | 0.5 | Minimum share of layer tokens (lower-case alphanumeric tokens of at least 3 characters) that must also occur in OCR to retain the layer; range 0–1. |
 | `ocr_psm` / `ocr_oem` | INTEGER | 3 / 3 | Page segmentation mode (automatic) / OCR engine mode (default). |
 | `ocr_smooth` | DOUBLE | 0 | Before thresholding, smooth halftone screens with a block convolution. Units are tenths of a block-convolution radius pixel at 300 DPI (10 = 1 px radius at 300 DPI); scales with DPI and must be 0–50. Radius rounds to the nearest pixel, so the smallest effective value is 1500 / DPI (5 at 300 DPI, about 20.83 at 72 DPI). Only applies when preprocessing is enabled. |
 | `ocr_backend` | VARCHAR | `'tesseract'` | `'tesseract'`, `'vision'` (Apple Vision, macOS only; see [OCR](#ocr)) or `'external'`; external requires a plugin. Persisted `pdf_ocr` requires Tesseract. |
