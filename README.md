@@ -114,7 +114,7 @@ Ordering a rotated line's words by `x0` does not give its reading order. Use
 | `ocr` | BOOLEAN | false | Force OCR on every page, even pages with a text layer. |
 | `auto_ocr` | BOOLEAN | true | OCR pages that have no extractable text layer. |
 | `ocr_language` | VARCHAR | `'eng'` | Tesseract model or `+`-separated model combination, such as `'eng+fra'`; all selected models must exist in the resolved model directory. |
-| `ocr_dpi` | INTEGER or INTEGER[] | 300 | Render DPI for the OCR raster (1–2400). A list of 1–5 resolutions runs OCR at each and keeps the highest-confidence result; ties keep the first. |
+| `ocr_dpi` | INTEGER or INTEGER[] | 300 | Render DPI for the OCR raster (1–2400). A list of 1–5 resolutions runs OCR at each and keeps the highest-confidence result; ties keep the first. `ocr_retry` is skipped when a list is supplied. |
 | `ocr_verify_layer` | BOOLEAN | false | Also OCR text layers with at least 10 alphanumeric words; replace the layer when its token agreement with OCR is below `ocr_layer_agreement`. |
 | `ocr_layer_agreement` | DOUBLE | 0.5 | Minimum share of layer tokens (lower-case alphanumeric tokens of at least 3 characters) that must also occur in OCR to retain the layer; range 0–1. |
 | `ocr_psm` / `ocr_oem` | INTEGER | 3 / 3 | Page segmentation mode (automatic) / OCR engine mode (default). |

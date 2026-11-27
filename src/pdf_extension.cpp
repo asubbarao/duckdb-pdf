@@ -2868,11 +2868,39 @@ static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
 				o.ocr_dpi_was_list = true;
 				o.ocr_dpis.clear();
 				for (const auto &value : ListValue::GetChildren(kv.second)) {
-					o.ocr_dpis.push_back(IntegerValue::Get(value));
+					if (value.IsNull()) {
+						throw InvalidInputException(
+						    "read_pdf: ocr_dpi list must not contain NULL; expected INTEGER or LIST(INTEGER)");
+					}
+					try {
+						auto converted = value.DefaultCastAs(LogicalType::INTEGER);
+						if (DoubleValue::Get(value.DefaultCastAs(LogicalType::DOUBLE)) !=
+						    IntegerValue::Get(converted)) {
+							throw InvalidInputException("ocr_dpi must contain whole-number resolutions");
+						}
+						o.ocr_dpis.push_back(IntegerValue::Get(converted));
+					} catch (const std::exception &) {
+						throw InvalidInputException(
+						    "read_pdf: ocr_dpi must be an INTEGER or LIST(INTEGER) that can be cast to whole numbers");
+					}
 				}
 			} else {
 				o.ocr_dpi_was_list = false;
-				o.ocr_dpi = IntegerValue::Get(kv.second);
+				if (kv.second.IsNull()) {
+					throw InvalidInputException(
+					    "read_pdf: ocr_dpi must not be NULL; expected INTEGER or LIST(INTEGER)");
+				}
+				try {
+					auto converted = kv.second.DefaultCastAs(LogicalType::INTEGER);
+					if (DoubleValue::Get(kv.second.DefaultCastAs(LogicalType::DOUBLE)) !=
+					    IntegerValue::Get(converted)) {
+						throw InvalidInputException("ocr_dpi must be a whole-number resolution");
+					}
+					o.ocr_dpi = IntegerValue::Get(converted);
+				} catch (const std::exception &) {
+					throw InvalidInputException(
+					    "read_pdf: ocr_dpi must be an INTEGER or LIST(INTEGER) that can be cast to a whole number");
+				}
 				o.ocr_dpis.clear();
 			}
 		} else if (key == "ocr_verify_layer") {

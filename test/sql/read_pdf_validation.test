@@ -10,6 +10,41 @@ PRAGMA enable_verification
 # ── OCR engine knobs are range-checked (out-of-range would be UB or OOM) ──
 
 statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_retry := false, ocr_dpi := 300.5);
+----
+ocr_dpi must be an INTEGER or LIST(INTEGER)
+
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_retry := false, ocr_dpi := [300, 200.5]);
+----
+ocr_dpi must be an INTEGER or LIST(INTEGER)
+
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_retry := false, ocr_dpi := [300, NULL]);
+----
+ocr_dpi list must not contain NULL
+
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_retry := false, ocr_dpi := 'not a number');
+----
+ocr_dpi must be an INTEGER or LIST(INTEGER)
+
+statement error
+SELECT * FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_retry := false, ocr_dpi := {'dpi': 300});
+----
+ocr_dpi must be an INTEGER or LIST(INTEGER)
+
+query I
+SELECT ocr_dpi_used FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_retry := false, ocr_dpi := 300::BIGINT);
+----
+300
+
+query I
+SELECT ocr_dpi_used FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_retry := false, ocr_dpi := [300::BIGINT]);
+----
+300
+
+statement error
 SELECT * FROM read_pdf('test/data/hello.pdf', ocr_dpi := -5);
 ----
 ocr_dpi must be between 1 and 2400
