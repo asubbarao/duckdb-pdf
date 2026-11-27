@@ -30,12 +30,12 @@ static const PdfFunctionDoc PDF_FUNCTION_DOCS[] = {
      "SELECT pdf_text('document.pdf', {layout: 'physical'});"},
     {"read_pdf", "files",
      "Read PDF pages by default, or select grain page, line, element, table or chunk at bind time. Each grain retains "
-     "its native typed columns and streams through DuckDB file readers. Unsupported options for the selected grain are "
-     "rejected.",
+     "its native typed columns and streams through DuckDB file readers. OCR options include ocr_smooth for halftone "
+     "descreening before thresholding. Unsupported options for the selected grain are rejected.",
      "SELECT page, text FROM read_pdf('document.pdf', grain := 'page');"},
     {"read_pdf_words", "files",
-     "Read positioned words with font, column/line grouping, label and OCR provenance. Coordinates use displayed page "
-     "points with a top-left origin.",
+      "Read positioned words with font, column/line grouping, label and OCR provenance. OCR options include ocr_smooth "
+      "for halftone descreening before thresholding. Coordinates use displayed page points with a top-left origin.",
      "SELECT * FROM read_pdf_words('document.pdf');"},
     {"pdf_info", "files",
      "Inspect metadata, permissions and features (detail basic), or qpdf structural and encryption statistics (detail "
@@ -95,7 +95,8 @@ static const PdfFunctionDoc PDF_FUNCTION_DOCS[] = {
      "SELECT to_pdf('document.docx', 'converted.pdf');"},
     {"ocr_image", "image_blob,options",
      "Recognize an encoded image BLOB. Scalar returns text, HOCR or TSV and accepts an optional options STRUCT. Table "
-     "returns text, confidence and format with named OCR settings.",
+     "returns text, confidence and format with named OCR settings, including ocr_smooth for halftone descreening "
+     "before thresholding.",
      "SELECT ocr_image(pdf_render('document.pdf', 1), {language: 'eng'});"},
     {"image_barcodes", "image_blob,options",
      "Detect barcodes and QR codes in an encoded image BLOB with Apple Vision (macOS only). Returns a list of structs: "
@@ -104,8 +105,9 @@ static const PdfFunctionDoc PDF_FUNCTION_DOCS[] = {
      "(comma-separated, e.g. 'EAN13,UPCE') restricts the search.",
      "SELECT unnest(image_barcodes(content), recursive := true) FROM read_blob('shelf.jpg');"},
     {"pdf_ocr", "input,output",
-     "Add searchable Tesseract layers to selected pages and return one status row per document page. Existing text "
-     "pages are skipped unless force is true. Force adds another layer and can duplicate extracted text.",
+      "Add searchable Tesseract layers to selected pages and return one status row per document page. OCR options include "
+      "ocr_smooth for halftone descreening before thresholding. Existing text pages are skipped unless force is true. "
+      "Force adds another layer and can duplicate extracted text.",
      "SELECT * FROM pdf_ocr('document.pdf', 'searchable.pdf', force := false);"},
     {"poppler_version", "", "Return the linked runtime Poppler version.", "SELECT poppler_version();"},
 };

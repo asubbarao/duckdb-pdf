@@ -2268,6 +2268,7 @@ struct PdfOptions {
 	bool auto_ocr = true;
 	string ocr_language = "eng";
 	int32_t ocr_dpi = 300;
+	double ocr_smooth = 0.0; // tenths of a pixel at 300 DPI; 0 disables descreening
 	int32_t ocr_psm = 3;        // PSM_AUTO
 	int32_t ocr_oem = 3;        // OEM_DEFAULT
 	bool ocr_preprocess = true; // leptonica grayscale/deskew/binarize/despeckle before OCR
@@ -2332,6 +2333,7 @@ static pdf_ocr::Options MakeOcrOptions(const PdfOptions &po, bool best_effort) {
 	pdf_ocr::Options o;
 	o.language = po.ocr_language;
 	o.dpi = po.ocr_dpi;
+	o.smooth = po.ocr_smooth;
 	o.psm = po.ocr_psm;
 	o.oem = po.ocr_oem;
 	o.tessdata_dir = po.tessdata_dir;
@@ -2786,6 +2788,8 @@ static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
 			o.ocr_language = StringValue::Get(kv.second);
 		} else if (key == "ocr_dpi") {
 			o.ocr_dpi = IntegerValue::Get(kv.second);
+		} else if (key == "ocr_smooth") {
+			o.ocr_smooth = DoubleValue::Get(kv.second);
 		} else if (key == "ocr_psm") {
 			o.ocr_psm = IntegerValue::Get(kv.second);
 		} else if (key == "ocr_oem") {
@@ -2840,6 +2844,9 @@ static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
 	if (o.ocr_oem < 0 || o.ocr_oem > 3) {
 		throw InvalidInputException("read_pdf: ocr_oem must be between 0 and 3 (got %d)", o.ocr_oem);
 	}
+	if (o.ocr_smooth < 0.0 || o.ocr_smooth > 50.0) {
+		throw InvalidInputException("ocr_smooth must be between 0 and 50 (tenths of a pixel at 300 DPI; maximum 5 pixels)");
+	}
 	ValidateLayout(o.layout);
 	if (o.first_page < 1) {
 		throw InvalidInputException("read_pdf: first_page must be >= 1 (got %d)", o.first_page);
@@ -2877,6 +2884,7 @@ static void AddOcrNamedParams(TableFunction &fn) {
 	AddNamedParameter(fn, "auto_ocr", LogicalType::BOOLEAN);
 	AddNamedParameter(fn, "ocr_language", LogicalType::VARCHAR);
 	AddNamedParameter(fn, "ocr_dpi", LogicalType::INTEGER);
+	AddNamedParameter(fn, "ocr_smooth", LogicalType::DOUBLE);
 	AddNamedParameter(fn, "ocr_psm", LogicalType::INTEGER);
 	AddNamedParameter(fn, "ocr_oem", LogicalType::INTEGER);
 	AddNamedParameter(fn, "ocr_preprocess", LogicalType::BOOLEAN);
@@ -6416,6 +6424,8 @@ static unique_ptr<FunctionData> OcrImageBind(ClientContext &context, TableFuncti
 			result->opt.preprocess = BooleanValue::Get(kv.second);
 		} else if (key == "dpi" || key == "ocr_dpi") {
 			result->opt.dpi = IntegerValue::Get(kv.second);
+		} else if (key == "ocr_smooth") {
+			result->opt.smooth = DoubleValue::Get(kv.second);
 		} else if (key == "vars" || key == "ocr_vars") {
 			ParseStringMapValueStd(kv.second, result->opt.vars, "ocr_image: vars");
 		} else if (key == "config" || key == "ocr_config") {
@@ -6432,6 +6442,9 @@ static unique_ptr<FunctionData> OcrImageBind(ClientContext &context, TableFuncti
 		} else {
 			throw InvalidInputException("ocr_image: unknown named parameter '%s'", kv.first);
 		}
+	}
+	if (result->opt.smooth < 0.0 || result->opt.smooth > 50.0) {
+		throw InvalidInputException("ocr_smooth must be between 0 and 50 (tenths of a pixel at 300 DPI; maximum 5 pixels)");
 	}
 	if (result->opt.psm < 0 || result->opt.psm > 13) {
 		throw InvalidInputException("ocr_image: psm must be between 0 and 13 (got %d)", result->opt.psm);
@@ -10964,6 +10977,7 @@ static void LoadInternal(ExtensionLoader &extension_loader) {
 	AddNamedParameter(ocr_image, "ocr_preprocess", LogicalType::BOOLEAN);
 	AddNamedParameter(ocr_image, "dpi", LogicalType::INTEGER);
 	AddNamedParameter(ocr_image, "ocr_dpi", LogicalType::INTEGER);
+	AddNamedParameter(ocr_image, "ocr_smooth", LogicalType::DOUBLE);
 	AddNamedParameter(ocr_image, "vars", map_vv);
 	AddNamedParameter(ocr_image, "ocr_vars", map_vv);
 	AddNamedParameter(ocr_image, "config", LogicalType::VARCHAR);

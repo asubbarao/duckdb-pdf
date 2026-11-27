@@ -116,13 +116,14 @@ Ordering a rotated line's words by `x0` does not give its reading order. Use
 | `ocr_language` | VARCHAR | `'eng'` | Tesseract model or `+`-separated model combination, such as `'eng+fra'`; all selected models must exist in the resolved model directory. |
 | `ocr_dpi` | INTEGER | 300 | Render DPI for the OCR raster (1–2400). |
 | `ocr_psm` / `ocr_oem` | INTEGER | 3 / 3 | Page segmentation mode (automatic) / OCR engine mode (default). |
+| `ocr_smooth` | DOUBLE | 0 | Before thresholding, smooth halftone screens with a block convolution. Units are tenths of a pixel at 300 DPI (10 = 1 px at 300 DPI); scales with render DPI, and must be 0–50. Only applies when preprocessing is enabled. |
 | `ocr_backend` | VARCHAR | `'tesseract'` | `'tesseract'`, `'vision'` (Apple Vision, macOS only; see [OCR](#ocr)) or `'external'`; external requires a plugin. Persisted `pdf_ocr` requires Tesseract. |
 | `ocr_plugin` | VARCHAR | — | External OCR shared library implementing the C ABI in `src/ocr_ops.hpp`. |
 | `ocr_endpoint` | VARCHAR | — | Reserved; does not send HTTP requests. |
 | `ocr_preprocess` | BOOLEAN | true | Run the Leptonica preprocessing pipeline (grayscale → deskew → binarize → despeckle) on the rendered page before OCR. |
 | `ocr_retry` | BOOLEAN | true | Re-render low-confidence pages (mean confidence < 55) at 2× DPI when the render was below 400 DPI, keeping whichever pass scores higher. |
 | `tessdata_dir` | VARCHAR | auto-detected | Explicit Tesseract model directory (see [OCR](#ocr)). |
-| `ocr_vars` | MAP(VARCHAR, VARCHAR) | — | Tess `SetVariable` key/values applied after Init (same surface as CLI `-c name=value`). |
+| `ocr_vars` | MAP(VARCHAR, VARCHAR) | — | Tess `SetVariable` key/values for this OCR call (same surface as CLI `-c name=value`). Tesseract `classify` and `textord` parameters can be process-global; those calls are serialized and prior values restored before returning. |
 | `ocr_config` | VARCHAR | — | Path or tessdata config name for `ReadConfigFile` (applied after Init, before `ocr_vars`). |
 | `ignore_errors` | BOOLEAN | false | page grain, basic census, outline and structure kinds: skip files that fail their reader's guarded load/extraction stage. |
 
@@ -374,7 +375,7 @@ SELECT ocr_image(content, {backend: 'vision'}) FROM read_blob('photo.jpg');
   ```
 - Confidence is the mean of Vision's per-line confidence on a 0–100 scale. It is
   not comparable with Tesseract's, so `ocr_retry` does not re-render Vision pages.
-- `psm`, `oem`, `tessdata_dir`, `ocr_preprocess` and `ocr_config` are
+- `psm`, `oem`, `tessdata_dir`, `ocr_preprocess`, `ocr_smooth` and `ocr_config` are
   Tesseract settings and have no effect. `format` must be `text`, and
   `pdf_ocr` (the searchable-PDF writer) needs Tesseract.
 - Image BLOBs are decoded by ImageIO (PNG, JPEG, TIFF, HEIC, ...), and EXIF
@@ -389,8 +390,13 @@ auto-OCR is best-effort. Other languages need installed models.
 
 Reader OCR uses preprocessing and a low-confidence retry. Positioned-word and
 persisted text layers avoid deskew so coordinates remain aligned with the page.
-`ocr_vars` overrides Tesseract settings after config loading; unknown variables
-are ignored by Tesseract. `ocr_endpoint` is reserved and sends no HTTP request.
+`ocr_smooth` is available on PDF reader functions that accept `ocr_preprocess`,
+on `pdf_ocr`, and on `ocr_image`; it descreens halftone bands before thresholding
+when preprocessing is enabled. `ocr_vars` overrides
+Tesseract settings for one call; `classify` and `textord` parameters can be
+process-global, so calls with variables are serialized and their prior values
+restored before returning. Unknown variables remain ignored. `ocr_endpoint` is
+reserved and sends no HTTP request.
 
 `pdf_ocr` honors page bounds but returns one status row per document page.
 Existing text pages are skipped unless force is true. Force adds another layer

@@ -16,11 +16,12 @@
 // backend.
 //
 // TessBaseAPI lifecycle: Init() is expensive (loads traineddata). Recognize*
-// reuses a thread_local TessBaseAPI keyed by (language, oem, datapath, config,
-// vars) and Clear()s between pages — matching DuckDB's per-worker-thread
+// reuses a thread_local TessBaseAPI keyed by (language, oem, datapath, config)
+// and Clear()s between pages — matching DuckDB's per-worker-thread
 // LocalState model without exposing tesseract types across this isolation
-// boundary. After Init: optional ReadConfigFile(config) then SetVariable for
-// each vars entry. Init is never called unless <datapath>/<lang>.traineddata
+// boundary. After Init: optional ReadConfigFile(config); per-call vars are
+// restored after OCR, with calls serialized against other OCR workers when any
+// variables are present. Init is never called unless <datapath>/<lang>.traineddata
 // is verified on disk first (stops "Failed loading language" stderr at source).
 //
 // Backends
@@ -80,6 +81,7 @@ const char *BackendName(Backend b);
 struct Options {
 	std::string language = "eng";
 	int dpi = 300;            // used for leptonica resolution + word PDF-point conversion
+	double smooth = 0.0;      // Gaussian-like descreen radius in tenths of a 300-dpi pixel
 	int psm = 3;              // PSM_AUTO
 	int oem = 3;              // OEM_DEFAULT
 	std::string tessdata_dir; // explicit model dir, or empty for auto-detect
