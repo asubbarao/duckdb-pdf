@@ -2263,11 +2263,19 @@ static void PdfCheckPairArgs(ClientContext &context, DataChunk &args) {
 
 // Common options bag (shared by read_pdf / read_pdf_words)
 //===--------------------------------------------------------------------===//
+// 0.5 was selected to reject a layer that shares fewer than half its meaningful
+// tokens with OCR, while tolerating ordinary OCR tokenization differences.
+static constexpr double DEFAULT_OCR_LAYER_AGREEMENT = 0.5;
+
 struct PdfOptions {
 	bool force_ocr = false;
 	bool auto_ocr = true;
 	string ocr_language = "eng";
 	int32_t ocr_dpi = 300;
+	vector<int32_t> ocr_dpis;
+	bool ocr_dpi_was_list = false;
+	bool ocr_verify_layer = false;
+	double ocr_layer_agreement = DEFAULT_OCR_LAYER_AGREEMENT;
 	int32_t ocr_psm = 3;        // PSM_AUTO
 	int32_t ocr_oem = 3;        // OEM_DEFAULT
 	bool ocr_preprocess = true; // leptonica grayscale/deskew/binarize/despeckle before OCR
@@ -2696,8 +2704,27 @@ static bool RetryAtDoubleDpi(const PdfOptions &po, const pdf_ocr::Options &opt, 
 	return po.ocr_retry && opt.backend == pdf_ocr::Backend::Tesseract && confidence < 55 && po.ocr_dpi < 400;
 }
 
-static pdf_ocr::TextResult OcrPageResult(poppler::page *page, const PdfOptions &po, bool best_effort) {
+static pdf_ocr::TextResult OcrPageResult(poppler::page *page, const PdfOptions &po, bool best_effort,
+                                         int32_t *dpi_used = nullptr) {
 	auto opt = MakeOcrOptions(po, best_effort);
+	const auto &dpis = po.ocr_dpis;
+	if (po.ocr_dpi_was_list) {
+		pdf_ocr::TextResult best;
+		int best_confidence = -1;
+		for (auto dpi : dpis) {
+			auto dpi_opt = opt;
+			dpi_opt.dpi = dpi;
+			auto image = RenderPageForOcr(page, dpi);
+			auto result = OcrBitmapText(image, dpi_opt);
+			if (result.confidence > best_confidence) {
+				best = std::move(result);
+				best_confidence = best.confidence;
+				if (dpi_used)
+					*dpi_used = dpi;
+			}
+		}
+		return best;
+	}
 	const int dpi = po.ocr_dpi;
 	poppler::image img = RenderPageForOcr(page, dpi);
 	pdf_ocr::TextResult first = OcrBitmapText(img, opt);
@@ -2707,10 +2734,62 @@ static pdf_ocr::TextResult OcrPageResult(poppler::page *page, const PdfOptions &
 		poppler::image img2 = RenderPageForOcr(page, dpi * 2);
 		pdf_ocr::TextResult second = OcrBitmapText(img2, opt2);
 		if (second.confidence > first.confidence) {
+			if (dpi_used)
+				*dpi_used = dpi * 2;
 			return second;
 		}
 	}
+	if (dpi_used)
+		*dpi_used = dpi;
 	return first;
+}
+
+static vector<string> AlphanumericTokens(const string &text) {
+	vector<string> tokens;
+	string token;
+	size_t token_length = 0;
+	auto finish_token = [&]() {
+		if (token_length >= 3)
+			tokens.push_back(token);
+		token.clear();
+		token_length = 0;
+	};
+	for (size_t i = 0; i < text.size();) {
+		utf8proc_int32_t codepoint;
+		const auto *bytes = reinterpret_cast<const utf8proc_uint8_t *>(text.data() + i);
+		const auto byte_count = utf8proc_iterate(bytes, static_cast<utf8proc_ssize_t>(text.size() - i), &codepoint);
+		if (byte_count <= 0) {
+			finish_token();
+			i++;
+			continue;
+		}
+		i += static_cast<size_t>(byte_count);
+		const auto category = utf8proc_category(codepoint);
+		const bool alphanumeric = (category >= UTF8PROC_CATEGORY_LU && category <= UTF8PROC_CATEGORY_LO) ||
+		                          category == UTF8PROC_CATEGORY_ND || category == UTF8PROC_CATEGORY_NL ||
+		                          category == UTF8PROC_CATEGORY_NO;
+		if (!alphanumeric) {
+			finish_token();
+			continue;
+		}
+		utf8proc_uint8_t lowered[4];
+		const auto lowered_length = utf8proc_encode_char(utf8proc_tolower(codepoint), lowered);
+		token.append(reinterpret_cast<const char *>(lowered), static_cast<size_t>(lowered_length));
+		token_length++;
+	}
+	finish_token();
+	return tokens;
+}
+
+static double LayerAgreement(const string &layer, const string &ocr) {
+	auto layer_tokens = AlphanumericTokens(layer);
+	auto ocr_tokens = AlphanumericTokens(ocr);
+	idx_t matched = 0;
+	for (const auto &token : layer_tokens) {
+		if (std::find(ocr_tokens.begin(), ocr_tokens.end(), token) != ocr_tokens.end())
+			++matched;
+	}
+	return layer_tokens.empty() ? 1.0 : static_cast<double>(matched) / layer_tokens.size();
 }
 
 static string OcrPage(poppler::page *page, const PdfOptions &po, bool best_effort) {
@@ -2785,7 +2864,21 @@ static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
 		} else if (key == "ocr_language") {
 			o.ocr_language = StringValue::Get(kv.second);
 		} else if (key == "ocr_dpi") {
-			o.ocr_dpi = IntegerValue::Get(kv.second);
+			if (kv.second.type().id() == LogicalTypeId::LIST) {
+				o.ocr_dpi_was_list = true;
+				o.ocr_dpis.clear();
+				for (const auto &value : ListValue::GetChildren(kv.second)) {
+					o.ocr_dpis.push_back(IntegerValue::Get(value));
+				}
+			} else {
+				o.ocr_dpi_was_list = false;
+				o.ocr_dpi = IntegerValue::Get(kv.second);
+				o.ocr_dpis.clear();
+			}
+		} else if (key == "ocr_verify_layer") {
+			o.ocr_verify_layer = BooleanValue::Get(kv.second);
+		} else if (key == "ocr_layer_agreement") {
+			o.ocr_layer_agreement = DoubleValue::Get(kv.second);
 		} else if (key == "ocr_psm") {
 			o.ocr_psm = IntegerValue::Get(kv.second);
 		} else if (key == "ocr_oem") {
@@ -2831,8 +2924,22 @@ static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
 	// silently returning zero rows or feeding out-of-range values to the
 	// rendering / OCR engines (a huge dpi can OOM; an out-of-range psm/oem is
 	// cast into an undefined enum).
-	if (o.ocr_dpi < 1 || o.ocr_dpi > 2400) {
+	if (o.ocr_dpi_was_list && o.ocr_dpis.empty()) {
+		throw InvalidInputException("read_pdf: ocr_dpi list must not be empty");
+	}
+	if (!o.ocr_dpi_was_list && (o.ocr_dpi < 1 || o.ocr_dpi > 2400)) {
 		throw InvalidInputException("read_pdf: ocr_dpi must be between 1 and 2400 (got %d)", o.ocr_dpi);
+	}
+	if (!o.ocr_dpis.empty() && o.ocr_dpis.size() > 5) {
+		throw InvalidInputException("read_pdf: ocr_dpi list must contain at most 5 resolutions");
+	}
+	for (auto dpi : o.ocr_dpis) {
+		if (dpi < 1 || dpi > 2400) {
+			throw InvalidInputException("read_pdf: every ocr_dpi resolution must be between 1 and 2400 (got %d)", dpi);
+		}
+	}
+	if (o.ocr_layer_agreement < 0.0 || o.ocr_layer_agreement > 1.0) {
+		throw InvalidInputException("read_pdf: ocr_layer_agreement must be between 0 and 1");
 	}
 	if (o.ocr_psm < 0 || o.ocr_psm > 13) {
 		throw InvalidInputException("read_pdf: ocr_psm must be between 0 and 13 (got %d)", o.ocr_psm);
@@ -2876,7 +2983,9 @@ static void AddOcrNamedParams(TableFunction &fn) {
 	AddNamedParameter(fn, "ocr", LogicalType::BOOLEAN);
 	AddNamedParameter(fn, "auto_ocr", LogicalType::BOOLEAN);
 	AddNamedParameter(fn, "ocr_language", LogicalType::VARCHAR);
-	AddNamedParameter(fn, "ocr_dpi", LogicalType::INTEGER);
+	AddNamedParameter(fn, "ocr_dpi", LogicalType::ANY);
+	AddNamedParameter(fn, "ocr_verify_layer", LogicalType::BOOLEAN);
+	AddNamedParameter(fn, "ocr_layer_agreement", LogicalType::DOUBLE);
 	AddNamedParameter(fn, "ocr_psm", LogicalType::INTEGER);
 	AddNamedParameter(fn, "ocr_oem", LogicalType::INTEGER);
 	AddNamedParameter(fn, "ocr_preprocess", LogicalType::BOOLEAN);
@@ -3075,9 +3184,9 @@ static unique_ptr<FunctionData> ReadPdfBind(ClientContext &context, TableFunctio
 	// a second pass over the file.
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::DOUBLE,  LogicalType::VARCHAR};
-	names = {"filename", "page",           "page_count", "text",           "width",
-	         "height",   "has_text_layer", "used_ocr",   "ocr_confidence", "label"};
+	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::DOUBLE};
+	names = {"filename",       "page",     "page_count",     "text",  "width",        "height",
+	         "has_text_layer", "used_ocr", "ocr_confidence", "label", "ocr_dpi_used", "layer_agreement"};
 	return std::move(result);
 }
 
@@ -3173,7 +3282,8 @@ static unique_ptr<GlobalTableFunctionState> ReadPdfInitGlobal(ClientContext &con
 	auto g = make_uniq<ReadPdfGlobalState>(max_threads);
 	g->column_ids = input.column_ids;
 	for (auto column_id : g->column_ids) {
-		g->needs_ocr = g->needs_ocr || column_id == 3 || column_id == 7 || column_id == 8;
+		g->needs_ocr =
+		    g->needs_ocr || column_id == 3 || column_id == 7 || column_id == 8 || column_id == 10 || column_id == 11;
 		g->needs_native_text = g->needs_native_text || column_id == 6;
 		g->needs_page = g->needs_page || column_id == 4 || column_id == 5 || column_id == 9;
 	}
@@ -3215,6 +3325,10 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 		bool used_ocr = false;
 		double ocr_confidence = 0.0;
 		bool has_ocr_confidence = false;
+		int32_t ocr_dpi_used = 0;
+		bool has_ocr_dpi_used = false;
+		double layer_agreement = 0.0;
+		bool has_layer_agreement = false;
 		unique_ptr<poppler::page> page;
 		bool want_ocr = false;
 		{
@@ -3246,12 +3360,14 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 					                    : UStringToUtf8(page->text(poppler::rectf(), layout));
 					has_text_layer = pdf_ocr::HasGlyphs(native);
 					text = native;
-					want_ocr = g.needs_ocr && (bind.opt.force_ocr || bind.opt.auto_ocr);
+					const bool verify_layer = bind.opt.ocr_verify_layer && AlphanumericTokens(native).size() >= 10;
+					want_ocr = g.needs_ocr && (bind.opt.force_ocr || bind.opt.auto_ocr || verify_layer);
 				}
 			}
 		}
 		// Outside the document guard: the stamp probe renders the page.
-		if (page && want_ocr && !bind.opt.force_ocr) {
+		const bool verify_this_layer = bind.opt.ocr_verify_layer && AlphanumericTokens(text).size() >= 10;
+		if (page && want_ocr && !bind.opt.force_ocr && !verify_this_layer) {
 			want_ocr = AutoOcrWantsPageText(page.get(), text);
 		}
 		if (page && want_ocr) {
@@ -3260,10 +3376,18 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 			// discard readable embedded text. Image-only pages still get the
 			// loud missing-model error under force_ocr.
 			const bool best_effort = !bind.opt.force_ocr || has_text_layer;
-			auto ocr = OcrPageResult(page.get(), bind.opt, best_effort);
+			auto ocr = OcrPageResult(page.get(), bind.opt, best_effort, &ocr_dpi_used);
+			has_ocr_dpi_used = true;
+			const bool compare_layer =
+			    bind.opt.ocr_verify_layer && has_text_layer && AlphanumericTokens(text).size() >= 10;
+			if (compare_layer) {
+				layer_agreement = LayerAgreement(text, ocr.text);
+				has_layer_agreement = true;
+			}
 			// Over a stamp, OCR wins only when it read more than the stamp itself.
-			const bool ocr_adds =
-			    bind.opt.force_ocr || !has_text_layer || GlyphCount(ocr.text) > ReadableGlyphCount(text);
+			const bool ocr_adds = compare_layer ? layer_agreement < bind.opt.ocr_layer_agreement
+			                                    : (bind.opt.force_ocr || !has_text_layer ||
+			                                       GlyphCount(ocr.text) > ReadableGlyphCount(text));
 			if (ocr_adds && pdf_ocr::HasGlyphs(ocr.text)) {
 				text = std::move(ocr.text);
 				used_ocr = true;
@@ -3312,6 +3436,18 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 				break;
 			case 9:
 				OutStringOrNull(out, count, page_label);
+				break;
+			case 10:
+				if (has_ocr_dpi_used)
+					OutInt32(out, count, ocr_dpi_used);
+				else
+					OutInt32Null(out, count);
+				break;
+			case 11:
+				if (has_layer_agreement)
+					OutDouble(out, count, layer_agreement);
+				else
+					OutDoubleNull(out, count);
 				break;
 			default:
 				// DuckDB requests a row-id placeholder for cardinality-only scans.

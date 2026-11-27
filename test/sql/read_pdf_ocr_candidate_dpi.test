@@ -1,0 +1,29 @@
+# name: test/sql/read_pdf_ocr_candidate_dpi.test
+# description: candidate OCR resolutions and provenance columns
+# group: [sql]
+
+require pdf
+
+query I
+WITH candidates AS (
+  SELECT page, ocr_confidence, ocr_dpi_used
+  FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_retry := false, ocr_dpi := [300, 200])
+), single_300 AS (
+  SELECT page, ocr_confidence FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_retry := false, ocr_dpi := 300)
+), single_200 AS (
+  SELECT page, ocr_confidence FROM read_pdf('test/data/scanned.pdf', ocr := true, ocr_retry := false, ocr_dpi := 200)
+)
+SELECT bool_and(c.ocr_dpi_used IN (300, 200))
+   AND bool_and(c.ocr_confidence = greatest(a.ocr_confidence, b.ocr_confidence))
+FROM candidates c
+JOIN single_300 a USING (page)
+JOIN single_200 b USING (page);
+----
+true
+
+query I
+SELECT bool_and(ocr_dpi_used IS NULL) AND bool_and(layer_agreement IS NULL)
+FROM read_pdf('test/data/two_pages.pdf', auto_ocr := false);
+----
+true
+

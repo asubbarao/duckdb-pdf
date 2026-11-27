@@ -20,6 +20,21 @@ SELECT * FROM read_pdf('test/data/hello.pdf', ocr_dpi := 100000);
 ocr_dpi must be between 1 and 2400
 
 statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', ocr_dpi := []);
+----
+ocr_dpi list must not be empty
+
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', ocr_dpi := [300, 200, 400, 600, 800, 1200]);
+----
+ocr_dpi list must contain at most 5 resolutions
+
+statement error
+SELECT * FROM read_pdf('test/data/hello.pdf', ocr_dpi := [300, 0]);
+----
+every ocr_dpi resolution must be between 1 and 2400
+
+statement error
 SELECT * FROM read_pdf('test/data/hello.pdf', ocr_psm := 99);
 ----
 ocr_psm must be between 0 and 13

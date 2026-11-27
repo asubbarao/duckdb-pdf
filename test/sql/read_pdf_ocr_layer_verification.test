@@ -1,0 +1,38 @@
+# name: test/sql/read_pdf_ocr_layer_verification.test
+# description: verify substantial native layers against rendered page OCR
+# group: [sql]
+
+require pdf
+
+query IIIII
+SELECT has_text_layer, used_ocr, layer_agreement < 0.5, ocr_dpi_used = 300,
+       contains(upper(text), 'LOSS RUN REPORT')
+FROM read_pdf('test/data/ocr_layer_mismatched.pdf', ocr_verify_layer := true, ocr_retry := false);
+----
+true	true	true	true	true
+
+query IIIII
+SELECT has_text_layer, used_ocr, layer_agreement >= 0.5, ocr_dpi_used = 300,
+       contains(upper(text), 'LOSS RUN REPORT')
+FROM read_pdf('test/data/ocr_layer_matching.pdf', ocr_verify_layer := true, ocr_retry := false);
+----
+true	false	true	true	true
+
+query II
+SELECT used_ocr, layer_agreement >= 0.0
+FROM read_pdf('test/data/ocr_layer_mismatched.pdf', ocr_verify_layer := true,
+              ocr_layer_agreement := 0.0, ocr_retry := false);
+----
+false	true
+
+query I
+WITH default_read AS (
+  SELECT page, text, used_ocr FROM read_pdf('test/data/ocr_layer_matching.pdf')
+), explicit_off AS (
+  SELECT page, text, used_ocr FROM read_pdf('test/data/ocr_layer_matching.pdf', ocr_verify_layer := false)
+)
+SELECT bool_and(default_read.text = explicit_off.text AND default_read.used_ocr = explicit_off.used_ocr)
+FROM default_read JOIN explicit_off USING (page);
+----
+true
+
