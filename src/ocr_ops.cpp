@@ -742,10 +742,11 @@ int RereadAtOtherQuarterTurns(tesseract::TessBaseAPI &api, Pix *&processed, int 
 }
 
 void SetOcrImage(tesseract::TessBaseAPI &api, const unsigned char *data, int width, int height, int bytes_per_row,
-	             ImageFormat format, int dpi, bool preprocess, double smooth, Pix *&base, Pix *&processed,
-	             bool deskew = true) {
+                 ImageFormat format, int dpi, bool preprocess, double smooth, Pix *&base, Pix *&processed,
+                 bool deskew = true) {
 	if (smooth < 0.0 || smooth > 50.0) {
-		throw std::runtime_error("ocr_smooth must be between 0 and 50 (tenths of a pixel at 300 DPI; maximum 5 pixels)");
+		throw std::runtime_error(
+		    "ocr_smooth must be between 0 and 50 (tenths of a pixel at 300 DPI; maximum 5 pixels)");
 	}
 	base = preprocess ? BufferToPix(data, width, height, bytes_per_row, format) : nullptr;
 	processed = base ? PreprocessPixForOcr(base, dpi, smooth, deskew) : nullptr;
@@ -1050,7 +1051,8 @@ TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Opti
 		return RecognizeVisionImageBlob(data, size, opt);
 	}
 	if (opt.smooth < 0.0 || opt.smooth > 50.0) {
-		throw std::runtime_error("ocr_smooth must be between 0 and 50 (tenths of a pixel at 300 DPI; maximum 5 pixels)");
+		throw std::runtime_error(
+		    "ocr_smooth must be between 0 and 50 (tenths of a pixel at 300 DPI; maximum 5 pixels)");
 	}
 
 	// leptonica owns the decoder (PNG/JPEG/TIFF/…); no poppler dependency here.

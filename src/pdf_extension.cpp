@@ -2268,7 +2268,7 @@ struct PdfOptions {
 	bool auto_ocr = true;
 	string ocr_language = "eng";
 	int32_t ocr_dpi = 300;
-	double ocr_smooth = 0.0; // tenths of a pixel at 300 DPI; 0 disables descreening
+	double ocr_smooth = 0.0;    // tenths of a pixel at 300 DPI; 0 disables descreening
 	int32_t ocr_psm = 3;        // PSM_AUTO
 	int32_t ocr_oem = 3;        // OEM_DEFAULT
 	bool ocr_preprocess = true; // leptonica grayscale/deskew/binarize/despeckle before OCR
@@ -2845,7 +2845,8 @@ static void ParseNamed(const named_argument_map_t &params, PdfOptions &o) {
 		throw InvalidInputException("read_pdf: ocr_oem must be between 0 and 3 (got %d)", o.ocr_oem);
 	}
 	if (o.ocr_smooth < 0.0 || o.ocr_smooth > 50.0) {
-		throw InvalidInputException("ocr_smooth must be between 0 and 50 (tenths of a pixel at 300 DPI; maximum 5 pixels)");
+		throw InvalidInputException(
+		    "ocr_smooth must be between 0 and 50 (tenths of a pixel at 300 DPI; maximum 5 pixels)");
 	}
 	ValidateLayout(o.layout);
 	if (o.first_page < 1) {
@@ -6444,7 +6445,8 @@ static unique_ptr<FunctionData> OcrImageBind(ClientContext &context, TableFuncti
 		}
 	}
 	if (result->opt.smooth < 0.0 || result->opt.smooth > 50.0) {
-		throw InvalidInputException("ocr_smooth must be between 0 and 50 (tenths of a pixel at 300 DPI; maximum 5 pixels)");
+		throw InvalidInputException(
+		    "ocr_smooth must be between 0 and 50 (tenths of a pixel at 300 DPI; maximum 5 pixels)");
 	}
 	if (result->opt.psm < 0 || result->opt.psm > 13) {
 		throw InvalidInputException("ocr_image: psm must be between 0 and 13 (got %d)", result->opt.psm);
