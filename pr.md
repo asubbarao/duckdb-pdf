@@ -1,30 +1,19 @@
-# fix: make automatic OCR reject stamp-only text and honor OCR opt-out
+# Skip the local PDF build guard in community CI
 
 ## Body
 
-`read_pdf` treated any readable glyph as useful native text, so a short layer of en-dashes could hide the scanned page beneath it. The unreadable-layer check handled garbled glyphs but did not reject punctuation-only content. Automatic OCR now counts Unicode letter/number words and treats fewer than 10 as an unreadable layer.
+The build guard is intended to validate the PDF artifact built by this local checkout. Community extension CI builds against its own DuckDB (today v2.0.1, commit `8d78114e`), so the guard's pinned-host assertion (`v2.0.0`, source `d54cbbe3df`) fails there — community job 138968520845 failed on exactly that line.
 
-`ocr := false` previously cleared only the forced-OCR flag. Since `auto_ocr` defaults to true, scan-only pages were still sent to OCR. An explicit opt-out now disables automatic OCR too, unless `auto_ocr := true` is explicitly supplied.
+The first attempt at a gate did not work: `require-env EXPECTED_EXT_VERSION` passes in community CI because this checkout's own `Makefile` exports it unconditionally, and community CI parses that same Makefile for `make test_release` (its test run carries this Makefile's `--fail-require-skip` flag and office-conversion prerequisites). An unconditional `PDF_LOCAL_BUILD_GUARD=1` export from the same Makefile would reach community CI the same way and skip nothing.
 
-Automatic OCR already used the common OCR options conversion path, which passes `ocr_psm`, DPI, OEM, language, preprocessing, retry and tessdata settings through. The regression test supplies `ocr_psm := 1`.
+The Makefile now defines the pinned version once and checks every `duckdb_version` input in this repo's workflow against it while parsing. A mismatch is a hard Make error, so changing the workflow pin alone cannot skip the guard. The guard test reads its expected library version from the exported Makefile pin. The sentinel is exported only when `DUCKDB_VERSION` is unset (local runs) or matches the pin (this repo's CI). The community-extensions workflow skips the source consistency check and runs with `DUCKDB_VERSION=v2.0.1`, so the export is skipped and the guard file skips at `require-env PDF_LOCAL_BUILD_GUARD`.
 
-## False-first evidence
+## Evidence
 
-Both new cases were run against the requested base, `d359f96`:
+- Community CI job 138968520845 (`build / linux_amd64`, run 45543778181): 68 passed, 1 failed — `test/sql/zz_build_guard.test:10`, `SELECT library_version = 'v2.0.0' AND starts_with(source_id, 'd54cbbe3df')` returned `0` instead of `true`. Its DuckDB is v2.0.1 / `8d78114e90a53823803660bf821f6073ac87da8c` (from the job's environment dump). [Run log](https://github.com/duckdb/community-extensions/actions/runs/45543778181/job/138968520845)
+- `make -pn test_release` on this branch: `PDF_LOCAL_BUILD_GUARD = 1` is defined with `DUCKDB_VERSION` unset and with `DUCKDB_VERSION=v2.0.0`, and absent with `DUCKDB_VERSION=v2.0.1`. Make also fails during parsing if the workflow's pinned version differs from the Makefile pin.
+- Skip/run behavior of the edited test file against a real test binary remains unverified locally (no built `unittest` binary in this worktree); this branch's own CI is the verification — it pins DuckDB v2.0.0, so the guard must run and pass there.
 
-- Dash-only text layer over a scanned page: expected `true, true`; actual `false, false` for `(used_ocr, contains(scanned_totals))`.
-- Scan-only page with `ocr := false`: expected `false, true`; actual `true, false` for `(used_ocr, text_is_empty)`.
+## Follow-up (not this PR)
 
-With the fix, `read_pdf_ocr_auto_options.test` passes all 6 assertions using the freshly built linked extension. The full repository test suite passes: 70 passed, 4 skipped (`LIBREOFFICE_PATH` and `PDF_NETWORK_TESTS` were not enabled).
-
-## ICW before and after
-
-Before, on the base reproduction, pages 16, 19, 32, 43, 53 and 62 kept their dash-only text layer with `used_ocr=false`; the other 56 pages used OCR. Passing `ocr := false` still allowed automatic OCR on scan-only pages.
-
-After, the requested `auto_ocr := true, ocr_psm := 1` query returned 62 rows and `used_ocr=true` for every page. The six formerly missed pages now have text lengths 369, 325, 310, 332, 342 and 287 respectively.
-
-After, `ocr := false` returned `used_ocr=false` for all 62 pages. The six native dash layers remained (lengths 7, 7, 3, 7, 11 and 7); the other pages returned empty text.
-
-## Scope
-
-Only `src/pdf_extension.cpp` and OCR SQLLogicTest inputs/fixture were changed. Poppler mutex and page rendering code were not changed. No installed extensions or dev services were touched. This change is committed locally only; it is not pushed and no PR was opened.
+Merging this does not by itself turn community-extensions #3788 green: that PR pins duckdb-pdf commit `03000e2` (0.10.1), which predates this fix. After merge, cut a 0.10.2 release and re-pin #3788's `extensions/pdf/description.yml` to the new commit.
