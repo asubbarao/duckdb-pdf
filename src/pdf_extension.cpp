@@ -3431,9 +3431,10 @@ static void ReadPdfScan(ClientContext &context, TableFunctionInput &data_p, Data
 				has_layer_agreement = true;
 			}
 			// Over a stamp, OCR wins only when it read more than the stamp itself.
-			const bool ocr_adds = bind.opt.force_ocr || (compare_layer ? layer_agreement < bind.opt.ocr_layer_agreement
-			                                                       : (!has_text_layer ||
-			                                                          GlyphCount(ocr.text) > ReadableGlyphCount(text)));
+			const bool ocr_adds =
+			    bind.opt.force_ocr ||
+			    (compare_layer ? layer_agreement < bind.opt.ocr_layer_agreement
+			                   : (!has_text_layer || GlyphCount(ocr.text) > ReadableGlyphCount(text)));
 			if (ocr_adds && pdf_ocr::HasGlyphs(ocr.text)) {
 				text = std::move(ocr.text);
 				used_ocr = true;
