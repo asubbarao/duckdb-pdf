@@ -22,6 +22,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 
@@ -333,9 +334,10 @@ Pix *BufferToPix(const unsigned char *base, int w, int h, int bpr, ImageFormat f
 // on any failure we return the best Pix produced so far (or nullptr).
 //   1. grayscale
 //   2. deskew (if |angle| > 0.3°)
-//   3. binarize (Otsu)
-//   4. despeckle (light 2x2 close-open at >=300 dpi)
-Pix *PreprocessPixForOcr(Pix *pixs, int dpi, bool deskew = true) {
+//   3. optional halftone smoothing
+//   4. binarize (Otsu)
+//   5. despeckle (light 2x2 close-open at >=300 dpi)
+Pix *PreprocessPixForOcr(Pix *pixs, int dpi, double smooth, bool deskew = true) {
 	if (!pixs) {
 		return nullptr;
 	}
@@ -372,6 +374,21 @@ Pix *PreprocessPixForOcr(Pix *pixs, int dpi, bool deskew = true) {
 			}
 		}
 		pixDestroy(&pixskew);
+	}
+
+	// Smooth the halftone screen before adaptive thresholding. A block convolution
+	// approximates a small Gaussian while remaining available on every supported
+	// Leptonica build. Zero bypasses this block exactly for existing callers.
+	if (smooth > 0.0) {
+		const double radius_pixels = smooth / 10.0 * static_cast<double>(dpi > 0 ? dpi : 300) / 300.0;
+		const int radius = static_cast<int>(std::lround(radius_pixels));
+		if (radius > 0) {
+			Pix *pixsmoothed = pixBlockconv(pixg, radius, radius);
+			if (pixsmoothed) {
+				pixDestroy(&pixg);
+				pixg = pixsmoothed;
+			}
+		}
 	}
 
 	Pix *pixb = nullptr;
@@ -496,11 +513,11 @@ static std::string MissingModelMessage(const Options &opt) {
 // pulling tesseract types across the ocr_ops isolation boundary into pdf_extension.
 //
 // Reuse rules:
-//   - Init once per (thread, language, oem, datapath, config, vars)
+//   - Init once per (thread, language, oem, datapath)
 //   - SetPageSegMode only when psm changes
 //   - Clear() between pages (free page bitmap/results) — never End() in the hot loop
 //   - Never call Init unless <datapath>/<lang>.traineddata exists on disk
-//   - After Init: ReadConfigFile (if set) then SetVariable for each vars entry
+//   - Apply config and vars only for their guarded OCR call
 struct ThreadTessEngine {
 	tesseract::TessBaseAPI api;
 	bool ready = false;
@@ -508,7 +525,6 @@ struct ThreadTessEngine {
 	int oem = -1;
 	std::string datapath;
 	int psm = -1;
-	std::string vars_key; // config path + serialized vars (Init-boundary knobs)
 
 	~ThreadTessEngine() {
 		if (ready) {
@@ -524,33 +540,80 @@ ThreadTessEngine &TlsTess() {
 	return eng;
 }
 
-// Fingerprint of post-Init Tess knobs so a changed config/vars forces re-Init
-// (SetVariable state is not rolled back without End).
-std::string VarsConfigKey(const Options &opt) {
-	std::string key = opt.config;
-	key.push_back('\0');
-	for (const auto &kv : opt.vars) {
-		key.append(kv.first);
-		key.push_back('=');
-		key.append(kv.second);
-		key.push_back('\0');
-	}
-	return key;
+// Tesseract documents that classify/textord SetVariable parameters can be
+// process-global. Calls with config or vars take the exclusive lock; ordinary calls take
+// a shared lock, so none can observe a temporary global override. Instance-only
+// parameters remain parallel with other ordinary calls.
+std::shared_timed_mutex &TessVariableMutex() {
+	static std::shared_timed_mutex mutex;
+	return mutex;
 }
 
-void ApplyTessConfigAndVars(tesseract::TessBaseAPI &api, const Options &opt) {
-	if (!opt.config.empty()) {
-		api.ReadConfigFile(opt.config.c_str());
-	}
-	for (const auto &kv : opt.vars) {
-		if (kv.first.empty()) {
-			continue;
+struct TessCallGuard {
+	explicit TessCallGuard(const Options &opt) : exclusive(!opt.vars.empty() || !opt.config.empty()) {
+		if (exclusive) {
+			TessVariableMutex().lock();
+		} else {
+			TessVariableMutex().lock_shared();
 		}
-		// Tess returns false for unknown names; ignore so typos don't abort scans.
-		// (Known-good keys still take effect; shellfs CLI hatch remains for full CLI.)
-		(void)api.SetVariable(kv.first.c_str(), kv.second.c_str());
 	}
-}
+	~TessCallGuard() {
+		if (exclusive) {
+			TessVariableMutex().unlock();
+		} else {
+			TessVariableMutex().unlock_shared();
+		}
+	}
+	TessCallGuard(const TessCallGuard &) = delete;
+	TessCallGuard &operator=(const TessCallGuard &) = delete;
+	bool exclusive;
+};
+
+struct ScopedTessVariables {
+	explicit ScopedTessVariables(tesseract::TessBaseAPI &api_p) : api(api_p) {
+	}
+	void Set(const std::string &key, const std::string &value) {
+		std::string previous;
+		if (api.GetVariableAsString(key.c_str(), &previous)) {
+			restore.emplace_back(key, std::move(previous));
+			api.SetVariable(key.c_str(), value.c_str());
+		}
+	}
+	void Apply(const Options &opt) {
+		if (!opt.config.empty()) {
+			// Match ReadConfigFile's search order and keep the whole value after the first delimiter.
+			std::string dir = api.GetDatapath();
+			std::ifstream file(dir + "/configs/" + opt.config);
+			if (!file.is_open())
+				file.open(dir + "/tessconfigs/" + opt.config);
+			if (!file.is_open())
+				file.open(opt.config);
+			std::string line;
+			while (std::getline(file, line)) {
+				if (!line.empty() && line.back() == '\r')
+					line.pop_back();
+				if (line.empty() || line.front() == '#')
+					continue;
+				auto end = line.find_first_of(" \t");
+				auto start = line.find_first_not_of(" \t", end);
+				Set(line.substr(0, end), start == std::string::npos ? "" : line.substr(start));
+			}
+			// The explicit page segmentation mode takes precedence over the config.
+			api.SetPageSegMode(static_cast<tesseract::PageSegMode>(opt.psm));
+		}
+		for (const auto &kv : opt.vars)
+			Set(kv.first, kv.second);
+	}
+	~ScopedTessVariables() {
+		for (auto it = restore.rbegin(); it != restore.rend(); ++it) {
+			(void)api.SetVariable(it->first.c_str(), it->second.c_str());
+		}
+	}
+	ScopedTessVariables(const ScopedTessVariables &) = delete;
+	ScopedTessVariables &operator=(const ScopedTessVariables &) = delete;
+	tesseract::TessBaseAPI &api;
+	std::vector<std::pair<std::string, std::string>> restore;
+};
 
 bool EnsureTesseract(const Options &opt) {
 	// Resolve + verify the model file BEFORE any TessBaseAPI::Init call.
@@ -565,9 +628,7 @@ bool EnsureTesseract(const Options &opt) {
 	}
 
 	auto &eng = TlsTess();
-	const std::string vars_key = VarsConfigKey(opt);
-	const bool need_init = !eng.ready || eng.language != opt.language || eng.oem != opt.oem ||
-	                       eng.datapath != datadir || eng.vars_key != vars_key;
+	const bool need_init = !eng.ready || eng.language != opt.language || eng.oem != opt.oem || eng.datapath != datadir;
 	if (need_init) {
 		if (eng.ready) {
 			eng.api.End();
@@ -586,13 +647,10 @@ bool EnsureTesseract(const Options &opt) {
 			}
 			throw std::runtime_error(MissingModelMessage(opt));
 		}
-		// Config then vars — matches Tess CLI: config file, then -c overrides.
-		ApplyTessConfigAndVars(eng.api, opt);
 		eng.ready = true;
 		eng.language = opt.language;
 		eng.oem = opt.oem;
 		eng.datapath = datadir;
-		eng.vars_key = vars_key;
 		eng.psm = -1; // force SetPageSegMode below
 	}
 	if (eng.psm != opt.psm) {
@@ -686,9 +744,14 @@ int RereadAtOtherQuarterTurns(tesseract::TessBaseAPI &api, Pix *&processed, int 
 }
 
 void SetOcrImage(tesseract::TessBaseAPI &api, const unsigned char *data, int width, int height, int bytes_per_row,
-                 ImageFormat format, int dpi, bool preprocess, Pix *&base, Pix *&processed, bool deskew = true) {
+                 ImageFormat format, int dpi, bool preprocess, double smooth, Pix *&base, Pix *&processed,
+                 bool deskew = true) {
+	if (smooth < 0.0 || smooth > 50.0) {
+		throw std::runtime_error(
+		    "ocr_smooth must be between 0 and 50 (tenths of a pixel at 300 DPI; maximum 5 pixels)");
+	}
 	base = preprocess ? BufferToPix(data, width, height, bytes_per_row, format) : nullptr;
-	processed = base ? PreprocessPixForOcr(base, dpi, deskew) : nullptr;
+	processed = base ? PreprocessPixForOcr(base, dpi, smooth, deskew) : nullptr;
 	Pix *use = processed ? processed : base;
 	if (use) {
 		api.SetImage(use);
@@ -734,14 +797,17 @@ TextResult RecognizeTesseractText(const unsigned char *data, int width, int heig
 		return out;
 	}
 
+	TessCallGuard call_guard(opt);
 	if (!EnsureTesseract(opt)) {
 		return out;
 	}
 	auto &api = TlsTess().api;
+	ScopedTessVariables scoped_vars(api);
+	scoped_vars.Apply(opt);
 
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
-	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed);
+	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, opt.smooth, base, processed);
 
 	// read_pdf page path always wants plain text; format on Options is for
 	// RecognizeImageBlob / ocr_image TVF. Keep text-only here for stability.
@@ -764,14 +830,18 @@ WordsResult RecognizeTesseractWords(const unsigned char *data, int width, int he
 		return out;
 	}
 
+	TessCallGuard call_guard(opt);
 	if (!EnsureTesseract(opt)) {
 		return out;
 	}
 	auto &api = TlsTess().api;
+	ScopedTessVariables scoped_vars(api);
+	scoped_vars.Apply(opt);
 
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
-	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed, false);
+	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, opt.smooth, base, processed,
+	            false);
 
 	int rec = api.Recognize(0);
 	if (rec != 0) {
@@ -925,6 +995,7 @@ PdfResult RenderSearchablePdf(const unsigned char *data, int width, int height, 
 	if (!data || width <= 0 || height <= 0) {
 		return out;
 	}
+	TessCallGuard call_guard(opt);
 	if (!EnsureTesseract(opt)) {
 		return out;
 	}
@@ -933,9 +1004,12 @@ PdfResult RenderSearchablePdf(const unsigned char *data, int width, int height, 
 	const bool has_pdf_font = pdf_font.good();
 
 	auto &api = TlsTess().api;
+	ScopedTessVariables scoped_vars(api);
+	scoped_vars.Apply(opt);
 	Pix *base = nullptr;
 	Pix *processed = nullptr;
-	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, base, processed, false);
+	SetOcrImage(api, data, width, height, bytes_per_row, format, opt.dpi, opt.preprocess, opt.smooth, base, processed,
+	            false);
 	const bool rendered = RenderTesseractPdf(api, output_base, datadir);
 	if (!rendered) {
 		api.Clear();
@@ -981,6 +1055,10 @@ TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Opti
 	if (opt.backend == Backend::Vision) {
 		return RecognizeVisionImageBlob(data, size, opt);
 	}
+	if (opt.smooth < 0.0 || opt.smooth > 50.0) {
+		throw std::runtime_error(
+		    "ocr_smooth must be between 0 and 50 (tenths of a pixel at 300 DPI; maximum 5 pixels)");
+	}
 
 	// leptonica owns the decoder (PNG/JPEG/TIFF/…); no poppler dependency here.
 	// Silence residual "Error in pixReadMem: …" chatter on bad inputs (same pattern
@@ -998,11 +1076,14 @@ TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Opti
 		                         "(expected PNG/JPEG/etc. readable by leptonica, e.g. from pdf_to_png)");
 	}
 
+	TessCallGuard call_guard(opt);
 	if (!EnsureTesseract(opt)) {
 		pixDestroy(&pix);
 		return out;
 	}
 	auto &api = TlsTess().api;
+	ScopedTessVariables scoped_vars(api);
+	scoped_vars.Apply(opt);
 
 	const int dpi = opt.dpi > 0 ? opt.dpi : 300;
 	// Prefer embedded resolution when present; otherwise stamp dpi for preprocess.
@@ -1016,7 +1097,7 @@ TextResult RecognizeImageBlob(const unsigned char *data, size_t size, const Opti
 
 	Pix *processed = nullptr;
 	if (opt.preprocess) {
-		processed = PreprocessPixForOcr(pix, dpi);
+		processed = PreprocessPixForOcr(pix, dpi, opt.smooth);
 	}
 	Pix *use = processed ? processed : pix;
 	api.SetImage(use);

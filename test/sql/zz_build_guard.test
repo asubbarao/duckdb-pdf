@@ -4,11 +4,17 @@
 
 require pdf
 
-# Set by the local test run; a build in another tree (community CI) pins its own DuckDB.
+# Exported by the Makefile only when the build's DuckDB is the repo's pin;
+# community CI parses the same Makefile but builds against its own DuckDB, so
+# the guard skips there instead of failing on the version assertion below.
+require-env PDF_LOCAL_BUILD_GUARD
+
 require-env EXPECTED_EXT_VERSION
 
+require-env PDF_DUCKDB_VERSION
+
 query I
-SELECT library_version = 'v2.0.0' AND starts_with(source_id, 'd54cbbe3df') FROM pragma_version();
+SELECT library_version = '${PDF_DUCKDB_VERSION}' AND starts_with(source_id, 'd54cbbe3df') FROM pragma_version();
 ----
 true
 
