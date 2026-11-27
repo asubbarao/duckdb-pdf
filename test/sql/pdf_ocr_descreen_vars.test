@@ -1,0 +1,156 @@
+# name: test/sql/pdf_ocr_descreen_vars.test
+# description: OCR halftone descreening and per-call Tesseract variable restoration
+# group: [sql]
+
+require pdf
+
+statement ok
+PRAGMA enable_verification
+
+# Synthetic one-page scan: five claim/date/amount rows were rendered to a 1687x2216
+# raster at 200 ppi. A repeating 2x2-pixel screen with 80% dark dots is composited
+# over each gray row. The PDF embeds that raster. This tuned pattern gives a
+# reproducible miss without preprocessing and recovery with smoothing.
+
+# False-first: without smoothing the first claim number remains unreadable.
+query I
+SELECT NOT contains(text, '4137337')
+FROM read_pdf('test/data/halftone_claims.pdf', ocr:=true, ocr_retry:=false);
+----
+true
+
+# A 1 px smoothing radius at 300 DPI recovers all five claim numbers.
+query I
+SELECT contains(text, '4137337') AND contains(text, '5281049') AND contains(text, '6672091')
+   AND contains(text, '7315086') AND contains(text, '8942163')
+FROM read_pdf('test/data/halftone_claims.pdf', ocr:=true, ocr_retry:=false, ocr_smooth:=10);
+----
+true
+
+# The encoded-image OCR path accepts the same smoothing radius.
+query I
+SELECT contains(text, '4137337') AND contains(text, '5281049') AND contains(text, '6672091')
+   AND contains(text, '7315086') AND contains(text, '8942163')
+FROM ocr_image(pdf_render('test/data/halftone_claims.pdf', 1, {dpi: 300}), dpi:=300, ocr_smooth:=10);
+----
+true
+
+# The STRUCT form accepts descreening and sends it through to OCR preprocessing.
+query I
+SELECT contains(text, '4137337') AND contains(text, '5281049') AND contains(text, '6672091')
+   AND contains(text, '7315086') AND contains(text, '8942163')
+FROM (SELECT ocr_image(pdf_render('test/data/halftone_claims.pdf', 1), {ocr_smooth: 10}) AS text);
+----
+true
+
+# At 300 DPI, 4.9 rounds to radius 0 while 5 rounds to radius 1.
+query I
+SELECT count(DISTINCT text) = 2
+FROM (
+    SELECT text FROM read_pdf('test/data/halftone_claims.pdf', ocr:=true, ocr_retry:=false, ocr_smooth:=4.9)
+    UNION ALL
+    SELECT text FROM read_pdf('test/data/halftone_claims.pdf', ocr:=true, ocr_retry:=false, ocr_smooth:=5)
+);
+----
+true
+
+# Zero is an exact opt-out: its text bytes match the default pipeline output.
+query I
+WITH defaults AS (
+    SELECT text FROM read_pdf('test/data/halftone_claims.pdf', ocr:=true, ocr_retry:=false)
+), explicit_zero AS (
+    SELECT text FROM read_pdf('test/data/halftone_claims.pdf', ocr:=true, ocr_retry:=false, ocr_smooth:=0)
+)
+SELECT count(DISTINCT text) = 1
+FROM (
+    SELECT text FROM defaults
+    UNION ALL
+    SELECT text FROM explicit_zero
+);
+----
+true
+
+statement error
+SELECT * FROM read_pdf('test/data/halftone_claims.pdf', ocr:=true, ocr_smooth:=-0.1);
+----
+ocr_smooth must be between 0 and 50
+
+statement error
+SELECT * FROM ocr_image(pdf_render('test/data/halftone_claims.pdf', 1), ocr_smooth:=50.1);
+----
+ocr_smooth must be between 0 and 50
+
+# Keep each call as its own statement so Tesseract's process-global parameter is
+# set between two identical reads in this one DuckDB process.
+statement ok
+CREATE TABLE ocr_descreen_leak_before AS
+SELECT ocr_image(pdf_render(content, 1, {dpi: 150}), {format: 'tsv'}) AS text
+FROM read_blob('test/data/scanned.pdf');
+
+statement ok
+CREATE TABLE ocr_descreen_leak_override AS
+SELECT ocr_image(pdf_render(content, 1, {dpi: 150}), {format: 'tsv', vars: MAP {'textord_heavy_nr': '1'}}) AS text
+FROM read_blob('test/data/scanned.pdf');
+
+statement ok
+CREATE TABLE ocr_descreen_leak_after AS
+SELECT ocr_image(pdf_render(content, 1, {dpi: 150}), {format: 'tsv'}) AS text
+FROM read_blob('test/data/scanned.pdf');
+
+# This variable changes the middle call on the fixture; after it returns, the
+# next default call is byte-identical to the first.
+query I
+SELECT count(DISTINCT text) = 2
+FROM (
+    SELECT text FROM ocr_descreen_leak_before
+    UNION ALL
+    SELECT text FROM ocr_descreen_leak_override
+);
+----
+true
+
+query I
+SELECT count(DISTINCT text) = 1
+FROM (
+    SELECT text FROM ocr_descreen_leak_before
+    UNION ALL
+    SELECT text FROM ocr_descreen_leak_after
+);
+----
+true
+
+statement ok
+CREATE TABLE ocr_config_override AS
+SELECT ocr_image(pdf_render(content, 1, {dpi: 150}), {format: 'tsv', config: 'test/data/ocr_heavy_nr.config'}) AS text
+FROM read_blob('test/data/scanned.pdf');
+
+# A config must produce the same override as vars, then restore the default for the next call.
+query I
+SELECT count(text) = 1 FROM ocr_config_override JOIN ocr_descreen_leak_override USING (text);
+----
+true
+
+query I
+SELECT count(text) = 1 FROM ocr_descreen_leak_before JOIN (
+    SELECT ocr_image(pdf_render(content, 1, {dpi: 150}), {format: 'tsv'}) AS text FROM read_blob('test/data/scanned.pdf')
+) after_config USING (text);
+----
+true
+
+# Explicit vars win when the config sets the same key.
+query I
+SELECT count(text) = 1 FROM ocr_descreen_leak_before JOIN ocr_image(
+    pdf_render('test/data/scanned.pdf', 1, {dpi: 150}), format:='tsv',
+    ocr_config:='test/data/ocr_heavy_nr.config', ocr_vars:=MAP {'textord_heavy_nr': '0'}
+) USING (text);
+----
+true
+
+statement ok
+DROP TABLE ocr_descreen_leak_before;
+
+statement ok
+DROP TABLE ocr_descreen_leak_override;
+
+statement ok
+DROP TABLE ocr_descreen_leak_after;
