@@ -11,6 +11,8 @@ require-env PDF_LOCAL_BUILD_GUARD
 
 require-env EXPECTED_EXT_VERSION
 
+require-env PDF_DUCKDB_VERSION
+
 query I
 SELECT library_version = '${PDF_DUCKDB_VERSION}' AND starts_with(source_id, 'd54cbbe3df') FROM pragma_version();
 ----
