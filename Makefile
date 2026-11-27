@@ -3,8 +3,9 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # Configuration of extension
 EXT_NAME=pdf
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
-DUCKDB_GIT_VERSION ?= v2.0.0
-OVERRIDE_GIT_DESCRIBE ?= v2.0.0
+PDF_DUCKDB_VERSION := v2.0.0
+DUCKDB_GIT_VERSION ?= $(PDF_DUCKDB_VERSION)
+OVERRIDE_GIT_DESCRIBE ?= $(PDF_DUCKDB_VERSION)
 
 # Staging archives can report an alpha version even for the release commit.
 # Build the pinned stable host so extension repository paths and ABI agree.
@@ -70,19 +71,27 @@ PDF_BUILT_VERSION = $(shell ./build/release/duckdb -unsigned -no-agent -noheader
 	 SELECT extension_version FROM duckdb_extensions() WHERE extension_name='$(EXT_NAME)';" 2>/dev/null | tail -1)
 export EXPECTED_EXT_VERSION = $(PDF_BUILT_VERSION)
 
-# The guard asserts the pinned DuckDB (v2.0.0, source d54cbbe3df). Community
+# The guard asserts the pinned DuckDB (source d54cbbe3df). Community
 # extension CI parses this same Makefile for `make test_release` — the
 # --fail-require-skip flag and the office-conversion prerequisites in its test
 # run come from here — but it builds against its own DuckDB (today v2.0.1), so
 # an unconditional export would run the guard there and fail (community job
-# 138968520845). Export the sentinel only when the DuckDB in play is the
-# pinned one: unset locally (the Makefile default) and v2.0.0 in this repo's
-# own CI, where the reusable workflow sets DUCKDB_VERSION from its
-# duckdb_version input. When the pin moves, update the version here and in
-# test/sql/zz_build_guard.test together.
+# 138968520845). Keep the workflow inputs aligned with this one Makefile pin;
+# when the repo workflow is present, any mismatch stops Make before tests run.
+PDF_DUCKDB_WORKFLOW := $(wildcard $(PROJ_DIR).github/workflows/MainDistributionPipeline.yml)
+ifneq ($(GITHUB_REPOSITORY),duckdb/community-extensions)
+ifneq ($(PDF_DUCKDB_WORKFLOW),)
+PDF_WORKFLOW_DUCKDB_VERSIONS := $(shell awk '/^[[:space:]]*duckdb_version:/ { print $$2 }' $(PDF_DUCKDB_WORKFLOW) | sort -u)
+ifneq ($(strip $(PDF_WORKFLOW_DUCKDB_VERSIONS)),$(PDF_DUCKDB_VERSION))
+$(error repo workflow DuckDB pin '$(PDF_WORKFLOW_DUCKDB_VERSIONS)' does not match Makefile pin '$(PDF_DUCKDB_VERSION)')
+endif
+endif
+endif
+
+export PDF_DUCKDB_VERSION
 ifeq ($(DUCKDB_VERSION),)
 export PDF_LOCAL_BUILD_GUARD = 1
-else ifeq ($(DUCKDB_VERSION),v2.0.0)
+else ifeq ($(DUCKDB_VERSION),$(PDF_DUCKDB_VERSION))
 export PDF_LOCAL_BUILD_GUARD = 1
 endif
 
