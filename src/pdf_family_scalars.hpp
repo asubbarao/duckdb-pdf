@@ -19,10 +19,9 @@ static void PdfFamilyResolveOptions(ResolveScalarFunctionTypesInput &input) {
 		    (name == "pdf_stamp" &&
 		     (key == "mode" || key == "text" || key == "opacity" || key == "prefix" || key == "start")) ||
 		    (name == "pdf_rewrite" && (key == "mode" || key == "password" || key == "owner_password")) ||
-		    (name == "ocr_image" &&
-		     (key == "language" || key == "psm" || key == "oem" || key == "tessdata_dir" || key == "preprocess" ||
-		      key == "vars" || key == "config" || key == "dpi" || key == "format" || key == "backend" ||
-		      key == "ocr_smooth")) ||
+		    (name == "ocr_image" && (key == "language" || key == "psm" || key == "oem" || key == "tessdata_dir" ||
+		                             key == "preprocess" || key == "vars" || key == "config" || key == "dpi" ||
+		                             key == "format" || key == "backend" || key == "ocr_smooth")) ||
 		    (name == "image_barcodes" && key == "symbologies");
 		if (!allowed)
 			throw BinderException("%s: unknown option '%s'", name, key);
